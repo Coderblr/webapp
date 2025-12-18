@@ -1,0 +1,133 @@
+@app.post("/upload_excel/")
+async def upload_excel(file: UploadFile = File(...)):
+
+    if not file.filename.endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="Only Excel files allowed")
+
+    contents = await file.read()
+    df = pd.read_excel(io.BytesIO(contents))
+
+    # ================= REQUIRED INPUT COLUMNS =================
+    required_columns = [
+        "FIRSTNAME", "LASTNAME", "MOBILE_NUMBER", "PANCARD",
+        "DOB", "GENDER", "EMAIL",
+        "REGION", "CATEGORY", "ACC_TYPE",
+        "P_CODE", "SEG_CODE", "BALANCE", "KYC_COMPLIANT"
+    ]
+
+    missing = [c for c in required_columns if c not in df.columns]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing required columns: {', '.join(missing)}"
+        )
+
+    # ================= OUTPUT COLUMNS =================
+    output_columns = [
+        "CIF_NUMBER", "CIF_STATUS", "CIF_ERROR",
+        "CKYC_STATUS", "CKYC_ERROR",
+        "DEPOSIT_ACCOUNT_NUMBER", "DEPOSIT_STATUS", "DEPOSIT_ERROR"
+    ]
+
+    for col in output_columns:
+        df[col] = ""
+
+    # ================= PROCESS EACH ROW =================
+    for index, row in df.iterrows():
+        try:
+            # -------- READ FROM EXCEL --------
+            firstname = read(row, "FIRSTNAME")
+            lastname  = read(row, "LASTNAME")
+            mobile    = read(row, "MOBILE_NUMBER")
+            pancard   = read(row, "PANCARD")
+            dob       = read(row, "DOB")
+            gender    = read(row, "GENDER")
+            email     = read(row, "EMAIL")
+
+            region    = read(row, "REGION")
+            category  = read(row, "CATEGORY")
+            acc_type  = read(row, "ACC_TYPE")
+            p_code    = read(row, "P_CODE")
+            seg_code  = read(row, "SEG_CODE")
+            kyc_flag  = read(row, "KYC_COMPLIANT", "N")
+
+            try:
+                balance = float(row.get("BALANCE", 0))
+            except:
+                raise Exception("Invalid BALANCE value")
+
+            # -------- STEP 1: CREATE CIF --------
+            cif_payload = {
+                "region": region,
+                "customerType": acc_type,
+                "customerDetails": {
+                    "firstName": firstname,
+                    "lastName": lastname,
+                    "mobile": mobile,
+                    "pan": pancard,
+                    "dob": dob,
+                    "gender": gender,
+                    "email": email
+                }
+            }
+
+            cif_response = EIS_API.create_cif(cif_payload)
+
+            if cif_response.get("ERROR_CODE"):
+                raise Exception("CIF creation failed")
+
+            cif_number = cif_response["ACCOUNT_NUMBER"]
+            df.at[index, "CIF_NUMBER"] = cif_number
+            df.at[index, "CIF_STATUS"] = "SUCCESS"
+
+            # -------- STEP 2: CREATE CKYC --------
+            ckyc_payload = {
+                "cifNumber": cif_number,
+                "category": category,
+                "kycCompliant": kyc_flag
+            }
+
+            ckyc_response = EIS_API.create_ckyc(ckyc_payload)
+
+            if ckyc_response.get("ERROR_CODE"):
+                raise Exception("CKYC creation failed")
+
+            df.at[index, "CKYC_STATUS"] = "SUCCESS"
+
+            # -------- STEP 3: CREATE DEPOSIT + BALANCE --------
+            deposit_payload = {
+                "cifNumber": cif_number,
+                "productCode": p_code,
+                "segmentCode": seg_code,
+                "openingBalance": balance   # 🔥 FROM EXCEL
+            }
+
+            deposit_response = EIS_API.create_deposit(deposit_payload)
+
+            if deposit_response.get("ERROR_CODE"):
+                raise Exception("Deposit creation failed")
+
+            df.at[index, "DEPOSIT_ACCOUNT_NUMBER"] = deposit_response["ACCOUNT_NUMBER"]
+            df.at[index, "DEPOSIT_STATUS"] = "SUCCESS"
+
+        except Exception as e:
+            df.at[index, "CIF_STATUS"] = "FAILED"
+            df.at[index, "CIF_ERROR"] = str(e)
+            df.at[index, "CKYC_STATUS"] = "FAILED"
+            df.at[index, "DEPOSIT_STATUS"] = "FAILED"
+            df.at[index, "DEPOSIT_ERROR"] = str(e)
+
+    # ================= RETURN UPDATED EXCEL =================
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Results")
+
+    output.seek(0)
+
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename=processed_{file.filename}"
+        }
+    )
