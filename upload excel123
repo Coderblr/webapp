@@ -1,86 +1,109 @@
-"use client";
 
-import { useState } from "react";
+from fastapi import APIRouter, UploadFile, File, HTTPException
+import pandas as pd
+import json
+import io
 
-export default function Home() {
-  const [file, setFile] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [downloadUrl, setDownloadUrl] = useState("");
+@app.post("/full_onboarding_with_excel/")
+async def full_onboarding_with_excel(
+    file: UploadFile = File(...)
+):
+    region = "Y2"
+    p_code = "10111101"
+    seg_code = "0706"
 
-  const handleUpload = async () => {
-    if (!file) {
-      alert("Please select an Excel or CSV file");
-      return;
-    }
+    try:
+        
+        contents = await file.read()
+        df = pd.read_excel(io.BytesIO(contents))
+        records = df.to_dict(orient="records")
 
-    setLoading(true);
-    setDownloadUrl("");
+        r_code = Configs.get_region(region)
+        if r_code == "AAA":
+            raise HTTPException(status_code=400, detail="Invalid region")
 
-    const formData = new FormData();
-    formData.append("file", file);
+        RRN_PREFIX = "SBI" + r_code
+        final_response = []
 
-    try {
-      const res = await fetch("http://127.0.0.1:8000/upload", {
-        method: "POST",
-        body: formData,
-      });
+        
+        for row in records:
+            RRNO_CIF = Configs.generate_random_string_with_timestamp(RRN_PREFIX)
 
-      const data = await res.json();
+            payload = CIF_Dep_Payload.generate_pcif_entry(
+                RRNO_CIF,
+                r_code
+            )
 
-      if (!res.ok) {
-        throw new Error(data.detail || "Upload failed");
-      }
+            for key in payload.keys() & row.keys():
+                payload[key] = row[key]
 
-      // 🔹 Backend should return download_url OR file_id
-      if (data.download_url) {
-        setDownloadUrl(`http://127.0.0.1:8000${data.download_url}`);
-      } else if (data.file_id) {
-        setDownloadUrl(`http://127.0.0.1:8000/download/${data.file_id}`);
-      }
+            cif_response = EIS_API.get_pers_cif(
+                json.dumps(payload),
+                RRNO_CIF
+            )
 
-      alert("File processed successfully");
-    } catch (err) {
-      alert(err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
+            cif_data = json.loads(cif_response) if isinstance(cif_response, str) else cif_response
 
-  return (
-    <div style={styles.container}>
-      <h1>Excel / CSV Processor</h1>
+            if "res_data" in cif_data:
+                cif_res_data = json.loads(cif_data["res_data"])
+                cif_account_number = cif_res_data.get("CUSTOMER_NUMBER", "")
+            else:
+                cif_account_number = cif_data.get("CUSTOMER_NUMBER", "")
 
-      <input
-        type="file"
-        accept=".xlsx,.xls,.csv"
-        onChange={(e) => setFile(e.target.files[0])}
-      />
+            if not cif_account_number:
+                raise HTTPException(status_code=400, detail="CIF creation failed")
 
-      <button onClick={handleUpload} disabled={loading}>
-        {loading ? "Processing..." : "Upload"}
-      </button>
+            RRNO_CKYC = Configs.generate_random_string_with_timestamp(RRN_PREFIX)
 
-      {downloadUrl && (
-        <a href={downloadUrl} download>
-          <button style={styles.downloadBtn}>
-            Download Processed File
-          </button>
-        </a>
-      )}
-    </div>
-  );
-}
+            ckyc_payload = CKYC_EXCEL.generate_ckyc_entry(
+                r_code,
+                cif_account_number
+            )
 
-const styles = {
-  container: {
-    padding: "50px",
-    display: "flex",
-    flexDirection: "column",
-    gap: "15px",
-    width: "400px",
-  },
-  downloadBtn: {
-    backgroundColor: "green",
-    color: "white",
-  },
-};
+            ckyc_response = EIS_API.get_ckyc_eis(
+                json.dumps(ckyc_payload),
+                RRNO_CKYC
+            )
+
+            RRNO_DEPOSIT = Configs.generate_random_string_with_timestamp(RRN_PREFIX)
+
+            deposit_payload = DEPOSIT_EXCEL.deposit_account_excel(
+                r_code,
+                cif_account_number,
+                p_code,
+                seg_code
+            )
+
+            deposit_response = EIS_API.get_deposit_eis(
+                json.dumps(deposit_payload),
+                RRNO_DEPOSIT
+            )
+
+            deposit_data = json.loads(deposit_response) if isinstance(deposit_response, str) else deposit_response
+
+            if "res_data" in deposit_data:
+                deposit_res_data = json.loads(deposit_data["res_data"])
+                deposit_account_number = deposit_res_data.get("ACCOUNT_NUMBER", "")
+            else:
+                deposit_account_number = deposit_data.get("ACCOUNT_NUMBER", "")
+
+            final_response.append({
+                "CIF_RRN": RRNO_CIF,
+                "CIF_NUMBER": cif_account_number,
+                "CKYC_RRN": RRNO_CKYC,
+                "DEPOSIT_RRN": RRNO_DEPOSIT,
+                "DEPOSIT_ACCOUNT": deposit_account_number
+            })
+
+        return {
+            "status": "SUCCESS",
+            "data": final_response
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Onboarding failed: {str(e)}"
+        )
