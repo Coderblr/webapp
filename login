@@ -1,240 +1,192 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { Menu } from "lucide-react";
 
-export default function LoginPage({ onLoginSuccess, onNavigate }) {
-    const [username, setUsername] = useState("");
-    const [password, setPassword] = useState("");
-    const [loading, setLoading] = useState(false);
-    const [error, setError] = useState("");
-    const [showPassword, setShowPassword] = useState(false);
+import Sidebar from "./Sidebar";
 
-    const [usernameError, setUsernameError] = useState("");
-    const [passwordError, setPasswordError] = useState("");
+// User Views
+import HomeView from "./HomeView";
+import CifCreationView from "./CifCreationView";
 
-    const [userFocused, setUserFocused] = useState(false);
-    const [passFocused, setPassFocused] = useState(false);
+// Admin Views
+import AdminDashboard from "../admin/AdminDashboard";
+import UserManagement from "../admin/UserManagement";
 
-    const BASE_URL = process.env.NEXT_PUBLIC_API_URL;
+const BASE_URL = process.env.NEXT_PUBLIC_API_URL;
 
-    // ─── Simple client-side validation ───────────────────────────
-    const validateUsername = (val) => {
-        if (!val.trim()) return "Username is required.";
-        if (val.trim().length < 3) return "Username must be at least 3 characters.";
-        return "";
-    };
+const IS_ADMIN  = (user) => user?.userType === 1;
+const IS_USER   = (user) => user?.userType === 3;
 
-    const validatePassword = (val) => {
-        if (!val) return "Password is required.";
-        if (val.length < 8) return "Password must be at least 8 characters.";
-        return "";
-    };
+function AccessDenied() {
+    return (
+        <div style={styles.accessDenied}>
+            <span>🔒 You don't have permission to view this page.</span>
+        </div>
+    );
+}
 
-    // ─── Submit ───────────────────────────────────────────────────
-    const handleLogin = async (e) => {
-        e.preventDefault();
-        setError("");
+export default function Dashboard({ user, onLogout }) {
+    const [sidebarOpen,   setSidebarOpen]   = useState(true);
+    const [activeService, setActiveService] = useState("home");
+    const [selectedUser,  setSelectedUser]  = useState(null);
 
-        // Validate before hitting the API
-        const usernameErr = validateUsername(username);
-        const passwordErr = validatePassword(password);
-        setUsernameError(usernameErr);
-        setPasswordError(passwordErr);
-        if (usernameErr || passwordErr) return;
+    // ── Redirect admin to their dashboard on first load ──────────
+    useEffect(() => {
+        if (IS_ADMIN(user)) {
+            setActiveService("admin_dashboard");
+        } else {
+            setActiveService("home");
+        }
+    }, [user]);
 
-        setLoading(true);
-
+    // ── Logout — calls backend to clear httpOnly cookie ──────────
+    const handleLogout = async () => {
         try {
-            // ── Step 1: Login — backend sets httpOnly cookies automatically ──
-            const response = await fetch(`${BASE_URL}/token`, {
+            await fetch(`${BASE_URL}/logout`, {
                 method: "POST",
-                credentials: "include",                          // ← allows cookie to be received & stored
-                headers: {
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                body: new URLSearchParams({ username, password }),
+                credentials: "include",   // sends the httpOnly cookie so backend can blacklist it
             });
-
-            const data = await response.json();
-
-            if (!response.ok) {
-                throw new Error(data.detail || "Login failed");
-            }
-
-            // ── Step 2: Handle force password change ──────────────────────
-            if (data.force_password_change) {
-                onNavigate("change-password");
-                return;
-            }
-
-            // ── Step 3: Fetch user profile — cookie sent automatically ────
-            const profileRes = await fetch(`${BASE_URL}/users/me`, {
-                method: "GET",
-                credentials: "include",                          // ← cookie sent automatically, no Bearer header needed
-                headers: { Accept: "application/json" },
-            });
-
-            if (!profileRes.ok) {
-                throw new Error("Failed to fetch user profile");
-            }
-
-            const userData = await profileRes.json();
-            // userData.userType comes directly from DB — 1 = Admin, 3 = User
-            // No localStorage, no manual token handling needed
-
-            setUsername("");
-            setPassword("");
-
-            onLoginSuccess(userData);                            // ← pass full user object up
-
         } catch (err) {
-            setError(err.message || "Something went wrong");
+            console.error("Logout error:", err);
         } finally {
-            setLoading(false);
+            onLogout();   // parent clears state regardless
+        }
+    };
+
+    // ── Content renderer ─────────────────────────────────────────
+    const renderContent = () => {
+        switch (activeService) {
+
+            /* ── Regular User Views ── */
+            case "home":
+                return <HomeView user={user} />;
+
+            case "cif":
+                return IS_USER(user) || IS_ADMIN(user)
+                    ? <CifCreationView />
+                    : <AccessDenied />;
+
+            /* ── Admin-only Views ── */
+            case "admin_dashboard":
+                return IS_ADMIN(user)
+                    ? <AdminDashboard />
+                    : <AccessDenied />;
+
+            case "user_management":
+                return IS_ADMIN(user) ? (
+                    <UserManagement
+                        onViewUser={(u) => {
+                            setSelectedUser(u);
+                            setActiveService("user_detail");
+                        }}
+                        onViewLogs={(u) => {
+                            setSelectedUser(u);
+                            setActiveService("activity_logs");
+                        }}
+                    />
+                ) : <AccessDenied />;
+
+            case "activity_logs":
+                return IS_ADMIN(user) ? (
+                    // <ActivityLogs
+                    //     user={selectedUser}
+                    //     onBack={() => setActiveService("user_management")}
+                    // />
+                    <div>Activity Logs — coming soon</div>
+                ) : <AccessDenied />;
+
+            case "user_detail":
+                return IS_ADMIN(user) ? (
+                    // <UserDetails
+                    //     user={selectedUser}
+                    //     onBack={() => setActiveService("user_management")}
+                    // />
+                    <div>User Details — coming soon</div>
+                ) : <AccessDenied />;
+
+            case "admin_create_user":
+                return IS_ADMIN(user) ? (
+                    // <CreateUser onBack={() => setActiveService("user_management")} />
+                    <div>Create User — coming soon</div>
+                ) : <AccessDenied />;
+
+            case "reset_password":
+                return IS_ADMIN(user) ? (
+                    // <ResetPassword user={selectedUser} onBack={() => setActiveService("user_management")} />
+                    <div>Reset Password — coming soon</div>
+                ) : <AccessDenied />;
+
+            default:
+                return <HomeView user={user} />;
         }
     };
 
     return (
-        <div style={styles.container}>
-            {/* LEFT PANEL */}
-            <div style={styles.leftPanel}>
-                <div style={styles.leftContent}>
-                    <img
-                        src="/signin/Welcome Back.svg"
-                        alt="Welcome Back"
-                        style={styles.welcomeImg}
-                    />
+        <div style={styles.dashboardContainer}>
 
-                    <img
-                        src="/signin/Sign in to access your test data creation platform.svg"
-                        alt="Sign in to access your test data creation platform"
-                        style={styles.subtitleImg}
-                    />
+            {/* ── TOP NAV ── */}
+            <nav style={styles.dashboardNav}>
+                <div style={styles.dashNavLeft}>
+                    <button
+                        onClick={() => setSidebarOpen(!sidebarOpen)}
+                        style={styles.menuBtn}
+                    >
+                        <Menu size={24} />
+                    </button>
 
-                    <div style={styles.featureLinks}>
-                        <span style={styles.featureLink}>Automated CIF Generation</span>
-                        <span style={styles.featureLink}>CCOD Account Creation</span>
-                        <span style={styles.featureLink}>Deposit Management</span>
+                    <div style={styles.navBrand}>
+                        <img src="/dashboard/logo123.png" alt="SBI" style={styles.logo} />
+                    </div>
+                </div>
+
+                <div style={styles.dashNavRight}>
+                    {/* User badge */}
+                    <div style={styles.userBadge}>
+                        <span style={styles.userBadgeName}>
+                            {user?.firstName} {user?.lastName}
+                        </span>
+                        <span style={styles.userBadgeRole}>
+                            {IS_ADMIN(user) ? "Admin" : "User"}
+                        </span>
                     </div>
 
-                    <button
-                        style={styles.backBtn}
-                        onClick={() => onNavigate("welcome")}
-                    >
+                    {/* Logout button */}
+                    <div style={styles.logoutWrapper} onClick={handleLogout} title="Logout">
                         <img
-                            src="/signin/Group 36286.svg"
-                            alt="Back to Home"
-                            style={styles.welcomeImg}
+                            src="/dashboard/Rectangle 17817.svg"
+                            alt="Logout"
+                            style={styles.yellowBtn}
                         />
-                    </button>
+                        <img
+                            src="/dashboard/Logout.svg"
+                            alt="logout"
+                            style={styles.logoutIcon}
+                        />
+                    </div>
                 </div>
-            </div>
+            </nav>
 
-            {/* RIGHT PANEL */}
-            <div style={styles.rightPanel}>
-                <img
-                    src="/signin/Mask Group 220.png"
-                    alt=""
-                    style={styles.rightBg}
+            {/* ── BODY ── */}
+            <div style={styles.mainContainer}>
+                <Sidebar
+                    sidebarOpen={sidebarOpen}
+                    activeService={activeService}
+                    setActiveService={setActiveService}
+                    user={user}           // Sidebar uses userType to show/hide menu items
                 />
 
-                <form onSubmit={handleLogin} style={styles.formCard}>
-                    <img src="/dashboard/logo123.png" alt="SBI" style={styles.logo} />
+                <main style={styles.content}>
+                    {renderContent()}
+                </main>
+            </div>
 
-                    <div style={styles.tag1}>Sign In to Continue</div>
-
-                    {/* USERNAME */}
-                    <div style={styles.fieldGroup}>
-                        <img
-                            src="/signin/Username.svg"
-                            alt="Username"
-                            style={styles.fieldLabelImg}
-                        />
-                        <input
-                            type="text"
-                            value={username}
-                            onChange={(e) => {
-                                setUsername(e.target.value);
-                                if (usernameError) setUsernameError("");
-                            }}
-                            onBlur={() => setUsernameError(validateUsername(username))}
-                            onFocus={() => setUserFocused(true)}
-                            style={{
-                                ...styles.input,
-                                borderColor: usernameError ? "#b91c1c" : userFocused ? "#003478" : "#b8cfe8",
-                            }}
-                            autoComplete="username"
-                            required
-                        />
-                        {usernameError && (
-                            <div style={styles.inlineError}>{usernameError}</div>
-                        )}
-                    </div>
-
-                    {/* PASSWORD */}
-                    <div style={styles.fieldGroup}>
-                        <img
-                            src="/signin/Password.svg"
-                            alt="Password"
-                            style={styles.fieldLabelImg}
-                        />
-                        <div style={{ position: "relative" }}>
-                            <input
-                                type={showPassword ? "text" : "password"}
-                                value={password}
-                                onChange={(e) => {
-                                    setPassword(e.target.value);
-                                    if (passwordError) setPasswordError("");
-                                }}
-                                onBlur={() => setPasswordError(validatePassword(password))}
-                                onFocus={() => setPassFocused(true)}
-                                style={{
-                                    ...styles.input,
-                                    borderColor: passwordError ? "#b91c1c" : passFocused ? "#003478" : "#b8cfe8",
-                                    paddingRight: "38px",
-                                }}
-                                autoComplete="current-password"
-                                required
-                            />
-                            <span
-                                onClick={() => setShowPassword(!showPassword)}
-                                style={styles.eyeIcon}
-                            >
-                                {showPassword ? "🙈" : "👁️"}
-                            </span>
-                        </div>
-                        {passwordError && (
-                            <div style={styles.inlineError}>{passwordError}</div>
-                        )}
-                    </div>
-
-                    {error && <div style={styles.errorMsg}>{error}</div>}
-
-                    <button
-                        type="submit"
-                        style={{
-                            ...styles.loginBtn,
-                            opacity: loading ? 0.7 : 1,
-                            cursor: loading ? "not-allowed" : "pointer",
-                        }}
-                        disabled={loading}
-                    >
-                        {loading ? "Signing in..." : "Login"}
-                    </button>
-
-                    <div style={styles.registerRow}>
-                        <img
-                            src="/signin/Don't have an account Click Here to Create Account.svg"
-                            alt="Register"
-                            style={styles.registerImg}
-                            onClick={() => onNavigate("register")}
-                        />
-                    </div>
-
-                    <div style={styles.developerStrip}>
-                        ©2026 Developed & Maintained by IT-QA CoE, GITC, SBI v1.0
-                    </div>
-                </form>
+            {/* ── FOOTER ── */}
+            <div style={styles.copyright_container}>
+                <p style={styles.copyright_text}>
+                    ©2026 Developed & Maintained by{" "}
+                    <strong>IT-QA CoE, GITC, SBI v1.0</strong>
+                </p>
             </div>
         </div>
     );
@@ -243,147 +195,117 @@ export default function LoginPage({ onLoginSuccess, onNavigate }) {
 /* ==================== STYLES ==================== */
 
 const styles = {
-    container: {
+    dashboardContainer: {
         display: "flex",
+        flexDirection: "column",
         minHeight: "100vh",
-        width: "100%",
+        backgroundColor: "#f8fafc",
         fontFamily: "'Inter', 'Segoe UI', sans-serif",
-        overflow: "hidden",
     },
-    leftPanel: {
-        backgroundColor: "#f0f5fb",
+    dashboardNav: {
+        backgroundColor: "white",
+        padding: "1rem 2rem",
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        borderBottom: "1px solid #e2e8f0",
+        boxShadow: "0 1px 3px rgba(0,0,0,0.05)",
+        position: "sticky",
+        top: 0,
+        zIndex: 1000,
+    },
+    dashNavLeft: {
         display: "flex",
         alignItems: "center",
-        padding: "48px 40px",
-        flex: "0 0 22%",
-        minWidth: "260px",
-    },
-    leftContent: {
-        display: "flex",
-        flexDirection: "column",
         gap: "12px",
     },
-    welcomeImg: { width: "280px" },
-    subtitleImg: { width: "300px" },
-    featureLinks: {
+    dashNavRight: {
         display: "flex",
-        flexDirection: "column",
-        gap: "6px",
-        marginBottom: "20px",
+        alignItems: "center",
+        gap: "16px",
     },
-    featureLink: {
-        color: "#00A9E0",
-        fontSize: "18px",
-        fontWeight: "500",
-    },
-    backBtn: {
+    menuBtn: {
         background: "none",
         border: "none",
         cursor: "pointer",
-        padding: 0,
-    },
-    rightPanel: {
-        flex: 1,
-        position: "relative",
         display: "flex",
         alignItems: "center",
-        justifyContent: "right",
+        padding: "4px",
+        borderRadius: "6px",
+        color: "#334155",
     },
-    rightBg: {
-        position: "absolute",
-        width: "100%",
-        height: "100%",
-        objectFit: "cover",
-        zIndex: 0,
+    navBrand: {
+        display: "flex",
+        alignItems: "center",
     },
-    formCard: {
-        position: "relative",
-        zIndex: 2,
-        backgroundColor: "white",
-        borderRadius: "16px",
-        padding: "36px 40px",
-        width: "90%",
-        maxWidth: "550px",
-        boxShadow: "0 8px 40px rgba(0,0,0,0.18)",
+    logo: {
+        height: "46px",
+        objectFit: "contain",
+    },
+    userBadge: {
         display: "flex",
         flexDirection: "column",
-        alignItems: "center",
-        marginRight: "48px",
+        alignItems: "flex-end",
+        lineHeight: 1.2,
     },
-    logo: { height: "52px", marginBottom: "8px" },
-    tag1: {
-        color: "#5c5c5c",
-        fontFamily: "Roboto",
-        fontSize: "14px",
-        fontWeight: "700",
-        letterSpacing: "0.5px",
-        marginBottom: "8px",
-    },
-    fieldGroup: {
-        width: "100%",
-        marginBottom: "14px",
-    },
-    fieldLabelImg: {
-        height: "16px",
-        marginBottom: "6px",
-        display: "block",
-    },
-    input: {
-        width: "100%",
-        padding: "10px 14px",
-        border: "1.5px solid #b8cfe8",
-        borderRadius: "6px",
-        fontSize: "14px",
-        outline: "none",
-        boxSizing: "border-box",
-    },
-    inlineError: {
-        fontSize: "12px",
-        color: "#b91c1c",
-        marginTop: "4px",
-    },
-    errorMsg: {
-        width: "100%",
-        backgroundColor: "#fee2e2",
-        color: "#991b1b",
-        padding: "10px 14px",
-        borderRadius: "6px",
-        marginBottom: "10px",
+    userBadgeName: {
         fontSize: "13px",
+        fontWeight: "600",
+        color: "#1e293b",
     },
-    loginBtn: {
-        width: "100%",
-        padding: "12px",
-        backgroundColor: "#ffd60a",
-        border: "none",
-        borderRadius: "8px",
-        fontWeight: "700",
-        marginTop: "6px",
-        marginBottom: "14px",
+    userBadgeRole: {
+        fontSize: "11px",
+        color: "#64748b",
+        textTransform: "uppercase",
+        letterSpacing: "0.5px",
     },
-    registerRow: {
+    logoutWrapper: {
+        position: "relative",
+        cursor: "pointer",
         display: "flex",
+        alignItems: "center",
         justifyContent: "center",
     },
-    registerImg: {
-        maxWidth: "270px",
-        cursor: "pointer",
+    yellowBtn: {
+        height: "34px",
     },
-    eyeIcon: {
+    logoutIcon: {
         position: "absolute",
-        right: "10px",
         top: "50%",
-        transform: "translateY(-50%)",
-        cursor: "pointer",
-        userSelect: "none",
+        left: "50%",
+        transform: "translate(-50%, -50%)",
+        height: "18px",
     },
-    developerStrip: {
-        marginTop: "15px",
-        padding: "8px",
-        width: "100%",
+    mainContainer: {
+        display: "flex",
+        flex: 1,
+        overflow: "hidden",
+    },
+    content: {
+        flex: 1,
+        overflowY: "auto",
+        padding: "24px",
+    },
+    accessDenied: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        height: "300px",
+        fontSize: "15px",
+        color: "#b91c1c",
+        backgroundColor: "#fee2e2",
+        borderRadius: "12px",
+        fontWeight: "500",
+    },
+    copyright_container: {
         textAlign: "center",
+        padding: "12px",
+        borderTop: "1px solid #e2e8f0",
+        backgroundColor: "white",
+    },
+    copyright_text: {
         fontSize: "12px",
-        color: "#555",
-        borderRadius: "10px 10px 10px 10px",
+        color: "#64748b",
+        margin: 0,
     },
 };
