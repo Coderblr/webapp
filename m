@@ -1,30 +1,16 @@
-"use client";
-import { useEffect } from "react";
+useEffect(() => {
+  const handleUnload = () => {
+    // If reload → skip logout
+    if (performance.getEntriesByType("navigation")[0]?.type === "reload") {
+      return;
+    }
 
-export const useSessionManager = () => {
-  useEffect(() => {
-    const handleBeforeUnload = () => {
-      // Mark that user is refreshing
-      sessionStorage.setItem("isReload", "true");
-    };
+    navigator.sendBeacon("/logout");
+  };
 
-    const handleUnload = () => {
-      const isReload = sessionStorage.getItem("isReload");
+  window.addEventListener("unload", handleUnload);
 
-      if (isReload) {
-        sessionStorage.removeItem("isReload");
-        return; // ✅ skip logout on refresh
-      }
-
-      navigator.sendBeacon("/logout"); // ✅ logout only on tab close
-    };
-
-    window.addEventListener("beforeunload", handleBeforeUnload);
-    window.addEventListener("unload", handleUnload);
-
-    return () => {
-      window.removeEventListener("beforeunload", handleBeforeUnload);
-      window.removeEventListener("unload", handleUnload);
-    };
-  }, []);
-};
+  return () => {
+    window.removeEventListener("unload", handleUnload);
+  };
+}, []);
