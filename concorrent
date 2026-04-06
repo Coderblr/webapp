@@ -1,0 +1,196 @@
+Make current_user optional so the same endpoint handles both cases:
+python@router.post("/logout", tags=["Auth"])
+async def logout(
+    request:  Request,
+    response: Response,
+    session:  DBS.SessionDep,
+):
+    # ── Get token from cookie, header, or beacon body ──
+    token = request.cookies.get("access_token")
+
+    if not token:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+
+    if not token:
+        # sendBeacon sends token in body
+        try:
+            body  = await request.json()
+            token = body.get("token")
+        except Exception:
+            pass
+
+    if not token:
+        return {"message": "Logged out."}
+
+    # ── Get username from token ──
+    try:
+        payload  = Security.decode_token(token)
+        username = payload.get("sub")
+    except Exception:
+        Security.clear_auth_cookies(response)
+        return {"message": "Logged out."}
+
+    if not username:
+        return {"message": "Logged out."}
+
+    # ── Blacklist token ──
+    Security.blacklist_token(token, username, session)
+
+    # ── Clear active_session_jti ──
+    session.execute(
+        sql_update(User.DBUser)
+        .where(User.DBUser.username == username)
+        .values(active_session_jti=None)
+    )
+    session.commit()
+
+    Security.clear_auth_cookies(response)
+
+    # ── Audit log (skip for beacon — no departmentCode easily available) ──
+    try:
+        db_user = session.get(User.DBUser, username)
+        if db_user:
+            garage.capture_log(username, "/token(logout)", db_user.departmentCode, session)
+    except Exception:
+        pass
+
+    return {"message": "Logged out successfully."}
+The key change is removing Depends(Security.get_current_user) from the parameters — now the endpoint extracts the username directly from the token itself, whether it comes from cookie, header, or beacon body. One endpoint handles all 3 cases.The application fails to properly JWt invalidate JWT tokens after logout. Even after the user logs out, the old WT remains valid when reused in another active session. This indicates that the application does not maintain server side token invalidation or proper revocation list replying only on client side logout. As a result expired or logged out tokens can still be used to authenticate requests successfully.
+Back request Attack
+The application accepts repeated or duplicate requests withour proper validation. An attacker can capture a valid request and rend it multiple times to perform the same action again.
+Single Admin account/lack of maker checker control
+The application uses single admin account to perform all critical actions without any pproval process. There is no maker-checker(dual control) mechanism. User can create, apprave, and execute sensitve operations.
+Nar Toy pronomea
+The application stores or transmits usernames and passwords in plain text without encryption. This menas senstive credentials are not protected and can be easily read if intercepted or accessed.
+Appsec - Checklist
+API
+ApI poC
+Medium
+High
+This weakness can allow attackers to compromise user account.
+Session Hijacking: Attacking can reuse stolen or intercepted tokens to gain unauthorized access even after the user logged out. Account takeover: An attacker with a valid (but supposedly invalidated) token can access user accounts indefinitely until token expiry. Data lekage: Sensitive business or customer data can be accessed without authorization.
+Duplicate transcations, unauthorized repeated actions, Data inconsistency in the system.
+the same user. It is also recommended to display an alert messagewhen the second user tries to login in.
+It is recommended to maintain revocation list or baclist for tokens after logout, password reset or account deactivation. Use short lived access tokens.
+Enforce token rotation. Monitoring &logging.
+Implement unique tokens one time use. Use CSRF tokens and validate to prevent reuse.
+Unauthorized or fraudlent actions can be performed without oversight.
+Increase risk of insders threats.
+High
+Attackers can steal user credentails. Unauthorized access to user account.
+Risk of account takeover.
+API - Checklist
+Search
+Procecs Review
+Implement a maker-checker(dual approval) process for critical actions. Enforce role based access control.
+Maintain audit logs for all admin activites.
+Store passwords using strong hashing algorithms.
+Never store passwords in plaintext. Implement encryption for senstive data storage. Enforce strongconcurrent user means if a user abruptly closes the window it active session jai token are still active and when the user sign it says Another session is already active for this account. Please log out from the other device first.", ) , but if we reload it should get logout.Show more5 AprArchitected dual-layer session invalidation combining backend expiry checks and frontend logout triggersArchitected dual-layer session invalidation combining backend expiry checks and frontend logout triggersTwo changes needed:
+Backend fix — store session expiry time and check it on login:
+Step 1 — Add session_expires_at column to User.py:
+pythonclass DBUser(SQLModel, table=True):
+    # ... existing fields ...
+    active_session_jti:     str | None      = SQLField(default=None, nullable=True)
+    session_expires_at:     datetime | None = SQLField(default=None, nullable=True)  # ← ADD
+Step 2 — Add migration in DBS.py:
+pythonmigrations = {
+    # ... existing ...
+    "active_session_jti":   "TEXT DEFAULT NULL",
+    "session_expires_at":   "DATETIME DEFAULT NULL",   # ← ADD
+}
+Step 3 — Update login single session check:
+Find this block and replace:
+python    # ── SINGLE SESSION CHECK ──
+    fresh_user = session.get(User.DBUser, raw_username)
+
+    if fresh_user.active_session_jti:
+        old_entry = session.get(User.BlacklistedToken, fresh_user.active_session_jti)
+
+        if old_entry is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Another session is already active for this account. Please log out from the other device first.",
+            )
+Replace with:
+python    # ── SINGLE SESSION CHECK ──
+    fresh_user = session.get(User.DBUser, raw_username)
+
+    if fresh_user.active_session_jti:
+        old_entry = session.get(User.BlacklistedToken, fresh_user.active_session_jti)
+
+        if old_entry is None:
+            # Check if session has naturally expired
+            session_expired = False
+            if fresh_user.session_expires_at:
+                expires = fresh_user.session_expires_at
+                if expires.tzinfo is None:
+                    expires = expires.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) > expires:
+                    session_expired = True
+
+            if not session_expired:
+                # Session still active — BLOCK
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Another session is already active for this account. Please log out from the other device first.",
+                )
+
+            # Session expired — clear and allow login
+            session.execute(
+                sql_update(User.DBUser)
+                .where(User.DBUser.username == user.username)
+                .values(active_session_jti=None, session_expires_at=None)
+            )
+            session.commit()
+Step 4 — Store expiry when issuing token:
+Find this block:
+python    new_jti = Security.decode_token(access_token).get("jti")
+    session.execute(
+        sql_update(User.DBUser)
+        .where(User.DBUser.username == user.username)
+        .values(active_session_jti=new_jti)
+    )
+    session.commit()
+Replace with:
+python    new_jti     = Security.decode_token(access_token).get("jti")
+    expires_at  = datetime.now(timezone.utc) + timedelta(minutes=Security.ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    session.execute(
+        sql_update(User.DBUser)
+        .where(User.DBUser.username == user.username)
+        .values(
+            active_session_jti = new_jti,
+            session_expires_at = expires_at,   # ← store expiry
+        )
+    )
+    session.commit()
+Step 5 — Clear expiry on logout too:
+python    session.execute(
+        sql_update(User.DBUser)
+        .where(User.DBUser.username == username)
+        .values(active_session_jti=None, session_expires_at=None)  # ← add session_expires_at=None
+    )
+    session.commit()
+
+Frontend fix — call logout on page reload/close:
+Add this in your main app component:
+jsxuseEffect(() => {
+    const handleUnload = () => {
+        const token = document.cookie
+            .split("; ")
+            .find(row => row.startsWith("access_token="))
+            ?.split("=")[1];
+
+        if (token) {
+            navigator.sendBeacon(
+                `${process.env.NEXT_PUBLIC_API_URL}/logout`,
+                new Blob([JSON.stringify({ token })], { type: "application/json" })
+            );
+        }
+    };
+
+    window.addEventListener("beforeunload", handleUnload);
+    return () => window.removeEventListener("beforeunload", handleUnload);
+}, []);
