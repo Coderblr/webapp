@@ -4,13 +4,21 @@ const BASE_URL = process.env.NEXT_PUBLIC_API_URL;
 
 export function useSessionManager() {
     useEffect(() => {
-        const handleBeforeUnload = () => {
-            sessionStorage.setItem("__unload_ts", Date.now().toString());
-        };
+        // On mount: if this is a reload, skip beacon by marking it
+        const navEntry = performance.getEntriesByType("navigation")[0];
+        const isReload = navEntry?.type === "reload";
+        
+        if (isReload) {
+            sessionStorage.setItem("__skip_beacon", "1");
+        }
 
         const handlePageHide = () => {
             const loggedIn = sessionStorage.getItem("sessionActive") === "true";
             if (!loggedIn) return;
+
+            const skip = sessionStorage.getItem("__skip_beacon") === "1";
+            sessionStorage.removeItem("__skip_beacon");
+            if (skip) return;
 
             navigator.sendBeacon(
                 `${BASE_URL}/logout-beacon`,
@@ -18,17 +26,9 @@ export function useSessionManager() {
             );
         };
 
-        // On mount: check if previous unload was a reload or close
-        // If sessionStorage has __unload_ts, it was a reload (sessionStorage persists on reload)
-        // If sessionStorage is empty, it was a tab close (sessionStorage is cleared on close)
-        const unloadTs = sessionStorage.getItem("__unload_ts");
-        sessionStorage.removeItem("__unload_ts");
-
-        window.addEventListener("beforeunload", handleBeforeUnload);
         window.addEventListener("pagehide", handlePageHide);
 
         return () => {
-            window.removeEventListener("beforeunload", handleBeforeUnload);
             window.removeEventListener("pagehide", handlePageHide);
         };
     }, []);
