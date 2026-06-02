@@ -1,0 +1,107 @@
+"""
+QA Automation Framework Generator
+Usage:
+    python main.py <url> [options]
+
+Examples:
+    python main.py https://example.com
+    python main.py https://example.com --output my_project --crawler selenium
+    python main.py https://example.com --headless --output output/demo
+"""
+
+import asyncio
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import yaml
+from dotenv import load_dotenv
+from loguru import logger
+
+load_dotenv()
+
+
+def load_config(path: str) -> dict:
+    p = Path(path)
+    if p.exists():
+        with open(p) as fh:
+            return yaml.safe_load(fh) or {}
+    return {}
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate a Behave/Selenium test framework from a live URL",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("url", help="Target application URL (e.g. https://example.com)")
+    parser.add_argument("--output", "-o", default="output", help="Output directory (default: output)")
+    parser.add_argument("--config", "-c", default="config/config.yaml", help="Config file path")
+    parser.add_argument(
+        "--crawler",
+        choices=["playwright", "selenium"],
+        help="Override crawler type from config",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        default=None,
+        help="Force headless browser mode",
+    )
+    parser.add_argument(
+        "--no-intermediate",
+        action="store_true",
+        help="Skip saving intermediate JSON files",
+    )
+    args = parser.parse_args()
+
+    if not os.environ.get("AZURE_OPENAI_API_KEY"):
+        logger.error("AZURE_OPENAI_API_KEY is not set.")
+        logger.error("Copy .env.example to .env and add your DeepSeek API key.")
+        sys.exit(1)
+
+    # Setup logging
+    Path("logs").mkdir(exist_ok=True)
+    logger.remove()
+    logger.add(
+        sys.stdout,
+        colorize=True,
+        format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | {message}",
+    )
+    logger.add("logs/pipeline.log", rotation="10 MB", retention="7 days")
+
+    config = load_config(args.config)
+    if args.crawler:
+        config.setdefault("crawler", {})["type"] = args.crawler
+    if args.headless:
+        config.setdefault("crawler", {})["headless"] = True
+    if args.no_intermediate:
+        config.setdefault("output", {})["save_intermediate"] = False
+
+    logger.info(f"Target URL   : {args.url}")
+    logger.info(f"Crawler      : {config.get('crawler', {}).get('type', 'playwright')}")
+    logger.info(f"Output dir   : {args.output}")
+    logger.info(f"LLM model    : {config.get('llm', {}).get('model', 'claude-sonnet-4-6')}")
+
+    from orchestrator.pipeline import QAPipeline
+
+    pipeline = QAPipeline(config)
+    try:
+        framework_dir = await pipeline.run(args.url, args.output)
+        print()
+        logger.success(f"Framework generated at  →  {framework_dir}")
+        logger.info("Run your tests:")
+        logger.info(f"  cd {framework_dir}")
+        logger.info("  pip install -r requirements.txt")
+        logger.info("  behave")
+    except KeyboardInterrupt:
+        logger.warning("Pipeline interrupted.")
+        sys.exit(0)
+    except Exception:
+        logger.exception("Pipeline failed with an unhandled exception.")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
