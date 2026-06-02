@@ -1,0 +1,235 @@
+"""
+QA Automation Generator — FastAPI Server
+Start: python server.py
+Then open: http://localhost:8000
+"""
+
+import asyncio
+import io
+import json
+import os
+import sys
+import uuid
+import zipfile
+from pathlib import Path
+from typing import Optional
+
+import yaml
+from dotenv import load_dotenv
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+load_dotenv()
+sys.path.insert(0, str(Path(__file__).parent))
+
+app = FastAPI(title="QA Automation Generator")
+app.mount("/static", StaticFiles(directory="frontend"), name="static")
+
+
+# ── Models ────────────────────────────────────────────────────────────────────
+
+class RunRequest(BaseModel):
+    url: str
+    crawler: str = "playwright"
+    headless: bool = True
+    max_pages: int = 6
+    output_dir: str = "output"
+    # Authentication (optional)
+    username: str = ""
+    password: str = ""
+    login_url: str = ""          # empty = same as url
+    username_selector: str = ""  # empty = auto-detect
+    password_selector: str = ""  # empty = auto-detect
+    submit_selector: str = ""    # empty = auto-detect
+    # Transaction mode
+    transaction_mode: bool = False
+    max_transactions: int = 50
+    transaction_numbers: str = ""    # comma-separated codes, e.g. "1001,1401,8401"
+
+
+class JobState:
+    def __init__(self):
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.status: str = "running"
+        self.framework_dir: Optional[str] = None
+        self.error: Optional[str] = None
+        self.events: list[dict] = []     # full replay buffer for reconnects
+
+
+jobs: dict[str, JobState] = {}
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/")
+async def index():
+    return FileResponse("frontend/index.html")
+
+
+@app.get("/api/health")
+async def health():
+    return {
+        "status": "ok",
+        "api_key_set": bool(os.environ.get("AZURE_OPENAI_API_KEY")),
+    }
+
+
+@app.post("/api/run")
+async def run_pipeline(req: RunRequest, bg: BackgroundTasks):
+    if not os.environ.get("AZURE_OPENAI_API_KEY"):
+        raise HTTPException(400, "AZURE_OPENAI_API_KEY not set. Add it to your .env file.")
+    job_id = uuid.uuid4().hex[:10]
+    jobs[job_id] = JobState()
+    bg.add_task(_execute_pipeline, job_id, req)
+    return {"job_id": job_id}
+
+
+@app.get("/api/status/{job_id}")
+async def get_status(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return {"status": job.status, "framework_dir": job.framework_dir, "error": job.error}
+
+
+@app.get("/api/progress/{job_id}")
+async def progress_stream(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(404, "Job not found")
+
+    async def _gen():
+        job = jobs[job_id]
+        # Replay past events so page-refresh reconnects work
+        for ev in job.events:
+            yield f"data: {json.dumps(ev)}\n\n"
+        if job.status in ("completed", "failed"):
+            return
+        while True:
+            try:
+                ev = await asyncio.wait_for(job.queue.get(), timeout=25)
+                yield f"data: {json.dumps(ev)}\n\n"
+                if ev.get("type") in ("complete", "error"):
+                    break
+            except asyncio.TimeoutError:
+                yield 'data: {"type":"ping"}\n\n'
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/files")
+async def list_files(job_id: str):
+    job = jobs.get(job_id)
+    if not job or not job.framework_dir:
+        raise HTTPException(404, "No files yet")
+    root = Path(job.framework_dir)
+    files = []
+    for p in sorted(root.rglob("*")):
+        if p.is_file() and "_meta" not in p.parts:
+            files.append(str(p.relative_to(root)).replace("\\", "/"))
+    return {"files": files, "root": str(root)}
+
+
+@app.get("/api/file")
+async def get_file(job_id: str, path: str):
+    job = jobs.get(job_id)
+    if not job or not job.framework_dir:
+        raise HTTPException(404, "No files yet")
+    root = Path(job.framework_dir).resolve()
+    target = (root / path).resolve()
+    try:
+        target.relative_to(root)         # security: no path traversal
+    except ValueError:
+        raise HTTPException(403, "Access denied")
+    if not target.is_file():
+        raise HTTPException(404, "File not found")
+    return {"content": target.read_text(encoding="utf-8", errors="replace"), "path": path}
+
+
+@app.get("/api/download")
+async def download_zip(job_id: str):
+    job = jobs.get(job_id)
+    if not job or not job.framework_dir:
+        raise HTTPException(404, "No files yet")
+    buf = io.BytesIO()
+    root = Path(job.framework_dir)
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in root.rglob("*"):
+            if p.is_file() and "_meta" not in p.parts:
+                zf.write(p, p.relative_to(root))
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=qa_framework.zip"},
+    )
+
+
+# ── Pipeline executor ─────────────────────────────────────────────────────────
+
+async def _execute_pipeline(job_id: str, req: RunRequest):
+    job = jobs[job_id]
+
+    async def emit(event: dict):
+        job.events.append(event)
+        await job.queue.put(event)
+
+    try:
+        config: dict = {}
+        cfg_path = Path("config/config.yaml")
+        if cfg_path.exists():
+            with open(cfg_path) as fh:
+                config = yaml.safe_load(fh) or {}
+
+        config.setdefault("crawler", {}).update({
+            "type": req.crawler,
+            "headless": req.headless,
+            "max_pages": req.max_pages,
+        })
+        config["transaction_mode"]  = req.transaction_mode
+        config["max_transactions"]  = req.max_transactions
+
+        from orchestrator.pipeline import QAPipeline
+        from crawler.base_crawler import LoginConfig
+
+        login_cfg = None
+        if req.username:
+            login_cfg = LoginConfig(
+                username=req.username,
+                password=req.password,
+                login_url=req.login_url,
+                username_selector=req.username_selector,
+                password_selector=req.password_selector,
+                submit_selector=req.submit_selector,
+            )
+
+        # Parse comma-separated transaction numbers
+        tx_numbers = [n.strip() for n in req.transaction_numbers.split(",") if n.strip()]
+        config["transaction_numbers"] = tx_numbers
+
+        pipeline = QAPipeline(config, login_config=login_cfg)
+        framework_dir = await pipeline.run(req.url, req.output_dir, emit=emit)
+        job.status = "completed"
+        job.framework_dir = framework_dir
+        await emit({"type": "complete", "framework_dir": framework_dir})
+
+    except Exception as exc:
+        import traceback
+        job.status = "failed"
+        job.error = str(exc)
+        await emit({"type": "error", "message": str(exc), "trace": traceback.format_exc()})
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+    print("\n  QA Automation Generator")
+    print("  ─────────────────────────────────────")
+    print("  http://localhost:8000\n")
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
