@@ -21,9 +21,13 @@ import re
 import sys
 
 # ----------------------------------------------------------------------------
-# CONFIG
+# CONFIG  <<< EDIT THESE PATHS TO MATCH YOUR MACHINE >>>
 # ----------------------------------------------------------------------------
-FOLDERS_TO_INDEX = ["page", "stepDefinitions", "locator", "locators"]
+FRAMEWORK_ROOT = r"D:\Automation\NBC_Suraj"                          # your framework folder
+PAGE_DIR       = r"D:\Automation\NBC_Suraj\src\page"                 # page classes
+STEPDEF_DIR    = r"D:\Automation\NBC_Suraj\src\stepDefinitions"      # step definition classes
+LOCATOR_DIR    = r"D:\Automation\NBC_Suraj\src\locator"              # locators (change if elsewhere)
+
 INDEX_FILE = "framework_index.json"
 STEP_ANNOTATIONS = ("@Given", "@When", "@Then", "@And", "@But")
 
@@ -32,20 +36,18 @@ STEP_ANNOTATIONS = ("@Given", "@When", "@Then", "@And", "@But")
 # 1. FRAMEWORK INDEXER
 # ----------------------------------------------------------------------------
 def build_index(root: str) -> dict:
-    """Walk the framework and index files inside target folders."""
-    index = {name: [] for name in FOLDERS_TO_INDEX}
+    """Index files from the folders configured at the top of this script."""
+    def list_files(folder):
+        if not os.path.isdir(folder):
+            return []
+        return [os.path.join(folder, f) for f in os.listdir(folder)
+                if f.endswith((".java", ".properties", ".json", ".xml"))]
 
-    for dirpath, dirnames, filenames in os.walk(root):
-        # skip build/output folders
-        dirnames[:] = [d for d in dirnames if d not in ("target", "bin", ".git", "node_modules")]
-        folder_name = os.path.basename(dirpath)
-        if folder_name in FOLDERS_TO_INDEX:
-            for f in filenames:
-                if f.endswith((".java", ".properties", ".json", ".xml")):
-                    index[folder_name].append(os.path.join(dirpath, f))
-
-    # merge locator/locators into one key
-    index["locator"] = index.get("locator", []) + index.pop("locators", [])
+    index = {
+        "page": list_files(PAGE_DIR),
+        "stepDefinitions": list_files(STEPDEF_DIR),
+        "locator": list_files(LOCATOR_DIR),
+    }
 
     with open(INDEX_FILE, "w", encoding="utf-8") as fh:
         json.dump(index, fh, indent=2)
@@ -181,7 +183,7 @@ def main():
         sys.exit(1)
 
     feature_path = sys.argv[1]
-    root = sys.argv[2] if len(sys.argv) > 2 else "."
+    root = sys.argv[2] if len(sys.argv) > 2 else FRAMEWORK_ROOT
 
     if not os.path.isfile(feature_path):
         print(f"ERROR: feature file not found: {feature_path}")
