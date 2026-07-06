@@ -209,16 +209,28 @@ def main():
     # 4. Compare
     missing = find_missing_steps(feature["steps"], java_patterns)
 
-    # Does any file relate to this transaction (by txn id in filename)?
-    def txn_match(paths):
-        return any(txn in os.path.basename(p) for p in paths) if txn != "UNKNOWN" else bool(paths)
+    # Find files matching the naming convention: TXN_000400_Steps.java, TXN_000400_Page.java, etc.
+    def find_txn_files(paths):
+        if txn == "UNKNOWN":
+            return []
+        key = f"TXN_{txn}".lower()
+        return [p for p in paths if key in os.path.basename(p).lower()]
 
-    locator_found = txn_match(index["locator"])
-    page_found = txn_match(index["page"])
-    step_file_found = txn_match(index["stepDefinitions"])
+    locator_files = find_txn_files(index["locator"])
+    page_files = find_txn_files(index["page"])
+    step_files = find_txn_files(index["stepDefinitions"])
+
+    locator_found = bool(locator_files)
+    page_found = bool(page_files)
+    step_file_found = bool(step_files)
 
     # 5. Report
     print_summary(txn, locator_found, page_found, step_file_found, missing)
+    for label, files in (("Page file", page_files),
+                         ("Step file", step_files),
+                         ("Locator file", locator_files)):
+        for f in files:
+            print(f"  {label}: {os.path.basename(f)}")
 
 
 if __name__ == "__main__":
