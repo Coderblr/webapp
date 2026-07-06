@@ -18,8 +18,7 @@ import subprocess
 subprocess.run(["java", "-jar", "MyApp.jar"])   # or ["java", "MyFrameClass"]
 
 
-
-  import subprocess
+import subprocess
 
 classpath = r"C:\MyFramework\bin;C:\MyFramework\lib\*"
 
