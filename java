@@ -16,3 +16,16 @@ jpype.shutdownJVM()
 
 import subprocess
 subprocess.run(["java", "-jar", "MyApp.jar"])   # or ["java", "MyFrameClass"]
+
+
+
+  import subprocess
+
+classpath = r"C:\MyFramework\bin;C:\MyFramework\lib\*"
+
+runner = "com.project.runner.RunnerFile"
+
+subprocess.run(
+    ["java", "-cp", classpath, runner],
+    check=True
+)
