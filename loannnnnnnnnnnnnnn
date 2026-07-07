@@ -2,58 +2,43 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from app import config
+# Array form: features = { "path/one.feature", "path/two.feature" }
+FEATURES_ARRAY_RE = re.compile(r'(features\s*=\s*\{)(.*?)(\})', re.DOTALL)
+# Single quoted-string form: features = "path/one.feature"
+FEATURES_STRING_RE = re.compile(r'(features\s*=\s*")([^"]*)(")')
 
-FEATURE_LINE_RE = re.compile(r"^\s*Feature:\s*(.+)$", re.MULTILINE)
-TXN_RE = re.compile(r"(Txn\d+)", re.IGNORECASE)
 
-
-class FeatureValidationError(Exception):
+class TestRunnerPatchError(Exception):
     pass
 
 
-def validate_feature_content(filename: str, content: str) -> None:
-    if not filename.lower().endswith(".feature"):
-        raise FeatureValidationError("Uploaded file must have a .feature extension.")
-    if not content.strip():
-        raise FeatureValidationError("Uploaded feature file is empty.")
-    if not FEATURE_LINE_RE.search(content):
-        raise FeatureValidationError(
-            "Uploaded file does not contain a valid 'Feature:' definition."
+class TestRunnerPatcher:
+    """Temporarily narrows TestRunner.java's @CucumberOptions(features=...) to a
+    single feature file, and restores the original content afterwards."""
+
+    def __init__(self, testrunner_path: Path):
+        self.testrunner_path = testrunner_path
+        self._original_content: Optional[str] = None
+
+    def point_to_single_feature(self, feature_relative_path: str) -> None:
+        self._original_content = self.testrunner_path.read_text(encoding="utf-8")
+        normalized = feature_relative_path.replace("\\", "/")
+
+        patched, count = FEATURES_ARRAY_RE.subn(
+            rf'\g<1>\n        "{normalized}"\n    \g<3>',
+            self._original_content,
+            count=1,
         )
+        if count == 0:
+            patched, count = FEATURES_STRING_RE.subn(
+                rf'\g<1>{normalized}\g<3>', self._original_content, count=1
+            )
+        if count == 0:
+            raise TestRunnerPatchError(
+                "Could not locate 'features' attribute in TestRunner.java"
+            )
+        self.testrunner_path.write_text(patched, encoding="utf-8")
 
-
-def extract_feature_name(content: str) -> str:
-    match = FEATURE_LINE_RE.search(content)
-    return match.group(1).strip() if match else "Unknown Feature"
-
-
-def extract_transaction_number(filename: str, content: str) -> Optional[str]:
-    match = TXN_RE.search(Path(filename).stem)
-    if match:
-        return match.group(1)
-    match = TXN_RE.search(content)
-    if match:
-        return match.group(1)
-    return None
-
-
-def find_existing_feature(
-    framework_root: Path, filename: str, txn_number: Optional[str]
-) -> Optional[Path]:
-    features_dir = framework_root / config.FEATURES_RELATIVE_DIR
-    if not features_dir.exists():
-        return None
-
-    candidates = list(features_dir.rglob("*.feature"))
-
-    for path in candidates:
-        if path.name.lower() == filename.lower():
-            return path
-
-    if txn_number:
-        for path in candidates:
-            if txn_number.lower() in path.name.lower():
-                return path
-
-    return None
+    def restore(self) -> None:
+        if self._original_content is not None:
+            self.testrunner_path.write_text(self._original_content, encoding="utf-8")
