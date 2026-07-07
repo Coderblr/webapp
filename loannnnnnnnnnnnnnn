@@ -1,104 +1,43 @@
-import time
+import json
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
-import subprocess
+from typing import Dict, Optional
 
 from app import config
 
 
-class ExecutionResult:
-    def __init__(self, return_code: int, duration_seconds: float, log_lines: List[str]):
-        self.return_code = return_code
-        self.duration_seconds = duration_seconds
-        self.log_lines = log_lines
-        self.passed = return_code == 0
+def find_latest_html_report(framework_root: Path) -> Optional[Path]:
+    reports_dir = framework_root / config.HTML_REPORT_RELATIVE_DIR
+    if not reports_dir.exists():
+        return None
+    html_files = list(reports_dir.rglob("*.html"))
+    if not html_files:
+        return None
+    return max(html_files, key=lambda p: p.stat().st_mtime)
 
 
-def _collect_classpath_entries(framework_root: Path) -> List[str]:
-    entries = []
-    for sub in ("target/classes", "target/test-classes"):
-        candidate = framework_root / sub
-        if candidate.exists():
-            entries.append(str(candidate))
+def summarize_json_report(framework_root: Path) -> Dict:
+    json_path = framework_root / config.JSON_REPORT_RELATIVE_PATH
+    summary = {"total_scenarios": 0, "passed_scenarios": 0, "failed_scenarios": 0}
+    if not json_path.exists():
+        return summary
 
-    if config.M2_REPOSITORY.exists():
-        entries.extend(str(jar) for jar in config.M2_REPOSITORY.rglob("*.jar"))
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return summary
 
-    return entries
+    for feature in data:
+        for element in feature.get("elements", []):
+            if element.get("type") != "scenario":
+                continue
+            summary["total_scenarios"] += 1
+            steps = element.get("steps", [])
+            failed = any(
+                step.get("result", {}).get("status") != "passed" for step in steps
+            )
+            if failed:
+                summary["failed_scenarios"] += 1
+            else:
+                summary["passed_scenarios"] += 1
 
-
-def _write_argfile(build_dir: Path, name: str, args: List[str]) -> Path:
-    """javac/java support '@file' to read arguments from a file, avoiding the
-    Windows command-line length limit that a huge .m2-derived classpath would hit."""
-    lines = [f'"{a}"' if " " in a else a for a in args]
-    argfile = build_dir / name
-    argfile.write_text("\n".join(lines), encoding="utf-8")
-    return argfile
-
-
-def _run_streamed(
-    cmd: List[str], cwd: Path, on_line: Optional[Callable[[str], None]]
-) -> Tuple[int, List[str]]:
-    log_lines: List[str] = []
-    process = subprocess.Popen(
-        cmd,
-        cwd=str(cwd),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        shell=False,
-    )
-    assert process.stdout is not None
-    for line in process.stdout:
-        clean_line = line.rstrip("\n")
-        log_lines.append(clean_line)
-        if on_line:
-            on_line(clean_line)
-    process.wait()
-    return process.returncode, log_lines
-
-
-def run_loop_runner(
-    framework_root: Path, on_line: Optional[Callable[[str], None]] = None
-) -> ExecutionResult:
-    """Compiles the (patched) TestRunner.java and runs LoopRunner directly with
-    javac/java, using target/classes, target/test-classes, and the local .m2
-    repository for the classpath. No Maven installation required."""
-    start = time.time()
-    all_log_lines: List[str] = []
-
-    build_dir = framework_root / "target" / "_no_maven_build"
-    build_dir.mkdir(parents=True, exist_ok=True)
-
-    test_classes_dir = framework_root / "target" / "test-classes"
-    test_classes_dir.mkdir(parents=True, exist_ok=True)
-
-    classpath = ";".join(_collect_classpath_entries(framework_root))
-
-    testrunner_source = framework_root / config.TESTRUNNER_RELATIVE_PATH
-
-    if on_line:
-        on_line("[EXECUTOR] Compiling TestRunner.java (javac)...")
-    compile_argfile = _write_argfile(
-        build_dir,
-        "javac_args.txt",
-        ["-cp", classpath, "-d", str(test_classes_dir), str(testrunner_source)],
-    )
-    return_code, lines = _run_streamed(
-        ["javac", f"@{compile_argfile}"], framework_root, on_line
-    )
-    all_log_lines.extend(lines)
-    if return_code != 0:
-        return ExecutionResult(return_code, time.time() - start, all_log_lines)
-
-    if on_line:
-        on_line(f"[EXECUTOR] Running {config.LOOP_RUNNER_MAIN_CLASS} (java)...")
-    run_argfile = _write_argfile(
-        build_dir, "java_args.txt", ["-cp", classpath, config.LOOP_RUNNER_MAIN_CLASS]
-    )
-    return_code, lines = _run_streamed(["java", f"@{run_argfile}"], framework_root, on_line)
-    all_log_lines.extend(lines)
-
-    duration = time.time() - start
-    return ExecutionResult(return_code, duration, all_log_lines)
+    return summary
