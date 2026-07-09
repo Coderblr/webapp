@@ -1,43 +1,1012 @@
+app/executor
+
+
+"""
+Runs the Java framework via Maven as a subprocess.
+
+Key trick (why no Java knowledge is needed):
+  Cucumber system properties OVERRIDE whatever is hardcoded in @CucumberOptions
+  inside TestRunner.java. So we can point the SAME TestRunner at any single
+  feature file — including one sitting in our own uploads folder — with:
+
+      mvn test -Dtest=TestRunner
+               -Dcucumber.features=<absolute path to .feature>
+               -Dcucumber.plugin=json:<report path>
+               -Dbrowser=edge
+
+  Nothing inside the framework is modified, so nothing needs restoring.
+"""
 import json
+import os
+import re
+import subprocess
+import threading
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
 
-from app import config
+from . import config
+
+JOBS: dict[str, "Job"] = {}
+
+# The properties file is shared state -> only one execution at a time.
+_RUN_LOCK = threading.Lock()
+
+_SECRET_RE = re.compile(r"(-D\w*[Pp]assword=)(\S+)")
 
 
-def find_latest_html_report(framework_root: Path) -> Optional[Path]:
-    reports_dir = framework_root / config.HTML_REPORT_RELATIVE_DIR
-    if not reports_dir.exists():
+def _effective_classpath() -> str:
+    """Assemble the classpath. If it involves recursively-scanned jar folders
+    or would exceed the Windows command-line limit, pack everything into a
+    'pathing jar' (a jar whose manifest Class-Path lists all entries) and
+    return just that jar's path."""
+    import glob
+    from urllib.request import pathname2url
+
+    entries: list[str] = []
+    override = getattr(config, "CLASSPATH_OVERRIDE", "")
+    if override:
+        entries.extend(x for x in override.split(config.CP_SEP) if x.strip())
+    else:
+        entries.extend(config.CLASSPATH_ENTRIES)
+
+    # expand wildcards like  lib/*  into real jar paths
+    expanded: list[str] = []
+    for e in entries:
+        if e.endswith("*"):
+            expanded.extend(glob.glob(e + ".jar") + glob.glob(e))
+        else:
+            expanded.append(e)
+
+    # recursive jar folders (Maven cache, nested lib dirs)
+    for d in getattr(config, "RECURSIVE_JAR_DIRS", []):
+        base = Path(d)
+        if base.is_dir():
+            expanded.extend(str(j) for j in base.rglob("*.jar"))
+
+    expanded = [e for e in dict.fromkeys(expanded) if Path(e).exists()]
+    flat = config.CP_SEP.join(expanded)
+    if len(flat) < 4000 and not any(Path(d).is_dir() for d in getattr(config, "RECURSIVE_JAR_DIRS", [])):
+        return flat
+
+    # build the pathing jar
+    urls = []
+    for e in expanded:
+        pth = Path(e).resolve()
+        u = "file:" + pathname2url(str(pth))
+        if pth.is_dir() and not u.endswith("/"):
+            u += "/"
+        urls.append(u)
+    raw = ("Manifest-Version: 1.0\r\nClass-Path: " + " ".join(urls) + "\r\n").encode("utf-8")
+    # manifest lines max 72 bytes; continuation lines start with one space
+    wrapped = bytearray()
+    line = bytearray()
+    for token in raw.split(b"\r\n"):
+        line = bytearray(token)
+        while len(line) > 70:
+            wrapped += line[:70] + b"\r\n"
+            line = bytearray(b" ") + line[70:]
+        wrapped += line + b"\r\n"
+    import zipfile
+    jar = config.DATA_DIR / "classpath.jar"
+    with zipfile.ZipFile(jar, "w") as z:
+        z.writestr("META-INF/MANIFEST.MF", bytes(wrapped))
+    return str(jar)
+
+
+def _mask(cmd: list[str]) -> str:
+    return _SECRET_RE.sub(r"\1*****", " ".join(cmd))
+
+
+def _patch_properties(run_params: dict | None) -> bytes | None:
+    """Write url / maker / checker into the framework's properties file.
+    Returns the ORIGINAL bytes so the caller can restore them afterwards."""
+    if not run_params or not any(run_params.get(f) for f in config.RUNTIME_PROPERTY_KEYS):
         return None
-    html_files = list(reports_dir.rglob("*.html"))
-    if not html_files:
+    pf = config.PROPERTIES_FILE
+    if not pf.exists():
         return None
-    return max(html_files, key=lambda p: p.stat().st_mtime)
+    original = pf.read_bytes()
+    lines = original.decode("utf-8", errors="ignore").splitlines()
+    wanted = {key: run_params[fld]
+              for fld, key in config.RUNTIME_PROPERTY_KEYS.items()
+              if run_params.get(fld)}
+    out, seen = [], set()
+    for line in lines:
+        stripped = line.strip()
+        replaced = False
+        if stripped and not stripped.startswith(("#", "!")) and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in wanted:
+                out.append(f"{key}={wanted[key]}")
+                seen.add(key)
+                replaced = True
+        if not replaced:
+            out.append(line)
+    for key, val in wanted.items():          # keys not present yet -> append
+        if key not in seen:
+            out.append(f"{key}={val}")
+    pf.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return original
 
 
-def summarize_json_report(framework_root: Path) -> Dict:
-    json_path = framework_root / config.JSON_REPORT_RELATIVE_PATH
-    summary = {"total_scenarios": 0, "passed_scenarios": 0, "failed_scenarios": 0}
-    if not json_path.exists():
-        return summary
+@dataclass
+class Job:
+    id: str
+    feature_path: str
+    status: str = "queued"          # queued | running | passed | failed | error | stopped
+    return_code: int | None = None
+    log_file: Path = None
+    report_file: Path = None
+    summary: dict = field(default_factory=dict)
+    proc: object = None
+    stop_requested: bool = False
 
+    def public(self) -> dict:
+        return {
+            "job_id": self.id,
+            "feature": self.feature_path,
+            "status": self.status,
+            "return_code": self.return_code,
+            "summary": self.summary,
+        }
+
+
+def _cucumber_props(feature_path: str, report_file: Path, dry_run: bool,
+                    run_params: dict | None, tag_filter: str | None = None) -> list[str]:
+    """System properties that OVERRIDE @CucumberOptions in TestRunner.java."""
+    if config.CUCUMBER_STYLE == "options":
+        # Cucumber 4.x: one combined option string
+        opts = f"{feature_path} --plugin json:{report_file}"
+        if dry_run:
+            opts += " --dry-run"
+        props = [f"-Dcucumber.options={opts}"]
+    else:
+        # Cucumber 5/6/7
+        props = [
+            f"-Dcucumber.features={feature_path}",
+            f"-Dcucumber.plugin=json:{report_file}",
+        ]
+        if dry_run:
+            props.append("-Dcucumber.execution.dry-run=true")
+    props.append(f"-D{config.BROWSER_SYSPROP}={config.BROWSER_VALUE}")
+    tag = tag_filter if tag_filter is not None else getattr(config, "CUCUMBER_TAG_FILTER", None)
+    if tag is not None:
+        # overrides the hardcoded tags="@400_pass" in TestRunner ("" = no filter)
+        props.append(f"-Dcucumber.filter.tags={tag}")
+    for k, v in getattr(config, "EXTRA_SYSTEM_PROPS", {}).items():
+        props.append(f"-D{k}={v}")
+    # Also expose url / maker / checker as system properties, in case
+    # PropertiesUtil checks System.getProperty() before the file.
+    for field, key in config.RUNTIME_PROPERTY_KEYS.items():
+        if run_params and run_params.get(field):
+            props.append(f"-D{key}={run_params[field]}")
+    return props
+
+
+def _build_command(feature_path: str, report_file: Path, dry_run: bool = False,
+                   run_params: dict | None = None, tag_filter: str | None = None) -> list[str]:
+    props = _cucumber_props(feature_path, report_file, dry_run, run_params, tag_filter)
+
+    if config.RUN_MODE == "java":
+        # No build tool: launch the already-compiled TestRunner directly.
+        # NOTE: -D properties must come BEFORE the main class.
+        base = [config.JAVA, *props, "-cp", _effective_classpath()]
+        if config.RUNNER_KIND == "testng":
+            return [*base, "org.testng.TestNG", "-testclass", config.TEST_RUNNER_CLASS]
+        return [*base, "org.junit.runner.JUnitCore", config.TEST_RUNNER_CLASS]
+
+    if config.RUN_MODE == "gradle":
+        return [
+            config.GRADLE, "test",
+            "--tests", config.TEST_RUNNER_CLASS,
+            *props,
+        ]
+
+    # maven
+    return [
+        config.MVN, "test",
+        f"-Dtest={config.TEST_RUNNER_CLASS}",
+        *props,
+        "-DfailIfNoTests=false",
+    ]
+
+
+def _parse_report(report_file: Path) -> dict:
+    """Turn cucumber's JSON report into a small pass/fail summary + undefined steps."""
+    if not report_file.exists():
+        return {}
     try:
-        data = json.loads(json_path.read_text(encoding="utf-8"))
+        data = json.loads(report_file.read_text(errors="ignore"))
     except (json.JSONDecodeError, OSError):
-        return summary
-
-    for feature in data:
-        for element in feature.get("elements", []):
-            if element.get("type") != "scenario":
+        return {}
+    total = passed = failed = skipped = 0
+    undefined: list[str] = []
+    failures: list[dict] = []
+    scenarios: list[dict] = []
+    steps_passed = steps_failed = 0
+    for feat in data:
+        for el in feat.get("elements", []):
+            if el.get("type") == "background":
                 continue
-            summary["total_scenarios"] += 1
-            steps = element.get("steps", [])
-            failed = any(
-                step.get("result", {}).get("status") != "passed" for step in steps
-            )
-            if failed:
-                summary["failed_scenarios"] += 1
+            total += 1
+            scenario_failed = False
+            duration_ns = 0
+            for step in el.get("steps", []):
+                res = step.get("result", {})
+                st = res.get("status")
+                duration_ns += res.get("duration", 0) or 0
+                if st == "passed":
+                    steps_passed += 1
+                if st == "undefined":
+                    undefined.append(step.get("name", ""))
+                if st in ("failed", "undefined"):
+                    scenario_failed = True
+                    steps_failed += 1
+                    if st == "failed":
+                        failures.append({
+                            "scenario": el.get("name"),
+                            "step": step.get("name"),
+                            "error": (res.get("error_message") or "")[:500],
+                        })
+                if st == "skipped":
+                    skipped += 1
+            if scenario_failed:
+                failed += 1
             else:
-                summary["passed_scenarios"] += 1
+                passed += 1
+            scenarios.append({
+                "name": el.get("name") or "(unnamed scenario)",
+                "status": "failed" if scenario_failed else "passed",
+                "duration_sec": round(duration_ns / 1e9, 2),
+            })
+    return {
+        "scenarios_total": total,
+        "scenarios_passed": passed,
+        "scenarios_failed": failed,
+        "steps_passed": steps_passed,
+        "steps_failed": steps_failed,
+        "steps_skipped": skipped,
+        "scenarios": scenarios,
+        "undefined_steps": sorted(set(undefined)),
+        "failures": failures,
+    }
 
-    return summary
+
+def _run(job: Job, dry_run: bool, run_params: dict | None, tag_filter: str | None = None):
+    job.status = "running"
+    cmd = _build_command(job.feature_path, job.report_file, dry_run, run_params, tag_filter)
+    original_props: bytes | None = None
+    try:
+        # One run at a time: the properties file (and the Edge session) are shared.
+        with _RUN_LOCK:
+            original_props = _patch_properties(run_params)
+            try:
+                with open(job.log_file, "w", encoding="utf-8", errors="ignore") as log:
+                    log.write(">>> " + _mask(cmd) + "\n\n")   # never log passwords
+                    log.flush()
+                    proc = subprocess.Popen(
+                        cmd,
+                        cwd=str(config.FRAMEWORK_ROOT),
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        shell=False,
+                    )
+                    job.proc = proc
+                    job.return_code = proc.wait()
+            finally:
+                # ALWAYS restore the original properties file, even on crash.
+                if original_props is not None:
+                    config.PROPERTIES_FILE.write_bytes(original_props)
+        job.summary = _parse_report(job.report_file)
+        if job.stop_requested:
+            job.status = "stopped"
+            return
+        if job.summary.get("undefined_steps"):
+            job.status = "failed"  # steps missing glue code
+        elif job.return_code == 0 and job.summary.get("scenarios_failed", 0) == 0:
+            job.status = "passed"
+        else:
+            job.status = "failed"
+    except FileNotFoundError as e:
+        job.status = "error"
+        job.summary = {"error": f"Could not start the launcher ({e}). Check JAVA_CMD/MVN_CMD and PATH."}
+    except Exception as e:  # noqa: BLE001
+        job.status = "error"
+        job.summary = {"error": str(e)}
+
+
+def start_job(feature_path: str, dry_run: bool = False,
+              run_params: dict | None = None, tag_filter: str | None = None) -> Job:
+    job_id = uuid.uuid4().hex[:12]
+    job = Job(
+        id=job_id,
+        feature_path=str(feature_path),
+        log_file=config.LOGS_DIR / f"{job_id}.log",
+        report_file=config.REPORTS_DIR / f"{job_id}.json",
+    )
+    JOBS[job_id] = job
+    threading.Thread(target=_run, args=(job, dry_run, run_params, tag_filter), daemon=True).start()
+    return job
+
+
+def stop_job(job_id: str) -> bool:
+    """Kill a running execution (java + its Edge/driver children)."""
+    job = JOBS.get(job_id)
+    if not job or job.status != "running" or job.proc is None:
+        return False
+    job.stop_requested = True
+    try:
+        if os.name == "nt":
+            # /T kills the whole tree: java -> msedgedriver -> Edge
+            subprocess.run(["taskkill", "/PID", str(job.proc.pid), "/T", "/F"],
+                           capture_output=True)
+        else:
+            job.proc.kill()
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
+def read_log(job_id: str, offset: int = 0) -> tuple[str, int]:
+    """Return log text from byte offset, plus the new offset (for live polling)."""
+    job = JOBS.get(job_id)
+    if not job or not job.log_file.exists():
+        return "", offset
+    with open(job.log_file, "r", encoding="utf-8", errors="ignore") as f:
+        f.seek(offset)
+        chunk = f.read()
+        return chunk, f.tell()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+app/main
+
+"""
+FastAPI orchestrator for the Java Cucumber framework.
+
+Flow 1 (manager's primary flow):
+    POST /execute/txn/{txn_no}      -> looks up the feature in the index, runs it on Edge
+
+Flow 2 (alternate flow):
+    POST /execute/upload            -> user uploads a .feature file; we detect its module,
+                                       dry-run to verify glue code exists, then execute it
+
+Common:
+    GET  /jobs/{job_id}             -> status + pass/fail summary
+    GET  /jobs/{job_id}/logs        -> live console log (poll with ?offset=)
+    GET  /txns?q=0104               -> search the index (for an autocomplete box in Next.js)
+    POST /index/rebuild             -> rescan the framework after new features are added
+
+Run with:  uvicorn app.main:app --reload --port 8000
+"""
+import re
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from . import config, executor, indexer
+
+
+class RunParams(BaseModel):
+    """Target environment + credentials for one execution.
+    All optional — omit any value to keep whatever the properties file already has."""
+    url: str | None = None
+    maker_id: str | None = None
+    maker_password: str | None = None
+    checker_id: str | None = None
+    checker_password: str | None = None
+
+app = FastAPI(title="Java Framework Orchestrator")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # your Next.js dev server
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def _startup():
+    if config.FRAMEWORK_ROOT.exists():
+        indexer.build_index()
+
+
+# ─────────────────────────── index endpoints ────────────────────────────────
+@app.post("/index/rebuild")
+def rebuild_index():
+    idx = indexer.build_index()
+    return {"indexed_txns": len(idx)}
+
+
+@app.get("/txns")
+def search_txns(q: str = "", all: bool = False):
+    """Returns [{txn, module, file}] — the full list when all=1 so the UI can
+    offer a scrollable, searchable dropdown of every feature."""
+    idx = indexer.get_index()
+    q = q.lower()
+    items = []
+    for k, v in sorted(idx.items()):
+        if q and q not in k.lower() and q not in (v.get("feature") or "").lower():
+            continue
+        from pathlib import Path as _P
+        items.append({"txn": k, "module": v.get("module") or "",
+                      "file": _P(v["feature"]).name if v.get("feature") else ""})
+    if not all:
+        items = items[:50]
+    return {"count": len(items), "txns": items}
+
+
+# ───────────────────────── flow 1: run by txn number ────────────────────────
+@app.post("/execute/txn/{txn_no}")
+def execute_txn(txn_no: str, params: RunParams | None = None):
+    """txn_no arrives as e.g. 'Txn36048' or 'txn69069' (prefix chosen in the UI).
+    We locate the feature via the index, VERIFY the matching @tag exists inside
+    the feature file, then run with cucumber.filter.tags=<that exact tag> —
+    same effect as replacing the number in TestRunner's tags, but with no
+    Java edit and no recompile."""
+    hit = indexer.lookup(txn_no)
+    if not hit:
+        raise HTTPException(404, f"Txn '{txn_no}' not found in index. Try POST /index/rebuild.")
+    if not hit.get("feature"):
+        raise HTTPException(409, f"{hit['txn']} exists but has no .feature file indexed.")
+
+    # find the matching tag inside the feature file. Frameworks tag in several
+    # styles, so we accept (in priority order):
+    #   1. @Txn012000                              (exact, any casing)
+    #   2. @Txn012000_LoansCreateLoanDetails       (starts with the txn id)
+    #   3. @12000                                  (bare number, zero-padding ignored)
+    from pathlib import Path as _P
+    text = _P(hit["feature"]).read_text(encoding="utf-8", errors="ignore")
+    tags_in_file = re.findall(r"@[\w]+", text)
+    digits = re.sub(r"\D", "", txn_no)
+
+    def _match_rank(t: str) -> int:
+        low = t.lower().lstrip("@")
+        if low == f"txn{digits}".lower():
+            return 1
+        if low.startswith(f"txn{digits}".lower()) and not low[len(f"txn{digits}"):][:1].isdigit():
+            return 2
+        if low.isdigit() and low.lstrip("0") == digits.lstrip("0"):
+            return 3
+        return 99
+
+    tag = min(tags_in_file, key=_match_rank, default=None)
+    if tag is not None and _match_rank(tag) == 99:
+        tag = None
+    if not tag:
+        raise HTTPException(409,
+            f"Feature found ({_P(hit['feature']).name}) but it has no @{txn_no} tag. "
+            f"Tags present in the file: {sorted(set(tags_in_file)) or 'none'}. "
+            f"Add the tag above the Scenario/Feature line, or run without tag matching.")
+
+    job = executor.start_job(hit["feature"],
+                             run_params=params.model_dump() if params else None,
+                             tag_filter=tag)
+    return {"txn": hit["txn"], "module": hit["module"], "tag": tag, **job.public()}
+
+
+# ───────────────────── flow 2: run an uploaded feature ──────────────────────
+@app.post("/execute/upload")
+async def execute_upload(
+    file: UploadFile = File(...),
+    dry_run: bool = False,
+    url: str | None = Form(None),
+    maker_id: str | None = Form(None),
+    maker_password: str | None = Form(None),
+    checker_id: str | None = Form(None),
+    checker_password: str | None = Form(None),
+):
+    if not file.filename.endswith(".feature"):
+        raise HTTPException(400, "Please upload a .feature file.")
+    text = (await file.read()).decode("utf-8", errors="ignore")
+    if "Scenario" not in text and "Scenario Outline" not in text:
+        raise HTTPException(400, "File does not look like a valid Gherkin feature.")
+
+    module = indexer.detect_module(text)
+    dest = config.UPLOADS_DIR / file.filename
+    dest.write_text(text, encoding="utf-8")
+
+    run_params = {
+        "url": url,
+        "maker_id": maker_id,
+        "maker_password": maker_password,
+        "checker_id": checker_id,
+        "checker_password": checker_password,
+    }
+    # NOTE: we execute the feature straight from our uploads folder via the
+    # cucumber features override. The framework's source is never modified;
+    # only the properties file is patched for the run and restored afterwards.
+    job = executor.start_job(str(dest), dry_run=dry_run, run_params=run_params)
+    closest = indexer.closest_feature(text, module)
+    return {
+        "module_detected": module,
+        "closest_existing_feature": closest,
+        "hint": "If the run reports undefined_steps, the framework has no Java glue "
+                "for those lines — reuse the closest_existing_feature's wording, "
+                "or generate new step definitions (phase 2).",
+        **job.public(),
+    }
+
+
+# ─────────────────────────── job status / logs ──────────────────────────────
+@app.post("/jobs/{job_id}/stop")
+def stop_job(job_id: str):
+    ok = executor.stop_job(job_id)
+    if not ok:
+        raise HTTPException(409, "Job is not running (or unknown id).")
+    return {"job_id": job_id, "status": "stopping"}
+
+
+@app.get("/jobs/{job_id}")
+def job_status(job_id: str):
+    job = executor.JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Unknown job id.")
+    return job.public()
+
+
+@app.get("/jobs/{job_id}/logs")
+def job_logs(job_id: str, offset: int = 0):
+    chunk, new_offset = executor.read_log(job_id, offset)
+    job = executor.JOBS.get(job_id)
+    return {
+        "log": chunk,
+        "next_offset": new_offset,
+        "status": job.status if job else "unknown",
+    }
+
+
+# ───────────────────────── serve the frontend ───────────────────────────────
+# Must be mounted LAST so it doesn't shadow the API routes above.
+# Open http://localhost:8000 in a browser after starting uvicorn.
+from pathlib import Path as _Path
+from fastapi.staticfiles import StaticFiles
+
+_FRONTEND_DIR = _Path(__file__).resolve().parent.parent / "frontend"
+if _FRONTEND_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIR), html=True), name="frontend")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+index.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Txn Automation Console</title>
+<style>
+  :root{
+    --bg:#eef2f9; --card:#ffffff; --ink:#101a2e; --muted:#64748b; --line:#e2e8f2;
+    --a1:#4f46e5; --a2:#0ea5e9; --grad:linear-gradient(135deg,#4f46e5 0%,#0ea5e9 100%);
+    --pass:#16a34a; --pass-soft:#e7f6ec; --fail:#dc2626; --fail-soft:#fdecec;
+    --warn:#b45309; --warn-soft:#fef3d8;
+    --console:#0b1220; --console-ink:#cfe0f4;
+    --mono:"Consolas","Cascadia Mono",monospace; --sans:"Segoe UI",system-ui,Arial,sans-serif;
+    --shadow:0 10px 30px rgba(16,26,46,.08), 0 2px 6px rgba(16,26,46,.05);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:
+       radial-gradient(1200px 400px at 80% -100px, rgba(79,70,229,.10), transparent 60%),
+       radial-gradient(900px 380px at 10% -80px, rgba(14,165,233,.10), transparent 60%),
+       var(--bg);
+       color:var(--ink);font-family:var(--sans);min-height:100vh}
+  /* ── header ── */
+  header{display:flex;align-items:center;gap:16px;padding:16px 28px}
+  .logo{width:38px;height:38px;border-radius:11px;background:var(--grad);display:grid;place-items:center;
+        color:#fff;font-weight:800;font-size:16px;box-shadow:0 6px 16px rgba(79,70,229,.35)}
+  header h1{font-size:18px;margin:0;letter-spacing:.2px}
+  header .sub{font-size:12px;color:var(--muted)}
+  .spacer{flex:1}
+  .btn{font:inherit;border:1px solid var(--line);background:#fff;color:var(--ink);
+       padding:9px 16px;border-radius:10px;cursor:pointer;transition:.15s;box-shadow:0 1px 2px rgba(16,26,46,.05)}
+  .btn:hover{border-color:var(--a1);transform:translateY(-1px)}
+  .btn:focus-visible{outline:2px solid var(--a1);outline-offset:2px}
+  .btn.primary{background:var(--grad);border:0;color:#fff;font-weight:700;letter-spacing:.3px;
+               box-shadow:0 8px 20px rgba(79,70,229,.35)}
+  .btn.primary:disabled{opacity:.55;cursor:not-allowed;transform:none}
+  .btn.stop{background:linear-gradient(135deg,#ef4444,#b91c1c);border:0;color:#fff;font-weight:700;
+            box-shadow:0 8px 20px rgba(220,38,38,.30);display:none}
+  /* ── layout per sketch: [new execution | execution] then reports full width ── */
+  main{display:grid;grid-template-columns:400px 1fr;gap:20px;padding:6px 28px 28px;max-width:1600px;margin:0 auto}
+  #reportcard{grid-column:1 / -1}
+  @media(max-width:1020px){main{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px;box-shadow:var(--shadow)}
+  .card h2{display:flex;align-items:center;gap:8px;font-size:12px;text-transform:uppercase;
+           letter-spacing:1.2px;color:var(--muted);margin:0 0 16px;font-weight:700}
+  .card h2::before{content:"";width:8px;height:8px;border-radius:3px;background:var(--grad)}
+  /* tabs — Upload first & default */
+  .tabs{display:flex;background:#f1f4fa;border-radius:12px;padding:4px;margin-bottom:18px}
+  .tabs button{flex:1;font:inherit;font-weight:600;padding:10px;border:0;border-radius:9px;
+               background:transparent;color:var(--muted);cursor:pointer;transition:.15s}
+  .tabs button.active{background:#fff;color:var(--a1);box-shadow:0 2px 8px rgba(16,26,46,.10)}
+  label{display:block;font-size:12px;color:var(--muted);margin:12px 0 6px;font-weight:600}
+  input[type=file]{width:100%;font:inherit;padding:10px;border:1.5px dashed var(--line);border-radius:10px;background:#fafbfe}
+  .check{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px;color:var(--muted)}
+  .hintbox{font-size:12px;color:var(--muted);background:#f6f8fd;border:1px solid var(--line);
+           border-radius:10px;padding:10px 12px;margin-top:12px;line-height:1.5}
+  .mono{font-family:var(--mono)}
+  /* ── Txn combo: fixed label + searchable scrollable dropdown ── */
+  .combo{position:relative}
+  .combo .row{display:flex;border:1.5px solid var(--line);border-radius:10px;overflow:hidden;background:#fff;transition:.15s}
+  .combo .row:focus-within{border-color:var(--a1);box-shadow:0 0 0 3px rgba(79,70,229,.12)}
+  .chip{background:var(--grad);color:#fff;font-weight:700;padding:11px 16px;font-size:14px;letter-spacing:.5px}
+  .combo input{flex:1;border:0;outline:0;font:inherit;padding:11px 12px;font-family:var(--mono)}
+  .ddl{position:absolute;z-index:30;top:calc(100% + 6px);left:0;right:0;background:#fff;
+       border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);
+       max-height:280px;overflow-y:auto;display:none}
+  .ddl.open{display:block}
+  .ddl .item{padding:10px 14px;cursor:pointer;display:flex;gap:10px;align-items:baseline;border-bottom:1px solid #f3f5fa}
+  .ddl .item:hover,.ddl .item.hl{background:#f4f6ff}
+  .ddl .num{font-family:var(--mono);font-weight:700;color:var(--a1);min-width:74px}
+  .ddl .fname{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+  .ddl .mod{font-size:10px;font-weight:700;text-transform:uppercase;color:#fff;background:#94a3b8;
+            border-radius:20px;padding:2px 8px;letter-spacing:.5px}
+  .ddl .empty{padding:14px;color:var(--muted);font-size:13px;text-align:center}
+  /* ── execution panel ── */
+  .rail{display:flex;margin:4px 0 16px}
+  .stage{flex:1;text-align:center;font-size:12px;color:var(--muted);position:relative;padding-top:20px}
+  .stage::before{content:"";width:13px;height:13px;border-radius:50%;background:#d3dced;
+                 position:absolute;top:0;left:50%;transform:translateX(-50%);transition:.25s}
+  .stage::after{content:"";position:absolute;top:6px;left:-50%;width:100%;height:2.5px;background:#d3dced;z-index:0;transition:.25s}
+  .stage:first-child::after{display:none}
+  .stage.on::before{background:var(--a1);box-shadow:0 0 0 4px rgba(79,70,229,.18)}
+  .stage.on::after{background:var(--a1)}
+  .stage.done::before{background:var(--pass)} .stage.done::after{background:var(--pass)}
+  .stage.bad::before{background:var(--fail)}
+  .badge{font-size:12px;font-weight:700;padding:4px 12px;border-radius:20px;text-transform:capitalize}
+  .badge.idle,.badge.queued{background:#eef1f7;color:var(--muted)}
+  .badge.running{background:#e6efff;color:var(--a1);animation:pulse 1.4s infinite}
+  .badge.passed{background:var(--pass-soft);color:var(--pass)}
+  .badge.failed,.badge.error{background:var(--fail-soft);color:var(--fail)}
+  .badge.stopped{background:var(--warn-soft);color:var(--warn)}
+  @keyframes pulse{50%{opacity:.55}}
+  #console{background:var(--console);color:var(--console-ink);font-family:var(--mono);font-size:12px;
+           line-height:1.6;border-radius:12px;padding:14px 16px;height:300px;overflow:auto;
+           white-space:pre-wrap;word-break:break-word;box-shadow:inset 0 2px 12px rgba(0,0,0,.45)}
+  #console:empty::before{content:"Console output will stream here once a run starts.";color:#5b6b85}
+  /* ── reports ── */
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:22px}
+  .kpi{border:1px solid var(--line);border-radius:14px;padding:16px 18px;background:linear-gradient(180deg,#fff, #fafbff)}
+  .kpi b{display:block;font-size:30px;line-height:1.1;font-variant-numeric:tabular-nums}
+  .kpi span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.7px;font-weight:600}
+  .kpi.p b{color:var(--pass)} .kpi.f b{color:var(--fail)} .kpi.a b{background:var(--grad);
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .charts{display:grid;grid-template-columns:260px 1fr 260px;gap:26px;align-items:start}
+  @media(max-width:1100px){.charts{grid-template-columns:1fr}}
+  .chart-title{font-size:12px;color:var(--muted);font-weight:700;text-transform:uppercase;
+               letter-spacing:.8px;margin-bottom:12px;text-align:center}
+  .legend{font-size:12px;color:var(--muted);display:flex;gap:16px;justify-content:center;margin-top:10px}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+  .barrow{display:grid;grid-template-columns:minmax(120px,260px) 1fr 58px;gap:12px;align-items:center;font-size:12px;margin:8px 0}
+  .barrow .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#334155}
+  .bartrack{background:#eef1f8;border-radius:6px;height:16px;overflow:hidden}
+  .barfill{height:100%;border-radius:6px;min-width:5px;transition:width .6s ease}
+  .stack{height:26px;border-radius:8px;overflow:hidden;display:flex;box-shadow:inset 0 1px 3px rgba(0,0,0,.08)}
+  .stack div{transition:width .6s ease}
+  .note{border-radius:10px;padding:10px 14px;font-size:13px;margin-top:18px;background:var(--warn-soft);color:var(--warn);display:none}
+  #toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--ink);color:#fff;
+         padding:11px 20px;border-radius:12px;font-size:13px;display:none;z-index:99;box-shadow:var(--shadow)}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">Tx</div>
+  <div>
+    <h1>Txn Automation Console</h1>
+    <div class="sub">NBC Cucumber framework &middot; executes via TestRunner on Microsoft Edge</div>
+  </div>
+  <div class="spacer"></div>
+  <span id="idxinfo" class="sub"></span>
+  <button class="btn" onclick="rebuildIndex()">&#8635; Rebuild index</button>
+</header>
+
+<main>
+  <!-- ═════════ NEW EXECUTION (sketch: top-left) ═════════ -->
+  <section class="card">
+    <h2>New Execution</h2>
+    <div class="tabs">
+      <button id="tab-up" class="active" onclick="setTab('up')">Upload feature</button>
+      <button id="tab-txn" onclick="setTab('txn')">Run by Txn No</button>
+    </div>
+
+    <div id="pane-up">
+      <label for="file">Feature file (.feature)</label>
+      <input id="file" type="file" accept=".feature">
+      <label class="check"><input id="dry" type="checkbox" checked>
+        Verify steps first (dry run &mdash; no browser, seconds)</label>
+      <div class="hintbox">The file runs from the server's uploads folder — the framework source is never modified.</div>
+    </div>
+
+    <div id="pane-txn" style="display:none">
+      <label>Transaction number</label>
+      <div class="combo" id="combo">
+        <div class="row">
+          <span class="chip">Txn</span>
+          <input id="txn" placeholder="type a number or click to browse&hellip;" autocomplete="off"
+                 oninput="filterDdl()" onfocus="openDdl()">
+        </div>
+        <div class="ddl" id="ddl"></div>
+      </div>
+      <div class="hintbox">All <b id="featcount">&hellip;</b> feature files are listed — scroll or type to search.
+        The backend verifies the matching tag exists inside the feature before launching.</div>
+    </div>
+
+    <button id="runbtn" class="btn primary" style="width:100%;margin-top:18px;padding:13px" onclick="run()">&#9654;&nbsp; Run on Edge</button>
+    <button id="stopbtn" class="btn stop" style="width:100%;margin-top:10px;padding:13px" onclick="stopRun()">&#9632;&nbsp; Stop execution</button>
+  </section>
+
+  <!-- ═════════ EXECUTION (sketch: top-right) ═════════ -->
+  <section class="card">
+    <h2>Execution <span id="jobmeta" class="sub" style="text-transform:none;letter-spacing:0"></span>
+        <span class="spacer"></span><span id="status" class="badge idle">idle</span></h2>
+    <div class="rail">
+      <div class="stage" id="s1">Lookup</div>
+      <div class="stage" id="s2">Launch JVM</div>
+      <div class="stage" id="s3">Edge run</div>
+      <div class="stage" id="s4">Report</div>
+    </div>
+    <div id="console" role="log" aria-live="polite"></div>
+  </section>
+
+  <!-- ═════════ REPORTS (sketch: full width below) ═════════ -->
+  <section class="card" id="reportcard" style="display:none">
+    <h2>Result Report</h2>
+    <div class="kpis" id="kpis"></div>
+    <div class="charts">
+      <div>
+        <div class="chart-title">Pass rate</div>
+        <div style="text-align:center"><svg id="donut" width="200" height="200" viewBox="0 0 200 200" role="img"></svg></div>
+        <div class="legend">
+          <span><span class="dot" style="background:var(--pass)"></span>Passed</span>
+          <span><span class="dot" style="background:var(--fail)"></span>Failed</span>
+        </div>
+      </div>
+      <div>
+        <div class="chart-title">Scenario durations</div>
+        <div id="bars"></div>
+      </div>
+      <div>
+        <div class="chart-title">Steps breakdown</div>
+        <div class="stack" id="stepstack"></div>
+        <div class="legend" style="flex-wrap:wrap">
+          <span><span class="dot" style="background:var(--pass)"></span>Passed</span>
+          <span><span class="dot" style="background:var(--fail)"></span>Failed</span>
+          <span><span class="dot" style="background:#f59e0b"></span>Skipped</span>
+        </div>
+        <div id="stepnums" style="text-align:center;font-size:13px;color:var(--muted);margin-top:12px"></div>
+      </div>
+    </div>
+    <div class="note" id="undefnote"></div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+const API = "";
+let tab = "up", job = null, offset = 0, timer = null, allTxns = [];
+
+function toast(m){ const t = document.getElementById("toast");
+  t.textContent = m; t.style.display = "block"; setTimeout(() => t.style.display = "none", 4200); }
+function v(id){ return document.getElementById(id).value.trim() || null; }
+
+function setTab(t){ tab = t;
+  document.getElementById("tab-up").classList.toggle("active", t === "up");
+  document.getElementById("tab-txn").classList.toggle("active", t === "txn");
+  document.getElementById("pane-up").style.display = t === "up" ? "" : "none";
+  document.getElementById("pane-txn").style.display = t === "txn" ? "" : "none";
+  closeDdl(); }
+
+/* ── index + searchable dropdown ─────────────────────────────────────── */
+async function loadTxns(){
+  try{
+    const r = await fetch(API + "/txns?all=1"); const d = await r.json();
+    allTxns = d.txns || [];
+    document.getElementById("idxinfo").textContent = d.count + " txns indexed";
+    document.getElementById("featcount").textContent = d.count;
+    renderDdl(allTxns);
+  }catch(e){}
+}
+function renderDdl(items){
+  const ddl = document.getElementById("ddl");
+  if (!items.length){ ddl.innerHTML = `<div class="empty">No matching transaction</div>`; return; }
+  ddl.innerHTML = items.slice(0, 400).map(x => {
+    const num = x.txn.replace(/^txn/i, "");
+    return `<div class="item" onmousedown="pick('${num}')">
+      <span class="num">${num}</span><span class="fname">${x.file}</span>
+      <span class="mod">${x.module}</span></div>`; }).join("")
+    + (items.length > 400 ? `<div class="empty">&hellip; ${items.length - 400} more — keep typing to narrow</div>` : "");
+}
+function filterDdl(){
+  const q = document.getElementById("txn").value.trim().toLowerCase().replace(/^txn/, "");
+  openDdl();
+  renderDdl(!q ? allTxns : allTxns.filter(x =>
+    x.txn.toLowerCase().includes(q) || (x.file || "").toLowerCase().includes(q)));
+}
+function openDdl(){ document.getElementById("ddl").classList.add("open"); }
+function closeDdl(){ document.getElementById("ddl").classList.remove("open"); }
+function pick(num){ document.getElementById("txn").value = num; closeDdl(); }
+document.addEventListener("click", e => { if (!document.getElementById("combo").contains(e.target)) closeDdl(); });
+
+async function rebuildIndex(){
+  const r = await fetch(API + "/index/rebuild", {method:"POST"}); const d = await r.json();
+  toast("Index rebuilt: " + d.indexed_txns + " transactions"); loadTxns(); }
+
+/* ── run / stop ──────────────────────────────────────────────────────── */
+async function run(){
+  resetPanels();
+  const btn = document.getElementById("runbtn"); btn.disabled = true;
+  try{
+    let res;
+    if (tab === "txn"){
+      const num = v("txn");
+      if (!num){ toast("Enter or select a transaction number."); btn.disabled = false; return; }
+      const txn = "Txn" + num.replace(/^txn/i, "");
+      stage("s1", "on");
+      res = await fetch(API + "/execute/txn/" + encodeURIComponent(txn),
+        {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+    } else {
+      const f = document.getElementById("file").files[0];
+      if (!f){ toast("Choose a .feature file."); btn.disabled = false; return; }
+      stage("s1", "on");
+      const fd = new FormData(); fd.append("file", f);
+      res = await fetch(API + "/execute/upload?dry_run=" + document.getElementById("dry").checked,
+        {method:"POST", body:fd});
+    }
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.detail || "Request failed");
+    job = d.job_id; offset = 0;
+    stage("s1", "done"); stage("s2", "on");
+    document.getElementById("jobmeta").textContent =
+      "— " + (d.txn ? d.txn + " (" + d.module + ")" : d.feature.split(/[\\\/]/).pop()) +
+      (d.tag ? "  ·  " + d.tag : "");
+    document.getElementById("stopbtn").style.display = "block";
+    timer = setInterval(poll, 1500);
+  }catch(err){ toast(err.message); setBadge("error"); btn.disabled = false; }
+}
+
+async function stopRun(){
+  if (!job) return;
+  try{
+    const r = await fetch(API + `/jobs/${job}/stop`, {method:"POST"});
+    if (r.ok) toast("Stopping execution — closing Edge…");
+  }catch(e){}
+}
+
+function resetPanels(){
+  document.getElementById("console").textContent = "";
+  document.getElementById("reportcard").style.display = "none";
+  document.getElementById("stopbtn").style.display = "none";
+  ["s1","s2","s3","s4"].forEach(id => document.getElementById(id).className = "stage");
+  setBadge("queued"); }
+function stage(id, cls){ document.getElementById(id).className = "stage " + cls; }
+function setBadge(s){ const b = document.getElementById("status"); b.className = "badge " + s; b.textContent = s; }
+
+/* ── polling ─────────────────────────────────────────────────────────── */
+async function poll(){
+  const r = await fetch(API + `/jobs/${job}/logs?offset=${offset}`);
+  const d = await r.json();
+  if (d.log){
+    const c = document.getElementById("console");
+    c.textContent += d.log; c.scrollTop = c.scrollHeight; offset = d.next_offset;
+    if (/Scenario|cucumber/i.test(d.log)){ stage("s3", "on"); stage("s2", "done"); }
+  }
+  setBadge(d.status);
+  if (["passed","failed","error","stopped"].includes(d.status)){
+    clearInterval(timer);
+    document.getElementById("runbtn").disabled = false;
+    document.getElementById("stopbtn").style.display = "none";
+    stage("s2", "done");
+    stage("s3", d.status === "passed" ? "done" : d.status === "failed" ? "done" : "bad");
+    stage("s4", d.status === "passed" ? "done" : "bad");
+    const jr = await fetch(API + "/jobs/" + job); renderReport(await jr.json());
+  }
+}
+
+/* ── report (no error dumps — counts + 3 graphics only) ──────────────── */
+function renderReport(j){
+  const s = j.summary || {};
+  document.getElementById("reportcard").style.display = "block";
+  const total = s.scenarios_total ?? 0, pass = s.scenarios_passed ?? 0, fail = s.scenarios_failed ?? 0;
+  const sp = s.steps_passed ?? 0, sf = s.steps_failed ?? 0, sk = s.steps_skipped ?? 0;
+  const dur = (s.scenarios || []).reduce((a, x) => a + (x.duration_sec || 0), 0);
+  const rate = total ? Math.round(100 * pass / total) : 0;
+  const kpi = (n, label, cls="") => `<div class="kpi ${cls}"><b>${n}</b><span>${label}</span></div>`;
+  document.getElementById("kpis").innerHTML =
+    kpi(total, "scenarios") + kpi(pass, "passed", "p") + kpi(fail, "failed", "f") +
+    kpi(rate + "%", "pass rate", "a") + kpi(sp, "steps passed", "p") +
+    kpi(sf, "steps failed", "f") + kpi(sk, "steps skipped") +
+    kpi(dur ? dur.toFixed(1) + "s" : "—", "total time", "a");
+
+  drawDonut(pass, fail);
+  drawBars(s.scenarios || []);
+  drawStack(sp, sf, sk);
+
+  const u = document.getElementById("undefnote");
+  if (s.undefined_steps && s.undefined_steps.length){
+    u.style.display = "block";
+    u.textContent = s.undefined_steps.length +
+      " step(s) in this feature have no matching step definition in the framework — they were skipped.";
+  } else u.style.display = "none";
+}
+
+function drawDonut(pass, fail){
+  const total = pass + fail, svg = document.getElementById("donut");
+  if (!total){ svg.innerHTML = `<text x="100" y="105" text-anchor="middle" fill="#64748b" font-size="13">no scenarios</text>`; return; }
+  const R = 78, C = 2 * Math.PI * R, passLen = C * pass / total;
+  svg.innerHTML = `
+    <circle cx="100" cy="100" r="${R}" fill="none" stroke="#dc2626" stroke-width="26"/>
+    <circle cx="100" cy="100" r="${R}" fill="none" stroke="#16a34a" stroke-width="26"
+      stroke-linecap="${pass && fail ? "butt" : "round"}"
+      stroke-dasharray="${passLen} ${C - passLen}" stroke-dashoffset="${C / 4}"
+      style="transition:stroke-dasharray .8s ease"/>
+    <circle cx="100" cy="100" r="52" fill="#fff"/>
+    <text x="100" y="97" text-anchor="middle" font-size="30" font-weight="800" fill="#101a2e">${Math.round(100 * pass / total)}%</text>
+    <text x="100" y="119" text-anchor="middle" font-size="11" fill="#64748b" letter-spacing="1">PASSED</text>`;
+}
+
+function drawBars(scenarios){
+  const max = Math.max(...scenarios.map(x => x.duration_sec || 0), 0.01);
+  document.getElementById("bars").innerHTML = scenarios.map(x => `
+    <div class="barrow">
+      <span class="name" title="${esc(x.name)}">${esc(x.name)}</span>
+      <div class="bartrack"><div class="barfill" style="width:${Math.max(4, 100 * (x.duration_sec || 0) / max)}%;
+        background:${x.status === "passed" ? "linear-gradient(90deg,#22c55e,#16a34a)" : "linear-gradient(90deg,#f87171,#dc2626)"}"></div></div>
+      <span class="mono" style="color:#64748b">${(x.duration_sec || 0).toFixed(1)}s</span>
+    </div>`).join("") || `<div style="color:#64748b;font-size:13px;text-align:center;padding:30px 0">No scenario timing data.</div>`;
+}
+
+function drawStack(p, f, k){
+  const tot = p + f + k || 1;
+  document.getElementById("stepstack").innerHTML =
+    `<div style="width:${100*p/tot}%;background:#16a34a"></div>` +
+    `<div style="width:${100*f/tot}%;background:#dc2626"></div>` +
+    `<div style="width:${100*k/tot}%;background:#f59e0b"></div>`;
+  document.getElementById("stepnums").innerHTML =
+    `<b style="color:var(--pass)">${p}</b> passed &nbsp;·&nbsp; <b style="color:var(--fail)">${f}</b> failed &nbsp;·&nbsp; <b style="color:#b45309">${k}</b> skipped`;
+}
+
+function esc(x){ return String(x ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+loadTxns();
+</script>
+</body>
+</html>
