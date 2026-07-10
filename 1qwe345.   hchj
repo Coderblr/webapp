@@ -1,140 +1,214 @@
 """
-Builds the Txn index ONCE (at startup or on demand) so lookups are instant.
+FastAPI orchestrator for the Java Cucumber framework.
 
-Result shape (saved to data/index.json):
-{
-  "Txn010450": {
-    "module":  "loans",
-    "feature": "C:/.../features/loans/Txn010450_LoanTransactionEnquiry.feature",
-    "page":    "C:/.../page/loans/Txn010450_LoanTransactionEnquiryPage.java",
-    "steps":   "C:/.../stepDefinitions/loans/Txn010450_LoanTransactionEnquirySteps.java"
-  },
-  ...
-}
+Flow 1 (manager's primary flow):
+    POST /execute/txn/{txn_no}      -> looks up the feature in the index, runs it on Edge
+
+Flow 2 (alternate flow):
+    POST /execute/upload            -> user uploads a .feature file; we detect its module,
+                                       dry-run to verify glue code exists, then execute it
+
+Common:
+    GET  /jobs/{job_id}             -> status + pass/fail summary
+    GET  /jobs/{job_id}/logs        -> live console log (poll with ?offset=)
+    GET  /txns?q=0104               -> search the index (for an autocomplete box in Next.js)
+    POST /index/rebuild             -> rescan the framework after new features are added
+
+Run with:  uvicorn app.main:app --reload --port 8000
 """
-import json
 import re
-import time
-from pathlib import Path
 
-from . import config
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-TXN_RE = re.compile(r"(Txn\d+)", re.IGNORECASE)
-
-_index: dict = {}
-_built_at: float = 0.0
+from . import config, executor, indexer
 
 
-def _module_of(path: Path, base: Path) -> str:
-    """Return the first sub-folder under base (e.g. 'loans'), or '' if file sits at root."""
-    try:
-        rel = path.relative_to(base)
-        return rel.parts[0].lower() if len(rel.parts) > 1 else ""
-    except ValueError:
-        return ""
+class RunParams(BaseModel):
+    """Target environment + credentials for one execution.
+    All optional — omit any value to keep whatever the properties file already has."""
+    url: str | None = None
+    maker_id: str | None = None
+    maker_password: str | None = None
+    checker_id: str | None = None
+    checker_password: str | None = None
+
+app = FastAPI(title="Java Framework Orchestrator")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # your Next.js dev server
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-def _canon(token: str) -> str:
-    """Canonical txn key: digits with leading zeros stripped, so Txn450,
-    Txn0450 and Txn000450 all merge into one entry."""
-    digits = re.sub(r"\D", "", token)
-    return digits.lstrip("0") or "0"
+@app.on_event("startup")
+def _startup():
+    if config.FRAMEWORK_ROOT.exists():
+        indexer.build_index()
 
 
-def build_index() -> dict:
-    """Walk the framework ONCE and map every Txn id to its feature/page/steps
-    files. Entries are keyed by the canonical number so zero-padding
-    differences between feature and java filenames can't split a txn."""
-    global _index, _built_at
-    idx: dict = {}
-
-    def scan(base: Path, key: str, suffix: str):
-        if not base.exists():
-            return
-        for f in base.rglob(f"*{suffix}"):
-            m = TXN_RE.search(f.stem)
-            if not m:
-                continue
-            token = "Txn" + m.group(1)[3:]  # normalise casing -> TxnNNNN
-            entry = idx.setdefault(_canon(token),
-                {"txn": token, "module": "", "feature": None, "page": None, "steps": None})
-            entry[key] = str(f)
-            if key == "feature":
-                entry["txn"] = token   # display name follows the FEATURE file's naming
-            mod = _module_of(f, base)
-            if mod and not entry["module"]:
-                entry["module"] = mod
-
-    scan(config.FEATURES_DIR, "feature", ".feature")
-    scan(config.PAGES_DIR, "page", ".java")
-    scan(config.STEPS_DIR, "steps", ".java")
-
-    _index = idx
-    _built_at = time.time()
-    config.INDEX_FILE.write_text(json.dumps(idx, indent=2))
-    return idx
+# ─────────────────────────── index endpoints ────────────────────────────────
+@app.post("/index/rebuild")
+def rebuild_index():
+    idx = indexer.build_index()
+    return {"indexed_txns": len(idx)}
 
 
-def get_index() -> dict:
-    """Load from memory, then disk cache, then rebuild."""
-    global _index
-    if _index:
-        return _index
-    if config.INDEX_FILE.exists():
-        _index = json.loads(config.INDEX_FILE.read_text())
-        return _index
-    return build_index()
-
-
-def lookup(txn_no: str) -> dict | None:
-    """Find a txn regardless of typing style or zero padding:
-    '450', '000450', 'txn0450', 'Txn000450' all resolve to the same entry."""
-    idx = get_index()
-    hit = idx.get(_canon(txn_no))
-    return dict(hit) if hit else None
-
-
-def detect_module(feature_text: str) -> str | None:
-    """
-    For an UPLOADED feature: figure out which module it belongs to.
-    1. If it mentions a known Txn id, use that txn's module from the index.
-    2. Else, look for a module name in tags / text (@loans, 'cash', ...).
-    """
-    m = TXN_RE.search(feature_text)
-    if m:
-        hit = lookup(m.group(1))
-        if hit and hit.get("module"):
-            return hit["module"]
-    low = feature_text.lower()
-    for mod in config.MODULES:
-        if f"@{mod}" in low or f"/{mod}/" in low or f" {mod} " in low:
-            return mod
-    return None
-
-
-def closest_feature(feature_text: str, module: str | None) -> dict | None:
-    """
-    Find the most similar EXISTING feature (used later as a style template
-    for AI code generation). Cheap token-overlap similarity, searched only
-    inside the detected module folder as your notes recommend.
-    """
-    base = config.FEATURES_DIR / module if module else config.FEATURES_DIR
-    if not base.exists():
-        base = config.FEATURES_DIR
-    words = set(re.findall(r"[a-zA-Z]{4,}", feature_text.lower()))
-    best, best_score = None, 0.0
-    for f in base.rglob("*.feature"):
-        try:
-            other = set(re.findall(r"[a-zA-Z]{4,}", f.read_text(errors="ignore").lower()))
-        except OSError:
+@app.get("/txns")
+def search_txns(q: str = "", all: bool = False):
+    """Returns [{txn, module, file}] — the full list when all=1 so the UI can
+    offer a scrollable, searchable dropdown of every feature."""
+    idx = indexer.get_index()
+    q = q.lower()
+    items = []
+    from pathlib import Path as _P
+    for k, v in idx.items():
+        if not v.get("feature"):
+            continue  # java-only entries can't be executed — keep them out of the picker
+        name = v.get("txn") or k
+        if q and q not in name.lower() and q not in (v.get("feature") or "").lower():
             continue
-        if not other:
-            continue
-        score = len(words & other) / len(words | other)
-        if score > best_score:
-            best, best_score = f, score
-    if not best:
-        return None
-    txn = TXN_RE.search(best.stem)
-    related = lookup(txn.group(1)) if txn else None
-    return {"feature": str(best), "similarity": round(best_score, 3), "related": related}
+        items.append({"txn": name, "module": v.get("module") or "",
+                      "file": _P(v["feature"]).name})
+    items.sort(key=lambda x: int(re.sub(r"\D", "", x["txn"]) or 0))
+    if not all:
+        items = items[:50]
+    return {"count": len(items), "txns": items}
+
+
+# ───────────────────────── flow 1: run by txn number ────────────────────────
+@app.post("/execute/txn/{txn_no}")
+def execute_txn(txn_no: str, params: RunParams | None = None):
+    """txn_no arrives as e.g. 'Txn36048' or 'txn69069' (prefix chosen in the UI).
+    We locate the feature via the index, VERIFY the matching @tag exists inside
+    the feature file, then run with cucumber.filter.tags=<that exact tag> —
+    same effect as replacing the number in TestRunner's tags, but with no
+    Java edit and no recompile."""
+    hit = indexer.lookup(txn_no)
+    if not hit:
+        raise HTTPException(404, f"Txn '{txn_no}' not found in index. Try POST /index/rebuild.")
+    if not hit.get("feature"):
+        raise HTTPException(409,
+            f"{hit['txn']} has step-definition/page Java files but NO .feature file was found "
+            f"for this number anywhere under {config.FEATURES_DIR.name}. This transaction is "
+            f"not automatable until its feature file exists (check the filename's Txn number).")
+
+    # find the matching tag inside the feature file. Frameworks tag in several
+    # styles, so we accept (in priority order):
+    #   1. @Txn012000                              (exact, any casing)
+    #   2. @Txn012000_LoansCreateLoanDetails       (starts with the txn id)
+    #   3. @12000                                  (bare number, zero-padding ignored)
+    from pathlib import Path as _P
+    text = _P(hit["feature"]).read_text(encoding="utf-8", errors="ignore")
+    tags_in_file = re.findall(r"@[\w]+", text)
+    digits = re.sub(r"\D", "", txn_no)
+
+    def _match_rank(t: str) -> int:
+        low = t.lower().lstrip("@")
+        if low == f"txn{digits}".lower():
+            return 1
+        if low.startswith(f"txn{digits}".lower()) and not low[len(f"txn{digits}"):][:1].isdigit():
+            return 2
+        if low.isdigit() and low.lstrip("0") == digits.lstrip("0"):
+            return 3
+        return 99
+
+    tag = min(tags_in_file, key=_match_rank, default=None)
+    if tag is not None and _match_rank(tag) == 99:
+        tag = None
+    if not tag:
+        raise HTTPException(409,
+            f"Feature found ({_P(hit['feature']).name}) but it has no @{txn_no} tag. "
+            f"Tags present in the file: {sorted(set(tags_in_file)) or 'none'}. "
+            f"Add the tag above the Scenario/Feature line, or run without tag matching.")
+
+    job = executor.start_job(hit["feature"],
+                             run_params=params.model_dump() if params else None,
+                             tag_filter=tag)
+    return {"txn": hit["txn"], "module": hit["module"], "tag": tag, **job.public()}
+
+
+# ───────────────────── flow 2: run an uploaded feature ──────────────────────
+@app.post("/execute/upload")
+async def execute_upload(
+    file: UploadFile = File(...),
+    dry_run: bool = False,
+    url: str | None = Form(None),
+    maker_id: str | None = Form(None),
+    maker_password: str | None = Form(None),
+    checker_id: str | None = Form(None),
+    checker_password: str | None = Form(None),
+):
+    if not file.filename.endswith(".feature"):
+        raise HTTPException(400, "Please upload a .feature file.")
+    text = (await file.read()).decode("utf-8", errors="ignore")
+    if "Scenario" not in text and "Scenario Outline" not in text:
+        raise HTTPException(400, "File does not look like a valid Gherkin feature.")
+
+    module = indexer.detect_module(text)
+    dest = config.UPLOADS_DIR / file.filename
+    dest.write_text(text, encoding="utf-8")
+
+    run_params = {
+        "url": url,
+        "maker_id": maker_id,
+        "maker_password": maker_password,
+        "checker_id": checker_id,
+        "checker_password": checker_password,
+    }
+    # NOTE: we execute the feature straight from our uploads folder via the
+    # cucumber features override. The framework's source is never modified;
+    # only the properties file is patched for the run and restored afterwards.
+    job = executor.start_job(str(dest), dry_run=dry_run, run_params=run_params)
+    closest = indexer.closest_feature(text, module)
+    return {
+        "module_detected": module,
+        "closest_existing_feature": closest,
+        "hint": "If the run reports undefined_steps, the framework has no Java glue "
+                "for those lines — reuse the closest_existing_feature's wording, "
+                "or generate new step definitions (phase 2).",
+        **job.public(),
+    }
+
+
+# ─────────────────────────── job status / logs ──────────────────────────────
+@app.post("/jobs/{job_id}/stop")
+def stop_job(job_id: str):
+    ok = executor.stop_job(job_id)
+    if not ok:
+        raise HTTPException(409, "Job is not running (or unknown id).")
+    return {"job_id": job_id, "status": "stopping"}
+
+
+@app.get("/jobs/{job_id}")
+def job_status(job_id: str):
+    job = executor.JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Unknown job id.")
+    return job.public()
+
+
+@app.get("/jobs/{job_id}/logs")
+def job_logs(job_id: str, offset: int = 0):
+    chunk, new_offset = executor.read_log(job_id, offset)
+    job = executor.JOBS.get(job_id)
+    return {
+        "log": chunk,
+        "next_offset": new_offset,
+        "status": job.status if job else "unknown",
+    }
+
+
+# ───────────────────────── serve the frontend ───────────────────────────────
+# Must be mounted LAST so it doesn't shadow the API routes above.
+# Open http://localhost:8000 in a browser after starting uvicorn.
+from pathlib import Path as _Path
+from fastapi.staticfiles import StaticFiles
+
+_FRONTEND_DIR = _Path(__file__).resolve().parent.parent / "frontend"
+if _FRONTEND_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIR), html=True), name="frontend")
