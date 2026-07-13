@@ -1,146 +1,247 @@
 """
-Central configuration. Everything you need to change for YOUR machine is here.
-No other file should need editing to get started.
+Phase 2: AI-driven framework updates.
+
+Flow (called from executor._run when the user enables AI on an upload):
+  1. dry-run already told us which steps are undefined
+  2. build a context pack: uploaded feature + old feature + existing Steps/Page java
+  3. ask Azure OpenAI for COMPLETE updated java files
+  4. javac them into an isolated classes dir (compile errors go back to the
+     model for up to AI_MAX_FIX_ROUNDS repair rounds)
+  5. return {rel_path: code} + the classes dir; the executor prepends that dir
+     to the classpath so the JVM uses the new classes WITHOUT touching the
+     framework. Commit-to-framework only happens after a green run.
 """
+import re
+import subprocess
 from pathlib import Path
-import os
 
-# ── 1. Where the Java Cucumber framework lives (folder containing pom.xml) ──
-FRAMEWORK_ROOT = Path(os.getenv("FRAMEWORK_ROOT", r"D:\NBC_Pankaj"))
+import requests
 
-# ── 2. Source folders inside the framework (adjust if yours differ) ─────────
-# Common layouts: src/test/resources/features  OR  src/test/java/features
-FEATURES_DIR = FRAMEWORK_ROOT / "src" / "test" / "features"
-PAGES_DIR = FRAMEWORK_ROOT / "src" / "test" / "java" / "com" / "nbc" / "pages"
-STEPS_DIR = FRAMEWORK_ROOT / "src" / "test" / "java" / "com" / "nbc" / "stepDefinitions"
+from . import config
 
-# ── 3. The fully-qualified TestRunner class Maven should run ────────────────
-# Find it with:  search the framework for a class containing @RunWith(Cucumber.class)
-# If it's  src/test/java/runners/TestRunner.java  ->  "runners.TestRunner"
-# If it has no package line at the top              ->  "TestRunner"
-TEST_RUNNER_CLASS = os.getenv("TEST_RUNNER_CLASS", "com.nbc.runners.TestRunner")
+FILE_RE = re.compile(r"===FILE:\s*(.+?)\s*===\s*\n(.*?)===END===", re.S)
+PKG_RE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.M)
+CLS_RE = re.compile(r"(?:public\s+)?class\s+(\w+)")
 
-# ── 4. How the framework is launched ────────────────────────────────────────
-# "java"   -> no build tool; run TestRunner directly with a classpath (most likely for you)
-# "gradle" -> framework has build.gradle / gradlew.bat
-# "maven"  -> framework has pom.xml
-RUN_MODE = os.getenv("RUN_MODE", "java")
+SYSTEM_PROMPT = """You are a senior Java test-automation engineer maintaining an enterprise
+Cucumber + Selenium + TestNG framework (package root com.nbc).
+Your job: update step-definition and/or page-object classes so a modified Gherkin feature executes.
 
-MVN = os.getenv("MVN_CMD", "mvn.cmd" if os.name == "nt" else "mvn")
-GRADLE = os.getenv("GRADLE_CMD", str(FRAMEWORK_ROOT / ("gradlew.bat" if os.name == "nt" else "gradlew")))
-JAVA = os.getenv("JAVA_CMD", "java")
-
-# For RUN_MODE="java": folders whose .class files and jars make up the classpath.
-# Wildcard 'lib/*' means "every jar in lib". Adjust to where your jars live
-# (look in Eclipse: right-click project -> Properties -> Java Build Path -> Libraries).
-CLASSPATH_ENTRIES = [
-    str(FRAMEWORK_ROOT / "target" / "test-classes"),
-    str(FRAMEWORK_ROOT / "target" / "classes"),
-    str(FRAMEWORK_ROOT / "target" / "nbc-automation-1.0.0.jar"),
-]
-
-# Folders to scan RECURSIVELY for dependency .jar files (e.g. a Maven cache
-# copied from another machine, or a lib folder with subfolders). Every jar
-# found is added to the classpath via an auto-generated "pathing jar", which
-# also sidesteps the Windows command-line length limit.
-RECURSIVE_JAR_DIRS = [
-    os.path.expanduser(r"~\.m2\repository"),   # remove/adjust if not present
-    str(FRAMEWORK_ROOT / "lib"),
-]
-CP_SEP = ";" if os.name == "nt" else ":"
-
-# EASIEST OPTION (IntelliJ): run TestRunner once in IntelliJ, expand the first
-# line of the Run console, copy everything after "-classpath", and paste it
-# here as one raw string. If set, it wins over CLASSPATH_ENTRIES above.
-CLASSPATH_OVERRIDE = os.getenv("CLASSPATH_OVERRIDE", r"")
-
-CLASSPATH = CLASSPATH_OVERRIDE or CP_SEP.join(CLASSPATH_ENTRIES)
-
-# For RUN_MODE="java": is TestRunner JUnit or TestNG?
-#   "junit"  -> TestRunner has @RunWith(Cucumber.class)   <- yours
-#   "testng" -> TestRunner extends AbstractTestNGCucumberTests
-RUNNER_KIND = os.getenv("RUNNER_KIND", "testng")
-
-# ── 4b. Cucumber version style ───────────────────────────────────────────────
-# Check the cucumber jar filename in your lib folder (e.g. cucumber-java-7.11.0.jar):
-#   version 5/6/7 -> "properties"  (uses -Dcucumber.features=...)
-#   version 4.x   -> "options"     (uses -Dcucumber.options=...)
-CUCUMBER_STYLE = os.getenv("CUCUMBER_STYLE", "properties")
-
-# TestRunner hardcodes tags = "@400_pass". An injected feature without that tag
-# would run 0 scenarios, so by default we CLEAR the tag filter ("" = run all
-# scenarios of the injected feature). Set to e.g. "@smoke" to filter, or None
-# to leave the annotation's @400_pass in force.
-CUCUMBER_TAG_FILTER = os.getenv("CUCUMBER_TAG_FILTER", "")
-
-# ── 4d. Fixed extra -D system properties added to every run ─────────────────
-# Selenium natively reads "webdriver.edge.driver" — set the msedgedriver path
-# here if the framework doesn't handle drivers itself (WebDriverManager /
-# Selenium Manager 4.6+ need nothing). Add any other fixed -D values too.
-EXTRA_SYSTEM_PROPS = {
-    # "webdriver.edge.driver": r"C:\drivers\msedgedriver.exe",
-}
-
-# ── 4c. Runtime inputs: target URL + maker/checker credentials ──────────────
-# The framework reads these from a properties file via PropertiesUtil.java.
-# Open PropertiesUtil.java to find (a) which file it loads and (b) the key names,
-# then correct the two settings below.
-# The framework keeps one properties folder PER ENVIRONMENT (preprod / uat).
-# PropertiesUtil reads these SOURCE files directly at runtime (via user.dir),
-# so patching them needs NO recompile. Credentials/URL live in common.properties.
-ENVIRONMENT = os.getenv("NBC_ENV", "preprod")   # "preprod" or "uat"
-PROPERTIES_FILE = FRAMEWORK_ROOT / "src" / "test" / "resources" / "data" / ENVIRONMENT / "common.properties"
-
-# Map: API field name -> property key name used INSIDE the properties file.
-# Only the right-hand side needs to match your framework.
-RUNTIME_PROPERTY_KEYS = {
-    "url": "baseUrl",
-    "maker_id": "makerID",          # capital ID — matches common.properties
-    "maker_password": "makerPassword",
-    "checker_id": "checkerID",
-    "checker_password": "checkerPassword",
-}
-
-# ── 5. How your framework selects the browser ───────────────────────────────
-# Look inside PropertiesUtil.java / config.properties for the property name.
-# It is usually something like  browser=chrome . We override it per run:
-BROWSER_SYSPROP = os.getenv("BROWSER_SYSPROP", "browser")   # the KEY name
-BROWSER_VALUE = os.getenv("BROWSER_VALUE", "edge")          # the VALUE
-
-# ── 6. Where this backend stores its own data ───────────────────────────────
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-UPLOADS_DIR = DATA_DIR / "uploads"        # uploaded .feature files
-LOGS_DIR = DATA_DIR / "logs"              # live console logs per job
-REPORTS_DIR = DATA_DIR / "reports"        # cucumber JSON reports per job
-INDEX_FILE = DATA_DIR / "index.json"      # the Txn -> files index
-
-for d in (DATA_DIR, UPLOADS_DIR, LOGS_DIR, REPORTS_DIR):
-    d.mkdir(parents=True, exist_ok=True)
-
-# ── 7. Known modules (used to detect which folder an uploaded feature targets)
-MODULES = ["batch", "cash", "cif", "common", "deposits", "fileUpload", "gl",
-           "healthCheck", "loans", "ndvp", "parameters", "sdv"]
+Rules:
+- Keep existing package declarations, imports, naming and coding style.
+- REUSE existing methods, steps and locators wherever possible; change only what the feature requires.
+- Cucumber matches steps by their exact sentence text - annotation strings must match the feature lines exactly.
+- NEVER invent application locators. If a genuinely new UI element is needed, copy the locator style
+  of the provided Page class and mark it with: // TODO QA: verify locator
+- APPEND-ONLY mindset: PRESERVE every existing method, field, locator and import exactly as given;
+  add the new step methods / page methods / locators needed by the new or changed scenarios.
+- Return COMPLETE files (never fragments), and ONLY the files that change.
+- Output format, with NOTHING else before, between, or after the blocks:
+===FILE: com/nbc/stepDefinitions/<module>/<ClassName>.java===
+<entire file content>
+===END===
+"""
 
 
-# ── 8. Phase 2: AI framework updates (Azure OpenAI) ──────────────────────────
-# Fill these from your Azure OpenAI resource (Portal -> Keys and Endpoint).
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://YOUR-RESOURCE.openai.azure.com")
-AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY", "PASTE-YOUR-KEY")
-AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")  # your deployment NAME
-AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
+def _azure_chat(messages: list[dict]) -> str:
+    url = (f"{config.AZURE_OPENAI_ENDPOINT.rstrip('/')}/openai/deployments/"
+           f"{config.AZURE_OPENAI_DEPLOYMENT}/chat/completions"
+           f"?api-version={config.AZURE_OPENAI_API_VERSION}")
+    if "YOUR-RESOURCE" in config.AZURE_OPENAI_ENDPOINT or "PASTE" in config.AZURE_OPENAI_KEY:
+        raise RuntimeError("Azure OpenAI is not configured yet - fill AZURE_OPENAI_ENDPOINT / "
+                           "AZURE_OPENAI_KEY / AZURE_OPENAI_DEPLOYMENT in app/config.py.")
+    try:
+        r = requests.post(url,
+                          headers={"api-key": config.AZURE_OPENAI_KEY,
+                                   "Content-Type": "application/json"},
+                          json={"messages": messages, "temperature": 0.1, "max_tokens": 8000},
+                          timeout=240)
+    except requests.RequestException as e:
+        raise RuntimeError(f"Cannot reach Azure OpenAI at {config.AZURE_OPENAI_ENDPOINT} "
+                           f"({e.__class__.__name__}: {e}). Check the endpoint URL and whether "
+                           "the office network/proxy allows it.")
+    if r.status_code == 401:
+        raise RuntimeError("Azure OpenAI rejected the API key (401). Re-check AZURE_OPENAI_KEY.")
+    if r.status_code == 404:
+        raise RuntimeError(f"Azure OpenAI returned 404 - deployment '{config.AZURE_OPENAI_DEPLOYMENT}' "
+                           "not found on this resource. Use the DEPLOYMENT NAME from Azure Portal "
+                           "(not the model name), and check AZURE_OPENAI_API_VERSION.")
+    if r.status_code != 200:
+        raise RuntimeError(f"Azure OpenAI error {r.status_code}: {r.text[:400]}")
+    return r.json()["choices"][0]["message"]["content"]
 
-# Where java sources live (for committing updated classes after a green run)
-JAVA_SRC_ROOT = FRAMEWORK_ROOT / "src" / "test" / "java"
-TEST_CLASSES_DIR = FRAMEWORK_ROOT / "target" / "test-classes"
 
-# javac: derived from JAVA by default (JDK required; a bare JRE has no javac)
-JAVAC = os.getenv("JAVAC_CMD", "")
-if not JAVAC:
-    JAVAC = JAVA[:-len("java.exe")] + "javac.exe" if JAVA.lower().endswith("java.exe") \
-            else (JAVA[:-4] + "javac" if JAVA.endswith("java") else "javac")
+def _read(path, cap=16000) -> str:
+    try:
+        t = Path(path).read_text(encoding="utf-8", errors="ignore")
+        return t[:cap] + ("\n// ...truncated..." if len(t) > cap else "")
+    except (OSError, TypeError):
+        return ""
 
-AI_MAX_FIX_ROUNDS = 2          # compile-error repair attempts
-GEN_DIR = DATA_DIR / "gen"         # per-job generated sources/classes (quarantine)
-ARCHIVE_DIR = DATA_DIR / "archive" # permanent reference copies of replaced files
-for _d in (GEN_DIR, ARCHIVE_DIR):
-    _d.mkdir(parents=True, exist_ok=True)
+
+def _parse_files(text: str) -> dict[str, str]:
+    """{relative java path: full code}. Path is normalised from the package line
+    when the header path looks wrong."""
+    out = {}
+    for raw_path, code in FILE_RE.findall(text):
+        code = code.strip()
+        pkg = PKG_RE.search(code)
+        cls = CLS_RE.search(code)
+        if pkg and cls:
+            rel = pkg.group(1).replace(".", "/") + "/" + cls.group(1) + ".java"
+        else:
+            rel = raw_path.strip().replace("\\", "/")
+        out[rel] = code + "\n"
+    return out
+
+
+def _compile(files: dict[str, str], job_dir: Path, classpath: str) -> tuple[bool, str, Path]:
+    """Write sources under job_dir/src, javac into job_dir/classes."""
+    src, classes = job_dir / "src", job_dir / "classes"
+    classes.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for rel, code in files.items():
+        f = src / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(code, encoding="utf-8")
+        paths.append(str(f))
+    cmd = [config.JAVAC, "-encoding", "UTF-8", "-cp", classpath,
+           "-d", str(classes), *paths]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except FileNotFoundError:
+        return False, ("javac not found at '" + config.JAVAC + "'. Point JAVAC_CMD (or config.JAVAC) "
+                       "at a JDK's bin\\javac.exe - a plain JRE cannot compile."), classes
+    return r.returncode == 0, (r.stdout + r.stderr).strip(), classes
+
+
+def generate_and_compile(ai_ctx: dict, undefined_steps: list[str],
+                         classpath: str, job_dir: Path, log) -> tuple[dict, Path]:
+    """Returns ({rel_path: code}, classes_dir). Raises RuntimeError with a
+    readable message on unrecoverable failure."""
+    hit = ai_ctx.get("hit") or {}
+    old_feature = _read(hit.get("feature")) if hit.get("feature") else ""
+    steps_java = _read(hit.get("steps")) if hit.get("steps") else ""
+    page_java = _read(hit.get("page")) if hit.get("page") else ""
+
+    try:
+        from . import knowledge
+        cat_steps = knowledge.step_catalog(ai_ctx.get("module"))
+        cat_pages = knowledge.page_catalog(ai_ctx.get("module"))
+    except Exception:  # noqa: BLE001 — knowledge is best-effort
+        cat_steps = cat_pages = "(knowledge base unavailable)"
+
+    user = f"""The QA engineer uploaded a modified feature file. Update the framework so it runs.
+
+## Uploaded feature (the one that must execute):
+```gherkin
+{ai_ctx['uploaded_text'][:12000]}
+```
+
+## Previous version of this feature in the framework{' (none - this txn had no feature)' if not old_feature else ''}:
+```gherkin
+{old_feature or '(none)'}
+```
+
+## Steps reported UNDEFINED by a cucumber dry run (these have no matching @Given/@When/@Then):
+{chr(10).join('- ' + u for u in undefined_steps) or '- (none - only wording/data changed)'}
+
+## EXISTING STEP SENTENCES across the framework (module + common) — REUSE these
+## (by keeping the feature wording identical) instead of writing new step methods:
+{cat_steps or '(none found)'}
+
+## EXISTING PAGE CLASSES in this module (locator names + method signatures) —
+## call these instead of inventing duplicates:
+{cat_pages or '(none found)'}
+
+## Existing step-definition class for this transaction:
+```java
+{steps_java or '(none exists yet - create one in com.nbc.stepDefinitions.<module>)'}
+```
+
+## Existing page-object class for this transaction:
+```java
+{page_java or '(none provided - reuse steps/pages patterns and add TODO markers for locators)'}
+```
+
+Produce the updated file(s) now, in the required ===FILE / ===END format."""
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user}]
+
+    log(f">>> AI: sending context to Azure OpenAI ({config.AZURE_OPENAI_DEPLOYMENT})...")
+    reply = _azure_chat(messages)
+    files = _parse_files(reply)
+    if not files:
+        raise RuntimeError("AI returned no file blocks - response did not follow the required format.")
+    log(">>> AI: received " + ", ".join(files.keys()))
+
+    for attempt in range(config.AI_MAX_FIX_ROUNDS + 1):
+        ok, err, classes = _compile(files, job_dir, classpath)
+        if ok:
+            log(">>> AI: compilation OK")
+            return files, classes
+        if attempt == config.AI_MAX_FIX_ROUNDS:
+            raise RuntimeError("Generated java failed to compile after "
+                               f"{config.AI_MAX_FIX_ROUNDS + 1} attempts:\n{err[:1500]}")
+        log(f">>> AI: compile errors, asking the model to fix (round {attempt + 1})...")
+        messages += [{"role": "assistant", "content": reply},
+                     {"role": "user", "content":
+                      "javac failed with these errors. Fix them and return the corrected "
+                      "complete files in the same ===FILE/===END format:\n\n" + err[:6000]}]
+        reply = _azure_chat(messages)
+        new_files = _parse_files(reply)
+        if new_files:
+            files.update(new_files)
+    raise RuntimeError("unreachable")
+
+
+# ─────────────────────── deterministic feature merge ────────────────────────
+SC_LINE = re.compile(r"\s*(?:Scenario Outline:|Scenario:)\s*(.+)")
+TAG_LINE = re.compile(r"\s*@")
+
+
+def _blocks(text: str):
+    """Split a feature into (head, {scenario_name: block_text}, order).
+    A block starts at its tag lines (if any) and runs to the next scenario."""
+    lines = text.splitlines(keepends=True)
+    starts = []           # (block_start_line, scenario_name)
+    for i, l in enumerate(lines):
+        m = SC_LINE.match(l)
+        if m:
+            j = i
+            while j > 0 and TAG_LINE.match(lines[j - 1]):
+                j -= 1
+            starts.append((j, m.group(1).strip()))
+    if not starts:
+        return text, {}, []
+    head = "".join(lines[:starts[0][0]])
+    blocks, order = {}, []
+    for n, (b, name) in enumerate(starts):
+        end = starts[n + 1][0] if n + 1 < len(starts) else len(lines)
+        blocks[name] = "".join(lines[b:end])
+        order.append(name)
+    return head, blocks, order
+
+
+def merge_feature(old_text: str, new_text: str) -> tuple[str, list[str], list[str]]:
+    """Merge the uploaded feature into the existing one.
+    - scenario with a NEW name -> appended at the end
+    - scenario with an EXISTING name but different body -> replaced in place
+    Returns (merged_text, added_names, replaced_names)."""
+    if not old_text.strip():
+        _, sc, order = _blocks(new_text)
+        return new_text, order, []
+    old_head, old_sc, old_order = _blocks(old_text)
+    _, new_sc, new_order = _blocks(new_text)
+    added, replaced = [], []
+    for name in new_order:
+        if name not in old_sc:
+            added.append(name)
+        elif old_sc[name].strip() != new_sc[name].strip():
+            old_sc[name] = new_sc[name]
+            replaced.append(name)
+    merged = old_head + "".join(old_sc[n] for n in old_order)
+    for name in added:
+        merged = merged.rstrip("\n") + "\n\n" + new_sc[name].rstrip("\n") + "\n"
+    return merged, added, replaced
