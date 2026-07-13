@@ -1,247 +1,110 @@
 """
-Phase 2: AI-driven framework updates.
+Framework knowledge base — the practical form of "training the AI on the framework".
 
-Flow (called from executor._run when the user enables AI on an upload):
-  1. dry-run already told us which steps are undefined
-  2. build a context pack: uploaded feature + old feature + existing Steps/Page java
-  3. ask Azure OpenAI for COMPLETE updated java files
-  4. javac them into an isolated classes dir (compile errors go back to the
-     model for up to AI_MAX_FIX_ROUNDS repair rounds)
-  5. return {rel_path: code} + the classes dir; the executor prepends that dir
-     to the classpath so the JVM uses the new classes WITHOUT touching the
-     framework. Commit-to-framework only happens after a green run.
+A scan of the ENTIRE framework extracts, per module:
+  - every step sentence (@Given/@When/@Then/@And/@But annotation text) and the
+    class+method implementing it
+  - every page class with its locator field names and public method signatures
+
+Saved to data/knowledge.json (rebuilt at startup and via POST /knowledge/rebuild).
+At generation time the relevant slice (target module + common) is included in
+the Azure OpenAI prompt so the model REUSES existing steps/locators instead of
+inventing duplicates. Only interface-level information (sentences, names,
+signatures) is included — not method bodies.
 """
+import json
 import re
-import subprocess
 from pathlib import Path
-
-import requests
 
 from . import config
 
-FILE_RE = re.compile(r"===FILE:\s*(.+?)\s*===\s*\n(.*?)===END===", re.S)
-PKG_RE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.M)
-CLS_RE = re.compile(r"(?:public\s+)?class\s+(\w+)")
+STEP_ANN = re.compile(r'@(Given|When|Then|And|But)\s*\(\s*"((?:[^"\\]|\\.)*)"', re.S)
+CLASS_RE = re.compile(r'(?:public\s+)?class\s+(\w+)')
+METHOD_RE = re.compile(r'^\s*(?:public|protected)\s+(?!class)[\w<>\[\], ]+\s+(\w+)\s*\(([^)]*)\)', re.M)
+LOCATOR_RE = re.compile(r'\bBy\s+(\w+)\s*=|WebElement\s+(\w+)\s*;')
 
-SYSTEM_PROMPT = """You are a senior Java test-automation engineer maintaining an enterprise
-Cucumber + Selenium + TestNG framework (package root com.nbc).
-Your job: update step-definition and/or page-object classes so a modified Gherkin feature executes.
-
-Rules:
-- Keep existing package declarations, imports, naming and coding style.
-- REUSE existing methods, steps and locators wherever possible; change only what the feature requires.
-- Cucumber matches steps by their exact sentence text - annotation strings must match the feature lines exactly.
-- NEVER invent application locators. If a genuinely new UI element is needed, copy the locator style
-  of the provided Page class and mark it with: // TODO QA: verify locator
-- APPEND-ONLY mindset: PRESERVE every existing method, field, locator and import exactly as given;
-  add the new step methods / page methods / locators needed by the new or changed scenarios.
-- Return COMPLETE files (never fragments), and ONLY the files that change.
-- Output format, with NOTHING else before, between, or after the blocks:
-===FILE: com/nbc/stepDefinitions/<module>/<ClassName>.java===
-<entire file content>
-===END===
-"""
+_kb: dict = {}
 
 
-def _azure_chat(messages: list[dict]) -> str:
-    url = (f"{config.AZURE_OPENAI_ENDPOINT.rstrip('/')}/openai/deployments/"
-           f"{config.AZURE_OPENAI_DEPLOYMENT}/chat/completions"
-           f"?api-version={config.AZURE_OPENAI_API_VERSION}")
-    if "YOUR-RESOURCE" in config.AZURE_OPENAI_ENDPOINT or "PASTE" in config.AZURE_OPENAI_KEY:
-        raise RuntimeError("Azure OpenAI is not configured yet - fill AZURE_OPENAI_ENDPOINT / "
-                           "AZURE_OPENAI_KEY / AZURE_OPENAI_DEPLOYMENT in app/config.py.")
+def _module_of(path: Path, base: Path) -> str:
     try:
-        r = requests.post(url,
-                          headers={"api-key": config.AZURE_OPENAI_KEY,
-                                   "Content-Type": "application/json"},
-                          json={"messages": messages, "temperature": 0.1, "max_tokens": 8000},
-                          timeout=240)
-    except requests.RequestException as e:
-        raise RuntimeError(f"Cannot reach Azure OpenAI at {config.AZURE_OPENAI_ENDPOINT} "
-                           f"({e.__class__.__name__}: {e}). Check the endpoint URL and whether "
-                           "the office network/proxy allows it.")
-    if r.status_code == 401:
-        raise RuntimeError("Azure OpenAI rejected the API key (401). Re-check AZURE_OPENAI_KEY.")
-    if r.status_code == 404:
-        raise RuntimeError(f"Azure OpenAI returned 404 - deployment '{config.AZURE_OPENAI_DEPLOYMENT}' "
-                           "not found on this resource. Use the DEPLOYMENT NAME from Azure Portal "
-                           "(not the model name), and check AZURE_OPENAI_API_VERSION.")
-    if r.status_code != 200:
-        raise RuntimeError(f"Azure OpenAI error {r.status_code}: {r.text[:400]}")
-    return r.json()["choices"][0]["message"]["content"]
+        rel = path.relative_to(base)
+        return rel.parts[0] if len(rel.parts) > 1 else "common"
+    except ValueError:
+        return "common"
 
 
-def _read(path, cap=16000) -> str:
-    try:
-        t = Path(path).read_text(encoding="utf-8", errors="ignore")
-        return t[:cap] + ("\n// ...truncated..." if len(t) > cap else "")
-    except (OSError, TypeError):
-        return ""
+def build_knowledge() -> dict:
+    """Scan the whole framework once. Returns and caches the knowledge dict."""
+    global _kb
+    steps, pages = [], []
+
+    if config.STEPS_DIR.exists():
+        for f in config.STEPS_DIR.rglob("*.java"):
+            text = f.read_text(encoding="utf-8", errors="ignore")
+            cls = CLASS_RE.search(text)
+            cls_name = cls.group(1) if cls else f.stem
+            module = _module_of(f, config.STEPS_DIR)
+            for kw, sentence in STEP_ANN.findall(text):
+                steps.append({"keyword": kw, "sentence": sentence,
+                              "class": cls_name, "module": module})
+
+    if config.PAGES_DIR.exists():
+        for f in config.PAGES_DIR.rglob("*.java"):
+            text = f.read_text(encoding="utf-8", errors="ignore")
+            cls = CLASS_RE.search(text)
+            locators = sorted({a or b for a, b in LOCATOR_RE.findall(text) if a or b})
+            methods = [f"{m}({', '.join(p.strip().split()[-1] for p in ps.split(',') if p.strip())})"
+                       for m, ps in METHOD_RE.findall(text)]
+            pages.append({"class": cls.group(1) if cls else f.stem,
+                          "module": _module_of(f, config.PAGES_DIR),
+                          "locators": locators, "methods": methods})
+
+    _kb = {"steps": steps, "pages": pages,
+           "stats": {"step_sentences": len(steps), "page_classes": len(pages),
+                     "locators": sum(len(p["locators"]) for p in pages)}}
+    (config.DATA_DIR / "knowledge.json").write_text(json.dumps(_kb, indent=1))
+    return _kb
 
 
-def _parse_files(text: str) -> dict[str, str]:
-    """{relative java path: full code}. Path is normalised from the package line
-    when the header path looks wrong."""
-    out = {}
-    for raw_path, code in FILE_RE.findall(text):
-        code = code.strip()
-        pkg = PKG_RE.search(code)
-        cls = CLS_RE.search(code)
-        if pkg and cls:
-            rel = pkg.group(1).replace(".", "/") + "/" + cls.group(1) + ".java"
-        else:
-            rel = raw_path.strip().replace("\\", "/")
-        out[rel] = code + "\n"
-    return out
+def get_knowledge() -> dict:
+    global _kb
+    if _kb:
+        return _kb
+    kf = config.DATA_DIR / "knowledge.json"
+    if kf.exists():
+        _kb = json.loads(kf.read_text())
+        return _kb
+    return build_knowledge()
 
 
-def _compile(files: dict[str, str], job_dir: Path, classpath: str) -> tuple[bool, str, Path]:
-    """Write sources under job_dir/src, javac into job_dir/classes."""
-    src, classes = job_dir / "src", job_dir / "classes"
-    classes.mkdir(parents=True, exist_ok=True)
-    paths = []
-    for rel, code in files.items():
-        f = src / rel
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(code, encoding="utf-8")
-        paths.append(str(f))
-    cmd = [config.JAVAC, "-encoding", "UTF-8", "-cp", classpath,
-           "-d", str(classes), *paths]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    except FileNotFoundError:
-        return False, ("javac not found at '" + config.JAVAC + "'. Point JAVAC_CMD (or config.JAVAC) "
-                       "at a JDK's bin\\javac.exe - a plain JRE cannot compile."), classes
-    return r.returncode == 0, (r.stdout + r.stderr).strip(), classes
+def step_catalog(module: str | None, cap: int = 350) -> str:
+    """Existing step sentences for the target module + common, one per line,
+    formatted for the LLM prompt."""
+    kb = get_knowledge()
+    wanted = {m for m in [module, "common"] if m}
+    lines, seen = [], set()
+    ordered = [s for s in kb["steps"] if s["module"] in wanted] + \
+              [s for s in kb["steps"] if s["module"] not in wanted]
+    for s in ordered:
+        key = s["sentence"]
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f'{s["keyword"]} "{s["sentence"]}"   [{s["class"]}]')
+        if len(lines) >= cap:
+            break
+    return "\n".join(lines)
 
 
-def generate_and_compile(ai_ctx: dict, undefined_steps: list[str],
-                         classpath: str, job_dir: Path, log) -> tuple[dict, Path]:
-    """Returns ({rel_path: code}, classes_dir). Raises RuntimeError with a
-    readable message on unrecoverable failure."""
-    hit = ai_ctx.get("hit") or {}
-    old_feature = _read(hit.get("feature")) if hit.get("feature") else ""
-    steps_java = _read(hit.get("steps")) if hit.get("steps") else ""
-    page_java = _read(hit.get("page")) if hit.get("page") else ""
-
-    try:
-        from . import knowledge
-        cat_steps = knowledge.step_catalog(ai_ctx.get("module"))
-        cat_pages = knowledge.page_catalog(ai_ctx.get("module"))
-    except Exception:  # noqa: BLE001 — knowledge is best-effort
-        cat_steps = cat_pages = "(knowledge base unavailable)"
-
-    user = f"""The QA engineer uploaded a modified feature file. Update the framework so it runs.
-
-## Uploaded feature (the one that must execute):
-```gherkin
-{ai_ctx['uploaded_text'][:12000]}
-```
-
-## Previous version of this feature in the framework{' (none - this txn had no feature)' if not old_feature else ''}:
-```gherkin
-{old_feature or '(none)'}
-```
-
-## Steps reported UNDEFINED by a cucumber dry run (these have no matching @Given/@When/@Then):
-{chr(10).join('- ' + u for u in undefined_steps) or '- (none - only wording/data changed)'}
-
-## EXISTING STEP SENTENCES across the framework (module + common) — REUSE these
-## (by keeping the feature wording identical) instead of writing new step methods:
-{cat_steps or '(none found)'}
-
-## EXISTING PAGE CLASSES in this module (locator names + method signatures) —
-## call these instead of inventing duplicates:
-{cat_pages or '(none found)'}
-
-## Existing step-definition class for this transaction:
-```java
-{steps_java or '(none exists yet - create one in com.nbc.stepDefinitions.<module>)'}
-```
-
-## Existing page-object class for this transaction:
-```java
-{page_java or '(none provided - reuse steps/pages patterns and add TODO markers for locators)'}
-```
-
-Produce the updated file(s) now, in the required ===FILE / ===END format."""
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user}]
-
-    log(f">>> AI: sending context to Azure OpenAI ({config.AZURE_OPENAI_DEPLOYMENT})...")
-    reply = _azure_chat(messages)
-    files = _parse_files(reply)
-    if not files:
-        raise RuntimeError("AI returned no file blocks - response did not follow the required format.")
-    log(">>> AI: received " + ", ".join(files.keys()))
-
-    for attempt in range(config.AI_MAX_FIX_ROUNDS + 1):
-        ok, err, classes = _compile(files, job_dir, classpath)
-        if ok:
-            log(">>> AI: compilation OK")
-            return files, classes
-        if attempt == config.AI_MAX_FIX_ROUNDS:
-            raise RuntimeError("Generated java failed to compile after "
-                               f"{config.AI_MAX_FIX_ROUNDS + 1} attempts:\n{err[:1500]}")
-        log(f">>> AI: compile errors, asking the model to fix (round {attempt + 1})...")
-        messages += [{"role": "assistant", "content": reply},
-                     {"role": "user", "content":
-                      "javac failed with these errors. Fix them and return the corrected "
-                      "complete files in the same ===FILE/===END format:\n\n" + err[:6000]}]
-        reply = _azure_chat(messages)
-        new_files = _parse_files(reply)
-        if new_files:
-            files.update(new_files)
-    raise RuntimeError("unreachable")
-
-
-# ─────────────────────── deterministic feature merge ────────────────────────
-SC_LINE = re.compile(r"\s*(?:Scenario Outline:|Scenario:)\s*(.+)")
-TAG_LINE = re.compile(r"\s*@")
-
-
-def _blocks(text: str):
-    """Split a feature into (head, {scenario_name: block_text}, order).
-    A block starts at its tag lines (if any) and runs to the next scenario."""
-    lines = text.splitlines(keepends=True)
-    starts = []           # (block_start_line, scenario_name)
-    for i, l in enumerate(lines):
-        m = SC_LINE.match(l)
-        if m:
-            j = i
-            while j > 0 and TAG_LINE.match(lines[j - 1]):
-                j -= 1
-            starts.append((j, m.group(1).strip()))
-    if not starts:
-        return text, {}, []
-    head = "".join(lines[:starts[0][0]])
-    blocks, order = {}, []
-    for n, (b, name) in enumerate(starts):
-        end = starts[n + 1][0] if n + 1 < len(starts) else len(lines)
-        blocks[name] = "".join(lines[b:end])
-        order.append(name)
-    return head, blocks, order
-
-
-def merge_feature(old_text: str, new_text: str) -> tuple[str, list[str], list[str]]:
-    """Merge the uploaded feature into the existing one.
-    - scenario with a NEW name -> appended at the end
-    - scenario with an EXISTING name but different body -> replaced in place
-    Returns (merged_text, added_names, replaced_names)."""
-    if not old_text.strip():
-        _, sc, order = _blocks(new_text)
-        return new_text, order, []
-    old_head, old_sc, old_order = _blocks(old_text)
-    _, new_sc, new_order = _blocks(new_text)
-    added, replaced = [], []
-    for name in new_order:
-        if name not in old_sc:
-            added.append(name)
-        elif old_sc[name].strip() != new_sc[name].strip():
-            old_sc[name] = new_sc[name]
-            replaced.append(name)
-    merged = old_head + "".join(old_sc[n] for n in old_order)
-    for name in added:
-        merged = merged.rstrip("\n") + "\n\n" + new_sc[name].rstrip("\n") + "\n"
-    return merged, added, replaced
+def page_catalog(module: str | None, cap: int = 40) -> str:
+    """Page classes of the target module: locator names + method signatures."""
+    kb = get_knowledge()
+    out = []
+    for p in kb["pages"]:
+        if module and p["module"] != module:
+            continue
+        out.append(f'{p["class"]}: locators={p["locators"][:25]} methods={p["methods"][:25]}')
+        if len(out) >= cap:
+            break
+    return "\n".join(out)
