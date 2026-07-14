@@ -41,6 +41,12 @@ Rules:
   helper action that doesn't exist yet, either reuse an EXACT existing method shown in the context,
   or write the new method's full implementation yourself in the appropriate file — never invent a
   call to a method you have not seen and are not also defining.
+- This framework's shared/common classes (login helpers, property readers, file utilities) often do
+  file I/O and throw CHECKED exceptions (e.g. IOException) from their constructors or methods. Every
+  time you call such a constructor or method, wrap the call in try/catch (matching this framework's
+  existing style, typically catching the exception and calling printStackTrace()) — do not let a
+  checked exception propagate unhandled, and do not just add a blanket "throws Exception" unless the
+  real code you were shown does the same.
 - Return COMPLETE files (never fragments), and ONLY the files that change.
 - Output format, with NOTHING else before, between, or after the blocks:
 ===FILE: com/nbc/stepDefinitions/<module>/<ClassName>.java===
@@ -155,11 +161,37 @@ def _find_class_source(class_name: str) -> str | None:
     return None
 
 
+_UNREPORTED_EXCEPTION_RE = re.compile(
+    r'unreported exception ([\w.]+); must be caught or declared to be thrown')
+
+
+def _exception_handling_hint(err: str) -> str:
+    """javac's 'unreported exception X; must be caught or declared to be
+    thrown' is a purely mechanical Java rule the model keeps failing to
+    satisfy blindly on retry — give it the exact fix instead of hoping it
+    guesses. Different failure category from a missing/hallucinated method:
+    the class and method here are REAL, the code just doesn't satisfy Java's
+    checked-exception handling requirement."""
+    exceptions = sorted(set(_UNREPORTED_EXCEPTION_RE.findall(err)))
+    if not exceptions:
+        return ""
+    exc_list = ", ".join(e.rsplit(".", 1)[-1] for e in exceptions)
+    return (f"\n\nJava CHECKED EXCEPTION error: your code throws {exc_list} without handling it. "
+           f"Java requires every checked exception to be either caught or declared. Fix this by "
+           f"wrapping ONLY the specific line(s) that throw it in a try/catch that catches "
+           f"{exc_list} and rethrows as an unchecked exception, for example:\n"
+           f"    try {{ ... }} catch ({exc_list} e) {{ throw new RuntimeException(e); }}\n"
+           f"Do not add `throws {exc_list}` to a Cucumber step method's signature — Cucumber step "
+           f"methods must not declare checked exceptions. Return the corrected COMPLETE file(s).")
+
+
 def _extra_context_for_compile_errors(err: str) -> str:
     """Parse javac's 'cannot find symbol: method X ... location: variable v
     of type ClassName' pattern and, for every ClassName we can find on disk,
     inject its REAL current source — this is what lets the retry round fix a
-    hallucinated method call instead of just guessing again."""
+    hallucinated method call instead of just guessing again. Also appends a
+    mechanical fix hint for unhandled checked exceptions, a separate and
+    common failure category."""
     found = {}
     for method, cls in _MISSING_SYMBOL_RE.findall(err):
         if cls in found:
@@ -167,14 +199,15 @@ def _extra_context_for_compile_errors(err: str) -> str:
         src = _find_class_source(cls)
         if src:
             found[cls] = src
-    if not found:
-        return ""
-    parts = ["\n\nThe methods you called do not exist. Here is the REAL current source of the "
-            "class(es) involved — use an exact existing method from here, or if the needed "
-            "behaviour genuinely doesn't exist yet, define it yourself in full:"]
-    for cls, src in found.items():
-        parts.append(f"\n## Real current source of {cls}:\n```java\n{src}\n```")
-    return "\n".join(parts)
+    parts = []
+    if found:
+        parts.append("\n\nThe methods you called do not exist. Here is the REAL current source of "
+                     "the class(es) involved — use an exact existing method from here, or if the "
+                     "needed behaviour genuinely doesn't exist yet, define it yourself in full:")
+        for cls, src in found.items():
+            parts.append(f"\n## Real current source of {cls}:\n```java\n{src}\n```")
+    parts.append(_exception_handling_hint(err))
+    return "".join(parts)
 
 
 def generate_and_compile(ai_ctx: dict, undefined_steps: list[str],
@@ -262,10 +295,18 @@ Produce the updated file(s) now, in the required ===FILE / ===END format."""
         if attempt == config.AI_MAX_FIX_ROUNDS:
             raise RuntimeError("Generated java failed to compile after "
                                f"{config.AI_MAX_FIX_ROUNDS + 1} attempts:\n{err[:1500]}")
+        undefined_method_hint = bool(_MISSING_SYMBOL_RE.search(err))
+        exception_hint = bool(_UNREPORTED_EXCEPTION_RE.search(err))
         extra = _extra_context_for_compile_errors(err)
-        if extra:
+        if undefined_method_hint and exception_hint:
+            log(f">>> AI: compile errors include an undefined method AND an unhandled checked "
+               f"exception — injecting real source + a fix hint (round {attempt + 1})...")
+        elif undefined_method_hint:
             log(f">>> AI: compile errors reference undefined methods — injecting the REAL source "
                f"of the class(es) involved, then asking the model to fix (round {attempt + 1})...")
+        elif exception_hint:
+            log(f">>> AI: compile errors are an unhandled checked exception — injecting a "
+               f"mechanical fix hint (round {attempt + 1})...")
         else:
             log(f">>> AI: compile errors, asking the model to fix (round {attempt + 1})...")
         messages += [{"role": "assistant", "content": reply},
