@@ -1,582 +1,40 @@
-/* ============================================================
-   AI Developer Assistant — frontend logic
-   Modules:
-     - config     : constants
-     - store      : multi-conversation persistence (localStorage)
-     - markdown   : minimal Markdown → HTML renderer (safe)
-     - highlight  : highlight.js integration
-     - ui         : DOM rendering helpers (chat + sidebar)
-     - api        : backend communication (streaming + fallback)
-     - app        : event wiring / orchestration
-   ============================================================ */
+keep any incomplete trailing event
 
-"use strict";
+      for (const event of events) {
+        const line = event.trim();
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") continue;
 
-/* ------------------------------------------------------------
-   config
-   ------------------------------------------------------------ */
-
-// When accessing from other devices on your network, change this to the
-// host machine's LAN IP, e.g. "http://10.51.1.165:8010".
-const API_BASE_URL = "http://127.0.0.1:8010";
-
-const STORAGE_KEY = "ai_dev_assistant_state_v2";
-const LEGACY_STORAGE_KEY = "ai_dev_assistant_conversation_v1";
-const MAX_HISTORY_SENT = 20; // prior turns forwarded for context
-const TITLE_MAX_LENGTH = 42;
-
-/* ------------------------------------------------------------
-   store — multiple conversations in localStorage
-   State shape:
-   {
-     conversations: [
-       { id, title, messages: [{role, content, timestamp}], updatedAt }
-     ],
-     activeId: string | null
-   }
-   ------------------------------------------------------------ */
-
-const store = {
-  load() {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (parsed && Array.isArray(parsed.conversations)) return parsed;
-      }
-      // One-time migration from the old single-conversation format.
-      const legacy = localStorage.getItem(LEGACY_STORAGE_KEY);
-      if (legacy) {
-        const messages = JSON.parse(legacy);
-        localStorage.removeItem(LEGACY_STORAGE_KEY);
-        if (Array.isArray(messages) && messages.length) {
-          const conversation = {
-            id: store.newId(),
-            title: store.titleFrom(messages),
-            messages,
-            updatedAt: Date.now(),
-          };
-          return { conversations: [conversation], activeId: conversation.id };
+        let payload;
+        try {
+          payload = JSON.parse(data);
+        } catch {
+          continue; // skip malformed events
+        }
+        if (payload.error) {
+          const error = new Error(payload.error);
+          error.partialText = fullText;
+          throw error;
+        }
+        if (payload.delta) {
+          fullText += payload.delta;
+          onDelta(payload.delta);
         }
       }
-    } catch {
-      /* corrupted storage — start fresh */
     }
-    return { conversations: [], activeId: null };
+
+    if (!fullText) {
+      throw new Error("The server returned an empty response.");
+    }
+    return fullText;
   },
 
-  save(state) {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    } catch {
-      /* storage full or unavailable — chat still works in memory */
-    }
-  },
-
-  newId() {
-    return `c_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  },
-
-  titleFrom(messages) {
-    const first = messages.find((m) => m.role === "user");
-    if (!first) return "New chat";
-    const text = first.content.replace(/\s+/g, " ").trim();
-    return text.length > TITLE_MAX_LENGTH
-      ? `${text.slice(0, TITLE_MAX_LENGTH)}…`
-      : text || "New chat";
-  },
-};
-
-/* ------------------------------------------------------------
-   markdown — tiny renderer supporting headings, lists, tables,
-   inline code, fenced code blocks, bold/italic, links, quotes.
-   All source text is HTML-escaped first, so rendering is safe.
-   ------------------------------------------------------------ */
-
-const markdown = (() => {
-  const escapeHtml = (text) =>
-    text
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#39;");
-
-  /** Inline transforms: code, bold, italic, links. */
-  const renderInline = (escaped) =>
-    escaped
-      .replace(/`([^`\n]+)`/g, "<code>$1</code>")
-      .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
-      .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>")
-      .replace(
-        /\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g,
-        '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
-      );
-
-  const isTableRow = (line) => /^\s*\|.*\|\s*$/.test(line);
-  const isTableDivider = (line) => /^\s*\|?\s*:?-{3,}.*$/.test(line) && line.includes("-");
-
-  const splitRow = (line) =>
-    line
-      .trim()
-      .replace(/^\|/, "")
-      .replace(/\|$/, "")
-      .split("|")
-      .map((cell) => cell.trim());
-
-  /** Convert a full Markdown string to safe HTML. */
-  function render(source) {
-    const lines = source.replace(/\r\n/g, "\n").split("\n");
-    const html = [];
-
-    let i = 0;
-    let listType = null; // "ul" | "ol" | null
-
-    const closeList = () => {
-      if (listType) {
-        html.push(`</${listType}>`);
-        listType = null;
-      }
-    };
-
-    while (i < lines.length) {
-      const line = lines[i];
-
-      /* ---- fenced code block (tolerates a missing closing fence,
-              which happens naturally while a reply is streaming) ---- */
-      const fence = line.match(/^\s*```(\w*)\s*$/);
-      if (fence) {
-        closeList();
-        const lang = fence[1] || "";
-        const buffer = [];
-        i += 1;
-        while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) {
-          buffer.push(lines[i]);
-          i += 1;
-        }
-        i += 1; // skip closing fence (or run past the end while streaming)
-        const langClass = lang ? ` class="language-${escapeHtml(lang)}"` : "";
-        html.push(
-          `<div class="codeblock">` +
-            `<div class="codeblock__header">` +
-            `<span class="codeblock__lang">${escapeHtml(lang || "code")}</span>` +
-            `<button class="copy-btn" type="button" data-copy-code>Copy</button>` +
-            `</div>` +
-            `<pre><code${langClass}>${escapeHtml(buffer.join("\n"))}</code></pre>` +
-            `</div>`
-        );
-        continue;
-      }
-
-      /* ---- table ---- */
-      if (isTableRow(line) && i + 1 < lines.length && isTableDivider(lines[i + 1])) {
-        closeList();
-        const headers = splitRow(line);
-        i += 2; // skip header + divider
-        const rows = [];
-        while (i < lines.length && isTableRow(lines[i])) {
-          rows.push(splitRow(lines[i]));
-          i += 1;
-        }
-        const thead =
-          "<thead><tr>" +
-          headers.map((h) => `<th>${renderInline(escapeHtml(h))}</th>`).join("") +
-          "</tr></thead>";
-        const tbody =
-          "<tbody>" +
-          rows
-            .map(
-              (cells) =>
-                "<tr>" +
-                cells.map((c) => `<td>${renderInline(escapeHtml(c))}</td>`).join("") +
-                "</tr>"
-            )
-            .join("") +
-          "</tbody>";
-        html.push(`<table>${thead}${tbody}</table>`);
-        continue;
-      }
-
-      /* ---- heading ---- */
-      const heading = line.match(/^(#{1,4})\s+(.*)$/);
-      if (heading) {
-        closeList();
-        const level = heading[1].length;
-        html.push(`<h${level}>${renderInline(escapeHtml(heading[2]))}</h${level}>`);
-        i += 1;
-        continue;
-      }
-
-      /* ---- blockquote ---- */
-      const quote = line.match(/^\s*>\s?(.*)$/);
-      if (quote) {
-        closeList();
-        html.push(`<blockquote>${renderInline(escapeHtml(quote[1]))}</blockquote>`);
-        i += 1;
-        continue;
-      }
-
-      /* ---- unordered list item ---- */
-      const ulItem = line.match(/^\s*[-*+]\s+(.*)$/);
-      if (ulItem) {
-        if (listType !== "ul") {
-          closeList();
-          html.push("<ul>");
-          listType = "ul";
-        }
-        html.push(`<li>${renderInline(escapeHtml(ulItem[1]))}</li>`);
-        i += 1;
-        continue;
-      }
-
-      /* ---- ordered list item ---- */
-      const olItem = line.match(/^\s*\d+[.)]\s+(.*)$/);
-      if (olItem) {
-        if (listType !== "ol") {
-          closeList();
-          html.push("<ol>");
-          listType = "ol";
-        }
-        html.push(`<li>${renderInline(escapeHtml(olItem[1]))}</li>`);
-        i += 1;
-        continue;
-      }
-
-      /* ---- blank line ---- */
-      if (!line.trim()) {
-        closeList();
-        i += 1;
-        continue;
-      }
-
-      /* ---- paragraph (merge consecutive plain lines) ---- */
-      closeList();
-      const paragraph = [line];
-      while (
-        i + 1 < lines.length &&
-        lines[i + 1].trim() &&
-        !/^\s*```/.test(lines[i + 1]) &&
-        !/^(#{1,4})\s+/.test(lines[i + 1]) &&
-        !/^\s*[-*+]\s+/.test(lines[i + 1]) &&
-        !/^\s*\d+[.)]\s+/.test(lines[i + 1]) &&
-        !/^\s*>/.test(lines[i + 1]) &&
-        !isTableRow(lines[i + 1])
-      ) {
-        paragraph.push(lines[i + 1]);
-        i += 1;
-      }
-      html.push(`<p>${renderInline(escapeHtml(paragraph.join(" ")))}</p>`);
-      i += 1;
-    }
-
-    closeList();
-    return html.join("");
-  }
-
-  return { render, escapeHtml };
-})();
-
-/* ------------------------------------------------------------
-   highlight — apply highlight.js to code blocks in a container
-   ------------------------------------------------------------ */
-
-function highlightCode(container) {
-  if (typeof window.hljs === "undefined") return; // CDN unavailable — degrade gracefully
-  container.querySelectorAll("pre code").forEach((block) => {
-    // hljs refuses to re-highlight an element; clear its marker first.
-    delete block.dataset.highlighted;
-    window.hljs.highlightElement(block);
-  });
-}
-
-/* ------------------------------------------------------------
-   ui — DOM rendering (chat window + sidebar)
-   ------------------------------------------------------------ */
-
-const ui = (() => {
-  const chatWindow = document.getElementById("chat-window");
-  const messagesEl = document.getElementById("messages");
-  const emptyState = document.getElementById("empty-state");
-  const input = document.getElementById("message-input");
-  const sendBtn = document.getElementById("send-btn");
-  const sendIcon = document.getElementById("send-icon");
-  const sendSpinner = document.getElementById("send-spinner");
-  const statusEl = document.getElementById("connection-status");
-  const sidebar = document.getElementById("sidebar");
-  const sidebarBackdrop = document.getElementById("sidebar-backdrop");
-  const conversationList = document.getElementById("conversation-list");
-
-  const formatTime = (timestamp) =>
-    new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-
-  const scrollToBottom = () => {
-    chatWindow.scrollTop = chatWindow.scrollHeight;
-  };
-
-  const updateEmptyState = () => {
-    emptyState.hidden = messagesEl.children.length > 0;
-  };
-
-  function buildMeta(timestamp, copyText) {
-    const meta = document.createElement("div");
-    meta.className = "message__meta";
-
-    const time = document.createElement("span");
-    time.textContent = formatTime(timestamp);
-    meta.appendChild(time);
-
-    if (copyText !== undefined) {
-      const copyBtn = document.createElement("button");
-      copyBtn.type = "button";
-      copyBtn.className = "copy-btn";
-      copyBtn.textContent = "Copy";
-      copyBtn.addEventListener("click", () => copyToClipboard(copyText, copyBtn));
-      meta.appendChild(copyBtn);
-    }
-    return meta;
-  }
-
-  /** Build and append one complete message row. */
-  function appendMessage({ role, content, timestamp, isError = false }) {
-    const row = document.createElement("div");
-    row.className = `message message--${role === "user" ? "user" : "ai"}${
-      isError ? " message--error" : ""
-    }`;
-
-    const avatar = document.createElement("div");
-    avatar.className = "message__avatar";
-    avatar.textContent = role === "user" ? "You" : "AI";
-
-    const body = document.createElement("div");
-    body.className = "message__body";
-
-    const bubble = document.createElement("div");
-    bubble.className = "message__bubble";
-
-    if (role === "user" || isError) {
-      bubble.textContent = content; // plain text, preserves newlines via CSS
-    } else {
-      bubble.classList.add("md");
-      bubble.innerHTML = markdown.render(content);
-      highlightCode(bubble);
-    }
-
-    body.appendChild(bubble);
-    body.appendChild(
-      buildMeta(timestamp, role === "assistant" && !isError ? content : undefined)
-    );
-    row.appendChild(avatar);
-    row.appendChild(body);
-    messagesEl.appendChild(row);
-
-    updateEmptyState();
-    scrollToBottom();
-    return row;
-  }
-
-  /**
-   * Begin an assistant message that will fill in as deltas stream.
-   * Returns { update(text), finalize(fullText), remove() }.
-   */
-  function beginStreamingMessage() {
-    const row = document.createElement("div");
-    row.className = "message message--ai";
-
-    const avatar = document.createElement("div");
-    avatar.className = "message__avatar";
-    avatar.textContent = "AI";
-
-    const body = document.createElement("div");
-    body.className = "message__body";
-
-    const bubble = document.createElement("div");
-    bubble.className = "message__bubble md";
-
-    body.appendChild(bubble);
-    row.appendChild(avatar);
-    row.appendChild(body);
-    messagesEl.appendChild(row);
-    updateEmptyState();
-    scrollToBottom();
-
-    return {
-      update(text) {
-        bubble.innerHTML =
-          markdown.render(text) + '<span class="stream-cursor" aria-hidden="true"></span>';
-        scrollToBottom();
-      },
-      finalize(fullText) {
-        bubble.innerHTML = markdown.render(fullText);
-        highlightCode(bubble);
-        body.appendChild(buildMeta(Date.now(), fullText));
-        scrollToBottom();
-      },
-      remove() {
-        row.remove();
-        updateEmptyState();
-      },
-    };
-  }
-
-  /** Show the animated three-dot typing indicator. Returns a remover. */
-  function showTypingIndicator() {
-    const row = document.createElement("div");
-    row.className = "message message--ai";
-    row.innerHTML =
-      `<div class="message__avatar">AI</div>` +
-      `<div class="message__body"><div class="message__bubble typing">` +
-      `<span class="typing__dot"></span><span class="typing__dot"></span>` +
-      `<span class="typing__dot"></span></div></div>`;
-    messagesEl.appendChild(row);
-    updateEmptyState();
-    scrollToBottom();
-    return () => row.remove();
-  }
-
-  /** Toggle the composer between idle and loading states. */
-  function setLoading(isLoading) {
-    sendBtn.disabled = isLoading || !input.value.trim();
-    input.disabled = isLoading;
-    sendIcon.hidden = isLoading;
-    sendSpinner.hidden = !isLoading;
-    if (!isLoading) input.focus();
-  }
-
-  function clearMessages() {
-    messagesEl.innerHTML = "";
-    updateEmptyState();
-  }
-
-  /** Grow the textarea with its content (up to the CSS max-height). */
-  function autoResizeInput() {
-    input.style.height = "auto";
-    input.style.height = `${input.scrollHeight}px`;
-  }
-
-  function setConnectionStatus(state) {
-    statusEl.className = `status status--${state}`;
-    statusEl.querySelector(".status__label").textContent =
-      state === "online" ? "Connected" : state === "offline" ? "Offline" : "Checking…";
-  }
-
-  async function copyToClipboard(text, button) {
-    try {
-      await navigator.clipboard.writeText(text);
-      const original = button.textContent;
-      button.textContent = "Copied!";
-      button.classList.add("copy-btn--done");
-      setTimeout(() => {
-        button.textContent = original;
-        button.classList.remove("copy-btn--done");
-      }, 1500);
-    } catch {
-      button.textContent = "Copy failed";
-    }
-  }
-
-  /* ---- sidebar ---- */
-
-  function renderSidebar(conversations, activeId, handlers) {
-    conversationList.innerHTML = "";
-
-    if (!conversations.length) {
-      const empty = document.createElement("p");
-      empty.className = "sidebar__empty";
-      empty.textContent = "No conversations yet. Start one below!";
-      conversationList.appendChild(empty);
-      return;
-    }
-
-    // Most recently updated first.
-    const sorted = [...conversations].sort((a, b) => b.updatedAt - a.updatedAt);
-
-    for (const conversation of sorted) {
-      const item = document.createElement("div");
-      item.className = `conv-item${conversation.id === activeId ? " conv-item--active" : ""}`;
-      item.setAttribute("role", "button");
-      item.tabIndex = 0;
-
-      const title = document.createElement("span");
-      title.className = "conv-item__title";
-      title.textContent = conversation.title;
-      title.title = conversation.title;
-
-      const deleteBtn = document.createElement("button");
-      deleteBtn.type = "button";
-      deleteBtn.className = "conv-item__delete";
-      deleteBtn.setAttribute("aria-label", `Delete "${conversation.title}"`);
-      deleteBtn.innerHTML =
-        '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" ' +
-        'stroke-width="2" stroke-linecap="round" aria-hidden="true">' +
-        '<path d="M3 6h18M8 6V4h8v2m1 0l-1 14H8L7 6" /></svg>';
-
-      const select = () => handlers.onSelect(conversation.id);
-      item.addEventListener("click", (event) => {
-        if (!event.target.closest(".conv-item__delete")) select();
-      });
-      item.addEventListener("keydown", (event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          select();
-        }
-      });
-      deleteBtn.addEventListener("click", (event) => {
-        event.stopPropagation();
-        handlers.onDelete(conversation.id);
-      });
-
-      item.appendChild(title);
-      item.appendChild(deleteBtn);
-      conversationList.appendChild(item);
-    }
-  }
-
-  function setSidebarOpen(open) {
-    sidebar.classList.toggle("sidebar--open", open);
-    sidebarBackdrop.hidden = !open;
-  }
-
-  return {
-    input,
-    sendBtn,
-    appendMessage,
-    beginStreamingMessage,
-    showTypingIndicator,
-    setLoading,
-    clearMessages,
-    autoResizeInput,
-    setConnectionStatus,
-    copyToClipboard,
-    renderSidebar,
-    setSidebarOpen,
-  };
-})();
-
-/* ------------------------------------------------------------
-   api — backend communication
-   ------------------------------------------------------------ */
-
-const api = {
-  buildBody(message, history) {
-    return JSON.stringify({
-      message,
-      history: history.slice(-MAX_HISTORY_SENT).map(({ role, content }) => ({
-        role,
-        content,
-      })),
-    });
-  },
-
-  /**
-   * Stream a reply. Calls `onDelta(text)` for each chunk and resolves
-   * with the full reply. Falls back to the non-streaming endpoint if
-   * the backend doesn't support /chat/stream.
-   * @throws {Error} with a user-friendly message on any failure.
-   */
-  async streamMessage(message, history, onDelta) {
+  /** Non-streaming request (used as a fallback). */
+  async sendMessage(message, history) {
     let response;
     try {
-      response = await fetch(`${API_BASE_URL}/chat/stream`, {
+      response = await fetch(`${API_BASE_URL}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: this.buildBody(message, history),
@@ -588,39 +46,275 @@ const api = {
       );
     }
 
-    // Older backend without the streaming route — fall back gracefully.
-    if (response.status === 404 || response.status === 405) {
-      const full = await this.sendMessage(message, history);
-      onDelta(full);
-      return full;
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      /* non-JSON body — handled below */
     }
 
     if (!response.ok) {
-      let detail = `The server returned an error (HTTP ${response.status}).`;
-      try {
-        const payload = await response.json();
-        if (payload && typeof payload.detail === "string") detail = payload.detail;
-      } catch {
-        /* non-JSON body */
-      }
+      const detail =
+        payload && typeof payload.detail === "string"
+          ? payload.detail
+          : `The server returned an error (HTTP ${response.status}).`;
       throw new Error(detail);
     }
 
-    // Parse the SSE stream: events are separated by blank lines and
-    // each event line looks like `data: <json>` or `data: [DONE]`.
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let fullText = "";
+    if (!payload || typeof payload.response !== "string") {
+      throw new Error("The server returned an unexpected response format.");
+    }
+    return payload.response;
+  },
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+  /** @returns {Promise<boolean>} whether the backend is reachable. */
+  async checkHealth() {
+    try {
+      const response = await fetch(`${API_BASE_URL}/health`);
+      const payload = await response.json();
+      return response.ok && payload.status === "running";
+    } catch {
+      return false;
+    }
+  },
+};
 
-      const events = buffer.split("\n\n");
-      buffer = events.pop(); // keep any incomplete trailing event
+/* ------------------------------------------------------------
+   app — orchestration
+   ------------------------------------------------------------ */
 
-      for (const event of events) {
-        const line = event.trim();
-        if (!line.st
+const app = (() => {
+  let state = { conversations: [], activeId: null };
+  let isSending = false;
+
+  const getActive = () =>
+    state.conversations.find((c) => c.id === state.activeId) || null;
+
+  function persist() {
+    store.save(state);
+  }
+
+  function refreshSidebar() {
+    ui.renderSidebar(state.conversations, state.activeId, {
+      onSelect: switchConversation,
+      onDelete: deleteConversation,
+    });
+  }
+
+  function renderActiveConversation() {
+    ui.clearMessages();
+    const conversation = getActive();
+    if (conversation) {
+      conversation.messages.forEach((message) => ui.appendMessage(message));
+    }
+  }
+
+  /** Create a new empty conversation and make it active. */
+  function createConversation() {
+    const conversation = {
+      id: store.newId(),
+      title: "New chat",
+      messages: [],
+      updatedAt: Date.now(),
+    };
+    state.conversations.push(conversation);
+    state.activeId = conversation.id;
+    persist();
+    return conversation;
+  }
+
+  /** Return the active conversation, creating one if none exists. */
+  function ensureActiveConversation() {
+    return getActive() || createConversation();
+  }
+
+  function switchConversation(id) {
+    if (isSending || id === state.activeId) {
+      ui.setSidebarOpen(false);
+      return;
+    }
+    state.activeId = id;
+    persist();
+    refreshSidebar();
+    renderActiveConversation();
+    ui.setSidebarOpen(false);
+    ui.input.focus();
+  }
+
+  function deleteConversation(id) {
+    if (isSending) return;
+    const conversation = state.conversations.find((c) => c.id === id);
+    if (!conversation) return;
+    if (!window.confirm(`Delete "${conversation.title}"? This cannot be undone.`)) return;
+
+    state.conversations = state.conversations.filter((c) => c.id !== id);
+    if (state.activeId === id) {
+      const mostRecent = [...state.conversations].sort(
+        (a, b) => b.updatedAt - a.updatedAt
+      )[0];
+      state.activeId = mostRecent ? mostRecent.id : null;
+      renderActiveConversation();
+    }
+    persist();
+    refreshSidebar();
+  }
+
+  function handleNewChat() {
+    if (isSending) return;
+    const active = getActive();
+    // Reuse the current conversation if it's already empty.
+    if (active && active.messages.length === 0) {
+      ui.setSidebarOpen(false);
+      ui.input.focus();
+      return;
+    }
+    createConversation();
+    refreshSidebar();
+    renderActiveConversation();
+    ui.setSidebarOpen(false);
+    ui.input.focus();
+  }
+
+  function addMessage(conversation, role, content) {
+    const message = { role, content, timestamp: Date.now() };
+    conversation.messages.push(message);
+    conversation.updatedAt = Date.now();
+    if (role === "user" && conversation.title === "New chat") {
+      conversation.title = store.titleFrom(conversation.messages);
+    }
+    persist();
+    refreshSidebar();
+    return message;
+  }
+
+  async function handleSend() {
+    const text = ui.input.value.trim();
+    if (!text || isSending) return;
+
+    isSending = true;
+
+    const conversation = ensureActiveConversation();
+    const history = conversation.messages.slice(); // context = turns before this one
+
+    addMessage(conversation, "user", text);
+    ui.appendMessage(conversation.messages[conversation.messages.length - 1]);
+    ui.input.value = "";
+    ui.autoResizeInput();
+    ui.setLoading(true);
+
+    // Show typing dots until the first token arrives, then stream.
+    let removeTyping = ui.showTypingIndicator();
+    let streamer = null;
+    let accumulated = "";
+
+    const onDelta = (delta) => {
+      if (!streamer) {
+        removeTyping();
+        removeTyping = null;
+        streamer = ui.beginStreamingMessage();
+      }
+      accumulated += delta;
+      streamer.update(accumulated);
+    };
+
+    try {
+      const fullText = await api.streamMessage(text, history, onDelta);
+      if (streamer) {
+        streamer.finalize(fullText);
+      }
+      addMessage(conversation, "assistant", fullText);
+    } catch (error) {
+      if (removeTyping) removeTyping();
+      // Keep any partial reply that streamed before the failure.
+      if (streamer && accumulated) {
+        streamer.finalize(accumulated);
+        addMessage(conversation, "assistant", accumulated);
+      } else if (streamer) {
+        streamer.remove();
+      }
+      // Errors are shown in the chat but not persisted to history.
+      ui.appendMessage({
+        role: "assistant",
+        content: `⚠ ${error.message}`,
+        timestamp: Date.now(),
+        isError: true,
+      });
+    } finally {
+      isSending = false;
+      ui.setLoading(false);
+    }
+  }
+
+  async function pollHealth() {
+    ui.setConnectionStatus((await api.checkHealth()) ? "online" : "offline");
+  }
+
+  function bindEvents() {
+    // Send button
+    ui.sendBtn.addEventListener("click", handleSend);
+
+    // Enter to send, Shift+Enter for a new line
+    ui.input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        handleSend();
+      }
+    });
+
+    // Enable/disable Send with content; auto-grow the textarea
+    ui.input.addEventListener("input", () => {
+      ui.sendBtn.disabled = !ui.input.value.trim() || isSending;
+      ui.autoResizeInput();
+    });
+
+    // New Chat (sidebar)
+    document.getElementById("new-chat-btn").addEventListener("click", handleNewChat);
+
+    // Sidebar open/close (mobile drawer)
+    document
+      .getElementById("sidebar-open-btn")
+      .addEventListener("click", () => ui.setSidebarOpen(true));
+    document
+      .getElementById("sidebar-close-btn")
+      .addEventListener("click", () => ui.setSidebarOpen(false));
+    document
+      .getElementById("sidebar-backdrop")
+      .addEventListener("click", () => ui.setSidebarOpen(false));
+
+    // Suggestion chips on the empty state
+    document.querySelectorAll(".chip[data-suggestion]").forEach((chip) => {
+      chip.addEventListener("click", () => {
+        ui.input.value = chip.dataset.suggestion;
+        ui.input.dispatchEvent(new Event("input"));
+        handleSend();
+      });
+    });
+
+    // Copy buttons inside rendered code blocks (event delegation)
+    document.getElementById("messages").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-copy-code]");
+      if (!button) return;
+      const code = button.closest(".codeblock")?.querySelector("code");
+      if (code) ui.copyToClipboard(code.textContent, button);
+    });
+  }
+
+  function init() {
+    state = store.load();
+    if (!getActive() && state.conversations.length) {
+      state.activeId = [...state.conversations].sort(
+        (a, b) => b.updatedAt - a.updatedAt
+      )[0].id;
+    }
+    bindEvents();
+    refreshSidebar();
+    renderActiveConversation();
+    ui.input.focus();
+    pollHealth();
+    setInterval(pollHealth, 30_000); // re-check the backend every 30s
+  }
+
+  return { init };
+})();
+
+document.addEventListener("DOMContentLoaded", app.init);
