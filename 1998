@@ -1,320 +1,143 @@
-keep any incomplete trailing event
+"""
+BRD Processor — closes the one gap in the Normalization/Update Engine spec:
+accepting a BUSINESS REQUIREMENT DOCUMENT (.pdf / .docx / .txt) instead of a
+ready-made .feature file.
 
-      for (const event of events) {
-        const line = event.trim();
-        if (!line.startsWith("data:")) continue;
-        const data = line.slice(5).trim();
-        if (data === "[DONE]") continue;
+Flow: extract text -> Azure OpenAI drafts a feature file USING THE FRAMEWORK'S
+OWN CONVENTIONS (existing step sentences via the knowledge catalog, tag styles,
+a real feature as a style example) -> the draft then enters the EXISTING
+pipeline (match -> normalize -> merge -> dry-run -> generate -> review) exactly
+as if the user had uploaded that feature themselves. The BRD is never the
+source of truth; the framework is — the draft exists only to be normalized and
+merged like any other upload, with the same human review gate.
+"""
+import io
+import re
+from pathlib import Path
 
-        let payload;
-        try {
-          payload = JSON.parse(data);
-        } catch {
-          continue; // skip malformed events
-        }
-        if (payload.error) {
-          const error = new Error(payload.error);
-          error.partialText = fullText;
-          throw error;
-        }
-        if (payload.delta) {
-          fullText += payload.delta;
-          onDelta(payload.delta);
-        }
-      }
-    }
+from . import config
 
-    if (!fullText) {
-      throw new Error("The server returned an empty response.");
-    }
-    return fullText;
-  },
 
-  /** Non-streaming request (used as a fallback). */
-  async sendMessage(message, history) {
-    let response;
-    try {
-      response = await fetch(`${API_BASE_URL}/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: this.buildBody(message, history),
-      });
-    } catch {
-      throw new Error(
-        "Could not reach the backend. Make sure the FastAPI server is running on " +
-          `${API_BASE_URL} (see README).`
-      );
-    }
+def extract_text(filename: str, data: bytes) -> str:
+    """Plain text from a BRD file. Raises ValueError with a user-facing
+    message for unsupported/broken files."""
+    suffix = Path(filename).suffix.lower()
+    if suffix == ".txt":
+        return data.decode("utf-8", errors="ignore")
+    if suffix == ".docx":
+        try:
+            import docx
+            document = docx.Document(io.BytesIO(data))
+            parts = [p.text for p in document.paragraphs]
+            for table in document.tables:
+                for row in table.rows:
+                    parts.append(" | ".join(c.text for c in row.cells))
+            return "\n".join(parts)
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f"Could not read .docx file: {e}")
+    if suffix == ".pdf":
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(data))
+            return "\n".join((page.extract_text() or "") for page in reader.pages)
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f"Could not read .pdf file: {e}")
+    if suffix == ".doc":
+        raise ValueError("Legacy .doc format is not supported - save the BRD as .docx or .pdf and re-upload.")
+    raise ValueError(f"Unsupported BRD type '{suffix}' - upload .pdf, .docx, or .txt (or a .feature file).")
 
-    let payload = null;
-    try {
-      payload = await response.json();
-    } catch {
-      /* non-JSON body — handled below */
-    }
 
-    if (!response.ok) {
-      const detail =
-        payload && typeof payload.detail === "string"
-          ? payload.detail
-          : `The server returned an error (HTTP ${response.status}).`;
-      throw new Error(detail);
-    }
+BRD_SYSTEM_PROMPT = """You are a senior QA automation engineer converting a business requirement
+document (BRD) into a Cucumber feature file for an existing enterprise banking automation framework.
 
-    if (!payload || typeof payload.response !== "string") {
-      throw new Error("The server returned an unexpected response format.");
-    }
-    return payload.response;
-  },
+STRICT RULES:
+- Output ONLY the Gherkin feature file. No explanations, no markdown fences, no commentary.
+- Start with tag line(s), then 'Feature:', then scenarios with Given/When/Then/And steps.
+- REUSE the exact wording of EXISTING STEP SENTENCES provided below whenever the required behaviour
+  matches - identical wording means the framework already automates that step with zero new code.
+- Follow the tag conventions and formatting style of the EXAMPLE EXISTING FEATURE provided below.
+- Write concrete, executable scenarios with real values from the BRD (amounts, codes, transaction
+  numbers). Use Scenario Outline + Examples tables when the BRD lists multiple data variations.
+- If the BRD references a transaction number, include it in scenario wording the same way the
+  example feature does.
+- Do not invent UI details the BRD doesn't mention; keep steps at the business-action level."""
 
-  /** @returns {Promise<boolean>} whether the backend is reachable. */
-  async checkHealth() {
-    try {
-      const response = await fetch(`${API_BASE_URL}/health`);
-      const payload = await response.json();
-      return response.ok && payload.status === "running";
-    } catch {
-      return false;
-    }
-  },
-};
 
-/* ------------------------------------------------------------
-   app — orchestration
-   ------------------------------------------------------------ */
+def brd_to_feature(brd_text: str, filename: str | None = None, log=lambda m: None) -> dict:
+    """Convert BRD text into a draft feature file written in the framework's
+    own conventions. Returns {feature_text, txn, module}."""
+    from . import framework_scanner, generator, indexer, knowledge
 
-const app = (() => {
-  let state = { conversations: [], activeId: null };
-  let isSending = false;
+    if len(brd_text.strip()) < 40:
+        raise ValueError("The BRD appears to be empty or unreadable after text extraction.")
 
-  const getActive = () =>
-    state.conversations.find((c) => c.id === state.activeId) || null;
+    txn_m = re.search(r"(?:Txn|transaction)\s*[#:]?\s*0*(\d{3,6})", brd_text, re.I)
+    txn = txn_m.group(1) if txn_m else None
+    module = indexer.detect_module(brd_text)
 
-  function persist() {
-    store.save(state);
-  }
+    try:
+        catalog = knowledge.step_catalog(module, cap=250)
+    except Exception:  # noqa: BLE001
+        catalog = "(knowledge base unavailable)"
 
-  function refreshSidebar() {
-    ui.renderSidebar(state.conversations, state.activeId, {
-      onSelect: switchConversation,
-      onDelete: deleteConversation,
-    });
-  }
+    style_example = ""
+    try:
+        kb = framework_scanner.get_framework_knowledge()
+        candidates = [f for f in kb["features"] if not module or f["module"] == module] or kb["features"]
+        if candidates:
+            style_example = Path(candidates[0]["path"]).read_text(encoding="utf-8", errors="ignore")[:3000]
+    except Exception:  # noqa: BLE001
+        pass
 
-  function renderActiveConversation() {
-    ui.clearMessages();
-    const conversation = getActive();
-    if (conversation) {
-      conversation.messages.forEach((message) => ui.appendMessage(message));
-    }
-  }
+    log(">>> BRD: converting business requirements to a framework-convention feature draft...")
+    user = f"""## BUSINESS REQUIREMENT DOCUMENT{f' ({filename})' if filename else ''}:
+{brd_text[:12000]}
 
-  /** Create a new empty conversation and make it active. */
-  function createConversation() {
-    const conversation = {
-      id: store.newId(),
-      title: "New chat",
-      messages: [],
-      updatedAt: Date.now(),
-    };
-    state.conversations.push(conversation);
-    state.activeId = conversation.id;
-    persist();
-    return conversation;
-  }
+## EXISTING STEP SENTENCES in the framework (reuse EXACT wording where behaviour matches):
+{catalog or '(none found)'}
 
-  /** Return the active conversation, creating one if none exists. */
-  function ensureActiveConversation() {
-    return getActive() || createConversation();
-  }
+## EXAMPLE EXISTING FEATURE (match this style, tags, and formatting):
+```gherkin
+{style_example or '(none available)'}
+```
 
-  function switchConversation(id) {
-    if (isSending || id === state.activeId) {
-      ui.setSidebarOpen(false);
-      return;
-    }
-    state.activeId = id;
-    persist();
-    refreshSidebar();
-    renderActiveConversation();
-    ui.setSidebarOpen(false);
-    ui.input.focus();
-  }
+Produce the feature file now."""
+    reply = generator._azure_chat([{"role": "system", "content": BRD_SYSTEM_PROMPT},
+                                   {"role": "user", "content": user}])
 
-  function deleteConversation(id) {
-    if (isSending) return;
-    const conversation = state.conversations.find((c) => c.id === id);
-    if (!conversation) return;
-    if (!window.confirm(`Delete "${conversation.title}"? This cannot be undone.`)) return;
+    text = reply.strip()
+    text = re.sub(r"^```(?:gherkin)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text).strip() + "\n"
 
-    state.conversations = state.conversations.filter((c) => c.id !== id);
-    if (state.activeId === id) {
-      const mostRecent = [...state.conversations].sort(
-        (a, b) => b.updatedAt - a.updatedAt
-      )[0];
-      state.activeId = mostRecent ? mostRecent.id : null;
-      renderActiveConversation();
-    }
-    persist();
-    refreshSidebar();
-  }
+    parsed = framework_scanner.parse_feature_text(text)
+    if not parsed or not parsed["scenarios"]:
+        raise ValueError("The AI's BRD conversion did not produce valid Gherkin - "
+                         "the BRD may be too vague to derive concrete scenarios. "
+                         "Add explicit flows/validations to the BRD, or write the feature manually.")
 
-  function handleNewChat() {
-    if (isSending) return;
-    const active = getActive();
-    // Reuse the current conversation if it's already empty.
-    if (active && active.messages.length === 0) {
-      ui.setSidebarOpen(false);
-      ui.input.focus();
-      return;
-    }
-    createConversation();
-    refreshSidebar();
-    renderActiveConversation();
-    ui.setSidebarOpen(false);
-    ui.input.focus();
-  }
+    # Snap the AI-drafted wording to the framework's ACTUAL step sentences. The
+    # BRD converter tends to invent near-miss phrasings ("validate the error
+    # message for pop up as Please enter Court Order") that don't exactly match
+    # the real step ("validate the error message for pop up as {string}"),
+    # which would make the dry-run see them as UNDEFINED and trigger the
+    # generator to write a (often wrong-guess) wrapper. Normalizing here rewrites
+    # those to the exact existing wording so they resolve as ALREADY DEFINED and
+    # no Java is generated for steps the framework already automates.
+    try:
+        from . import feature_normalizer, indexer
+        existing_text = ""
+        hit = indexer.lookup(txn) if txn else None
+        if hit and hit.get("feature"):
+            existing_text = Path(hit["feature"]).read_text(encoding="utf-8", errors="ignore")
+        norm = feature_normalizer.normalize_feature(text, existing_text)
+        snapped = norm["summary"].get("steps_normalized", 0)
+        if snapped:
+            log(f">>> BRD: snapped {snapped} drafted step(s) to exact framework wording "
+                "(so existing steps are reused, not regenerated).")
+        text = norm["normalized_text"]
+    except Exception as e:  # noqa: BLE001 — normalization is best-effort
+        log(f">>> BRD: wording normalization skipped ({e}); using the draft as-is.")
 
-  function addMessage(conversation, role, content) {
-    const message = { role, content, timestamp: Date.now() };
-    conversation.messages.push(message);
-    conversation.updatedAt = Date.now();
-    if (role === "user" && conversation.title === "New chat") {
-      conversation.title = store.titleFrom(conversation.messages);
-    }
-    persist();
-    refreshSidebar();
-    return message;
-  }
-
-  async function handleSend() {
-    const text = ui.input.value.trim();
-    if (!text || isSending) return;
-
-    isSending = true;
-
-    const conversation = ensureActiveConversation();
-    const history = conversation.messages.slice(); // context = turns before this one
-
-    addMessage(conversation, "user", text);
-    ui.appendMessage(conversation.messages[conversation.messages.length - 1]);
-    ui.input.value = "";
-    ui.autoResizeInput();
-    ui.setLoading(true);
-
-    // Show typing dots until the first token arrives, then stream.
-    let removeTyping = ui.showTypingIndicator();
-    let streamer = null;
-    let accumulated = "";
-
-    const onDelta = (delta) => {
-      if (!streamer) {
-        removeTyping();
-        removeTyping = null;
-        streamer = ui.beginStreamingMessage();
-      }
-      accumulated += delta;
-      streamer.update(accumulated);
-    };
-
-    try {
-      const fullText = await api.streamMessage(text, history, onDelta);
-      if (streamer) {
-        streamer.finalize(fullText);
-      }
-      addMessage(conversation, "assistant", fullText);
-    } catch (error) {
-      if (removeTyping) removeTyping();
-      // Keep any partial reply that streamed before the failure.
-      if (streamer && accumulated) {
-        streamer.finalize(accumulated);
-        addMessage(conversation, "assistant", accumulated);
-      } else if (streamer) {
-        streamer.remove();
-      }
-      // Errors are shown in the chat but not persisted to history.
-      ui.appendMessage({
-        role: "assistant",
-        content: `⚠ ${error.message}`,
-        timestamp: Date.now(),
-        isError: true,
-      });
-    } finally {
-      isSending = false;
-      ui.setLoading(false);
-    }
-  }
-
-  async function pollHealth() {
-    ui.setConnectionStatus((await api.checkHealth()) ? "online" : "offline");
-  }
-
-  function bindEvents() {
-    // Send button
-    ui.sendBtn.addEventListener("click", handleSend);
-
-    // Enter to send, Shift+Enter for a new line
-    ui.input.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" && !event.shiftKey) {
-        event.preventDefault();
-        handleSend();
-      }
-    });
-
-    // Enable/disable Send with content; auto-grow the textarea
-    ui.input.addEventListener("input", () => {
-      ui.sendBtn.disabled = !ui.input.value.trim() || isSending;
-      ui.autoResizeInput();
-    });
-
-    // New Chat (sidebar)
-    document.getElementById("new-chat-btn").addEventListener("click", handleNewChat);
-
-    // Sidebar open/close (mobile drawer)
-    document
-      .getElementById("sidebar-open-btn")
-      .addEventListener("click", () => ui.setSidebarOpen(true));
-    document
-      .getElementById("sidebar-close-btn")
-      .addEventListener("click", () => ui.setSidebarOpen(false));
-    document
-      .getElementById("sidebar-backdrop")
-      .addEventListener("click", () => ui.setSidebarOpen(false));
-
-    // Suggestion chips on the empty state
-    document.querySelectorAll(".chip[data-suggestion]").forEach((chip) => {
-      chip.addEventListener("click", () => {
-        ui.input.value = chip.dataset.suggestion;
-        ui.input.dispatchEvent(new Event("input"));
-        handleSend();
-      });
-    });
-
-    // Copy buttons inside rendered code blocks (event delegation)
-    document.getElementById("messages").addEventListener("click", (event) => {
-      const button = event.target.closest("[data-copy-code]");
-      if (!button) return;
-      const code = button.closest(".codeblock")?.querySelector("code");
-      if (code) ui.copyToClipboard(code.textContent, button);
-    });
-  }
-
-  function init() {
-    state = store.load();
-    if (!getActive() && state.conversations.length) {
-      state.activeId = [...state.conversations].sort(
-        (a, b) => b.updatedAt - a.updatedAt
-      )[0].id;
-    }
-    bindEvents();
-    refreshSidebar();
-    renderActiveConversation();
-    ui.input.focus();
-    pollHealth();
-    setInterval(pollHealth, 30_000); // re-check the backend every 30s
-  }
-
-  return { init };
-})();
-
-document.addEventListener("DOMContentLoaded", app.init);
+    log(f">>> BRD: draft feature ready - {len(parsed['scenarios'])} scenario(s), "
+        f"txn hint: {txn or 'none'}, module: {module or 'undetected'}.")
+    return {"feature_text": text, "txn": txn, "module": module}
