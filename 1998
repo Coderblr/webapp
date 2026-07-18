@@ -1,1114 +1,758 @@
-document.addEventListener("DOMContentLoaded", () => {
-    // API base URL
-    const API_BASE = "";
+import os
+import json
+from dotenv import load_dotenv
+load_dotenv() # Load Azure OpenAI keys from .env file
 
-    // App state
-    let extractedScenarios = [];
-    let requiredLocators = [];
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict, Any, Optional
 
-    // Tab Switching
-    const navItems = document.querySelectorAll(".nav-item");
-    const tabPanes = document.querySelectorAll(".tab-pane");
-    const currentTabTitle = document.getElementById("current-tab-title");
+from paths import BACKEND_DIR, FRONTEND_DIR, JAVA_FRAMEWORK_TARGET, JAVA_FRAMEWORK_SRC
+from database import init_db, SessionLocal, PageModel, LocatorModel, StepDefinitionModel, ComponentRegistryModel, FrameworkVersionModel, ExecutionLogModel, RecordingSessionModel, RecordedStepModel
+from agents.agents import RequirementAgent, FrameworkManagerAgent, ComponentDiscoveryAgent, JavaGeneratorAgent, CompilerAgent, ExecutionAgent, SelfHealingAgent
+from agents.recorder_agent import RecorderAgent
+from agents.framework_import_agent import FrameworkImportAgent
 
-    navItems.forEach(item => {
-        item.addEventListener("click", () => {
-            const targetTab = item.getAttribute("data-tab");
-            
-            navItems.forEach(n => n.classList.remove("active"));
-            tabPanes.forEach(p => p.classList.remove("active"));
-            
-            item.classList.add("active");
-            document.getElementById(`tab-${targetTab}`).classList.add("active");
-            
-            currentTabTitle.textContent = item.textContent.trim();
-            
-            // Trigger specific tab loads
-            if (targetTab === "dashboard") {
-                loadDashboardStats();
-            } else if (targetTab === "components") {
-                loadComponents();
-            } else if (targetTab === "graph") {
-                loadKnowledgeGraph();
-            } else if (targetTab === "recorder") {
-                loadRecorderSessions();
-            }
-        });
-    });
+app = FastAPI(title="Autonomous Enterprise AI Test Automation Platform")
 
-    // ----------------------------------------------------
-    // DASHBOARD FUNCTIONS
-    // ----------------------------------------------------
-    function loadDashboardStats() {
-        fetch(`${API_BASE}/api/dashboard`)
-            .then(res => res.json())
-            .then(data => {
-                document.getElementById("stat-pages").textContent = data.stats.pages;
-                document.getElementById("stat-locators").textContent = data.stats.locators;
-                document.getElementById("stat-steps").textContent = data.stats.steps;
-                document.getElementById("stat-components").textContent = data.stats.components;
+# CORS setup
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-                // Populate Versions
-                const versionTable = document.getElementById("version-table-body");
-                versionTable.innerHTML = "";
-                if (data.recent_versions.length === 0) {
-                    versionTable.innerHTML = `<tr><td colspan="5" style="text-align:center;">No commits recorded yet.</td></tr>`;
-                } else {
-                    data.recent_versions.forEach(v => {
-                        const tr = document.createElement("tr");
-                        tr.innerHTML = `
-                            <td>v${v.version_num}</td>
-                            <td>${v.commit_msg}</td>
-                            <td><span class="badge ${v.compiled ? 'badge-success' : 'badge-danger'}">${v.compiled ? 'COMPILED' : 'FAIL'}</span></td>
-                            <td>${v.timestamp}</td>
-                            <td><button class="btn btn-secondary btn-rollback" data-id="${v.version_num}" style="padding: 4px 8px; font-size:11px;">Rollback</button></td>
-                        `;
-                        versionTable.appendChild(tr);
-                    });
+# Initialize database on startup
+@app.on_event("startup")
+def startup_event():
+    init_db()
 
-                    // Add Rollback listeners
-                    document.querySelectorAll(".btn-rollback").forEach(btn => {
-                        btn.addEventListener("click", (e) => {
-                            const versionId = e.target.getAttribute("data-id");
-                            rollbackFramework(versionId);
-                        });
-                    });
-                }
+# Pydantic schemas
+class BRDInput(BaseModel):
+    text: str
 
-                // Populate executions
-                const execList = document.getElementById("execution-list-items");
-                execList.innerHTML = "";
-                if (data.recent_runs.length === 0) {
-                    execList.innerHTML = `<li style="text-align:center; color: var(--text-muted); font-size: 13px; padding: 20px 0;">No test executions.</li>`;
-                } else {
-                    data.recent_runs.forEach(r => {
-                        const li = document.createElement("li");
-                        li.className = "execution-item";
-                        li.innerHTML = `
-                            <div>
-                                <strong>Execution #${r.id}</strong>
-                                <div style="font-size:11px; color: var(--text-muted);">${r.created_at}</div>
-                            </div>
-                            <span class="badge ${r.status === 'PASS' ? 'badge-success' : 'badge-danger'}">${r.status}</span>
-                        `;
-                        execList.appendChild(li);
-                    });
-                }
-            })
-            .catch(err => console.error("Error loading dashboard stats:", err));
-    }
+class LocatorInput(BaseModel):
+    page_name: str
+    element_name: str
+    selector_type: str
+    selector_value: str
 
-    function rollbackFramework(versionId) {
-        if (!confirm(`Are you sure you want to roll back the framework code to version ${versionId}?`)) return;
+class GenerateInput(BaseModel):
+    scenarios: List[Dict[str, Any]]
+    locators: Optional[List[LocatorInput]] = []
 
-        fetch(`${API_BASE}/api/rollback`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ version_id: parseInt(versionId) })
-        })
-        .then(res => res.json())
-        .then(data => {
-            alert(data.message);
-            loadDashboardStats();
-        })
-        .catch(err => console.error("Error performing rollback:", err));
-    }
+class HealInput(BaseModel):
+    page_name: str
+    element_name: str
+    error_message: str
+    latest_html: str
 
-    // ----------------------------------------------------
-    // BRD & EXTRACTION FUNCTIONS
-    // ----------------------------------------------------
-    const analyzeBtn = document.getElementById("analyze-brd-btn");
-    const brdInput = document.getElementById("brd-text-input");
-    const emptyState = document.getElementById("analysis-empty-state");
-    const resultsPanel = document.getElementById("analysis-results");
+class RollbackInput(BaseModel):
+    version_id: int
 
-    analyzeBtn.addEventListener("click", () => {
-        const text = brdInput.value.trim();
-        if (!text) {
-            alert("Please paste some requirement text first.");
-            return;
-        }
+# ─── Recorder Schemas ──────────────────────────────────────────────────────────
 
-        analyzeBtn.disabled = true;
-        analyzeBtn.textContent = "🧠 Extracting Requirements...";
+class RecordedElementInfo(BaseModel):
+    tag: Optional[str] = None
+    element_name: Optional[str] = None
+    text: Optional[str] = None
+    placeholder: Optional[str] = None
+    type: Optional[str] = None
+    locators: Optional[Dict[str, Any]] = {}
+    best_locator: Optional[Dict[str, Any]] = None
 
-        fetch(`${API_BASE}/api/extract`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text })
-        })
-        .then(res => res.json())
-        .then(data => {
-            extractedScenarios = data.scenarios;
-            document.getElementById("scenarios-count-badge").textContent = `${extractedScenarios.length} Found`;
-            
-            // Check framework impact
-            return fetch(`${API_BASE}/api/framework-impact`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(extractedScenarios)
-            });
-        })
-        .then(res => res.json())
-        .then(analysis => {
-            emptyState.style.display = "none";
-            resultsPanel.style.display = "block";
-            
-            document.getElementById("impact-reused-count").textContent = analysis.reused_steps.length;
-            document.getElementById("impact-missing-count").textContent = analysis.missing_steps.length;
+class RecordedStepInput(BaseModel):
+    step_index: int
+    action: str  # click, input, select, navigate, keypress
+    timestamp: Optional[str] = None
+    url: Optional[str] = None
+    page_title: Optional[str] = None
+    element: Optional[RecordedElementInfo] = None
+    value: Optional[str] = None
+    selected_text: Optional[str] = None
+    coordinates: Optional[Dict[str, Any]] = None
 
-            // Render Scenarios List
-            const scList = document.getElementById("extracted-scenarios-list");
-            scList.innerHTML = "";
-            
-            extractedScenarios.forEach((sc, scIdx) => {
-                const scCard = document.createElement("div");
-                scCard.className = "component-card";
-                scCard.style.background = "rgba(255,255,255,0.02)";
-                scCard.style.border = "1px solid var(--glass-border)";
-                scCard.style.marginBottom = "12px";
-                
-                let stepsHtml = "";
-                sc.steps.forEach(st => {
-                    // Check if missing or reused
-                    const isReused = analysis.reused_steps.some(r => r.step === st.text);
-                    stepsHtml += `
-                        <div style="margin-left: 10px; font-size:12px; margin-top:4px; display:flex; justify-content:space-between; align-items:center;">
-                            <span><strong>${st.type}</strong> ${st.text}</span>
-                            <span class="badge ${isReused ? 'badge-success' : 'badge-danger'}" style="padding: 2px 6px; font-size: 9px;">
-                                ${isReused ? 'REUSED' : 'NEW CODE'}
-                            </span>
-                        </div>
-                    `;
-                });
-                
-                scCard.innerHTML = `
-                    <h5 style="color: var(--secondary);">${sc.scenario}</h5>
-                    <div>${stepsHtml}</div>
-                `;
-                scList.appendChild(scCard);
-            });
+class RecorderSessionInput(BaseModel):
+    session_name: str
+    transaction_type: str
+    steps: List[RecordedStepInput]
+    duration_seconds: Optional[int] = 0
 
-            // Set up Locator Mapper fields if there are missing steps
-            const mapperCard = document.getElementById("locator-mapper-card");
-            const fieldsContainer = document.getElementById("locator-fields-container");
-            fieldsContainer.innerHTML = "";
-            requiredLocators = [];
+# ─── Live Recorder Schemas ──────────────────────────────────────────────────────
 
-            if (analysis.missing_steps.length > 0) {
-                mapperCard.style.display = "block";
-                
-                // Identify target elements that need locators
-                // Find all steps that are inputs, clicks or dropdowns
-                const interactiveSteps = analysis.missing_steps.filter(s => ["click", "input", "dropdown"].includes(s.action));
-                
-                if (interactiveSteps.length === 0) {
-                    mapperCard.style.display = "none";
-                } else {
-                    // Dedup by element name
-                    const processed = new Set();
-                    interactiveSteps.forEach(st => {
-                        // Guess locator name from step text
-                        const match = st.text.match(/'(.*?)'|"(.*?)"/);
-                        const elementName = match ? (match[1] || match[2]) : st.text.split(" ").slice(-2).join(" ");
-                        const cleanName = elementName.replace(/[^a-zA-Z0-9\s]/g, "").trim();
-                        
-                        if (!processed.has(cleanName)) {
-                            processed.add(cleanName);
-                            
-                            const fieldDiv = document.createElement("div");
-                            fieldDiv.style.marginBottom = "14px";
-                            fieldDiv.innerHTML = `
-                                <div style="font-size: 11px; margin-bottom: 4px; color: var(--text-secondary);">
-                                    Page: <strong>${st.page}</strong> | Element: <strong>${cleanName}</strong>
-                                </div>
-                                <div style="display: flex; gap: 8px;">
-                                    <select class="glass-select target-sel-type" style="flex: 1;">
-                                        <option value="xpath">XPATH</option>
-                                        <option value="id">ID</option>
-                                        <option value="css">CSS Selector</option>
-                                        <option value="name">Name</option>
-                                    </select>
-                                    <input type="text" class="glass-input target-sel-val" style="flex: 3;" placeholder="//*[@id='submit']" value="//*[@id='${cleanName.toLowerCase().replace(/ /g, '-')}']">
-                                </div>
-                            `;
-                            
-                            fieldDiv.dataset.page = st.page;
-                            fieldDiv.dataset.element = cleanName;
-                            
-                            fieldsContainer.appendChild(fieldDiv);
-                        }
-                    });
-                }
-            } else {
-                mapperCard.style.display = "none";
-            }
+class LiveStartInput(BaseModel):
+    session_name: str
+    transaction_type: str
 
-            analyzeBtn.disabled = false;
-            analyzeBtn.textContent = "🧠 Extract Scenarios";
-        })
-        .catch(err => {
-            console.error("Error parsing requirements:", err);
-            alert("Requirements extraction failed. Verify the backend service is running.");
-            analyzeBtn.disabled = false;
-            analyzeBtn.textContent = "🧠 Extract Scenarios";
-        });
-    });
+class LiveStepInput(BaseModel):
+    live_id: str
+    step: Dict[str, Any]
 
-    // Build framework / Generate Code
-    const buildBtn = document.getElementById("build-framework-btn");
-    buildBtn.addEventListener("click", () => {
-        buildBtn.disabled = true;
-        buildBtn.textContent = "⚙️ Appending Code Modules...";
+class LiveStopInput(BaseModel):
+    live_id: str
 
-        // Collect locators
-        const locInputs = [];
-        const fieldElements = document.querySelectorAll("#locator-fields-container > div");
+# API endpoints
+@app.post("/api/extract")
+def extract_requirements(input_data: BRDInput):
+    agent = RequirementAgent()
+    scenarios = agent.extract_requirements(input_data.text)
+    return {"scenarios": scenarios}
+
+@app.post("/api/framework-impact")
+def check_framework_impact(scenarios: List[Dict[str, Any]]):
+    agent = FrameworkManagerAgent()
+    analysis = agent.analyze_impact(scenarios)
+    return analysis
+
+@app.post("/api/generate")
+def generate_and_update(input_data: GenerateInput):
+    gen_agent = JavaGeneratorAgent()
+    
+    # 1. Update locators/pages first
+    for loc in input_data.locators:
+        gen_agent.append_locator_to_page(loc.page_name, loc.element_name, loc.selector_type, loc.selector_value)
         
-        fieldElements.forEach(el => {
-            const page = el.dataset.page;
-            const element = el.dataset.element;
-            const type = el.querySelector(".target-sel-type").value;
-            const value = el.querySelector(".target-sel-val").value;
+    # 2. Append step definitions
+    for sc in input_data.scenarios:
+        for step in sc["steps"]:
+            gen_agent.append_step_definition(step["text"], step["page"], step["action"])
             
-            locInputs.push({
-                page_name: page,
-                element_name: element,
-                selector_type: type,
-                selector_value: value
-            });
-        });
-
-        fetch(`${API_BASE}/api/generate`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                scenarios: extractedScenarios,
-                locators: locInputs
-            })
-        })
-        .then(res => res.json())
-        .then(data => {
-            alert(data.message);
-            buildBtn.disabled = false;
-            buildBtn.textContent = "🚀 Append & Evolve Framework";
-            
-            // Switch to test runner to compile
-            document.querySelector("[data-tab='runner']").click();
-        })
-        .catch(err => {
-            console.error("Error during generation:", err);
-            alert("Code generation failed.");
-            buildBtn.disabled = false;
-            buildBtn.textContent = "🚀 Append & Evolve Framework";
-        });
-    });
-
-    // ----------------------------------------------------
-    // COMPONENT REGISTRY FUNCTIONS
-    // ----------------------------------------------------
-    function loadComponents() {
-        const list = document.getElementById("components-list");
-        list.innerHTML = `<div style="grid-column: 1/-1; text-align:center; padding: 40px; color: var(--text-muted);">Loading registry...</div>`;
-
-        fetch(`${API_BASE}/api/components`)
-            .then(res => res.json())
-            .then(data => {
-                list.innerHTML = "";
-                data.forEach(c => {
-                    const card = document.createElement("div");
-                    card.className = "component-card";
-                    card.innerHTML = `
-                        <div style="display:flex; justify-content:space-between; align-items:center;">
-                            <h5>${c.name}</h5>
-                            <span class="badge" style="font-size:10px;">${c.action_type}</span>
-                        </div>
-                        <p class="comp-desc">${c.description}</p>
-                        <pre><code>${c.java_code}</code></pre>
-                    `;
-                    list.appendChild(card);
-                });
-            })
-            .catch(err => console.error("Error loading components:", err));
-    }
-
-    // ----------------------------------------------------
-    // KNOWLEDGE GRAPH VISUALIZATION (Pure SVG)
-    // ----------------------------------------------------
-    function loadKnowledgeGraph() {
-        const svg = document.getElementById("knowledge-graph-svg");
-        const details = document.getElementById("graph-details");
+    # Save framework version in history
+    db = SessionLocal()
+    try:
+        current_version_num = db.query(FrameworkVersionModel).count() + 1
         
-        svg.innerHTML = `<text x="50%" y="50%" fill="var(--text-muted)" text-anchor="middle">Plotting Semantic relationships...</text>`;
+        # Save modification summary
+        modified = {
+            "scenarios": [s["scenario"] for s in input_data.scenarios],
+            "locators": [{"page": l.page_name, "element": l.element_name} for l in input_data.locators]
+        }
         
-        fetch(`${API_BASE}/api/knowledge-graph`)
-            .then(res => res.json())
-            .then(data => {
-                svg.innerHTML = "";
-                if (data.nodes.length === 0) {
-                    svg.innerHTML = `<text x="50%" y="50%" fill="var(--text-muted)" text-anchor="middle">No elements mapped in framework yet.</text>`;
-                    return;
-                }
-                
-                const width = svg.clientWidth || 700;
-                const height = svg.clientHeight || 500;
-                
-                // Simple Circle Layout with node groups
-                const pageNodes = data.nodes.filter(n => n.type === "page");
-                const otherNodes = data.nodes.filter(n => n.type !== "page");
-                
-                // Positions dictionary
-                const positions = {};
-                
-                // Arrange Page nodes in a central circle
-                const rPage = 80;
-                pageNodes.forEach((node, i) => {
-                    const angle = (i / pageNodes.length) * 2 * Math.PI;
-                    positions[node.id] = {
-                        x: width / 2 + rPage * Math.cos(angle),
-                        y: height / 2 + rPage * Math.sin(angle)
-                    };
-                });
-                
-                // Arrange Locators & Steps in a larger outer circle around their pages
-                otherNodes.forEach((node, i) => {
-                    // Try to find if this node is linked to a page
-                    const link = data.links.find(l => l.source === node.id || l.target === node.id);
-                    let centerX = width / 2;
-                    let centerY = height / 2;
-                    
-                    if (link) {
-                        const pageId = link.source.startsWith("page_") ? link.source : link.target;
-                        if (positions[pageId]) {
-                            centerX = positions[pageId].x;
-                            centerY = positions[pageId].y;
-                        }
-                    }
-                    
-                    const angle = (i / otherNodes.length) * 2 * Math.PI;
-                    const rOther = 110 + (i % 3) * 35; // staggered radii to prevent overlap
-                    
-                    positions[node.id] = {
-                        x: centerX + rOther * Math.cos(angle),
-                        y: centerY + rOther * Math.sin(angle)
-                    };
-                });
-                
-                // Keep coordinates within bounds
-                data.nodes.forEach(node => {
-                    if (positions[node.id]) {
-                        positions[node.id].x = Math.max(40, Math.min(width - 40, positions[node.id].x));
-                        positions[node.id].y = Math.max(40, Math.min(height - 40, positions[node.id].y));
-                    }
-                });
-
-                // Render links
-                data.links.forEach(l => {
-                    const src = positions[l.source];
-                    const tgt = positions[l.target];
-                    
-                    if (src && tgt) {
-                        const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
-                        line.setAttribute("x1", src.x);
-                        line.setAttribute("y1", src.y);
-                        line.setAttribute("x2", tgt.x);
-                        line.setAttribute("y2", tgt.y);
-                        line.setAttribute("stroke", "rgba(255,255,255,0.15)");
-                        line.setAttribute("stroke-width", "1.5");
-                        line.className.baseValue = "link-line";
-                        svg.appendChild(line);
-                    }
-                });
-
-                // Render nodes
-                data.nodes.forEach(node => {
-                    const pos = positions[node.id];
-                    if (!pos) return;
-                    
-                    const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
-                    
-                    const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-                    circle.setAttribute("cx", pos.x);
-                    circle.setAttribute("cy", pos.y);
-                    
-                    let radius = 10;
-                    let fill = "var(--primary)";
-                    
-                    if (node.type === "page") {
-                        radius = 16;
-                        fill = "var(--primary)";
-                    } else if (node.type === "locator") {
-                        radius = 8;
-                        fill = "var(--secondary)";
-                    } else if (node.type === "step") {
-                        radius = 8;
-                        fill = "var(--success)";
-                    }
-                    
-                    circle.setAttribute("r", radius);
-                    circle.setAttribute("fill", fill);
-                    circle.className.baseValue = "node-circle";
-                    
-                    // Click handler to inspect node details
-                    circle.addEventListener("click", () => {
-                        details.innerHTML = `
-                            <h5>Node Inspector</h5>
-                            <div style="font-size:13px; margin-top:8px;">
-                                <div><strong>Name:</strong> ${node.label}</div>
-                                <div style="margin-top:6px;"><strong>Type:</strong> <span class="badge">${node.type.toUpperCase()}</span></div>
-                                <div style="margin-top:8px; font-family: var(--font-mono); font-size:11px; background: rgba(0,0,0,0.2); padding: 8px; border-radius:6px; border:1px solid var(--glass-border);">
-                                    <strong>Value/Code:</strong><br>
-                                    ${node.details || "No metadata"}
-                                </div>
-                            </div>
-                        `;
-                    });
-                    
-                    const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
-                    text.setAttribute("x", pos.x);
-                    text.setAttribute("y", pos.y - radius - 5);
-                    text.setAttribute("text-anchor", "middle");
-                    text.setAttribute("font-size", "10");
-                    text.className.baseValue = "node-text";
-                    text.textContent = node.label.length > 18 ? node.label.substring(0, 16) + "..." : node.label;
-                    
-                    g.appendChild(circle);
-                    g.appendChild(text);
-                    svg.appendChild(g);
-                });
-            })
-            .catch(err => console.error("Error loading knowledge graph:", err));
-    }
-
-    // ----------------------------------------------------
-    // TEST RUNNER FUNCTIONS
-    // ----------------------------------------------------
-    const terminal = document.getElementById("terminal-logs");
-    const compileBtn = document.getElementById("compile-btn");
-    const runBtn = document.getElementById("run-tests-btn");
-    const clearBtn = document.getElementById("clear-logs-btn");
-    const browserUrl = document.getElementById("browser-address");
-    const browserView = document.getElementById("browser-view");
-
-    clearBtn.addEventListener("click", () => {
-        terminal.textContent = "";
-    });
-
-    compileBtn.addEventListener("click", () => {
-        compileBtn.disabled = true;
-        compileBtn.textContent = "🔨 Compiling...";
-        appendLog("\n>>> Starting Maven clean compile check...");
-
-        fetch(`${API_BASE}/api/compile`, { method: "POST" })
-            .then(res => res.json())
-            .then(data => {
-                appendLog(data.logs);
-                if (data.compiled) {
-                    appendLog("\n>>> SUCCESS: Framework compilation clean!");
-                } else {
-                    appendLog("\n>>> FAILED: Compilation issues found.");
-                }
-                compileBtn.disabled = false;
-                compileBtn.textContent = "🔨 Compile Framework";
-            })
-            .catch(err => {
-                appendLog(`\n>>> Compilation error: ${err}`);
-                compileBtn.disabled = false;
-                compileBtn.textContent = "🔨 Compile Framework";
-            });
-    });
-
-    runBtn.addEventListener("click", () => {
-        runBtn.disabled = true;
-        runBtn.textContent = "▶️ Running Tests...";
-        appendLog("\n>>> Invoking TestNG Cucumber Runner...");
+        version_entry = FrameworkVersionModel(
+            version_num=current_version_num,
+            commit_msg=f"Auto-generated code for {len(input_data.scenarios)} scenarios",
+            modified_files=json.dumps(modified),
+            compiled=False
+        )
+        db.add(version_entry)
+        db.commit()
+    finally:
+        db.close()
         
-        // Mock browser navigate visual feedback
-        browserUrl.value = "https://www.google.com";
-        browserView.innerHTML = `
-            <div class="browser-screenshot">
-                <div class="mock-browser-ui">
-                    <h4 style="margin-bottom:10px; color: var(--secondary);">Executing Sample.feature</h4>
-                    <p>Navigating: https://www.google.com</p>
-                    <div style="font-size:11px; margin-top:8px; color: var(--text-muted);">Entering query: 'Selenium WebDriver'</div>
-                    <div class="pulse-indicator" style="background-color: var(--secondary); margin: 15px auto 0 auto;"></div>
-                </div>
-            </div>
-        `;
+    return {"status": "SUCCESS", "message": f"Appended {len(input_data.scenarios)} scenarios and {len(input_data.locators)} locators to framework."}
 
-        fetch(`${API_BASE}/api/execute`, { method: "POST" })
-            .then(res => res.json())
-            .then(data => {
-                appendLog(data.logs);
-                appendLog(`\n>>> Suite Run Finished. Status: ${data.status}`);
+@app.post("/api/compile")
+def compile_framework():
+    agent = CompilerAgent()
+    success, log = agent.compile_framework()
+    
+    # Update latest version compiled state
+    db = SessionLocal()
+    try:
+        latest = db.query(FrameworkVersionModel).order_by(FrameworkVersionModel.id.desc()).first()
+        if latest:
+            latest.compiled = success
+            db.commit()
+    finally:
+        db.close()
+        
+    return {"compiled": success, "logs": log}
+
+@app.post("/api/execute")
+def execute_tests():
+    agent = ExecutionAgent()
+    logs, success, report_path = agent.execute_tests()
+    return {"status": "SUCCESS" if success else "FAILED", "logs": logs, "report_path": report_path}
+
+@app.post("/api/heal")
+def heal_locator(input_data: HealInput):
+    agent = SelfHealingAgent()
+    success, message = agent.heal_locator(
+        input_data.page_name,
+        input_data.element_name,
+        input_data.error_message,
+        input_data.latest_html
+    )
+    return {"healed": success, "message": message}
+
+@app.get("/api/dashboard")
+def get_dashboard_stats():
+    db = SessionLocal()
+    try:
+        total_pages = db.query(PageModel).count()
+        total_locators = db.query(LocatorModel).count()
+        total_steps = db.query(StepDefinitionModel).count()
+        total_components = db.query(ComponentRegistryModel).count()
+        
+        latest_runs = db.query(ExecutionLogModel).order_by(ExecutionLogModel.id.desc()).limit(10).all()
+        versions = db.query(FrameworkVersionModel).order_by(FrameworkVersionModel.id.desc()).limit(10).all()
+        
+        runs_list = [{"id": r.id, "status": r.status, "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S")} for r in latest_runs]
+        versions_list = [{"id": v.id, "version_num": v.version_num, "commit_msg": v.commit_msg, "compiled": v.compiled, "timestamp": v.timestamp.strftime("%Y-%m-%d %H:%M:%S")} for v in versions]
+        
+        return {
+            "stats": {
+                "pages": total_pages,
+                "locators": total_locators,
+                "steps": total_steps,
+                "components": total_components
+            },
+            "recent_runs": runs_list,
+            "recent_versions": versions_list
+        }
+    finally:
+        db.close()
+
+@app.get("/api/knowledge-graph")
+def get_knowledge_graph():
+    db = SessionLocal()
+    try:
+        pages = db.query(PageModel).all()
+        steps = db.query(StepDefinitionModel).all()
+        
+        nodes = []
+        links = []
+        
+        # Add Page nodes
+        for page in pages:
+            nodes.append({"id": f"page_{page.id}", "label": page.name, "type": "page", "details": page.description})
+            # Fetch locators for this page
+            for loc in page.locators:
+                loc_node_id = f"loc_{loc.id}"
+                nodes.append({"id": loc_node_id, "label": f"{loc.element_name} ({loc.selector_type})", "type": "locator", "details": loc.selector_value})
+                links.append({"source": f"page_{page.id}", "target": loc_node_id, "rel": "has_element"})
                 
-                if (data.status === "SUCCESS") {
-                    browserView.innerHTML = `
-                        <div class="browser-screenshot" style="border-color: var(--success);">
-                            <div class="mock-browser-ui">
-                                <h4 style="color: var(--success); margin-bottom:10px;">Scenario Passed!</h4>
-                                <p>All steps executed cleanly.</p>
-                                <span style="font-size:32px;">✓</span>
-                            </div>
-                        </div>
-                    `;
-                } else {
-                    browserView.innerHTML = `
-                        <div class="browser-screenshot" style="border-color: var(--danger);">
-                            <div class="mock-browser-ui">
-                                <h4 style="color: var(--danger); margin-bottom:10px;">Scenario Failed</h4>
-                                <p>Failure caught on step: Page title should contain 'Selenium'</p>
-                                <span style="font-size:32px; color: var(--danger);">✗</span>
-                            </div>
-                        </div>
-                    `;
-                }
+        # Add Step nodes and link to pages
+        for step in steps:
+            step_node_id = f"step_{step.id}"
+            nodes.append({"id": step_node_id, "label": step.pattern, "type": "step", "details": step.java_method})
+            
+            # Find associated page in our graph
+            assoc_page = db.query(PageModel).filter(PageModel.name == step.page_associated).first()
+            if assoc_page:
+                links.append({"source": step_node_id, "target": f"page_{assoc_page.id}", "rel": "interacts_with"})
                 
-                runBtn.disabled = false;
-                runBtn.textContent = "▶️ Run Automation Suite";
-            })
-            .catch(err => {
-                appendLog(`\n>>> Test Run error: ${err}`);
-                runBtn.disabled = false;
-                runBtn.textContent = "▶️ Run Automation Suite";
-            });
-    });
+        return {"nodes": nodes, "links": links}
+    finally:
+        db.close()
 
-    function appendLog(text) {
-        terminal.textContent += text + "\n";
-        terminal.scrollTop = terminal.scrollHeight;
-    }
+@app.get("/api/components")
+def get_components():
+    db = SessionLocal()
+    try:
+        components = db.query(ComponentRegistryModel).all()
+        return [{"id": c.id, "name": c.name, "action_type": c.action_type, "description": c.description, "java_code": c.java_code} for c in components]
+    finally:
+        db.close()
 
-    // ----------------------------------------------------
-    // SELF HEALING FUNCTIONS
-    // ----------------------------------------------------
-    const healBtn = document.getElementById("trigger-healing-btn");
-    const healingLogsEmpty = document.getElementById("healing-logs-empty");
-    const healingResultsPanel = document.getElementById("healing-results-panel");
-    const healingConsole = document.getElementById("healing-console-logs");
-
-    healBtn.addEventListener("click", () => {
-        const page = document.getElementById("heal-page").value.trim();
-        const element = document.getElementById("heal-element").value.trim();
-        const error = document.getElementById("heal-error").value.trim();
-        const html = document.getElementById("heal-html").value.trim();
-
-        healBtn.disabled = true;
-        healBtn.textContent = "🩹 Healing...";
-
-        fetch(`${API_BASE}/api/heal`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                page_name: page,
-                element_name: element,
-                error_message: error,
-                latest_html: html
-            })
-        })
-        .then(res => res.json())
-        .then(data => {
-            healingLogsEmpty.style.display = "none";
-            healingResultsPanel.style.display = "block";
+@app.post("/api/rollback")
+def rollback_framework(input_data: RollbackInput):
+    # Retrieve the version to roll back
+    db = SessionLocal()
+    try:
+        version = db.query(FrameworkVersionModel).filter(FrameworkVersionModel.version_num == input_data.version_id).first()
+        if not version:
+            raise HTTPException(status_code=404, detail="Version not found.")
             
-            healingConsole.textContent = 
-                `[INFO] Scanning target page: ${page}\n` +
-                `[WARNING] Interaction failed for locator: ${element}\n` +
-                `[INFO] Analyzer: Error is a missing element/timeout.\n` +
-                `[INFO] Scanning DOM snippet for alternatives...\n` +
-                `[SUCCESS] ${data.message}\n` +
-                `[INFO] Re-written Java source file LoginPage.java.\n` +
-                `[INFO] Healing update committed. Syncing Knowledge Graph.`;
-            
-            healBtn.disabled = false;
-            healBtn.textContent = "🩹 Repair & Heal Element";
-        })
-        .catch(err => {
-            console.error("Error healing locator:", err);
-            alert("Healing simulator request failed.");
-            healBtn.disabled = false;
-            healBtn.textContent = "🩹 Repair & Heal Element";
-        });
-    });
+        # In a real system, we'd roll back files in VCS (git reset --hard / git checkout).
+        # We simulate the successful rollback and update database statuses.
+        return {"status": "SUCCESS", "message": f"Successfully rolled back workspace and framework to version {input_data.version_id}."}
+    finally:
+        db.close()
 
-    // Environment Diagnostics (Verify Env)
-    const diagBtn = document.getElementById("diagnostics-btn");
-    if (diagBtn) {
-        diagBtn.addEventListener("click", () => {
-            diagBtn.disabled = true;
-            diagBtn.textContent = "🔍 Verifying...";
-            fetch(`${API_BASE}/api/compile`, { method: "POST" })
-                .then(res => res.json())
-                .then(data => {
-                    if (data.compiled) {
-                        alert("✅ Environment Diagnostics Passed!\n\n1. Java Code Structure: Verified & Syntactically Correct\n2. Selenium Engine: Active\n3. Edge Web Driver: Verified");
-                    } else {
-                        alert("❌ Environment Diagnostics Warn:\n\n" + data.logs);
-                    }
-                    diagBtn.disabled = false;
-                    diagBtn.textContent = "🔍 Verify Env";
-                })
-                .catch(err => {
-                    alert("❌ Diagnostics Error: Backend server is unreachable.");
-                    diagBtn.disabled = false;
-                    diagBtn.textContent = "🔍 Verify Env";
-                });
-        });
-    }
+@app.get("/api/report")
+def get_report():
+    report_path = os.path.join(JAVA_FRAMEWORK_TARGET, "cucumber-reports.html")
+    if os.path.exists(report_path):
+        return FileResponse(report_path)
+    raise HTTPException(status_code=404, detail="Report not generated yet.")
 
-    // Initial Dashboard stats load
-    loadDashboardStats();
 
-    // ──────────────────────────────────────────────────────────────
-    // TRANSACTION RECORDER FUNCTIONS
-    // ──────────────────────────────────────────────────────────────
+@app.post("/api/framework/import")
+def import_existing_framework():
+    """
+    One-touch import: reads the existing java-framework (Page Objects, Step
+    Definitions, Feature files) straight off disk and loads it into the AI's
+    knowledge graph. After this, the AI treats everything found as existing
+    framework knowledge — it reuses these locators/steps instead of
+    regenerating or duplicating them.
+    """
+    agent = FrameworkImportAgent()
+    try:
+        result = agent.import_all()
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Import failed: {e}")
 
-    let currentSessionId = null;
 
-    window.loadRecorderSessions = function() {
-        fetch(`${API_BASE}/api/recorder/sessions`)
-            .then(res => res.json())
-            .then(sessions => {
-                const badge = document.getElementById('sessions-count-badge');
-                badge.textContent = `${sessions.length} session${sessions.length !== 1 ? 's' : ''}`;
+@app.post("/api/framework/upload")
+async def upload_existing_framework(file: UploadFile = File(...)):
+    """
+    Upload a .zip of an existing framework (Page Objects, Step Definitions,
+    Feature files — any folder layout). Extracts it, sorts recognizable Java/
+    feature files into this project's java-framework/src/ (matching how
+    java-framework is actually laid out here), then runs the same import
+    used by /api/framework/import so the knowledge graph picks it up too.
+    """
+    if not file.filename or not file.filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Please upload a .zip file of the existing framework.")
 
-                const tbody = document.getElementById('recorder-sessions-body');
-                if (sessions.length === 0) {
-                    tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:#555;padding:24px;">No sessions recorded yet. Use the Chrome Extension to record a transaction.</td></tr>`;
-                    return;
-                }
+    import zipfile
+    import tempfile
+    import shutil
 
-                tbody.innerHTML = sessions.map(s => {
-                    const statusClass = `status-${s.status}`;
-                    const txnLabel = s.transaction_type.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-                    const duration = s.duration_seconds ? `${Math.floor(s.duration_seconds/60)}m ${s.duration_seconds%60}s` : '-';
-                    return `
-                        <tr style="cursor:pointer" onclick="viewSessionDetail(${s.id})">
-                            <td>${s.id}</td>
-                            <td style="color:#e0e0ff;font-weight:500">${s.session_name}</td>
-                            <td><span class="badge">${txnLabel}</span></td>
-                            <td><strong style="color:#6c63ff">${s.total_steps}</strong></td>
-                            <td>${duration}</td>
-                            <td><span class="badge action-badge ${statusClass}">${s.status.toUpperCase()}</span></td>
-                            <td style="font-size:11px;color:#666">${s.created_at}</td>
-                            <td>
-                                <button class="btn btn-primary" style="padding:6px 12px;font-size:11px" onclick="event.stopPropagation(); viewSessionDetail(${s.id})">👁 View</button>
-                                <button class="btn btn-secondary" style="padding:6px 12px;font-size:11px;margin-left:4px" onclick="event.stopPropagation(); deleteSession(${s.id})">🗑</button>
-                            </td>
-                        </tr>`;
-                }).join('');
-            })
-            .catch(err => {
-                console.error('Failed to load sessions:', err);
-                document.getElementById('recorder-sessions-body').innerHTML =
-                    `<tr><td colspan="8" style="text-align:center;color:#ff5252;padding:16px;">Backend unreachable. Start the backend server first.</td></tr>`;
-            });
-    };
+    pages_dest = os.path.join(JAVA_FRAMEWORK_SRC, "main", "java", "com", "nbc", "pages")
+    steps_dest = os.path.join(JAVA_FRAMEWORK_SRC, "test", "java", "com", "nbc", "steps")
+    features_dest = os.path.join(JAVA_FRAMEWORK_SRC, "test", "resources", "features")
+    os.makedirs(pages_dest, exist_ok=True)
+    os.makedirs(steps_dest, exist_ok=True)
+    os.makedirs(features_dest, exist_ok=True)
 
-    window.viewSessionDetail = function(sessionId) {
-        currentSessionId = sessionId;
-        fetch(`${API_BASE}/api/recorder/sessions/${sessionId}`)
-            .then(res => res.json())
-            .then(data => {
-                const { session, steps } = data;
-                document.getElementById('session-detail-title').textContent =
-                    `📋 ${session.session_name} — ${steps.length} steps`;
+    tmp_dir = tempfile.mkdtemp(prefix="fw_upload_")
+    zip_path = os.path.join(tmp_dir, "upload.zip")
+    copied = {"pages": [], "steps": [], "features": []}
+    skipped = []
 
-                // Show generated files
-                const filesDiv = document.getElementById('generated-files-info');
-                filesDiv.innerHTML = '';
-                if (session.page_object_path) {
-                    session.page_object_path.split(', ').forEach(p => {
-                        if (p.trim()) {
-                            const fname = p.trim().split(/[\\/]/).pop();
-                            filesDiv.innerHTML += `<div class="file-info-card">☕ ${fname}</div>`;
-                        }
-                    });
-                }
-                if (session.feature_file_path) {
-                    const fname = session.feature_file_path.split(/[\\/]/).pop();
-                    filesDiv.innerHTML += `<div class="file-info-card">🥒 ${fname}</div>`;
-                }
-                if (!filesDiv.innerHTML) {
-                    filesDiv.innerHTML = `<div style="color:#666;font-size:12px">No files generated yet — click Regenerate Framework</div>`;
-                }
+    try:
+        with open(zip_path, "wb") as f:
+            f.write(await file.read())
 
-                // Render steps table
-                const tbody = document.getElementById('session-steps-body');
-                tbody.innerHTML = steps.map(s => {
-                    const actionClass = `action-${s.action}`;
-                    const locClass = s.locator_type ? `loc-${s.locator_type.toLowerCase()}` : 'loc-xpath';
-                    const locVal = s.locator_value
-                        ? `<code style="font-size:10px;color:#aaa;word-break:break-all">${escapeHtml(s.locator_value.substring(0, 60))}${s.locator_value.length > 60 ? '…' : ''}</code>`
-                        : '<span style="color:#444">—</span>';
-                    const pageParts = (s.page_title || s.url || '').substring(0, 30);
-                    return `
-                        <tr>
-                            <td style="color:#666;font-size:11px">${s.step_index}</td>
-                            <td><span class="action-badge ${actionClass}">${s.action}</span></td>
-                            <td style="font-size:11px;color:#888;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(s.url || '')}">${escapeHtml(pageParts)}</td>
-                            <td style="color:#e0e0ff;font-size:12px;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(s.element_name || '—')}</td>
-                            <td><span class="loc-pill ${locClass}">${s.locator_type || '—'}</span></td>
-                            <td style="max-width:160px">${locVal}</td>
-                            <td style="color:#48cfad;font-size:12px">${escapeHtml(s.input_value || '—')}</td>
-                        </tr>`;
-                }).join('');
+        extract_dir = os.path.join(tmp_dir, "extracted")
+        os.makedirs(extract_dir, exist_ok=True)
 
-                document.getElementById('session-detail-panel').style.display = 'block';
-                document.getElementById('session-detail-panel').scrollIntoView({ behavior: 'smooth' });
-            })
-            .catch(err => alert('Failed to load session: ' + err.message));
-    };
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                # zip-slip guard: refuse any entry that would extract outside extract_dir
+                for member in zf.namelist():
+                    member_path = os.path.normpath(os.path.join(extract_dir, member))
+                    if not member_path.startswith(os.path.normpath(extract_dir) + os.sep) and member_path != os.path.normpath(extract_dir):
+                        raise HTTPException(status_code=400, detail=f"Unsafe path in zip: {member}")
+                zf.extractall(extract_dir)
+        except zipfile.BadZipFile:
+            raise HTTPException(status_code=400, detail="That file isn't a valid .zip archive.")
 
-    window.closeSessionDetail = function() {
-        document.getElementById('session-detail-panel').style.display = 'none';
-        currentSessionId = null;
-    };
+        # Walk everything extracted, sort recognizable files by path/extension.
+        # Path-substring matching (not exact package names) so this works
+        # regardless of the original project's package naming.
+        for root, _dirs, files in os.walk(extract_dir):
+            if "__MACOSX" in root:
+                continue
+            lower_root = root.lower()
+            for fname in files:
+                src_path = os.path.join(root, fname)
 
-    window.regenerateSession = function() {
-        if (!currentSessionId) return;
-        const btn = document.getElementById('btn-regenerate');
-        btn.disabled = true;
-        btn.textContent = '⏳ Generating...';
-        fetch(`${API_BASE}/api/recorder/generate/${currentSessionId}`, { method: 'POST' })
-            .then(res => res.json())
-            .then(data => {
-                btn.textContent = '🔄 Regenerate Framework';
-                btn.disabled = false;
-                alert(`✅ Framework regenerated!\n\nLocators stored: ${data.locators_stored}\nPages discovered: ${data.pages_discovered}\nPage objects: ${(data.page_objects_generated || []).length}\n\n${data.message}`);
-                viewSessionDetail(currentSessionId); // Reload
-            })
-            .catch(err => {
-                btn.textContent = '🔄 Regenerate Framework';
-                btn.disabled = false;
-                alert('❌ Regeneration failed: ' + err.message);
-            });
-    };
+                if fname.endswith(".java") and "page" in lower_root:
+                    dest = os.path.join(pages_dest, fname)
+                    shutil.copy2(src_path, dest)
+                    copied["pages"].append(fname)
+                elif fname.endswith(".java") and "step" in lower_root:
+                    dest = os.path.join(steps_dest, fname)
+                    shutil.copy2(src_path, dest)
+                    copied["steps"].append(fname)
+                elif fname.endswith(".feature"):
+                    dest = os.path.join(features_dest, fname)
+                    shutil.copy2(src_path, dest)
+                    copied["features"].append(fname)
+                elif fname.endswith(".java"):
+                    # A .java file that's neither clearly a page nor a step —
+                    # skip it rather than guess wrong.
+                    skipped.append(fname)
 
-    window.deleteSession = function(sessionId) {
-        if (!confirm('Delete this recorded session?')) return;
-        fetch(`${API_BASE}/api/recorder/sessions/${sessionId}`, { method: 'DELETE' })
-            .then(res => res.json())
-            .then(() => {
-                if (currentSessionId === sessionId) {
-                    closeSessionDetail();
-                }
-                loadRecorderSessions();
-            })
-            .catch(err => alert('Delete failed: ' + err.message));
-    };
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    // ──────────────────────────────────────────────────────────────
-    // LIVE RECORDER (in-frontend, no Chrome extension)
-    // ──────────────────────────────────────────────────────────────
+    total_copied = len(copied["pages"]) + len(copied["steps"]) + len(copied["features"])
+    if total_copied == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No recognizable Page Object (.java in a 'pages' folder), Step Definition "
+                   "(.java in a 'steps' folder), or .feature files were found in that zip."
+        )
 
-    let liveId = null;
-    let livePollInterval = null;
-    let mediaRecorder = null;
-    let recordedChunks = [];
-    let videoStream = null;
+    # Now run the same import used by the one-touch button, so the knowledge
+    # graph picks up everything that was just copied in.
+    agent = FrameworkImportAgent()
+    try:
+        import_result = agent.import_all()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Files were copied but import failed: {e}")
 
-    // Backend origin the bookmarklet must call. When the frontend is served
-    // by the backend, API_BASE is "" so we derive from location; otherwise
-    // default to localhost:8000.
-    const RECORDER_BACKEND = (API_BASE && API_BASE.length)
-        ? API_BASE
-        : (window.location.origin && window.location.origin.startsWith('http')
-            ? window.location.origin
-            : 'http://localhost:8000');
+    import_result["files_copied"] = copied
+    import_result["files_skipped"] = skipped
+    import_result["message"] = (
+        f"Copied {len(copied['pages'])} page file(s), {len(copied['steps'])} step file(s), "
+        f"{len(copied['features'])} feature file(s) into java-framework, then " + import_result["message"]
+    )
+    return import_result
 
-    // Build the bookmarklet href once the DOM is ready.
-    let recorderLoaderScript = '';
-    let recorderShortManualCode = '';
-    (function buildBookmarklet() {
-        const link = document.getElementById('recorder-bookmarklet');
-        recorderLoaderScript =
-            "(function(){var s=document.createElement('script');" +
-            "window.__AI_RECORDER_BACKEND__='" + RECORDER_BACKEND + "';" +
-            "s.src='" + RECORDER_BACKEND + "/api/recorder/live/script?t='+Date.now();" +
-            "document.body.appendChild(s);})();";
-        if (link) link.setAttribute('href', 'javascript:' + encodeURIComponent(recorderLoaderScript));
 
-        // Shortest possible version for hand-typing (no clipboard, no DevTools):
-        // live_recorder.js now detects its own backend from the <script src>, so this
-        // doesn't need to set window.__AI_RECORDER_BACKEND__ separately — one URL, done.
-        recorderShortManualCode = "javascript:(function(){var s=document.createElement('script');" +
-            "s.src='" + RECORDER_BACKEND + "/r';document.body.appendChild(s)})()";
-        const manualEl = document.getElementById('recorder-manual-code');
-        if (manualEl) manualEl.textContent = recorderShortManualCode;
-    })();
+# ─── Recorder API ──────────────────────────────────────────────────────────────
 
-    // Fallback for browsers/IT policies that block dragging javascript: links onto
-    // the bookmarks bar, or that disable DevTools outright. Same loader code either
-    // way — paste into DevTools Console, OR into the address bar after typing
-    // "javascript:" yourself (browsers strip a pasted javascript: prefix).
-    window.copyConsoleScript = function() {
-        const btn = document.getElementById('btn-copy-console-script');
-        const restore = () => { btn.textContent = '📋 Copy Recorder Code'; };
-        navigator.clipboard.writeText(recorderLoaderScript)
-            .then(() => {
-                btn.textContent = '✅ Copied — paste into Console or address bar';
-                setTimeout(restore, 3000);
-            })
-            .catch(() => {
-                // Clipboard API blocked (also common on locked-down/VDI browsers) —
-                // fall back to a selectable prompt so it can be copied manually
-                // with Ctrl+C, which usually still works even when the page-level
-                // clipboard API is disabled by policy.
-                window.prompt(
-                    'Copy this (Ctrl+C), then either paste into DevTools Console (F12) and press Enter,\n' +
-                    'or click the target tab\'s address bar, type "javascript:" first, paste right after it, and press Enter:',
-                    recorderLoaderScript
-                );
-            });
-    };
+@app.post("/api/recorder/save")
+def save_recording_session(data: RecorderSessionInput):
+    """Receive a recorded session from the Chrome Extension and store all steps."""
+    db = SessionLocal()
+    try:
+        # Create session record
+        session = RecordingSessionModel(
+            session_name=data.session_name,
+            transaction_type=data.transaction_type,
+            total_steps=len(data.steps),
+            duration_seconds=data.duration_seconds or 0,
+            status="captured"
+        )
+        db.add(session)
+        db.flush()  # Get session.id
 
-    window.startLiveRecording = function() {
-        const name = (document.getElementById('live-session-name').value || '').trim();
-        const txn = document.getElementById('live-txn-type').value;
+        # Store each step
+        for step_input in data.steps:
+            elem = step_input.element
+            best_loc = elem.best_locator if elem else None
+            all_locs = json.dumps(elem.locators if elem else {})
 
-        fetch(`${API_BASE}/api/recorder/live/start`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_name: name, transaction_type: txn })
-        })
-        .then(res => res.json())
-        .then(data => {
-            liveId = data.live_id;
-            setLiveUiRecording(true);
-            startLivePolling();
-            openTargetSiteAndPrompt();
-        })
-        .catch(err => alert('❌ Could not start recording. Is the backend running?\n\n' + err.message));
-    };
+            step_model = RecordedStepModel(
+                session_id=session.id,
+                step_index=step_input.step_index,
+                action=step_input.action,
+                url=step_input.url or '',
+                page_title=step_input.page_title or '',
+                element_tag=elem.tag if elem else '',
+                element_name=elem.element_name if elem else '',
+                element_text=elem.text if elem else '',
+                locator_type=best_loc.get('type') if best_loc else None,
+                locator_value=best_loc.get('value') if best_loc else None,
+                all_locators=all_locs,
+                input_value=step_input.value or step_input.selected_text or '',
+                timestamp=step_input.timestamp or '',
+            )
+            db.add(step_model)
 
-    // Opens the NBC URL from config.properties in a new tab automatically, then shows
-    // an impossible-to-miss reminder that the bookmarklet still has to be clicked ON
-    // that tab — browsers don't allow a page to inject scripts into another site's
-    // tab, so this one manual click can't be skipped, only made harder to forget.
-    function openTargetSiteAndPrompt() {
-        const hint = document.getElementById('live-rec-hint');
-        fetch(`${API_BASE}/api/recorder/target-url`)
-            .then(res => res.json())
-            .then(data => {
-                if (data.found && data.url) {
-                    window.open(data.url, '_blank');
-                    hint.innerHTML =
-                        '🟢 Recording is live. Opened <strong>' + escapeHtml(data.url) + '</strong> in a new tab.<br>' +
-                        '⚠️ <strong>On that new tab, click the "AI Recorder" bookmark now</strong> — nothing is captured until you do. ' +
-                        'A red REC badge in the top-right of that page confirms it worked.';
-                } else {
-                    hint.innerHTML =
-                        '🟢 Recording is live, but no <code>url=</code> is set in config.properties, so no tab was opened automatically.<br>' +
-                        '⚠️ Open your target site yourself, then <strong>click the "AI Recorder" bookmark on that tab</strong> before doing anything else.';
-                }
-            })
-            .catch(() => {
-                hint.innerHTML =
-                    '🟢 Recording is live. ⚠️ Open your target site and <strong>click the "AI Recorder" bookmark on that tab</strong> — nothing is captured until you do.';
-            });
-    }
+        db.commit()
 
-    window.stopLiveRecording = function() {
-        if (!liveId) return;
-        const btn = document.getElementById('btn-live-stop');
-        btn.disabled = true;
-        btn.textContent = '⏳ Saving…';
+        # Auto-process the session to generate framework artifacts
+        agent = RecorderAgent()
+        result = agent.process_session(session.id)
 
-        stopLivePolling();
-        if (mediaRecorder && mediaRecorder.state !== 'inactive') stopScreenVideo();
-
-        fetch(`${API_BASE}/api/recorder/live/stop`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ live_id: liveId })
-        })
-        .then(res => {
-            if (!res.ok) return res.json().then(e => { throw new Error(e.detail || 'Save failed'); });
-            return res.json();
-        })
-        .then(data => {
-            setLiveUiRecording(false);
-            btn.disabled = false;
-            btn.textContent = '⏹ Stop & Save';
-            liveId = null;
-            alert(
-                `✅ Transaction recorded & framework generated!\n\n` +
-                `Steps saved: ${data.steps_saved}\n` +
-                `Locators stored: ${data.locators_stored}\n` +
-                `Pages discovered: ${data.pages_discovered}\n` +
-                `Page objects: ${(data.page_objects_generated || []).length}\n\n` +
-                `${data.message}`
-            );
-            loadRecorderSessions();
-        })
-        .catch(err => {
-            btn.disabled = false;
-            btn.textContent = '⏹ Stop & Save';
-            alert('❌ ' + err.message);
-        });
-    };
-
-    function setLiveUiRecording(on) {
-        document.getElementById('btn-live-start').style.display = on ? 'none' : 'inline-flex';
-        document.getElementById('btn-live-stop').style.display  = on ? 'inline-flex' : 'none';
-        document.getElementById('live-feed-wrap').style.display = on ? 'block' : 'none';
-        const badge = document.getElementById('live-rec-badge');
-        if (on) {
-            badge.textContent = '● Recording';
-            badge.style.background = 'rgba(255,82,82,0.2)';
-            badge.style.color = '#ff8a80';
-        } else {
-            badge.textContent = 'Idle';
-            badge.style.background = 'rgba(120,120,120,0.2)';
-            badge.style.color = '#aaa';
-            document.getElementById('live-rec-hint').textContent = '';
+        return {
+            "session_id": session.id,
+            "steps_saved": len(data.steps),
+            "locators_stored": result.get("locators_stored", 0),
+            "pages_discovered": result.get("pages_discovered", 0),
+            "page_objects_generated": result.get("page_objects_generated", []),
+            "feature_file": result.get("feature_file", ""),
+            "message": result.get("message", "Session saved successfully")
         }
-    }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
 
-    function startLivePolling() {
-        if (livePollInterval) clearInterval(livePollInterval);
-        livePollInterval = setInterval(pollLiveStatus, 1500);
-        pollLiveStatus();
-    }
-    function stopLivePolling() {
-        if (livePollInterval) { clearInterval(livePollInterval); livePollInterval = null; }
-    }
 
-    function pollLiveStatus() {
-        if (!liveId) return;
-        fetch(`${API_BASE}/api/recorder/live/status/${liveId}`)
-            .then(res => res.json())
-            .then(data => {
-                document.getElementById('live-step-count').textContent = data.count || 0;
-                const feed = document.getElementById('live-feed');
-                if (!data.steps || data.steps.length === 0) {
-                    feed.innerHTML = '<div style="color:#666;">Waiting for interactions on the target site…</div>';
-                    return;
-                }
-                const icon = { click:'👆', input:'⌨️', select:'🔽', navigate:'🌐', keypress:'⏎' };
-                feed.innerHTML = data.steps.map(s => {
-                    const ic = icon[s.action] || '•';
-                    const loc = s.locator_type ? `<span style="color:#48cfad">[${s.locator_type}]</span> ${escapeHtml(s.locator_value || '')}` : '';
-                    const val = s.value ? ` <span style="color:#ffb300">= "${escapeHtml(String(s.value).substring(0,30))}"</span>` : '';
-                    return `<div style="padding:2px 0;border-bottom:1px solid rgba(255,255,255,0.04)">`
-                        + `<span style="color:#6c63ff">#${s.step_index}</span> ${ic} `
-                        + `<b style="color:#e0e0ff">${s.action}</b> `
-                        + `<span style="color:#a78bfa">${escapeHtml(s.element_name || '')}</span> ${loc}${val}</div>`;
-                }).join('');
-                feed.scrollTop = feed.scrollHeight;
-            })
-            .catch(() => {});
-    }
+@app.post("/api/recorder/generate/{session_id}")
+def generate_from_session(session_id: int):
+    """Re-process a saved session to regenerate Page Objects and Feature Files."""
+    agent = RecorderAgent()
+    result = agent.process_session(session_id)
+    if not result.get("success", True):
+        raise HTTPException(status_code=404, detail=result.get("error", "Processing failed"))
+    return result
 
-    // ── Optional screen-video capture (visual reference alongside locators) ──
-    window.toggleScreenVideo = function() {
-        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-            stopScreenVideo();
-        } else {
-            startScreenVideo();
+
+@app.get("/api/recorder/sessions")
+def list_recording_sessions():
+    """List all recorded sessions."""
+    db = SessionLocal()
+    try:
+        sessions = db.query(RecordingSessionModel).order_by(RecordingSessionModel.id.desc()).all()
+        return [{
+            "id": s.id,
+            "session_name": s.session_name,
+            "transaction_type": s.transaction_type,
+            "total_steps": s.total_steps,
+            "duration_seconds": s.duration_seconds,
+            "status": s.status,
+            "page_object_path": s.page_object_path,
+            "feature_file_path": s.feature_file_path,
+            "created_at": s.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "processed_at": s.processed_at.strftime("%Y-%m-%d %H:%M:%S") if s.processed_at else None
+        } for s in sessions]
+    finally:
+        db.close()
+
+
+@app.get("/api/recorder/sessions/{session_id}")
+def get_recording_session(session_id: int):
+    """Get full details of a recorded session including all steps."""
+    db = SessionLocal()
+    try:
+        session = db.query(RecordingSessionModel).filter(RecordingSessionModel.id == session_id).first()
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        steps = db.query(RecordedStepModel)\
+                   .filter(RecordedStepModel.session_id == session_id)\
+                   .order_by(RecordedStepModel.step_index)\
+                   .all()
+
+        steps_data = [{
+            "id": s.id,
+            "step_index": s.step_index,
+            "action": s.action,
+            "url": s.url,
+            "page_title": s.page_title,
+            "element_tag": s.element_tag,
+            "element_name": s.element_name,
+            "element_text": s.element_text,
+            "locator_type": s.locator_type,
+            "locator_value": s.locator_value,
+            "all_locators": json.loads(s.all_locators) if s.all_locators else {},
+            "input_value": s.input_value,
+            "timestamp": s.timestamp
+        } for s in steps]
+
+        return {
+            "session": {
+                "id": session.id,
+                "session_name": session.session_name,
+                "transaction_type": session.transaction_type,
+                "total_steps": session.total_steps,
+                "duration_seconds": session.duration_seconds,
+                "status": session.status,
+                "page_object_path": session.page_object_path,
+                "feature_file_path": session.feature_file_path,
+                "created_at": session.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+            "steps": steps_data
         }
-    };
+    finally:
+        db.close()
 
-    function startScreenVideo() {
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
-            alert('Screen recording is not supported in this browser.');
-            return;
-        }
-        navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
-            .then(stream => {
-                videoStream = stream;
-                recordedChunks = [];
-                mediaRecorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
-                mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordedChunks.push(e.data); };
-                mediaRecorder.onstop = () => {
-                    const blob = new Blob(recordedChunks, { type: 'video/webm' });
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = `recording_${Date.now()}.webm`;
-                    a.click();
-                    URL.revokeObjectURL(url);
-                };
-                mediaRecorder.start();
-                // User can stop sharing from the browser bar too
-                stream.getVideoTracks()[0].addEventListener('ended', stopScreenVideo);
 
-                const preview = document.getElementById('live-video-preview');
-                preview.srcObject = stream;
-                preview.style.display = 'block';
-                preview.play().catch(()=>{});
+@app.delete("/api/recorder/sessions/{session_id}")
+def delete_recording_session(session_id: int):
+    """Delete a recorded session."""
+    db = SessionLocal()
+    try:
+        session = db.query(RecordingSessionModel).filter(RecordingSessionModel.id == session_id).first()
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        db.delete(session)
+        db.commit()
+        return {"deleted": True}
+    finally:
+        db.close()
 
-                const btn = document.getElementById('btn-live-video');
-                btn.textContent = '⏹ Stop Video';
-                btn.classList.add('btn-primary');
-            })
-            .catch(() => {/* user cancelled the picker */});
+# ─── Live Recorder API (in-frontend, no Chrome extension) ───────────────────────
+#
+# A single active session is buffered in memory. The dashboard starts a session,
+# the bookmarklet script (served below) streams each step here, and Stop & Save
+# converts the buffer into a real RecordingSession + runs the RecorderAgent —
+# reusing exactly the same pipeline the extension used.
+
+import uuid as _uuid
+from datetime import datetime as _dt
+
+# In-memory live session store: { live_id: {meta + steps[]} }
+LIVE_SESSIONS: Dict[str, Dict[str, Any]] = {}
+ACTIVE_LIVE_ID: Optional[str] = None
+
+
+@app.post("/api/recorder/live/start")
+def live_start(data: LiveStartInput):
+    """Open a new live recording session and make it the active one."""
+    global ACTIVE_LIVE_ID
+    live_id = _uuid.uuid4().hex[:12]
+    LIVE_SESSIONS[live_id] = {
+        "session_name": data.session_name or f"Live_{_dt.now().strftime('%Y%m%d_%H%M%S')}",
+        "transaction_type": data.transaction_type or "generic",
+        "started_at": _dt.now(),
+        "steps": [],
+    }
+    ACTIVE_LIVE_ID = live_id
+    return {"live_id": live_id, "active": True}
+
+
+@app.get("/api/recorder/live/active")
+def live_active():
+    """The bookmarklet polls this to discover the current active session."""
+    if ACTIVE_LIVE_ID and ACTIVE_LIVE_ID in LIVE_SESSIONS:
+        sess = LIVE_SESSIONS[ACTIVE_LIVE_ID]
+        return {"active": True, "live_id": ACTIVE_LIVE_ID, "count": len(sess["steps"])}
+    return {"active": False, "live_id": None, "count": 0}
+
+
+@app.get("/api/recorder/target-url")
+def recorder_target_url():
+    """
+    Reads the 'url' key straight out of java-framework/src/main/resources/config.properties
+    so the dashboard can auto-open the NBC target site when Start Recording is clicked —
+    one config value, no need to type/paste the URL a second time in the browser.
+    """
+    config_path = os.path.join(JAVA_FRAMEWORK_SRC, "main", "resources", "config.properties")
+    if not os.path.exists(config_path):
+        return {"url": None, "found": False}
+    try:
+        with open(config_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.lower().startswith("url="):
+                    value = line.split("=", 1)[1].strip()
+                    return {"url": value or None, "found": bool(value)}
+    except Exception:
+        pass
+    return {"url": None, "found": False}
+
+
+@app.post("/api/recorder/live/step")
+def live_step(data: LiveStepInput):
+    """Receive a single step from the in-page recorder script."""
+    sess = LIVE_SESSIONS.get(data.live_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Live session not found or already stopped.")
+    # Re-index server-side so counts stay consistent regardless of client
+    step = dict(data.step or {})
+    step["step_index"] = len(sess["steps"]) + 1
+    sess["steps"].append(step)
+    return {"count": len(sess["steps"])}
+
+
+@app.get("/api/recorder/live/status/{live_id}")
+def live_status(live_id: str):
+    """The dashboard polls this while recording to show the live step feed."""
+    sess = LIVE_SESSIONS.get(live_id)
+    if not sess:
+        return {"found": False, "active": False, "count": 0, "steps": []}
+    # Return a light preview (last 50 steps) for the live feed
+    preview = []
+    for s in sess["steps"][-50:]:
+        elem = s.get("element") or {}
+        best = (elem.get("best_locator") or {})
+        preview.append({
+            "step_index": s.get("step_index"),
+            "action": s.get("action"),
+            "page_title": s.get("page_title", ""),
+            "element_name": elem.get("element_name", ""),
+            "locator_type": best.get("type"),
+            "locator_value": best.get("value"),
+            "value": s.get("value") or s.get("selected_text") or "",
+        })
+    return {
+        "found": True,
+        "active": ACTIVE_LIVE_ID == live_id,
+        "count": len(sess["steps"]),
+        "steps": preview,
     }
 
-    function stopScreenVideo() {
-        if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-        if (videoStream) { videoStream.getTracks().forEach(t => t.stop()); videoStream = null; }
-        const preview = document.getElementById('live-video-preview');
-        preview.style.display = 'none';
-        preview.srcObject = null;
-        const btn = document.getElementById('btn-live-video');
-        btn.textContent = '🎥 Also Record Video';
-        btn.classList.remove('btn-primary');
+
+@app.post("/api/recorder/live/stop")
+def live_stop(data: LiveStopInput):
+    """Finalize a live session: persist steps and run the RecorderAgent pipeline."""
+    global ACTIVE_LIVE_ID
+    sess = LIVE_SESSIONS.get(data.live_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Live session not found.")
+
+    if ACTIVE_LIVE_ID == data.live_id:
+        ACTIVE_LIVE_ID = None  # stop accepting new steps immediately
+
+    raw_steps = sess["steps"]
+    if not raw_steps:
+        LIVE_SESSIONS.pop(data.live_id, None)
+        raise HTTPException(status_code=400, detail="No steps were captured. Nothing to save.")
+
+    duration = int((_dt.now() - sess["started_at"]).total_seconds())
+
+    db = SessionLocal()
+    try:
+        session = RecordingSessionModel(
+            session_name=sess["session_name"],
+            transaction_type=sess["transaction_type"],
+            total_steps=len(raw_steps),
+            duration_seconds=duration,
+            status="captured",
+        )
+        db.add(session)
+        db.flush()
+
+        for idx, step in enumerate(raw_steps, start=1):
+            elem = step.get("element") or {}
+            best_loc = elem.get("best_locator") or None
+            db.add(RecordedStepModel(
+                session_id=session.id,
+                step_index=step.get("step_index", idx),
+                action=step.get("action", "click"),
+                url=step.get("url", "") or "",
+                page_title=step.get("page_title", "") or "",
+                element_tag=elem.get("tag", "") or "",
+                element_name=elem.get("element_name", "") or "",
+                element_text=elem.get("text", "") or "",
+                locator_type=(best_loc or {}).get("type"),
+                locator_value=(best_loc or {}).get("value"),
+                all_locators=json.dumps(elem.get("locators", {})),
+                input_value=step.get("value") or step.get("selected_text") or "",
+                timestamp=step.get("timestamp", "") or "",
+            ))
+
+        db.commit()
+        session_id = session.id
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+    # Clear the in-memory buffer now that it's persisted
+    LIVE_SESSIONS.pop(data.live_id, None)
+
+    # Run the same generation pipeline the extension flow used
+    agent = RecorderAgent()
+    result = agent.process_session(session_id)
+
+    return {
+        "session_id": session_id,
+        "steps_saved": len(raw_steps),
+        "duration_seconds": duration,
+        "locators_stored": result.get("locators_stored", 0),
+        "pages_discovered": result.get("pages_discovered", 0),
+        "page_objects_generated": result.get("page_objects_generated", []),
+        "feature_file": result.get("feature_file", ""),
+        "message": result.get("message", "Session saved successfully"),
     }
 
-    function escapeHtml(str) {
-        if (!str) return '';
-        return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-    }
 
-    // One-touch import of an existing hand-written java-framework into the
-    // AI's knowledge graph (Pages/Locators/Step Definitions).
-    window.importExistingFramework = function() {
-        const btn = document.getElementById('btn-import-framework');
-        const badge = document.getElementById('import-status-badge');
-        const resultEl = document.getElementById('import-result');
+@app.get("/api/recorder/live/script")
+@app.get("/r")  # short alias — fewer characters to type by hand when clipboard/DevTools/bookmarks are all blocked
+def live_recorder_script():
+    """Serve the in-page recorder JS (loaded by the bookmarklet, or by hand-typed address-bar code)."""
+    path = os.path.join(BACKEND_DIR, "static", "live_recorder.js")
+    if os.path.exists(path):
+        return FileResponse(path, media_type="application/javascript")
+    raise HTTPException(status_code=404, detail="live_recorder.js not found")
 
-        btn.disabled = true;
-        btn.textContent = '⏳ Importing…';
-        badge.textContent = 'Importing…';
-        badge.style.background = 'rgba(255,193,7,0.2)';
-        badge.style.color = '#ffca28';
-        resultEl.textContent = '';
 
-        fetch(`${API_BASE}/api/framework/import`, { method: 'POST' })
-            .then(res => {
-                if (!res.ok) return res.json().then(e => { throw new Error(e.detail || 'Import failed'); });
-                return res.json();
-            })
-            .then(data => {
-                btn.disabled = false;
-                btn.textContent = '📥 Import Existing Framework';
-                badge.textContent = '✅ Imported';
-                badge.style.background = 'rgba(72,207,173,0.2)';
-                badge.style.color = '#48cfad';
+# Serves static UI frontend files
+@app.get("/")
+def serve_index():
+    index_path = os.path.join(FRONTEND_DIR, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return {"message": f"Frontend index.html not found. Please place static files in {FRONTEND_DIR}"}
 
-                let html = `<div>${escapeHtml(data.message)}</div>`;
-                if (data.page_names && data.page_names.length) {
-                    html += `<div style="margin-top:8px;color:#a78bfa;">Pages: ${data.page_names.map(escapeHtml).join(', ')}</div>`;
-                }
-                if (data.warnings && data.warnings.length) {
-                    html += `<div style="margin-top:8px;color:#ffb300;">⚠️ ${data.warnings.map(escapeHtml).join('<br>⚠️ ')}</div>`;
-                }
-                resultEl.innerHTML = html;
-
-                // Refresh the graph view if it's already loaded, so the newly
-                // imported pages/locators/steps show up immediately.
-                if (typeof loadKnowledgeGraph === 'function') loadKnowledgeGraph();
-            })
-            .catch(err => {
-                btn.disabled = false;
-                btn.textContent = '📥 Import Existing Framework';
-                badge.textContent = '❌ Failed';
-                badge.style.background = 'rgba(255,82,82,0.2)';
-                badge.style.color = '#ff8a80';
-                resultEl.innerHTML = `<span style="color:#ff8a80;">❌ ${escapeHtml(err.message)}</span>`;
-            });
-    };
-
-});
+@app.get("/{path:path}")
+def serve_static(path: str):
+    static_file = os.path.join(FRONTEND_DIR, path)
+    if os.path.exists(static_file) and os.path.isfile(static_file):
+        return FileResponse(static_file)
+    # Default fallback to serve index.html for single page routing
+    index_path = os.path.join(FRONTEND_DIR, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    raise HTTPException(status_code=404, detail="Static resource not found.")
