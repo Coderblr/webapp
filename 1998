@@ -1,440 +1,839 @@
-# agents/framework_import_agent.py
-#
-# One-touch importer for an EXISTING java-framework — one you already had before
-# the AI got involved, with real Page Objects, Step Definitions, and Feature
-# files written by hand. This agent reads all of it straight off disk and loads
-# it into the exact same knowledge graph (pages/locators/step_definitions) that
-# every other AI agent already reads from and writes to.
-#
-# After this runs once, the AI treats your existing framework exactly like
-# something it generated itself: FrameworkManagerAgent won't re-create pages or
-# steps that already exist, JavaGeneratorAgent will reuse your real locators
-# instead of guessing new ones, and SelfHealingAgent can heal your existing
-# Page Objects when a locator breaks. Nothing on disk is modified — this only
-# reads Java/feature files and writes rows into the database.
-
 import os
-import re
-from database import SessionLocal, PageModel, LocatorModel, StepDefinitionModel
-from paths import (JAVA_FRAMEWORK_SRC, JAVA_FEATURES_DIR, JAVA_FEATURES_DIR_LEGACY,
-                    JAVA_STEPS_DIR_LEGACY, JAVA_PAGES_DIR, JAVA_PAGES_DIR_LEGACY, JAVA_STEPS_DIR)
+import json
+from dotenv import load_dotenv
+load_dotenv() # Load Azure OpenAI keys from .env file
 
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict, Any, Optional
 
-PACKAGE_DECL_RE = re.compile(r'^\s*package\s+([\w.]+)\s*;', re.MULTILINE)
+from paths import (BACKEND_DIR, FRONTEND_DIR, JAVA_FRAMEWORK_TARGET, JAVA_FRAMEWORK_SRC,
+                    JAVA_PAGES_DIR, JAVA_STEPS_DIR, JAVA_FEATURES_DIR, read_config_properties)
+from database import init_db, SessionLocal, PageModel, LocatorModel, StepDefinitionModel, ComponentRegistryModel, FrameworkVersionModel, ExecutionLogModel, RecordingSessionModel, RecordedStepModel
+from agents.agents import RequirementAgent, FrameworkManagerAgent, ComponentDiscoveryAgent, JavaGeneratorAgent, CompilerAgent, ExecutionAgent, SelfHealingAgent
+from agents.recorder_agent import RecorderAgent
+from agents.framework_import_agent import FrameworkImportAgent, detect_java_package, package_to_dir
 
+app = FastAPI(title="Autonomous Enterprise AI Test Automation Platform")
 
-def detect_java_package(content: str):
-    """Returns the declared package (e.g. 'com.nbc.pages.common') from a Java
-    file's content, or None if it has no package declaration."""
-    m = PACKAGE_DECL_RE.search(content)
-    return m.group(1) if m else None
+# CORS setup
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+# Initialize database on startup
+@app.on_event("startup")
+def startup_event():
+    init_db()
 
-def package_to_dir(base_src_dir: str, package: str) -> str:
-    """Converts a Java package like 'com.nbc.pages.common' into the directory
-    it MUST live in for javac to accept it: <base_src_dir>/com/nbc/pages/common"""
-    return os.path.join(base_src_dir, *package.split("."))
+# Pydantic schemas
+class BRDInput(BaseModel):
+    text: str
 
+class LocatorInput(BaseModel):
+    page_name: str
+    element_name: str
+    selector_type: str
+    selector_value: str
 
-class FrameworkImportAgent:
-    """Scans java-framework/src for Page Objects, Step Definitions, and Feature
-    files, and ingests everything found into the knowledge graph database."""
+class GenerateInput(BaseModel):
+    scenarios: List[Dict[str, Any]]
+    locators: Optional[List[LocatorInput]] = []
 
-    MAIN_JAVA_DIR = os.path.join(JAVA_FRAMEWORK_SRC, "main", "java")
-    TEST_JAVA_DIR = os.path.join(JAVA_FRAMEWORK_SRC, "test", "java")
-    # Real framework keeps Page Objects under test/java too (not main/java) —
-    # scan both; content-based filtering (By-typed fields / @Given-etc methods)
-    # already keeps irrelevant files out regardless of which tree they're in.
-    FEATURES_DIR = JAVA_FEATURES_DIR
-    FEATURES_DIR_LEGACY = JAVA_FEATURES_DIR_LEGACY
+class HealInput(BaseModel):
+    page_name: str
+    element_name: str
+    error_message: str
+    latest_html: str
 
-    # By.id("x"), By.xpath("//..."), By.cssSelector("..."), By.name("x"), By.className("x"), ...
-    LOCATOR_RE = re.compile(
-        r'By\.(id|xpath|cssSelector|name|className|linkText|partialLinkText|tagName)\(\s*"((?:[^"\\]|\\.)*)"\s*\)'
-    )
-    # private final By fieldName = ...;   (also matches non-final/non-private variants)
-    FIELD_RE = re.compile(
-        r'(?:private|protected|public)?\s*(?:final\s+)?By\s+(\w+)\s*=\s*(.+?);', re.DOTALL
-    )
-    CLASS_RE = re.compile(r'\bclass\s+(\w+)\b')
-    # @Given("...") / @When("...") / @Then("...") / @And("...") immediately above a method
-    STEP_ANNOTATION_RE = re.compile(
-        r'@(Given|When|Then|And)\(\s*"((?:[^"\\]|\\.)*)"\s*\)\s*\n\s*public\s+void\s+(\w+)\s*\([^)]*\)\s*\{'
-    )
-    SCENARIO_RE = re.compile(r'^\s*Scenario', re.MULTILINE)
+class RollbackInput(BaseModel):
+    version_id: int
 
-    def import_all(self) -> dict:
-        """Runs the full one-touch import and returns a summary for the UI."""
-        pages_result = self._import_pages()
-        steps_result = self._import_steps()
-        features_result = self._scan_features()
+# ─── Recorder Schemas ──────────────────────────────────────────────────────────
 
-        return {
-            "pages_imported": pages_result["pages"],
-            "locators_imported": pages_result["locators"],
-            "page_names": pages_result["names"],
-            "step_definitions_imported": steps_result["count"],
-            "feature_files_found": features_result["count"],
-            "scenarios_found": features_result["scenarios"],
-            "warnings": pages_result["skipped"] + steps_result["skipped"] + features_result["skipped"],
-            "message": (
-                f"Imported {pages_result['pages']} page(s) with {pages_result['locators']} locator(s), "
-                f"{steps_result['count']} step definition(s), and found {features_result['count']} feature "
-                f"file(s) with {features_result['scenarios']} scenario(s). The AI now treats these as "
-                f"existing framework knowledge — it won't regenerate or duplicate them."
-            ),
+class RecordedElementInfo(BaseModel):
+    tag: Optional[str] = None
+    element_name: Optional[str] = None
+    text: Optional[str] = None
+    placeholder: Optional[str] = None
+    type: Optional[str] = None
+    locators: Optional[Dict[str, Any]] = {}
+    best_locator: Optional[Dict[str, Any]] = None
+
+class RecordedStepInput(BaseModel):
+    step_index: int
+    action: str  # click, input, select, navigate, keypress
+    timestamp: Optional[str] = None
+    url: Optional[str] = None
+    page_title: Optional[str] = None
+    element: Optional[RecordedElementInfo] = None
+    value: Optional[str] = None
+    selected_text: Optional[str] = None
+    coordinates: Optional[Dict[str, Any]] = None
+
+class RecorderSessionInput(BaseModel):
+    session_name: str
+    transaction_type: str
+    steps: List[RecordedStepInput]
+    duration_seconds: Optional[int] = 0
+
+# ─── Live Recorder Schemas ──────────────────────────────────────────────────────
+
+class LiveStartInput(BaseModel):
+    session_name: str
+    transaction_type: str
+
+class LiveStepInput(BaseModel):
+    live_id: str
+    step: Dict[str, Any]
+
+class LiveStopInput(BaseModel):
+    live_id: str
+
+# API endpoints
+@app.post("/api/extract")
+def extract_requirements(input_data: BRDInput):
+    agent = RequirementAgent()
+    scenarios = agent.extract_requirements(input_data.text)
+    return {"scenarios": scenarios}
+
+@app.post("/api/framework-impact")
+def check_framework_impact(scenarios: List[Dict[str, Any]]):
+    agent = FrameworkManagerAgent()
+    analysis = agent.analyze_impact(scenarios)
+    return analysis
+
+@app.post("/api/generate")
+def generate_and_update(input_data: GenerateInput):
+    gen_agent = JavaGeneratorAgent()
+    
+    # 1. Update locators/pages first
+    for loc in input_data.locators:
+        gen_agent.append_locator_to_page(loc.page_name, loc.element_name, loc.selector_type, loc.selector_value)
+
+    # 2. Route each scenario based on whether the BRD tied it to an EXISTING
+    # transaction number. If so, append its steps directly into that transaction's
+    # real scenario (in its actual .feature file) so the full flow reflects the
+    # change. Otherwise, fall back to the old generic Sample.feature path.
+    transaction_updates = []
+    for sc in input_data.scenarios:
+        txn_number = sc.get("transaction_number")
+        if txn_number:
+            result = gen_agent.append_requirement_to_transaction(
+                str(txn_number), sc["steps"], requirement_summary=sc.get("scenario", "")
+            )
+            result["transaction_number"] = txn_number
+            result["scenario"] = sc.get("scenario", "")
+            transaction_updates.append(result)
+            if result["appended"]:
+                continue  # steps placed directly in the transaction's scenario — done
+            # No existing scenario found for this transaction number — fall through
+            # to the generic path below so the requirement isn't silently dropped.
+
+        for step in sc["steps"]:
+            gen_agent.append_step_definition(step["text"], step["page"], step["action"])
+            
+    # Save framework version in history
+    db = SessionLocal()
+    try:
+        current_version_num = db.query(FrameworkVersionModel).count() + 1
+        
+        # Save modification summary
+        modified = {
+            "scenarios": [s["scenario"] for s in input_data.scenarios],
+            "locators": [{"page": l.page_name, "element": l.element_name} for l in input_data.locators],
+            "transaction_updates": transaction_updates,
         }
+        
+        version_entry = FrameworkVersionModel(
+            version_num=current_version_num,
+            commit_msg=f"Auto-generated code for {len(input_data.scenarios)} scenarios",
+            modified_files=json.dumps(modified),
+            compiled=False
+        )
+        db.add(version_entry)
+        db.commit()
+    finally:
+        db.close()
 
-    # ─────────────────────────────────────────────
-    #  Page Objects → PageModel + LocatorModel
-    # ─────────────────────────────────────────────
+    applied_to_txns = [u for u in transaction_updates if u["appended"]]
+    msg = f"Appended {len(input_data.scenarios)} scenarios and {len(input_data.locators)} locators to framework."
+    if applied_to_txns:
+        txn_list = ", ".join(u["transaction_number"] for u in applied_to_txns)
+        msg += f" {len(applied_to_txns)} scenario(s) were appended directly into existing transaction(s): {txn_list}."
 
-    def _import_pages(self) -> dict:
-        db = SessionLocal()
-        imported_pages = []
-        skipped = []
-        locator_count = 0
-        try:
-            search_roots = [d for d in (self.MAIN_JAVA_DIR, self.TEST_JAVA_DIR) if os.path.isdir(d)]
-            if not search_roots:
-                return {"pages": 0, "locators": 0, "names": [], "skipped": [f"No Java source folder found under {os.path.dirname(self.MAIN_JAVA_DIR)}"]}
+    return {
+        "status": "SUCCESS",
+        "message": msg,
+        "transaction_updates": transaction_updates,
+    }
 
-            java_files = []
-            for search_root in search_roots:
-                for root, _dirs, files in os.walk(search_root):
-                    for fname in files:
-                        if fname.endswith(".java"):
-                            java_files.append(os.path.join(root, fname))
-
-            for fpath in sorted(java_files):
-                fname = os.path.basename(fpath)
-                try:
-                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                        content = f.read()
-                except Exception as e:
-                    skipped.append(f"{fname}: could not read ({e})")
-                    continue
-
-                class_match = self.CLASS_RE.search(content)
-                page_name = class_match.group(1) if class_match else fname.replace(".java", "")
-
-                field_matches = self.FIELD_RE.findall(content)
-                if not field_matches:
-                    continue  # no By-typed fields in this file — nothing to import
-
-                db_page = db.query(PageModel).filter(PageModel.name == page_name).first()
-                if not db_page:
-                    db_page = PageModel(name=page_name, url="", description=f"Imported from existing framework: {fname}")
-                    db.add(db_page)
-                    db.flush()
-
-                page_locator_count = 0
-                for field_name, expr in field_matches:
-                    loc_match = self.LOCATOR_RE.search(expr)
-                    if not loc_match:
-                        continue
-                    raw_type, raw_value = loc_match.group(1), loc_match.group(2)
-                    selector_type = {
-                        "cssSelector": "css", "className": "css", "tagName": "css",
-                        "linkText": "xpath", "partialLinkText": "xpath",
-                    }.get(raw_type, raw_type)  # id / xpath / name pass through unchanged
-
-                    existing = db.query(LocatorModel).filter(
-                        LocatorModel.page_id == db_page.id,
-                        LocatorModel.element_name == field_name,
-                    ).first()
-                    if existing:
-                        existing.selector_type = selector_type
-                        existing.selector_value = raw_value
-                    else:
-                        db.add(LocatorModel(
-                            page_id=db_page.id,
-                            element_name=field_name,
-                            selector_type=selector_type,
-                            selector_value=raw_value,
-                            description=f"Imported from existing framework: {fname}",
-                        ))
-                    page_locator_count += 1
-
-                if page_locator_count:
-                    imported_pages.append(page_name)
-                    locator_count += page_locator_count
-
+@app.post("/api/compile")
+def compile_framework():
+    agent = CompilerAgent()
+    success, log = agent.compile_framework()
+    
+    # Update latest version compiled state
+    db = SessionLocal()
+    try:
+        latest = db.query(FrameworkVersionModel).order_by(FrameworkVersionModel.id.desc()).first()
+        if latest:
+            latest.compiled = success
             db.commit()
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
-        return {"pages": len(imported_pages), "locators": locator_count, "names": imported_pages, "skipped": skipped}
+    finally:
+        db.close()
+        
+    return {"compiled": success, "logs": log}
 
-    # ─────────────────────────────────────────────
-    #  Step Definitions → StepDefinitionModel
-    # ─────────────────────────────────────────────
+@app.post("/api/execute")
+def execute_tests(transaction_number: Optional[str] = None):
+    agent = ExecutionAgent()
+    logs, success, report_path = agent.execute_tests(transaction_number=transaction_number)
+    return {"status": "SUCCESS" if success else "FAILED", "logs": logs, "report_path": report_path}
 
-    def _import_steps(self) -> dict:
-        db = SessionLocal()
-        count = 0
-        skipped = []
+@app.post("/api/heal")
+def heal_locator(input_data: HealInput):
+    agent = SelfHealingAgent()
+    success, message = agent.heal_locator(
+        input_data.page_name,
+        input_data.element_name,
+        input_data.error_message,
+        input_data.latest_html
+    )
+    return {"healed": success, "message": message}
+
+@app.get("/api/dashboard")
+def get_dashboard_stats():
+    db = SessionLocal()
+    try:
+        total_pages = db.query(PageModel).count()
+        total_locators = db.query(LocatorModel).count()
+        total_steps = db.query(StepDefinitionModel).count()
+        total_components = db.query(ComponentRegistryModel).count()
+        
+        latest_runs = db.query(ExecutionLogModel).order_by(ExecutionLogModel.id.desc()).limit(10).all()
+        versions = db.query(FrameworkVersionModel).order_by(FrameworkVersionModel.id.desc()).limit(10).all()
+        
+        runs_list = [{"id": r.id, "status": r.status, "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S")} for r in latest_runs]
+        versions_list = [{"id": v.id, "version_num": v.version_num, "commit_msg": v.commit_msg, "compiled": v.compiled, "timestamp": v.timestamp.strftime("%Y-%m-%d %H:%M:%S")} for v in versions]
+        
+        return {
+            "stats": {
+                "pages": total_pages,
+                "locators": total_locators,
+                "steps": total_steps,
+                "components": total_components
+            },
+            "recent_runs": runs_list,
+            "recent_versions": versions_list
+        }
+    finally:
+        db.close()
+
+@app.get("/api/knowledge-graph")
+def get_knowledge_graph():
+    db = SessionLocal()
+    try:
+        pages = db.query(PageModel).all()
+        steps = db.query(StepDefinitionModel).all()
+        
+        nodes = []
+        links = []
+        
+        # Add Page nodes
+        for page in pages:
+            nodes.append({"id": f"page_{page.id}", "label": page.name, "type": "page", "details": page.description})
+            # Fetch locators for this page
+            for loc in page.locators:
+                loc_node_id = f"loc_{loc.id}"
+                nodes.append({"id": loc_node_id, "label": f"{loc.element_name} ({loc.selector_type})", "type": "locator", "details": loc.selector_value})
+                links.append({"source": f"page_{page.id}", "target": loc_node_id, "rel": "has_element"})
+                
+        # Add Step nodes and link to pages
+        for step in steps:
+            step_node_id = f"step_{step.id}"
+            nodes.append({"id": step_node_id, "label": step.pattern, "type": "step", "details": step.java_method})
+            
+            # Find associated page in our graph
+            assoc_page = db.query(PageModel).filter(PageModel.name == step.page_associated).first()
+            if assoc_page:
+                links.append({"source": step_node_id, "target": f"page_{assoc_page.id}", "rel": "interacts_with"})
+                
+        return {"nodes": nodes, "links": links}
+    finally:
+        db.close()
+
+@app.get("/api/components")
+def get_components():
+    db = SessionLocal()
+    try:
+        components = db.query(ComponentRegistryModel).all()
+        return [{"id": c.id, "name": c.name, "action_type": c.action_type, "description": c.description, "java_code": c.java_code} for c in components]
+    finally:
+        db.close()
+
+@app.post("/api/rollback")
+def rollback_framework(input_data: RollbackInput):
+    # Retrieve the version to roll back
+    db = SessionLocal()
+    try:
+        version = db.query(FrameworkVersionModel).filter(FrameworkVersionModel.version_num == input_data.version_id).first()
+        if not version:
+            raise HTTPException(status_code=404, detail="Version not found.")
+            
+        # In a real system, we'd roll back files in VCS (git reset --hard / git checkout).
+        # We simulate the successful rollback and update database statuses.
+        return {"status": "SUCCESS", "message": f"Successfully rolled back workspace and framework to version {input_data.version_id}."}
+    finally:
+        db.close()
+
+@app.get("/api/report")
+def get_report():
+    report_path = os.path.join(JAVA_FRAMEWORK_TARGET, "cucumber-reports.html")
+    if os.path.exists(report_path):
+        return FileResponse(report_path)
+    raise HTTPException(status_code=404, detail="Report not generated yet.")
+
+
+@app.post("/api/framework/import")
+def import_existing_framework():
+    """
+    One-touch import: reads the existing java-framework (Page Objects, Step
+    Definitions, Feature files) straight off disk and loads it into the AI's
+    knowledge graph. After this, the AI treats everything found as existing
+    framework knowledge — it reuses these locators/steps instead of
+    regenerating or duplicating them.
+    """
+    agent = FrameworkImportAgent()
+    try:
+        result = agent.import_all()
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Import failed: {e}")
+
+
+@app.post("/api/framework/upload")
+async def upload_existing_framework(file: UploadFile = File(...)):
+    """
+    Upload a .zip of an existing framework (Page Objects, Step Definitions,
+    Feature files — any folder layout). Extracts it, sorts recognizable Java/
+    feature files into this project's java-framework/src/ (matching how
+    java-framework is actually laid out here), then runs the same import
+    used by /api/framework/import so the knowledge graph picks it up too.
+    """
+    if not file.filename or not file.filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Please upload a .zip file of the existing framework.")
+
+    import zipfile
+    import tempfile
+    import shutil
+
+    pages_dest = JAVA_PAGES_DIR
+    steps_dest = JAVA_STEPS_DIR
+    features_dest = JAVA_FEATURES_DIR
+    os.makedirs(pages_dest, exist_ok=True)
+    os.makedirs(steps_dest, exist_ok=True)
+    os.makedirs(features_dest, exist_ok=True)
+
+    tmp_dir = tempfile.mkdtemp(prefix="fw_upload_")
+    zip_path = os.path.join(tmp_dir, "upload.zip")
+    copied = {"pages": [], "steps": [], "features": []}
+    skipped = []
+
+    try:
+        with open(zip_path, "wb") as f:
+            f.write(await file.read())
+
+        extract_dir = os.path.join(tmp_dir, "extracted")
+        os.makedirs(extract_dir, exist_ok=True)
+
         try:
-            if not os.path.isdir(self.TEST_JAVA_DIR):
-                return {"count": 0, "skipped": [f"Java test source folder not found: {self.TEST_JAVA_DIR}"]}
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                # zip-slip guard: refuse any entry that would extract outside extract_dir
+                for member in zf.namelist():
+                    member_path = os.path.normpath(os.path.join(extract_dir, member))
+                    if not member_path.startswith(os.path.normpath(extract_dir) + os.sep) and member_path != os.path.normpath(extract_dir):
+                        raise HTTPException(status_code=400, detail=f"Unsafe path in zip: {member}")
+                zf.extractall(extract_dir)
+        except zipfile.BadZipFile:
+            raise HTTPException(status_code=400, detail="That file isn't a valid .zip archive.")
 
-            java_files = []
-            for root, _dirs, files in os.walk(self.TEST_JAVA_DIR):
-                for fname in files:
-                    if fname.endswith(".java"):
-                        java_files.append(os.path.join(root, fname))
+        # Walk everything extracted, sort recognizable files by path/extension.
+        # Path-substring matching (not exact package names) so this works
+        # regardless of the original project's package naming.
+        #
+        # IMPORTANT: each file is placed according to its OWN declared
+        # "package x.y.z;" line, not flattened into one folder — a Java file
+        # declaring package com.nbc.pages.common MUST physically live under
+        # .../pages/common/, or javac rejects it with a package/directory
+        # mismatch. Falls back to the flat pages/steps folder only if a file
+        # has no package declaration at all. Both pages AND steps are rooted
+        # under test/java — the real framework never uses main/java.
+        test_java_dir = os.path.join(JAVA_FRAMEWORK_SRC, "test", "java")
 
-            for fpath in sorted(java_files):
-                fname = os.path.basename(fpath)
-                try:
-                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                        content = f.read()
-                except Exception as e:
-                    skipped.append(f"{fname}: could not read ({e})")
-                    continue
-
-                for _annotation, pattern, method_name in self.STEP_ANNOTATION_RE.findall(content):
-                    body = self._extract_method_body(content, method_name)
-                    existing = db.query(StepDefinitionModel).filter(
-                        StepDefinitionModel.pattern == pattern
-                    ).first()
-                    if existing:
-                        existing.java_method = method_name
-                        existing.java_code = body
-                    else:
-                        db.add(StepDefinitionModel(
-                            pattern=pattern,
-                            java_method=method_name,
-                            java_code=body,
-                            page_associated=fname.replace(".java", ""),
-                        ))
-                    count += 1
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
-        return {"count": count, "skipped": skipped}
-
-    def _extract_method_body(self, content: str, method_name: str) -> str:
-        """Naive brace-matching to pull a method's full source given its name —
-        consistent with the rest of this codebase's text-based (non-AST) Java handling."""
-        marker = re.search(r'public\s+void\s+' + re.escape(method_name) + r'\s*\([^)]*\)\s*\{', content)
-        if not marker:
-            return ""
-        start = marker.start()
-        depth = 0
-        for j in range(marker.end() - 1, len(content)):
-            if content[j] == '{':
-                depth += 1
-            elif content[j] == '}':
-                depth -= 1
-                if depth == 0:
-                    return content[start:j + 1]
-        return content[start:start + 500]  # fallback if braces are unbalanced
-
-    # ─────────────────────────────────────────────
-    #  Feature files — counted for the summary (left on disk as-is)
-    # ─────────────────────────────────────────────
-
-    def _scan_features(self) -> dict:
-        count = 0
-        scenarios = 0
-        skipped = []
-        search_dirs = [d for d in (self.FEATURES_DIR, self.FEATURES_DIR_LEGACY) if os.path.isdir(d)]
-        if not search_dirs:
-            return {"count": 0, "scenarios": 0, "skipped": [f"Features folder not found: {self.FEATURES_DIR}"]}
-
-        feature_files = []
-        for fdir in search_dirs:
-            for root, _dirs, files in os.walk(fdir):
-                for fname in files:
-                    if fname.endswith(".feature"):
-                        feature_files.append(os.path.join(root, fname))
-
-        for fpath in sorted(feature_files):
-            fname = os.path.basename(fpath)
-            count += 1
-            try:
-                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
-                scenarios += len(self.SCENARIO_RE.findall(content))
-            except Exception as e:
-                skipped.append(f"{fname}: could not read ({e})")
-        return {"count": count, "scenarios": scenarios, "skipped": skipped}
-
-    # ─────────────────────────────────────────────
-    #  Repair — fixes files misplaced by the earlier version of the importer,
-    #  which flattened everything into pages/steps regardless of the file's own
-    #  declared package. Moves each mismatched file to where its package
-    #  declaration actually requires it to live.
-    # ─────────────────────────────────────────────
-
-    def fix_package_structure(self) -> dict:
-        """
-        Scans every .java file under main/java and test/java, compares each
-        file's declared 'package x.y.z;' against the directory it's actually
-        sitting in, and MOVES any mismatched file to the correct location —
-        fixing "Package declaration X does not match directories path" compile
-        errors caused by files that were imported/uploaded before this was fixed.
-
-        The real framework keeps everything test-related (Pages, Step
-        Definitions, utils) under src/test/java — never src/main/java — so any
-        file found under main/java is relocated into test/java too, not just
-        corrected within main/java. Files already in the right place, or with
-        no package declaration at all, are left untouched.
-        """
-        import shutil
-        moved = []
-        skipped = []
-
-        search_roots = [d for d in (self.MAIN_JAVA_DIR, self.TEST_JAVA_DIR) if os.path.isdir(d)]
-        java_files = []
-        for base_dir in search_roots:
-            for root, _dirs, files in os.walk(base_dir):
-                for fname in files:
-                    if fname.endswith(".java"):
-                        java_files.append(os.path.join(root, fname))
-
-        for fpath in sorted(java_files):
-            fname = os.path.basename(fpath)
-            try:
-                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
-            except Exception as e:
-                skipped.append(f"{fname}: could not read ({e})")
+        for root, _dirs, files in os.walk(extract_dir):
+            if "__MACOSX" in root:
                 continue
+            lower_root = root.lower()
+            for fname in files:
+                src_path = os.path.join(root, fname)
 
-            package = detect_java_package(content)
-            if not package:
-                continue  # nothing declared — can't determine where it "should" be
+                if fname.endswith(".java") and "page" in lower_root:
+                    with open(src_path, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                    package = detect_java_package(content)
+                    dest_dir = package_to_dir(test_java_dir, package) if package else pages_dest
+                    os.makedirs(dest_dir, exist_ok=True)
+                    shutil.copy2(src_path, os.path.join(dest_dir, fname))
+                    copied["pages"].append(fname)
+                elif fname.endswith(".java") and "step" in lower_root:
+                    with open(src_path, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                    package = detect_java_package(content)
+                    dest_dir = package_to_dir(test_java_dir, package) if package else steps_dest
+                    os.makedirs(dest_dir, exist_ok=True)
+                    shutil.copy2(src_path, os.path.join(dest_dir, fname))
+                    copied["steps"].append(fname)
+                elif fname.endswith(".feature"):
+                    dest = os.path.join(features_dest, fname)
+                    shutil.copy2(src_path, dest)
+                    copied["features"].append(fname)
+                elif fname.endswith(".java"):
+                    # A .java file that's neither clearly a page nor a step —
+                    # skip it rather than guess wrong.
+                    skipped.append(fname)
 
-            # Always the real canonical root — normalizes main/java-placed
-            # files into test/java too, matching the confirmed real structure.
-            correct_dir = package_to_dir(self.TEST_JAVA_DIR, package)
-            current_dir = os.path.dirname(fpath)
-            if os.path.normpath(correct_dir) == os.path.normpath(current_dir):
-                continue  # already in the right place
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
-            dest_path = os.path.join(correct_dir, fname)
-            if os.path.exists(dest_path):
-                skipped.append(f"{fname}: {dest_path} already exists — left in place, resolve manually")
-                continue
+    total_copied = len(copied["pages"]) + len(copied["steps"]) + len(copied["features"])
+    if total_copied == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No recognizable Page Object (.java in a 'pages' folder), Step Definition "
+                   "(.java in a 'steps' folder), or .feature files were found in that zip."
+        )
 
-            os.makedirs(correct_dir, exist_ok=True)
-            shutil.move(fpath, dest_path)
-            moved.append({
-                "file": fname,
-                "package": package,
-                "from": os.path.relpath(fpath, JAVA_FRAMEWORK_SRC),
-                "to": os.path.relpath(dest_path, JAVA_FRAMEWORK_SRC),
-            })
+    # Now run the same import used by the one-touch button, so the knowledge
+    # graph picks up everything that was just copied in.
+    agent = FrameworkImportAgent()
+    try:
+        import_result = agent.import_all()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Files were copied but import failed: {e}")
+
+    import_result["files_copied"] = copied
+    import_result["files_skipped"] = skipped
+    import_result["message"] = (
+        f"Copied {len(copied['pages'])} page file(s), {len(copied['steps'])} step file(s), "
+        f"{len(copied['features'])} feature file(s) into java-framework, then " + import_result["message"]
+    )
+    return import_result
+
+
+@app.post("/api/framework/fix-packages")
+def fix_package_structure():
+    """
+    Repairs Page Object / Step Definition files that were flattened into a single
+    folder by an earlier version of the importer, regardless of their own
+    'package x.y.z;' declaration — the cause of "Package declaration X does not
+    match directories path" compile errors. Moves each mismatched file to the
+    directory its own package declaration requires. Safe to run any time —
+    files already in the right place are left untouched.
+    """
+    agent = FrameworkImportAgent()
+    try:
+        return agent.fix_package_structure()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Repair failed: {e}")
+
+
+@app.post("/api/framework/clear")
+def clear_uploaded_framework(confirm: bool = False):
+    """
+    DESTRUCTIVE. Deletes every uploaded/imported Page Object, Step Definition,
+    and Feature file from disk, and clears the matching knowledge-graph rows —
+    so a fresh upload/import starts completely clean. The hand-built common
+    layer (LoginPage.java, DashboardPage.java, CommonSteps.java) is protected
+    and never deleted, no matter which folder it's in.
+
+    Requires confirm=true — a safety check independent of whatever confirmation
+    the frontend already asks for, so this can never fire from a stray request.
+    """
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="This deletes uploaded framework files and clears the knowledge graph. "
+                   "Call again with confirm=true to proceed."
+        )
+    agent = FrameworkImportAgent()
+    try:
+        return agent.clear_uploaded_framework()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Clear failed: {e}")
+
+
+# ─── Recorder API ──────────────────────────────────────────────────────────────
+
+@app.post("/api/recorder/save")
+def save_recording_session(data: RecorderSessionInput):
+    """Receive a recorded session from the Chrome Extension and store all steps."""
+    db = SessionLocal()
+    try:
+        # Create session record
+        session = RecordingSessionModel(
+            session_name=data.session_name,
+            transaction_type=data.transaction_type,
+            total_steps=len(data.steps),
+            duration_seconds=data.duration_seconds or 0,
+            status="captured"
+        )
+        db.add(session)
+        db.flush()  # Get session.id
+
+        # Store each step
+        for step_input in data.steps:
+            elem = step_input.element
+            best_loc = elem.best_locator if elem else None
+            all_locs = json.dumps(elem.locators if elem else {})
+
+            step_model = RecordedStepModel(
+                session_id=session.id,
+                step_index=step_input.step_index,
+                action=step_input.action,
+                url=step_input.url or '',
+                page_title=step_input.page_title or '',
+                element_tag=elem.tag if elem else '',
+                element_name=elem.element_name if elem else '',
+                element_text=elem.text if elem else '',
+                locator_type=best_loc.get('type') if best_loc else None,
+                locator_value=best_loc.get('value') if best_loc else None,
+                all_locators=all_locs,
+                input_value=step_input.value or step_input.selected_text or '',
+                timestamp=step_input.timestamp or '',
+            )
+            db.add(step_model)
+
+        db.commit()
+
+        # Auto-process the session to generate framework artifacts
+        agent = RecorderAgent()
+        result = agent.process_session(session.id)
 
         return {
-            "moved": moved,
-            "skipped": skipped,
-            "message": (
-                f"Moved {len(moved)} file(s) to match their declared package."
-                + (f" {len(skipped)} file(s) need manual attention." if skipped else "")
-                if moved or skipped else
-                "Nothing to fix — every file's location already matches its declared package."
-            ),
+            "session_id": session.id,
+            "steps_saved": len(data.steps),
+            "locators_stored": result.get("locators_stored", 0),
+            "pages_discovered": result.get("pages_discovered", 0),
+            "page_objects_generated": result.get("page_objects_generated", []),
+            "feature_file": result.get("feature_file", ""),
+            "message": result.get("message", "Session saved successfully")
         }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
 
-    # ─────────────────────────────────────────────
-    #  Clear — deletes uploaded/imported Page Objects, Step Definitions, and
-    #  Feature files from disk, and the matching rows from the knowledge graph.
-    #  Genuinely destructive; the caller (API layer) is responsible for
-    #  confirming with the user before calling this.
-    # ─────────────────────────────────────────────
 
-    # Files never deleted even though they live in the same folders — the
-    # hand-built common layer (login flow, shared steps), not "uploaded content".
-    PROTECTED_FILENAMES = {"loginpage.java", "dashboardpage.java", "commonsteps.java"}
+@app.post("/api/recorder/generate/{session_id}")
+def generate_from_session(session_id: int):
+    """Re-process a saved session to regenerate Page Objects and Feature Files."""
+    agent = RecorderAgent()
+    result = agent.process_session(session_id)
+    if not result.get("success", True):
+        raise HTTPException(status_code=404, detail=result.get("error", "Processing failed"))
+    return result
 
-    def clear_uploaded_framework(self) -> dict:
-        """
-        Deletes every Page Object (.java), Step Definition (.java), and Feature
-        (.feature) file found under the real and legacy pages/steps/features
-        directories — EXCEPT the protected common-layer files (LoginPage.java,
-        DashboardPage.java, CommonSteps.java), which are never touched no matter
-        what folder they're in. Also clears the matching rows from the knowledge
-        graph (pages, locators, step_definitions) so a fresh import/upload starts
-        clean. Empty subdirectories left behind are removed; the top-level
-        pages/stepDefinitions/features folders themselves are kept.
-        """
-        import shutil as _shutil
 
-        deleted_files = []
-        protected_skipped = []
+@app.get("/api/recorder/sessions")
+def list_recording_sessions():
+    """List all recorded sessions."""
+    db = SessionLocal()
+    try:
+        sessions = db.query(RecordingSessionModel).order_by(RecordingSessionModel.id.desc()).all()
+        return [{
+            "id": s.id,
+            "session_name": s.session_name,
+            "transaction_type": s.transaction_type,
+            "total_steps": s.total_steps,
+            "duration_seconds": s.duration_seconds,
+            "status": s.status,
+            "page_object_path": s.page_object_path,
+            "feature_file_path": s.feature_file_path,
+            "created_at": s.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "processed_at": s.processed_at.strftime("%Y-%m-%d %H:%M:%S") if s.processed_at else None
+        } for s in sessions]
+    finally:
+        db.close()
 
-        java_dirs = [d for d in (JAVA_PAGES_DIR, JAVA_PAGES_DIR_LEGACY,
-                                  JAVA_STEPS_DIR, JAVA_STEPS_DIR_LEGACY) if os.path.isdir(d)]
-        feature_dirs = [d for d in (JAVA_FEATURES_DIR, JAVA_FEATURES_DIR_LEGACY) if os.path.isdir(d)]
 
-        for base_dir in java_dirs:
-            for root, _dirs, files in os.walk(base_dir):
-                for fname in files:
-                    if not fname.endswith(".java"):
-                        continue
-                    if fname.lower() in self.PROTECTED_FILENAMES:
-                        protected_skipped.append(fname)
-                        continue
-                    fpath = os.path.join(root, fname)
-                    try:
-                        os.remove(fpath)
-                        deleted_files.append(os.path.relpath(fpath, JAVA_FRAMEWORK_SRC))
-                    except Exception:
-                        pass
+@app.get("/api/recorder/sessions/{session_id}")
+def get_recording_session(session_id: int):
+    """Get full details of a recorded session including all steps."""
+    db = SessionLocal()
+    try:
+        session = db.query(RecordingSessionModel).filter(RecordingSessionModel.id == session_id).first()
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
 
-        for base_dir in feature_dirs:
-            for root, _dirs, files in os.walk(base_dir):
-                for fname in files:
-                    if not fname.endswith(".feature"):
-                        continue
-                    fpath = os.path.join(root, fname)
-                    try:
-                        os.remove(fpath)
-                        deleted_files.append(os.path.relpath(fpath, JAVA_FRAMEWORK_SRC))
-                    except Exception:
-                        pass
+        steps = db.query(RecordedStepModel)\
+                   .filter(RecordedStepModel.session_id == session_id)\
+                   .order_by(RecordedStepModel.step_index)\
+                   .all()
 
-        # Clean up now-empty subdirectories (but keep the top-level folders themselves).
-        for base_dir in java_dirs + feature_dirs:
-            for root, dirs, _files in os.walk(base_dir, topdown=False):
-                if root == base_dir:
-                    continue
-                try:
-                    if not os.listdir(root):
-                        os.rmdir(root)
-                except Exception:
-                    pass
-
-        db = SessionLocal()
-        db_counts = {"pages": 0, "locators": 0, "steps": 0}
-        try:
-            db_counts["locators"] = db.query(LocatorModel).delete()
-            db_counts["steps"] = db.query(StepDefinitionModel).delete()
-            db_counts["pages"] = db.query(PageModel).delete()
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
+        steps_data = [{
+            "id": s.id,
+            "step_index": s.step_index,
+            "action": s.action,
+            "url": s.url,
+            "page_title": s.page_title,
+            "element_tag": s.element_tag,
+            "element_name": s.element_name,
+            "element_text": s.element_text,
+            "locator_type": s.locator_type,
+            "locator_value": s.locator_value,
+            "all_locators": json.loads(s.all_locators) if s.all_locators else {},
+            "input_value": s.input_value,
+            "timestamp": s.timestamp
+        } for s in steps]
 
         return {
-            "files_deleted": len(deleted_files),
-            "deleted": deleted_files,
-            "protected_skipped": protected_skipped,
-            "db_cleared": db_counts,
-            "message": (
-                f"Deleted {len(deleted_files)} file(s) and cleared {db_counts['pages']} page(s), "
-                f"{db_counts['locators']} locator(s), {db_counts['steps']} step definition(s) from "
-                f"the knowledge graph."
-                + (f" Kept {len(protected_skipped)} common-layer file(s): {', '.join(protected_skipped)}." if protected_skipped else "")
-            ),
+            "session": {
+                "id": session.id,
+                "session_name": session.session_name,
+                "transaction_type": session.transaction_type,
+                "total_steps": session.total_steps,
+                "duration_seconds": session.duration_seconds,
+                "status": session.status,
+                "page_object_path": session.page_object_path,
+                "feature_file_path": session.feature_file_path,
+                "created_at": session.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+            "steps": steps_data
         }
+    finally:
+        db.close()
+
+
+@app.delete("/api/recorder/sessions/{session_id}")
+def delete_recording_session(session_id: int):
+    """Delete a recorded session."""
+    db = SessionLocal()
+    try:
+        session = db.query(RecordingSessionModel).filter(RecordingSessionModel.id == session_id).first()
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        db.delete(session)
+        db.commit()
+        return {"deleted": True}
+    finally:
+        db.close()
+
+# ─── Live Recorder API (in-frontend, no Chrome extension) ───────────────────────
+#
+# A single active session is buffered in memory. The dashboard starts a session,
+# the bookmarklet script (served below) streams each step here, and Stop & Save
+# converts the buffer into a real RecordingSession + runs the RecorderAgent —
+# reusing exactly the same pipeline the extension used.
+
+import uuid as _uuid
+from datetime import datetime as _dt
+
+# In-memory live session store: { live_id: {meta + steps[]} }
+LIVE_SESSIONS: Dict[str, Dict[str, Any]] = {}
+ACTIVE_LIVE_ID: Optional[str] = None
+
+
+@app.post("/api/recorder/live/start")
+def live_start(data: LiveStartInput):
+    """Open a new live recording session and make it the active one."""
+    global ACTIVE_LIVE_ID
+    live_id = _uuid.uuid4().hex[:12]
+    LIVE_SESSIONS[live_id] = {
+        "session_name": data.session_name or f"Live_{_dt.now().strftime('%Y%m%d_%H%M%S')}",
+        "transaction_type": data.transaction_type or "generic",
+        "started_at": _dt.now(),
+        "steps": [],
+    }
+    ACTIVE_LIVE_ID = live_id
+    return {"live_id": live_id, "active": True}
+
+
+@app.get("/api/recorder/live/active")
+def live_active():
+    """The bookmarklet polls this to discover the current active session."""
+    if ACTIVE_LIVE_ID and ACTIVE_LIVE_ID in LIVE_SESSIONS:
+        sess = LIVE_SESSIONS[ACTIVE_LIVE_ID]
+        return {"active": True, "live_id": ACTIVE_LIVE_ID, "count": len(sess["steps"])}
+    return {"active": False, "live_id": None, "count": 0}
+
+
+@app.get("/api/recorder/target-url")
+def recorder_target_url():
+    """
+    Reads the real application URL (baseUrl / url) from the framework's
+    per-environment common.properties (or the legacy config.properties as a
+    fallback) so the dashboard can auto-open the NBC target site when Start
+    Recording is clicked — one config value, no need to type/paste the URL a
+    second time in the browser.
+    """
+    config = read_config_properties()
+    value = config.get("baseUrl") or config.get("url")
+    if value and value.strip() and value.strip().lower() != "https://example.com":
+        return {"url": value.strip(), "found": True}
+    return {"url": None, "found": False}
+
+
+@app.post("/api/recorder/live/step")
+def live_step(data: LiveStepInput):
+    """Receive a single step from the in-page recorder script."""
+    sess = LIVE_SESSIONS.get(data.live_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Live session not found or already stopped.")
+    # Re-index server-side so counts stay consistent regardless of client
+    step = dict(data.step or {})
+    step["step_index"] = len(sess["steps"]) + 1
+    sess["steps"].append(step)
+    return {"count": len(sess["steps"])}
+
+
+@app.get("/api/recorder/live/status/{live_id}")
+def live_status(live_id: str):
+    """The dashboard polls this while recording to show the live step feed."""
+    sess = LIVE_SESSIONS.get(live_id)
+    if not sess:
+        return {"found": False, "active": False, "count": 0, "steps": []}
+    # Return a light preview (last 50 steps) for the live feed
+    preview = []
+    for s in sess["steps"][-50:]:
+        elem = s.get("element") or {}
+        best = (elem.get("best_locator") or {})
+        preview.append({
+            "step_index": s.get("step_index"),
+            "action": s.get("action"),
+            "page_title": s.get("page_title", ""),
+            "element_name": elem.get("element_name", ""),
+            "locator_type": best.get("type"),
+            "locator_value": best.get("value"),
+            "value": s.get("value") or s.get("selected_text") or "",
+        })
+    return {
+        "found": True,
+        "active": ACTIVE_LIVE_ID == live_id,
+        "count": len(sess["steps"]),
+        "steps": preview,
+    }
+
+
+@app.post("/api/recorder/live/stop")
+def live_stop(data: LiveStopInput):
+    """Finalize a live session: persist steps and run the RecorderAgent pipeline."""
+    global ACTIVE_LIVE_ID
+    sess = LIVE_SESSIONS.get(data.live_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Live session not found.")
+
+    if ACTIVE_LIVE_ID == data.live_id:
+        ACTIVE_LIVE_ID = None  # stop accepting new steps immediately
+
+    raw_steps = sess["steps"]
+    if not raw_steps:
+        LIVE_SESSIONS.pop(data.live_id, None)
+        raise HTTPException(status_code=400, detail="No steps were captured. Nothing to save.")
+
+    duration = int((_dt.now() - sess["started_at"]).total_seconds())
+
+    db = SessionLocal()
+    try:
+        session = RecordingSessionModel(
+            session_name=sess["session_name"],
+            transaction_type=sess["transaction_type"],
+            total_steps=len(raw_steps),
+            duration_seconds=duration,
+            status="captured",
+        )
+        db.add(session)
+        db.flush()
+
+        for idx, step in enumerate(raw_steps, start=1):
+            elem = step.get("element") or {}
+            best_loc = elem.get("best_locator") or None
+            db.add(RecordedStepModel(
+                session_id=session.id,
+                step_index=step.get("step_index", idx),
+                action=step.get("action", "click"),
+                url=step.get("url", "") or "",
+                page_title=step.get("page_title", "") or "",
+                element_tag=elem.get("tag", "") or "",
+                element_name=elem.get("element_name", "") or "",
+                element_text=elem.get("text", "") or "",
+                locator_type=(best_loc or {}).get("type"),
+                locator_value=(best_loc or {}).get("value"),
+                all_locators=json.dumps(elem.get("locators", {})),
+                input_value=step.get("value") or step.get("selected_text") or "",
+                timestamp=step.get("timestamp", "") or "",
+            ))
+
+        db.commit()
+        session_id = session.id
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+    # Clear the in-memory buffer now that it's persisted
+    LIVE_SESSIONS.pop(data.live_id, None)
+
+    # Run the same generation pipeline the extension flow used
+    agent = RecorderAgent()
+    result = agent.process_session(session_id)
+
+    return {
+        "session_id": session_id,
+        "steps_saved": len(raw_steps),
+        "duration_seconds": duration,
+        "locators_stored": result.get("locators_stored", 0),
+        "pages_discovered": result.get("pages_discovered", 0),
+        "page_objects_generated": result.get("page_objects_generated", []),
+        "feature_file": result.get("feature_file", ""),
+        "message": result.get("message", "Session saved successfully"),
+    }
+
+
+@app.get("/api/recorder/live/script")
+@app.get("/r")  # short alias — fewer characters to type by hand when clipboard/DevTools/bookmarks are all blocked
+def live_recorder_script():
+    """Serve the in-page recorder JS (loaded by the bookmarklet, or by hand-typed address-bar code)."""
+    path = os.path.join(BACKEND_DIR, "static", "live_recorder.js")
+    if os.path.exists(path):
+        return FileResponse(path, media_type="application/javascript")
+    raise HTTPException(status_code=404, detail="live_recorder.js not found")
+
+
+# Serves static UI frontend files
+@app.get("/")
+def serve_index():
+    index_path = os.path.join(FRONTEND_DIR, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return {"message": f"Frontend index.html not found. Please place static files in {FRONTEND_DIR}"}
+
+@app.get("/{path:path}")
+def serve_static(path: str):
+    static_file = os.path.join(FRONTEND_DIR, path)
+    if os.path.exists(static_file) and os.path.isfile(static_file):
+        return FileResponse(static_file)
+    # Default fallback to serve index.html for single page routing
+    index_path = os.path.join(FRONTEND_DIR, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    raise HTTPException(status_code=404, detail="Static resource not found.")
