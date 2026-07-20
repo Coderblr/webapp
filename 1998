@@ -1,839 +1,656 @@
-import os
-import json
-from dotenv import load_dotenv
-load_dotenv() # Load Azure OpenAI keys from .env file
-
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
-
-from paths import (BACKEND_DIR, FRONTEND_DIR, JAVA_FRAMEWORK_TARGET, JAVA_FRAMEWORK_SRC,
-                    JAVA_PAGES_DIR, JAVA_STEPS_DIR, JAVA_FEATURES_DIR, read_config_properties)
-from database import init_db, SessionLocal, PageModel, LocatorModel, StepDefinitionModel, ComponentRegistryModel, FrameworkVersionModel, ExecutionLogModel, RecordingSessionModel, RecordedStepModel
-from agents.agents import RequirementAgent, FrameworkManagerAgent, ComponentDiscoveryAgent, JavaGeneratorAgent, CompilerAgent, ExecutionAgent, SelfHealingAgent
-from agents.recorder_agent import RecorderAgent
-from agents.framework_import_agent import FrameworkImportAgent, detect_java_package, package_to_dir
-
-app = FastAPI(title="Autonomous Enterprise AI Test Automation Platform")
-
-# CORS setup
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Initialize database on startup
-@app.on_event("startup")
-def startup_event():
-    init_db()
-
-# Pydantic schemas
-class BRDInput(BaseModel):
-    text: str
-
-class LocatorInput(BaseModel):
-    page_name: str
-    element_name: str
-    selector_type: str
-    selector_value: str
-
-class GenerateInput(BaseModel):
-    scenarios: List[Dict[str, Any]]
-    locators: Optional[List[LocatorInput]] = []
-
-class HealInput(BaseModel):
-    page_name: str
-    element_name: str
-    error_message: str
-    latest_html: str
-
-class RollbackInput(BaseModel):
-    version_id: int
-
-# ─── Recorder Schemas ──────────────────────────────────────────────────────────
-
-class RecordedElementInfo(BaseModel):
-    tag: Optional[str] = None
-    element_name: Optional[str] = None
-    text: Optional[str] = None
-    placeholder: Optional[str] = None
-    type: Optional[str] = None
-    locators: Optional[Dict[str, Any]] = {}
-    best_locator: Optional[Dict[str, Any]] = None
-
-class RecordedStepInput(BaseModel):
-    step_index: int
-    action: str  # click, input, select, navigate, keypress
-    timestamp: Optional[str] = None
-    url: Optional[str] = None
-    page_title: Optional[str] = None
-    element: Optional[RecordedElementInfo] = None
-    value: Optional[str] = None
-    selected_text: Optional[str] = None
-    coordinates: Optional[Dict[str, Any]] = None
-
-class RecorderSessionInput(BaseModel):
-    session_name: str
-    transaction_type: str
-    steps: List[RecordedStepInput]
-    duration_seconds: Optional[int] = 0
-
-# ─── Live Recorder Schemas ──────────────────────────────────────────────────────
-
-class LiveStartInput(BaseModel):
-    session_name: str
-    transaction_type: str
-
-class LiveStepInput(BaseModel):
-    live_id: str
-    step: Dict[str, Any]
-
-class LiveStopInput(BaseModel):
-    live_id: str
-
-# API endpoints
-@app.post("/api/extract")
-def extract_requirements(input_data: BRDInput):
-    agent = RequirementAgent()
-    scenarios = agent.extract_requirements(input_data.text)
-    return {"scenarios": scenarios}
-
-@app.post("/api/framework-impact")
-def check_framework_impact(scenarios: List[Dict[str, Any]]):
-    agent = FrameworkManagerAgent()
-    analysis = agent.analyze_impact(scenarios)
-    return analysis
-
-@app.post("/api/generate")
-def generate_and_update(input_data: GenerateInput):
-    gen_agent = JavaGeneratorAgent()
-    
-    # 1. Update locators/pages first
-    for loc in input_data.locators:
-        gen_agent.append_locator_to_page(loc.page_name, loc.element_name, loc.selector_type, loc.selector_value)
-
-    # 2. Route each scenario based on whether the BRD tied it to an EXISTING
-    # transaction number. If so, append its steps directly into that transaction's
-    # real scenario (in its actual .feature file) so the full flow reflects the
-    # change. Otherwise, fall back to the old generic Sample.feature path.
-    transaction_updates = []
-    for sc in input_data.scenarios:
-        txn_number = sc.get("transaction_number")
-        if txn_number:
-            result = gen_agent.append_requirement_to_transaction(
-                str(txn_number), sc["steps"], requirement_summary=sc.get("scenario", "")
-            )
-            result["transaction_number"] = txn_number
-            result["scenario"] = sc.get("scenario", "")
-            transaction_updates.append(result)
-            if result["appended"]:
-                continue  # steps placed directly in the transaction's scenario — done
-            # No existing scenario found for this transaction number — fall through
-            # to the generic path below so the requirement isn't silently dropped.
-
-        for step in sc["steps"]:
-            gen_agent.append_step_definition(step["text"], step["page"], step["action"])
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Autonomous Enterprise AI Test Automation Platform</title>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="glass-bg-glow"></div>
+    <div class="app-container">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div class="brand">
+                <span class="brand-icon">⚡</span>
+                <div class="brand-text">
+                    <h1>A3E Platform</h1>
+                    <span class="subtext">Autonomous QA Agent</span>
+                </div>
+            </div>
             
-    # Save framework version in history
-    db = SessionLocal()
-    try:
-        current_version_num = db.query(FrameworkVersionModel).count() + 1
-        
-        # Save modification summary
-        modified = {
-            "scenarios": [s["scenario"] for s in input_data.scenarios],
-            "locators": [{"page": l.page_name, "element": l.element_name} for l in input_data.locators],
-            "transaction_updates": transaction_updates,
-        }
-        
-        version_entry = FrameworkVersionModel(
-            version_num=current_version_num,
-            commit_msg=f"Auto-generated code for {len(input_data.scenarios)} scenarios",
-            modified_files=json.dumps(modified),
-            compiled=False
-        )
-        db.add(version_entry)
-        db.commit()
-    finally:
-        db.close()
-
-    applied_to_txns = [u for u in transaction_updates if u["appended"]]
-    msg = f"Appended {len(input_data.scenarios)} scenarios and {len(input_data.locators)} locators to framework."
-    if applied_to_txns:
-        txn_list = ", ".join(u["transaction_number"] for u in applied_to_txns)
-        msg += f" {len(applied_to_txns)} scenario(s) were appended directly into existing transaction(s): {txn_list}."
-
-    return {
-        "status": "SUCCESS",
-        "message": msg,
-        "transaction_updates": transaction_updates,
-    }
-
-@app.post("/api/compile")
-def compile_framework():
-    agent = CompilerAgent()
-    success, log = agent.compile_framework()
-    
-    # Update latest version compiled state
-    db = SessionLocal()
-    try:
-        latest = db.query(FrameworkVersionModel).order_by(FrameworkVersionModel.id.desc()).first()
-        if latest:
-            latest.compiled = success
-            db.commit()
-    finally:
-        db.close()
-        
-    return {"compiled": success, "logs": log}
-
-@app.post("/api/execute")
-def execute_tests(transaction_number: Optional[str] = None):
-    agent = ExecutionAgent()
-    logs, success, report_path = agent.execute_tests(transaction_number=transaction_number)
-    return {"status": "SUCCESS" if success else "FAILED", "logs": logs, "report_path": report_path}
-
-@app.post("/api/heal")
-def heal_locator(input_data: HealInput):
-    agent = SelfHealingAgent()
-    success, message = agent.heal_locator(
-        input_data.page_name,
-        input_data.element_name,
-        input_data.error_message,
-        input_data.latest_html
-    )
-    return {"healed": success, "message": message}
-
-@app.get("/api/dashboard")
-def get_dashboard_stats():
-    db = SessionLocal()
-    try:
-        total_pages = db.query(PageModel).count()
-        total_locators = db.query(LocatorModel).count()
-        total_steps = db.query(StepDefinitionModel).count()
-        total_components = db.query(ComponentRegistryModel).count()
-        
-        latest_runs = db.query(ExecutionLogModel).order_by(ExecutionLogModel.id.desc()).limit(10).all()
-        versions = db.query(FrameworkVersionModel).order_by(FrameworkVersionModel.id.desc()).limit(10).all()
-        
-        runs_list = [{"id": r.id, "status": r.status, "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S")} for r in latest_runs]
-        versions_list = [{"id": v.id, "version_num": v.version_num, "commit_msg": v.commit_msg, "compiled": v.compiled, "timestamp": v.timestamp.strftime("%Y-%m-%d %H:%M:%S")} for v in versions]
-        
-        return {
-            "stats": {
-                "pages": total_pages,
-                "locators": total_locators,
-                "steps": total_steps,
-                "components": total_components
-            },
-            "recent_runs": runs_list,
-            "recent_versions": versions_list
-        }
-    finally:
-        db.close()
-
-@app.get("/api/knowledge-graph")
-def get_knowledge_graph():
-    db = SessionLocal()
-    try:
-        pages = db.query(PageModel).all()
-        steps = db.query(StepDefinitionModel).all()
-        
-        nodes = []
-        links = []
-        
-        # Add Page nodes
-        for page in pages:
-            nodes.append({"id": f"page_{page.id}", "label": page.name, "type": "page", "details": page.description})
-            # Fetch locators for this page
-            for loc in page.locators:
-                loc_node_id = f"loc_{loc.id}"
-                nodes.append({"id": loc_node_id, "label": f"{loc.element_name} ({loc.selector_type})", "type": "locator", "details": loc.selector_value})
-                links.append({"source": f"page_{page.id}", "target": loc_node_id, "rel": "has_element"})
-                
-        # Add Step nodes and link to pages
-        for step in steps:
-            step_node_id = f"step_{step.id}"
-            nodes.append({"id": step_node_id, "label": step.pattern, "type": "step", "details": step.java_method})
-            
-            # Find associated page in our graph
-            assoc_page = db.query(PageModel).filter(PageModel.name == step.page_associated).first()
-            if assoc_page:
-                links.append({"source": step_node_id, "target": f"page_{assoc_page.id}", "rel": "interacts_with"})
-                
-        return {"nodes": nodes, "links": links}
-    finally:
-        db.close()
-
-@app.get("/api/components")
-def get_components():
-    db = SessionLocal()
-    try:
-        components = db.query(ComponentRegistryModel).all()
-        return [{"id": c.id, "name": c.name, "action_type": c.action_type, "description": c.description, "java_code": c.java_code} for c in components]
-    finally:
-        db.close()
-
-@app.post("/api/rollback")
-def rollback_framework(input_data: RollbackInput):
-    # Retrieve the version to roll back
-    db = SessionLocal()
-    try:
-        version = db.query(FrameworkVersionModel).filter(FrameworkVersionModel.version_num == input_data.version_id).first()
-        if not version:
-            raise HTTPException(status_code=404, detail="Version not found.")
-            
-        # In a real system, we'd roll back files in VCS (git reset --hard / git checkout).
-        # We simulate the successful rollback and update database statuses.
-        return {"status": "SUCCESS", "message": f"Successfully rolled back workspace and framework to version {input_data.version_id}."}
-    finally:
-        db.close()
-
-@app.get("/api/report")
-def get_report():
-    report_path = os.path.join(JAVA_FRAMEWORK_TARGET, "cucumber-reports.html")
-    if os.path.exists(report_path):
-        return FileResponse(report_path)
-    raise HTTPException(status_code=404, detail="Report not generated yet.")
-
-
-@app.post("/api/framework/import")
-def import_existing_framework():
-    """
-    One-touch import: reads the existing java-framework (Page Objects, Step
-    Definitions, Feature files) straight off disk and loads it into the AI's
-    knowledge graph. After this, the AI treats everything found as existing
-    framework knowledge — it reuses these locators/steps instead of
-    regenerating or duplicating them.
-    """
-    agent = FrameworkImportAgent()
-    try:
-        result = agent.import_all()
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Import failed: {e}")
-
-
-@app.post("/api/framework/upload")
-async def upload_existing_framework(file: UploadFile = File(...)):
-    """
-    Upload a .zip of an existing framework (Page Objects, Step Definitions,
-    Feature files — any folder layout). Extracts it, sorts recognizable Java/
-    feature files into this project's java-framework/src/ (matching how
-    java-framework is actually laid out here), then runs the same import
-    used by /api/framework/import so the knowledge graph picks it up too.
-    """
-    if not file.filename or not file.filename.lower().endswith(".zip"):
-        raise HTTPException(status_code=400, detail="Please upload a .zip file of the existing framework.")
-
-    import zipfile
-    import tempfile
-    import shutil
-
-    pages_dest = JAVA_PAGES_DIR
-    steps_dest = JAVA_STEPS_DIR
-    features_dest = JAVA_FEATURES_DIR
-    os.makedirs(pages_dest, exist_ok=True)
-    os.makedirs(steps_dest, exist_ok=True)
-    os.makedirs(features_dest, exist_ok=True)
-
-    tmp_dir = tempfile.mkdtemp(prefix="fw_upload_")
-    zip_path = os.path.join(tmp_dir, "upload.zip")
-    copied = {"pages": [], "steps": [], "features": []}
-    skipped = []
-
-    try:
-        with open(zip_path, "wb") as f:
-            f.write(await file.read())
-
-        extract_dir = os.path.join(tmp_dir, "extracted")
-        os.makedirs(extract_dir, exist_ok=True)
-
-        try:
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                # zip-slip guard: refuse any entry that would extract outside extract_dir
-                for member in zf.namelist():
-                    member_path = os.path.normpath(os.path.join(extract_dir, member))
-                    if not member_path.startswith(os.path.normpath(extract_dir) + os.sep) and member_path != os.path.normpath(extract_dir):
-                        raise HTTPException(status_code=400, detail=f"Unsafe path in zip: {member}")
-                zf.extractall(extract_dir)
-        except zipfile.BadZipFile:
-            raise HTTPException(status_code=400, detail="That file isn't a valid .zip archive.")
-
-        # Walk everything extracted, sort recognizable files by path/extension.
-        # Path-substring matching (not exact package names) so this works
-        # regardless of the original project's package naming.
-        #
-        # IMPORTANT: each file is placed according to its OWN declared
-        # "package x.y.z;" line, not flattened into one folder — a Java file
-        # declaring package com.nbc.pages.common MUST physically live under
-        # .../pages/common/, or javac rejects it with a package/directory
-        # mismatch. Falls back to the flat pages/steps folder only if a file
-        # has no package declaration at all. Both pages AND steps are rooted
-        # under test/java — the real framework never uses main/java.
-        test_java_dir = os.path.join(JAVA_FRAMEWORK_SRC, "test", "java")
-
-        for root, _dirs, files in os.walk(extract_dir):
-            if "__MACOSX" in root:
-                continue
-            lower_root = root.lower()
-            for fname in files:
-                src_path = os.path.join(root, fname)
-
-                if fname.endswith(".java") and "page" in lower_root:
-                    with open(src_path, "r", encoding="utf-8", errors="ignore") as f:
-                        content = f.read()
-                    package = detect_java_package(content)
-                    dest_dir = package_to_dir(test_java_dir, package) if package else pages_dest
-                    os.makedirs(dest_dir, exist_ok=True)
-                    shutil.copy2(src_path, os.path.join(dest_dir, fname))
-                    copied["pages"].append(fname)
-                elif fname.endswith(".java") and "step" in lower_root:
-                    with open(src_path, "r", encoding="utf-8", errors="ignore") as f:
-                        content = f.read()
-                    package = detect_java_package(content)
-                    dest_dir = package_to_dir(test_java_dir, package) if package else steps_dest
-                    os.makedirs(dest_dir, exist_ok=True)
-                    shutil.copy2(src_path, os.path.join(dest_dir, fname))
-                    copied["steps"].append(fname)
-                elif fname.endswith(".feature"):
-                    dest = os.path.join(features_dest, fname)
-                    shutil.copy2(src_path, dest)
-                    copied["features"].append(fname)
-                elif fname.endswith(".java"):
-                    # A .java file that's neither clearly a page nor a step —
-                    # skip it rather than guess wrong.
-                    skipped.append(fname)
-
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    total_copied = len(copied["pages"]) + len(copied["steps"]) + len(copied["features"])
-    if total_copied == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="No recognizable Page Object (.java in a 'pages' folder), Step Definition "
-                   "(.java in a 'steps' folder), or .feature files were found in that zip."
-        )
-
-    # Now run the same import used by the one-touch button, so the knowledge
-    # graph picks up everything that was just copied in.
-    agent = FrameworkImportAgent()
-    try:
-        import_result = agent.import_all()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Files were copied but import failed: {e}")
-
-    import_result["files_copied"] = copied
-    import_result["files_skipped"] = skipped
-    import_result["message"] = (
-        f"Copied {len(copied['pages'])} page file(s), {len(copied['steps'])} step file(s), "
-        f"{len(copied['features'])} feature file(s) into java-framework, then " + import_result["message"]
-    )
-    return import_result
-
-
-@app.post("/api/framework/fix-packages")
-def fix_package_structure():
-    """
-    Repairs Page Object / Step Definition files that were flattened into a single
-    folder by an earlier version of the importer, regardless of their own
-    'package x.y.z;' declaration — the cause of "Package declaration X does not
-    match directories path" compile errors. Moves each mismatched file to the
-    directory its own package declaration requires. Safe to run any time —
-    files already in the right place are left untouched.
-    """
-    agent = FrameworkImportAgent()
-    try:
-        return agent.fix_package_structure()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Repair failed: {e}")
-
-
-@app.post("/api/framework/clear")
-def clear_uploaded_framework(confirm: bool = False):
-    """
-    DESTRUCTIVE. Deletes every uploaded/imported Page Object, Step Definition,
-    and Feature file from disk, and clears the matching knowledge-graph rows —
-    so a fresh upload/import starts completely clean. The hand-built common
-    layer (LoginPage.java, DashboardPage.java, CommonSteps.java) is protected
-    and never deleted, no matter which folder it's in.
-
-    Requires confirm=true — a safety check independent of whatever confirmation
-    the frontend already asks for, so this can never fire from a stray request.
-    """
-    if not confirm:
-        raise HTTPException(
-            status_code=400,
-            detail="This deletes uploaded framework files and clears the knowledge graph. "
-                   "Call again with confirm=true to proceed."
-        )
-    agent = FrameworkImportAgent()
-    try:
-        return agent.clear_uploaded_framework()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Clear failed: {e}")
-
-
-# ─── Recorder API ──────────────────────────────────────────────────────────────
-
-@app.post("/api/recorder/save")
-def save_recording_session(data: RecorderSessionInput):
-    """Receive a recorded session from the Chrome Extension and store all steps."""
-    db = SessionLocal()
-    try:
-        # Create session record
-        session = RecordingSessionModel(
-            session_name=data.session_name,
-            transaction_type=data.transaction_type,
-            total_steps=len(data.steps),
-            duration_seconds=data.duration_seconds or 0,
-            status="captured"
-        )
-        db.add(session)
-        db.flush()  # Get session.id
-
-        # Store each step
-        for step_input in data.steps:
-            elem = step_input.element
-            best_loc = elem.best_locator if elem else None
-            all_locs = json.dumps(elem.locators if elem else {})
-
-            step_model = RecordedStepModel(
-                session_id=session.id,
-                step_index=step_input.step_index,
-                action=step_input.action,
-                url=step_input.url or '',
-                page_title=step_input.page_title or '',
-                element_tag=elem.tag if elem else '',
-                element_name=elem.element_name if elem else '',
-                element_text=elem.text if elem else '',
-                locator_type=best_loc.get('type') if best_loc else None,
-                locator_value=best_loc.get('value') if best_loc else None,
-                all_locators=all_locs,
-                input_value=step_input.value or step_input.selected_text or '',
-                timestamp=step_input.timestamp or '',
-            )
-            db.add(step_model)
-
-        db.commit()
-
-        # Auto-process the session to generate framework artifacts
-        agent = RecorderAgent()
-        result = agent.process_session(session.id)
-
-        return {
-            "session_id": session.id,
-            "steps_saved": len(data.steps),
-            "locators_stored": result.get("locators_stored", 0),
-            "pages_discovered": result.get("pages_discovered", 0),
-            "page_objects_generated": result.get("page_objects_generated", []),
-            "feature_file": result.get("feature_file", ""),
-            "message": result.get("message", "Session saved successfully")
-        }
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
-
-
-@app.post("/api/recorder/generate/{session_id}")
-def generate_from_session(session_id: int):
-    """Re-process a saved session to regenerate Page Objects and Feature Files."""
-    agent = RecorderAgent()
-    result = agent.process_session(session_id)
-    if not result.get("success", True):
-        raise HTTPException(status_code=404, detail=result.get("error", "Processing failed"))
-    return result
-
-
-@app.get("/api/recorder/sessions")
-def list_recording_sessions():
-    """List all recorded sessions."""
-    db = SessionLocal()
-    try:
-        sessions = db.query(RecordingSessionModel).order_by(RecordingSessionModel.id.desc()).all()
-        return [{
-            "id": s.id,
-            "session_name": s.session_name,
-            "transaction_type": s.transaction_type,
-            "total_steps": s.total_steps,
-            "duration_seconds": s.duration_seconds,
-            "status": s.status,
-            "page_object_path": s.page_object_path,
-            "feature_file_path": s.feature_file_path,
-            "created_at": s.created_at.strftime("%Y-%m-%d %H:%M:%S"),
-            "processed_at": s.processed_at.strftime("%Y-%m-%d %H:%M:%S") if s.processed_at else None
-        } for s in sessions]
-    finally:
-        db.close()
-
-
-@app.get("/api/recorder/sessions/{session_id}")
-def get_recording_session(session_id: int):
-    """Get full details of a recorded session including all steps."""
-    db = SessionLocal()
-    try:
-        session = db.query(RecordingSessionModel).filter(RecordingSessionModel.id == session_id).first()
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-
-        steps = db.query(RecordedStepModel)\
-                   .filter(RecordedStepModel.session_id == session_id)\
-                   .order_by(RecordedStepModel.step_index)\
-                   .all()
-
-        steps_data = [{
-            "id": s.id,
-            "step_index": s.step_index,
-            "action": s.action,
-            "url": s.url,
-            "page_title": s.page_title,
-            "element_tag": s.element_tag,
-            "element_name": s.element_name,
-            "element_text": s.element_text,
-            "locator_type": s.locator_type,
-            "locator_value": s.locator_value,
-            "all_locators": json.loads(s.all_locators) if s.all_locators else {},
-            "input_value": s.input_value,
-            "timestamp": s.timestamp
-        } for s in steps]
-
-        return {
-            "session": {
-                "id": session.id,
-                "session_name": session.session_name,
-                "transaction_type": session.transaction_type,
-                "total_steps": session.total_steps,
-                "duration_seconds": session.duration_seconds,
-                "status": session.status,
-                "page_object_path": session.page_object_path,
-                "feature_file_path": session.feature_file_path,
-                "created_at": session.created_at.strftime("%Y-%m-%d %H:%M:%S"),
-            },
-            "steps": steps_data
-        }
-    finally:
-        db.close()
-
-
-@app.delete("/api/recorder/sessions/{session_id}")
-def delete_recording_session(session_id: int):
-    """Delete a recorded session."""
-    db = SessionLocal()
-    try:
-        session = db.query(RecordingSessionModel).filter(RecordingSessionModel.id == session_id).first()
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-        db.delete(session)
-        db.commit()
-        return {"deleted": True}
-    finally:
-        db.close()
-
-# ─── Live Recorder API (in-frontend, no Chrome extension) ───────────────────────
-#
-# A single active session is buffered in memory. The dashboard starts a session,
-# the bookmarklet script (served below) streams each step here, and Stop & Save
-# converts the buffer into a real RecordingSession + runs the RecorderAgent —
-# reusing exactly the same pipeline the extension used.
-
-import uuid as _uuid
-from datetime import datetime as _dt
-
-# In-memory live session store: { live_id: {meta + steps[]} }
-LIVE_SESSIONS: Dict[str, Dict[str, Any]] = {}
-ACTIVE_LIVE_ID: Optional[str] = None
-
-
-@app.post("/api/recorder/live/start")
-def live_start(data: LiveStartInput):
-    """Open a new live recording session and make it the active one."""
-    global ACTIVE_LIVE_ID
-    live_id = _uuid.uuid4().hex[:12]
-    LIVE_SESSIONS[live_id] = {
-        "session_name": data.session_name or f"Live_{_dt.now().strftime('%Y%m%d_%H%M%S')}",
-        "transaction_type": data.transaction_type or "generic",
-        "started_at": _dt.now(),
-        "steps": [],
-    }
-    ACTIVE_LIVE_ID = live_id
-    return {"live_id": live_id, "active": True}
-
-
-@app.get("/api/recorder/live/active")
-def live_active():
-    """The bookmarklet polls this to discover the current active session."""
-    if ACTIVE_LIVE_ID and ACTIVE_LIVE_ID in LIVE_SESSIONS:
-        sess = LIVE_SESSIONS[ACTIVE_LIVE_ID]
-        return {"active": True, "live_id": ACTIVE_LIVE_ID, "count": len(sess["steps"])}
-    return {"active": False, "live_id": None, "count": 0}
-
-
-@app.get("/api/recorder/target-url")
-def recorder_target_url():
-    """
-    Reads the real application URL (baseUrl / url) from the framework's
-    per-environment common.properties (or the legacy config.properties as a
-    fallback) so the dashboard can auto-open the NBC target site when Start
-    Recording is clicked — one config value, no need to type/paste the URL a
-    second time in the browser.
-    """
-    config = read_config_properties()
-    value = config.get("baseUrl") or config.get("url")
-    if value and value.strip() and value.strip().lower() != "https://example.com":
-        return {"url": value.strip(), "found": True}
-    return {"url": None, "found": False}
-
-
-@app.post("/api/recorder/live/step")
-def live_step(data: LiveStepInput):
-    """Receive a single step from the in-page recorder script."""
-    sess = LIVE_SESSIONS.get(data.live_id)
-    if not sess:
-        raise HTTPException(status_code=404, detail="Live session not found or already stopped.")
-    # Re-index server-side so counts stay consistent regardless of client
-    step = dict(data.step or {})
-    step["step_index"] = len(sess["steps"]) + 1
-    sess["steps"].append(step)
-    return {"count": len(sess["steps"])}
-
-
-@app.get("/api/recorder/live/status/{live_id}")
-def live_status(live_id: str):
-    """The dashboard polls this while recording to show the live step feed."""
-    sess = LIVE_SESSIONS.get(live_id)
-    if not sess:
-        return {"found": False, "active": False, "count": 0, "steps": []}
-    # Return a light preview (last 50 steps) for the live feed
-    preview = []
-    for s in sess["steps"][-50:]:
-        elem = s.get("element") or {}
-        best = (elem.get("best_locator") or {})
-        preview.append({
-            "step_index": s.get("step_index"),
-            "action": s.get("action"),
-            "page_title": s.get("page_title", ""),
-            "element_name": elem.get("element_name", ""),
-            "locator_type": best.get("type"),
-            "locator_value": best.get("value"),
-            "value": s.get("value") or s.get("selected_text") or "",
-        })
-    return {
-        "found": True,
-        "active": ACTIVE_LIVE_ID == live_id,
-        "count": len(sess["steps"]),
-        "steps": preview,
-    }
-
-
-@app.post("/api/recorder/live/stop")
-def live_stop(data: LiveStopInput):
-    """Finalize a live session: persist steps and run the RecorderAgent pipeline."""
-    global ACTIVE_LIVE_ID
-    sess = LIVE_SESSIONS.get(data.live_id)
-    if not sess:
-        raise HTTPException(status_code=404, detail="Live session not found.")
-
-    if ACTIVE_LIVE_ID == data.live_id:
-        ACTIVE_LIVE_ID = None  # stop accepting new steps immediately
-
-    raw_steps = sess["steps"]
-    if not raw_steps:
-        LIVE_SESSIONS.pop(data.live_id, None)
-        raise HTTPException(status_code=400, detail="No steps were captured. Nothing to save.")
-
-    duration = int((_dt.now() - sess["started_at"]).total_seconds())
-
-    db = SessionLocal()
-    try:
-        session = RecordingSessionModel(
-            session_name=sess["session_name"],
-            transaction_type=sess["transaction_type"],
-            total_steps=len(raw_steps),
-            duration_seconds=duration,
-            status="captured",
-        )
-        db.add(session)
-        db.flush()
-
-        for idx, step in enumerate(raw_steps, start=1):
-            elem = step.get("element") or {}
-            best_loc = elem.get("best_locator") or None
-            db.add(RecordedStepModel(
-                session_id=session.id,
-                step_index=step.get("step_index", idx),
-                action=step.get("action", "click"),
-                url=step.get("url", "") or "",
-                page_title=step.get("page_title", "") or "",
-                element_tag=elem.get("tag", "") or "",
-                element_name=elem.get("element_name", "") or "",
-                element_text=elem.get("text", "") or "",
-                locator_type=(best_loc or {}).get("type"),
-                locator_value=(best_loc or {}).get("value"),
-                all_locators=json.dumps(elem.get("locators", {})),
-                input_value=step.get("value") or step.get("selected_text") or "",
-                timestamp=step.get("timestamp", "") or "",
-            ))
-
-        db.commit()
-        session_id = session.id
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
-
-    # Clear the in-memory buffer now that it's persisted
-    LIVE_SESSIONS.pop(data.live_id, None)
-
-    # Run the same generation pipeline the extension flow used
-    agent = RecorderAgent()
-    result = agent.process_session(session_id)
-
-    return {
-        "session_id": session_id,
-        "steps_saved": len(raw_steps),
-        "duration_seconds": duration,
-        "locators_stored": result.get("locators_stored", 0),
-        "pages_discovered": result.get("pages_discovered", 0),
-        "page_objects_generated": result.get("page_objects_generated", []),
-        "feature_file": result.get("feature_file", ""),
-        "message": result.get("message", "Session saved successfully"),
-    }
-
-
-@app.get("/api/recorder/live/script")
-@app.get("/r")  # short alias — fewer characters to type by hand when clipboard/DevTools/bookmarks are all blocked
-def live_recorder_script():
-    """Serve the in-page recorder JS (loaded by the bookmarklet, or by hand-typed address-bar code)."""
-    path = os.path.join(BACKEND_DIR, "static", "live_recorder.js")
-    if os.path.exists(path):
-        return FileResponse(path, media_type="application/javascript")
-    raise HTTPException(status_code=404, detail="live_recorder.js not found")
-
-
-# Serves static UI frontend files
-@app.get("/")
-def serve_index():
-    index_path = os.path.join(FRONTEND_DIR, "index.html")
-    if os.path.exists(index_path):
-        return FileResponse(index_path)
-    return {"message": f"Frontend index.html not found. Please place static files in {FRONTEND_DIR}"}
-
-@app.get("/{path:path}")
-def serve_static(path: str):
-    static_file = os.path.join(FRONTEND_DIR, path)
-    if os.path.exists(static_file) and os.path.isfile(static_file):
-        return FileResponse(static_file)
-    # Default fallback to serve index.html for single page routing
-    index_path = os.path.join(FRONTEND_DIR, "index.html")
-    if os.path.exists(index_path):
-        return FileResponse(index_path)
-    raise HTTPException(status_code=404, detail="Static resource not found.")
+            <nav class="nav-menu">
+                <button class="nav-item active" data-tab="dashboard">
+                    <span class="icon">📊</span> Dashboard
+                </button>
+                <button class="nav-item" data-tab="requirements">
+                    <span class="icon">📄</span> BRD & Scenarios
+                </button>
+                <button class="nav-item" data-tab="recorder">
+                    <span class="icon">🎬</span> Transaction Recorder
+                </button>
+                <button class="nav-item" data-tab="components">
+                    <span class="icon">🧩</span> Component Registry
+                </button>
+                <button class="nav-item" data-tab="graph">
+                    <span class="icon">🌐</span> Knowledge Graph
+                </button>
+                <button class="nav-item" data-tab="runner">
+                    <span class="icon">⚙️</span> Test Runner
+                </button>
+                <button class="nav-item" data-tab="healing">
+                    <span class="icon">🩺</span> Self-Healing
+                </button>
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="status-indicator">
+                    <span class="dot pulse-green"></span>
+                    <span class="status-label">Agent Engine Idle</span>
+                </div>
+                <div class="version">Version 1.0.4</div>
+            </div>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <!-- Top Bar -->
+            <header class="top-bar">
+                <div class="page-title">
+                    <h2 id="current-tab-title">Platform Dashboard</h2>
+                </div>
+                <div class="system-controls">
+                    <div class="control-group">
+                        <label for="env-selector">Env:</label>
+                        <select id="env-selector" class="glass-select">
+                            <option value="staging">STAGING (Edge)</option>
+                            <option value="uat">UAT (Edge)</option>
+                            <option value="prod-mock">PROD-MOCK</option>
+                        </select>
+                    </div>
+                    <button class="btn btn-secondary" id="diagnostics-btn">🔍 Verify Env</button>
+                </div>
+            </header>
+
+            <!-- Dashboard Tab -->
+            <section class="tab-pane active" id="tab-dashboard">
+                <div class="stats-grid">
+                    <div class="stat-card glass-card">
+                        <div class="stat-icon">📄</div>
+                        <div class="stat-info">
+                            <span class="stat-label">Mapped Pages</span>
+                            <h3 id="stat-pages">0</h3>
+                        </div>
+                    </div>
+                    <div class="stat-card glass-card">
+                        <div class="stat-icon">📍</div>
+                        <div class="stat-info">
+                            <span class="stat-label">Active Locators</span>
+                            <h3 id="stat-locators">0</h3>
+                        </div>
+                    </div>
+                    <div class="stat-card glass-card">
+                        <div class="stat-icon">📖</div>
+                        <div class="stat-info">
+                            <span class="stat-label">Step Definitions</span>
+                            <h3 id="stat-steps">0</h3>
+                        </div>
+                    </div>
+                    <div class="stat-card glass-card">
+                        <div class="stat-icon">🧱</div>
+                        <div class="stat-info">
+                            <span class="stat-label">Registry Components</span>
+                            <h3 id="stat-components">0</h3>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="dashboard-grid">
+                    <div class="glass-card flex-2">
+                        <div class="card-header">
+                            <h4>Framework Evolution Activity</h4>
+                            <span class="badge">VCS History</span>
+                        </div>
+                        <div class="table-container">
+                            <table class="glass-table">
+                                <thead>
+                                    <tr>
+                                        <th>Version</th>
+                                        <th>Commit Message</th>
+                                        <th>Compiled</th>
+                                        <th>Date</th>
+                                        <th>Action</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="version-table-body">
+                                    <!-- Dynamic rows -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <div class="glass-card flex-1">
+                        <div class="card-header">
+                            <h4>Recent Executions</h4>
+                        </div>
+                        <ul class="execution-list" id="execution-list-items">
+                            <!-- Dynamic items -->
+                        </ul>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Transaction Recorder Tab -->
+            <section class="tab-pane" id="tab-recorder">
+                <!-- Live Recorder Panel (in-frontend, no extension) -->
+                <div class="glass-card" id="live-recorder-card" style="margin-bottom:16px;border:1px solid rgba(108,99,255,0.3);background:linear-gradient(135deg,rgba(108,99,255,0.08),rgba(72,207,173,0.05));">
+                    <div class="card-header">
+                        <h4>🎬 Live Transaction Recorder</h4>
+                        <span class="badge" id="live-rec-badge" style="background:rgba(120,120,120,0.2);color:#aaa">Idle</span>
+                    </div>
+
+                    <div style="padding:0 0 8px;display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start;">
+                        <!-- Controls -->
+                        <div style="flex:1;min-width:280px;">
+                            <p class="description-text" style="margin-bottom:12px;">
+                                Record any banking transaction directly from here — no Chrome extension needed.
+                                Start a session, run the <strong>Recorder</strong> on the target site, perform the transaction,
+                                then come back and <strong>Stop &amp; Save</strong>. Every click, input, and dropdown is captured with its best locator.
+                            </p>
+
+                            <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
+                                <input type="text" id="live-session-name" placeholder="Session name (e.g. Fund Transfer)"
+                                    style="flex:1;min-width:180px;background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:9px 12px;color:#e0e0ff;font-size:13px;" />
+                                <select id="live-txn-type"
+                                    style="background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:9px 12px;color:#e0e0ff;font-size:13px;">
+                                    <option value="fund_transfer">Fund Transfer</option>
+                                    <option value="bill_payment">Bill Payment</option>
+                                    <option value="account_opening">Account Opening</option>
+                                    <option value="loan_application">Loan Application</option>
+                                    <option value="login">Login</option>
+                                    <option value="generic" selected>Generic</option>
+                                </select>
+                            </div>
+
+                            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                                <button class="btn btn-primary" id="btn-live-start" onclick="startLiveRecording()">🔴 Start Recording</button>
+                                <button class="btn btn-primary" id="btn-live-stop" onclick="stopLiveRecording()" style="display:none;background:linear-gradient(135deg,#ff5252,#ff8a80);">⏹ Stop &amp; Save</button>
+                                <button class="btn btn-secondary" id="btn-live-video" onclick="toggleScreenVideo()">🎥 Also Record Video</button>
+                                <button class="btn btn-secondary" onclick="loadRecorderSessions()">🔄 Refresh Sessions</button>
+                            </div>
+
+                            <div id="live-rec-hint" style="margin-top:10px;font-size:12px;color:#888;"></div>
+                        </div>
+
+                        <!-- Bookmarklet / activation -->
+                        <div style="background:rgba(0,0,0,0.2);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:14px;min-width:240px;max-width:340px;">
+                            <div style="font-size:11px;color:#888;margin-bottom:8px;text-transform:uppercase;letter-spacing:0.8px;">Arm the recorder on the target tab</div>
+
+                            <a id="recorder-bookmarklet" href="#"
+                                style="display:inline-block;background:linear-gradient(135deg,#6c63ff,#48cfad);color:#fff;text-decoration:none;font-weight:700;font-size:13px;padding:9px 16px;border-radius:8px;cursor:grab;margin-bottom:6px;">
+                                🎬 AI Recorder
+                            </a>
+                            <div style="font-size:11px;color:#888;margin-bottom:14px;">Drag to your bookmarks bar once, then click it on the target tab.</div>
+
+                            <button class="btn btn-secondary" id="btn-copy-console-script" onclick="copyConsoleScript()" style="width:100%;font-size:12px;margin-bottom:6px;">
+                                📋 Copy Recorder Code
+                            </button>
+                            <div style="font-size:11px;color:#888;">
+                                Then either: paste into DevTools (F12) → Console and press Enter,
+                                <strong>or</strong> click the target tab's address bar, type <code>javascript:</code> first,
+                                paste right after it, and press Enter. (Browsers strip a pasted <code>javascript:</code> prefix
+                                as a safety measure — typing it yourself first works around that.)
+                            </div>
+                        </div>
+
+                        <!-- Manual type-it-yourself fallback: no clipboard, no DevTools, no bookmarks needed -->
+                        <div style="background:rgba(255,152,0,0.06);border:1px solid rgba(255,152,0,0.3);border-radius:12px;padding:14px;min-width:240px;max-width:420px;">
+                            <div style="font-size:11px;color:#ffb300;margin-bottom:8px;text-transform:uppercase;letter-spacing:0.8px;">
+                                Clipboard, DevTools, and bookmarks all blocked? Type this by hand
+                            </div>
+                            <div style="font-size:11px;color:#ccc;margin-bottom:8px;line-height:1.6;">
+                                On the target tab: click the address bar, clear it, then type <code>javascript:</code> yourself
+                                followed by the exact text below, and press Enter.
+                            </div>
+                            <div id="recorder-manual-code"
+                                style="background:rgba(0,0,0,0.35);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:10px;font-family:monospace;font-size:12px;color:#ffe082;word-break:break-all;line-height:1.6;user-select:all;">
+                                (loading…)
+                            </div>
+                            <div style="font-size:11px;color:#888;margin-top:8px;">
+                                If Edge refuses to navigate or shows a warning after pressing Enter, <code>javascript:</code>
+                                links are blocked at the policy level too — no browser-side method will work on this machine;
+                                ask IT for an exception on one of the three, or ask about the proxy-based alternative.
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Live step feed (visible while recording) -->
+                    <div id="live-feed-wrap" style="display:none;margin-top:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:12px;">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                            <span style="font-size:12px;color:#a78bfa;font-weight:700;">● LIVE FEED</span>
+                            <span style="font-size:12px;color:#48cfad;"><strong id="live-step-count">0</strong> steps captured</span>
+                        </div>
+                        <div id="live-feed" style="max-height:240px;overflow-y:auto;font-family:monospace;font-size:12px;color:#cfcfe0;background:rgba(0,0,0,0.25);border-radius:8px;padding:8px 10px;">
+                            <div style="color:#666;">Waiting for interactions on the target site…</div>
+                        </div>
+                        <!-- Video preview -->
+                        <video id="live-video-preview" style="display:none;width:100%;max-height:220px;margin-top:10px;border-radius:8px;border:1px solid rgba(255,255,255,0.1);background:#000;" muted></video>
+                    </div>
+                </div>
+
+                <!-- Locator Workflow Diagram -->
+                <div class="glass-card" style="margin-bottom:16px;">
+                    <div class="card-header"><h4>⚡ Locator Discovery Pipeline</h4></div>
+                    <div style="display:flex;align-items:center;gap:0;overflow-x:auto;padding:8px 0;">
+                        <div class="pipeline-step" style="background:rgba(108,99,255,0.15);border-color:rgba(108,99,255,0.3);">
+                            <div class="pipe-icon">🎬</div>
+                            <div class="pipe-label">User Records<br>Transaction</div>
+                        </div>
+                        <div class="pipe-arrow">→</div>
+                        <div class="pipeline-step" style="background:rgba(72,207,173,0.1);border-color:rgba(72,207,173,0.3);">
+                            <div class="pipe-icon">🔍</div>
+                            <div class="pipe-label">DOM Event<br>Captured</div>
+                        </div>
+                        <div class="pipe-arrow">→</div>
+                        <div class="pipeline-step" style="background:rgba(255,179,0,0.1);border-color:rgba(255,179,0,0.3);">
+                            <div class="pipe-icon">🎯</div>
+                            <div class="pipe-label">Best Locator<br>Discovered</div>
+                        </div>
+                        <div class="pipe-arrow">→</div>
+                        <div class="pipeline-step" style="background:rgba(255,82,82,0.1);border-color:rgba(255,82,82,0.3);">
+                            <div class="pipe-icon">🗄️</div>
+                            <div class="pipe-label">Stored in<br>Knowledge DB</div>
+                        </div>
+                        <div class="pipe-arrow">→</div>
+                        <div class="pipeline-step" style="background:rgba(108,99,255,0.15);border-color:rgba(108,99,255,0.3);">
+                            <div class="pipe-icon">☕</div>
+                            <div class="pipe-label">Java Page Object<br>Generated</div>
+                        </div>
+                        <div class="pipe-arrow">→</div>
+                        <div class="pipeline-step" style="background:rgba(72,207,173,0.1);border-color:rgba(72,207,173,0.3);">
+                            <div class="pipe-icon">🥒</div>
+                            <div class="pipe-label">Feature File<br>Generated</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Locator Priority Legend -->
+                <div class="glass-card" style="margin-bottom:16px;">
+                    <div class="card-header"><h4>🏆 Locator Priority (Best → Worst)</h4></div>
+                    <div style="display:flex;gap:10px;flex-wrap:wrap;padding-bottom:4px;">
+                        <div class="locator-badge" style="background:rgba(72,207,173,0.15);border-color:#48cfad;color:#48cfad;">🥇 id="value"</div>
+                        <div class="locator-badge" style="background:rgba(108,99,255,0.15);border-color:#6c63ff;color:#a78bfa;">🥈 name="value"</div>
+                        <div class="locator-badge" style="background:rgba(255,179,0,0.12);border-color:#ffb300;color:#ffb300;">🥉 [data-testid]</div>
+                        <div class="locator-badge" style="background:rgba(255,100,100,0.12);border-color:#ff6464;color:#ff9494;">[aria-label]</div>
+                        <div class="locator-badge" style="background:rgba(180,180,255,0.08);border-color:rgba(180,180,255,0.2);color:#888;">CSS Selector</div>
+                        <div class="locator-badge" style="background:rgba(100,100,100,0.1);border-color:rgba(255,255,255,0.1);color:#666;">XPath (last resort)</div>
+                    </div>
+                </div>
+
+                <!-- Recorded Sessions Table -->
+                <div class="glass-card">
+                    <div class="card-header">
+                        <h4>📋 Recorded Sessions</h4>
+                        <span class="badge" id="sessions-count-badge">0 sessions</span>
+                    </div>
+                    <div class="table-container">
+                        <table class="glass-table">
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>Session Name</th>
+                                    <th>Type</th>
+                                    <th>Steps</th>
+                                    <th>Duration</th>
+                                    <th>Status</th>
+                                    <th>Recorded</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="recorder-sessions-body">
+                                <tr><td colspan="8" style="text-align:center;color:#555;padding:24px;">No sessions recorded yet. Use the Chrome Extension to record a transaction.</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Session Detail Panel (hidden until clicked) -->
+                <div class="glass-card" id="session-detail-panel" style="display:none;margin-top:16px;">
+                    <div class="card-header">
+                        <h4 id="session-detail-title">Session Details</h4>
+                        <div style="display:flex;gap:8px;">
+                            <button class="btn btn-primary" id="btn-regenerate" onclick="regenerateSession()">🔄 Regenerate Framework</button>
+                            <button class="btn btn-secondary" onclick="closeSessionDetail()">✕ Close</button>
+                        </div>
+                    </div>
+
+                    <!-- Generated Files Info -->
+                    <div id="generated-files-info" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;"></div>
+
+                    <!-- Steps Table -->
+                    <div class="table-container">
+                        <table class="glass-table">
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>Action</th>
+                                    <th>Page</th>
+                                    <th>Element</th>
+                                    <th>Best Locator</th>
+                                    <th>Locator Value</th>
+                                    <th>Value Entered</th>
+                                </tr>
+                            </thead>
+                            <tbody id="session-steps-body">
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <!-- BRD & Scenarios Tab -->
+            <section class="tab-pane" id="tab-requirements">
+
+                <div class="grid-layout">
+                    <div class="glass-card">
+                        <div class="card-header">
+                            <h4>Upload Requirement Document</h4>
+                        </div>
+                        <p class="description-text">Upload your BRD, Solution Document, or Cucumber Feature file to automatically extract scenarios and generate tests.</p>
+                        
+                        <div class="upload-dropzone" id="upload-zone">
+                            <div class="dropzone-content">
+                                <span class="upload-icon">📁</span>
+                                <p>Drag and drop BRD files, or click to browse</p>
+                                <span class="sub-dropzone-text">Supports .txt, .feature, .md, .docx</span>
+                            </div>
+                        </div>
+
+                        <div class="textarea-container">
+                            <label for="brd-text-input">Or paste requirement text directly:</label>
+                            <textarea id="brd-text-input" placeholder="Scenario: Customer Transfer Money&#10;  Given User is on login page 'http://bank.com'&#10;  When User enters credentials and clicks login&#10;  Then Account balance should reflect transfer..."></textarea>
+                        </div>
+                        <button class="btn btn-primary btn-full" id="analyze-brd-btn">🧠 Extract Scenarios</button>
+                    </div>
+
+                    <div class="glass-card">
+                        <div class="card-header">
+                            <h4>Extracted Scenarios & Impact Analysis</h4>
+                            <span class="badge" id="scenarios-count-badge">0 Found</span>
+                        </div>
+                        
+                        <div class="analysis-results-container" id="analysis-empty-state">
+                            <div class="empty-state">
+                                <span>🔍</span>
+                                <p>No scenarios extracted yet. Parse a document to view impact and code diffs.</p>
+                            </div>
+                        </div>
+
+                        <div id="analysis-results" style="display: none;">
+                            <div class="impact-summary">
+                                <div class="impact-item">
+                                    <span class="impact-title">Reused Step Definitions</span>
+                                    <span class="impact-value text-green" id="impact-reused-count">0</span>
+                                </div>
+                                <div class="impact-item">
+                                    <span class="impact-title">Missing Code Modules</span>
+                                    <span class="impact-value text-orange" id="impact-missing-count">0</span>
+                                </div>
+                            </div>
+
+                            <div class="scenarios-list" id="extracted-scenarios-list">
+                                <!-- Dynamic scenarios list -->
+                            </div>
+
+                            <!-- Locator mapper for missing elements -->
+                            <div class="locator-mapper-card" id="locator-mapper-card" style="display: none;">
+                                <h5>Required Locators Assignment</h5>
+                                <div id="locator-fields-container"></div>
+                            </div>
+
+                            <button class="btn btn-success btn-full" id="build-framework-btn">🚀 Append & Evolve Framework</button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Component Registry Tab -->
+            <section class="tab-pane" id="tab-components">
+                <div class="components-grid-container">
+                    <div class="glass-card col-span-3">
+                        <div class="card-header">
+                            <h4>Component Registry</h4>
+                            <p class="description-text">These are the reusable Java-Selenium action plugins. The AI agent searches here first to avoid creating duplicate steps.</p>
+                        </div>
+                        <div class="components-grid" id="components-list">
+                            <!-- Dynamic components -->
+                        </div>
+                    </div>
+                    <div class="glass-card">
+                        <div class="card-header">
+                            <h4>Add Custom Component</h4>
+                        </div>
+                        <div class="form-group">
+                            <label for="comp-name">Component Name:</label>
+                            <input type="text" id="comp-name" class="glass-input" placeholder="e.g. AGGridTableAction">
+                        </div>
+                        <div class="form-group">
+                            <label for="comp-type">Action Type:</label>
+                            <select id="comp-type" class="glass-select">
+                                <option value="click">Click Interaction</option>
+                                <option value="input">Input / Entering Text</option>
+                                <option value="dropdown">Selection Dropdown</option>
+                                <option value="custom">Custom Banking Widget</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="comp-desc">Description:</label>
+                            <textarea id="comp-desc" class="glass-textarea" placeholder="Describe the component actions..."></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label for="comp-code">Java Template Code:</label>
+                            <textarea id="comp-code" class="glass-textarea code-area" placeholder="public void selectItem(...) { ... }"></textarea>
+                        </div>
+                        <button class="btn btn-primary btn-full" id="add-component-btn">➕ Register Component</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Knowledge Graph Tab -->
+            <section class="tab-pane" id="tab-graph">
+                <div class="glass-card" style="margin-bottom:16px;border:1px solid rgba(108,99,255,0.3);background:linear-gradient(135deg,rgba(108,99,255,0.08),rgba(72,207,173,0.05));">
+                    <div class="card-header">
+                        <h4>📥 Import Existing Framework</h4>
+                        <span class="badge" id="import-status-badge" style="background:rgba(120,120,120,0.2);color:#aaa">Ready</span>
+                    </div>
+                    <p class="description-text">
+                        Already have a hand-written java-framework — Page Objects, Step Definitions, Feature files? One touch reads all
+                        of it and loads it into the knowledge graph below. From then on, the AI reuses your existing locators and steps
+                        instead of regenerating or duplicating them.
+                    </p>
+
+                    <div style="display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start;">
+                        <div style="flex:1;min-width:240px;">
+                            <div style="font-size:11px;color:#888;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.8px;">Already on this server</div>
+                            <button class="btn btn-primary" id="btn-import-framework" onclick="importExistingFramework()">📥 Import Existing Framework</button>
+                        </div>
+                        <div style="flex:1;min-width:280px;border-left:1px solid rgba(255,255,255,0.1);padding-left:24px;">
+                            <div style="font-size:11px;color:#888;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.8px;">Or upload it as a .zip</div>
+                            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+                                <input type="file" id="framework-zip-input" accept=".zip"
+                                    style="color:#ccc;font-size:12px;max-width:200px;" />
+                                <button class="btn btn-secondary" id="btn-upload-framework" onclick="uploadExistingFramework()">📤 Upload &amp; Import</button>
+                            </div>
+                            <div style="font-size:11px;color:#888;margin-top:6px;">
+                                Any folder layout works — files are matched by path (anything with "pages"/"steps" in the folder, plus any .feature file).
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="import-result" style="margin-top:12px;font-size:13px;color:#ccc;"></div>
+
+                    <div style="margin-top:16px;padding-top:14px;border-top:1px solid rgba(255,255,255,0.1);">
+                        <div style="font-size:11px;color:#888;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.8px;">Getting "Package declaration does not match directories path" errors?</div>
+                        <button class="btn btn-secondary" id="btn-fix-packages" onclick="fixPackageStructure()">🔧 Fix Package Structure</button>
+                        <div style="font-size:11px;color:#888;margin-top:6px;">
+                            Moves any Page Object / Step Definition file to match its own declared <code>package</code> line — fixes files an earlier import/upload placed in the wrong folder. Safe to run any time.
+                        </div>
+                        <div id="fix-packages-result" style="margin-top:10px;font-size:13px;color:#ccc;"></div>
+                    </div>
+
+                    <div style="margin-top:16px;padding-top:14px;border-top:1px solid rgba(255,82,82,0.25);">
+                        <div style="font-size:11px;color:#ff8a80;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.8px;">⚠️ Danger zone</div>
+                        <button class="btn" id="btn-clear-framework" onclick="clearUploadedFramework()"
+                            style="background:rgba(255,82,82,0.15);border:1px solid rgba(255,82,82,0.4);color:#ff8a80;">🗑️ Clear Uploaded Framework</button>
+                        <div style="font-size:11px;color:#888;margin-top:6px;">
+                            Deletes every uploaded Page Object, Step Definition, and Feature file, and clears the knowledge graph — for starting a fresh upload.
+                            <strong>LoginPage.java, DashboardPage.java, and CommonSteps.java are protected and never deleted.</strong> This cannot be undone.
+                        </div>
+                        <div id="clear-framework-result" style="margin-top:10px;font-size:13px;color:#ccc;"></div>
+                    </div>
+                </div>
+
+                <div class="glass-card graph-full-card">
+                    <div class="card-header">
+                        <h4>Semantic Knowledge Graph</h4>
+                        <div class="graph-legend">
+                            <span class="legend-item"><span class="legend-dot color-page"></span> Page Object</span>
+                            <span class="legend-item"><span class="legend-dot color-locator"></span> Locator</span>
+                            <span class="legend-item"><span class="legend-dot color-step"></span> Cucumber Step</span>
+                        </div>
+                    </div>
+                    <p class="description-text">Real-time mapping showing how Pages, Step Definitions, and DOM elements link together. The AI framework utilizes these relationships to self-heal and avoid duplicates.</p>
+                    
+                    <div class="graph-viewer-container">
+                        <div class="graph-canvas-wrapper">
+                            <!-- SVG network graph goes here -->
+                            <svg id="knowledge-graph-svg" width="100%" height="500"></svg>
+                        </div>
+                        <div class="graph-details-panel" id="graph-details">
+                            <h5>Node Inspector</h5>
+                            <div class="empty-state-panel">
+                                <p>Click any node in the network to inspect its locators, steps, and associated source code.</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Test Runner Tab -->
+            <section class="tab-pane" id="tab-runner">
+                <div class="grid-layout">
+                    <div class="glass-card">
+                        <div class="card-header">
+                            <h4>Execution Console</h4>
+                        </div>
+                        <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;">
+                            <input type="text" id="run-transaction-number" placeholder="Transaction number (e.g. 069069) — leave blank to run the default sample"
+                                style="flex:1;min-width:260px;background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:9px 12px;color:#e0e0ff;font-size:13px;" />
+                        </div>
+                        <div class="runner-controls">
+                            <button class="btn btn-secondary" id="compile-btn">🔨 Compile Framework</button>
+                            <button class="btn btn-primary" id="run-tests-btn">▶️ Run Automation Suite</button>
+                        </div>
+                        
+                        <div class="logs-console">
+                            <div class="console-header">
+                                <span class="console-title">Maven / TestNG Terminal Output</span>
+                                <button class="btn-clear" id="clear-logs-btn">Clear</button>
+                            </div>
+                            <pre class="console-output" id="terminal-logs">Autonomous Platform ready. Select Compile or Run to start...</pre>
+                        </div>
+                    </div>
+
+                    <div class="glass-card">
+                        <div class="card-header">
+                            <h4>Live Browser State & HTML Report</h4>
+                        </div>
+                        <div class="browser-state-mock">
+                            <div class="browser-address-bar">
+                                <span class="browser-dots">🔴 🟡 🟢</span>
+                                <input type="text" value="" placeholder="Application URL appears here once a run starts" class="browser-url" readonly id="browser-address">
+                            </div>
+                            <div class="browser-body" id="browser-view">
+                                <div class="run-status run-status-pending">Idle — click Run Automation Suite to start</div>
+                            </div>
+                        </div>
+                        <div class="report-box" style="margin-top:20px;">
+                            <h5>Latest Extent Report:</h5>
+                            <a href="/api/report" target="_blank" class="report-link" id="view-report-link">Open HTML Report in browser</a>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Self-Healing Tab -->
+            <section class="tab-pane" id="tab-healing">
+                <div class="grid-layout">
+                    <div class="glass-card">
+                        <div class="card-header">
+                            <h4>Trigger Failure & Self-Heal Demo</h4>
+                        </div>
+                        <p class="description-text">Simulate a locator failure (such as an element XPath changes on the target page) to verify how the Self-Healing Agent detects the issue, scans the DOM, repairs the XPath selector, and updates the Java source code automatically.</p>
+                        
+                        <div class="form-group">
+                            <label for="heal-page">Failed Page Class:</label>
+                            <input type="text" id="heal-page" class="glass-input" value="LoginPage">
+                        </div>
+                        <div class="form-group">
+                            <label for="heal-element">Failed Element Name:</label>
+                            <input type="text" id="heal-element" class="glass-input" value="loginButton">
+                        </div>
+                        <div class="form-group">
+                            <label for="heal-error">Exception Message:</label>
+                            <textarea id="heal-error" class="glass-textarea">org.openqa.selenium.NoSuchElementException: no such element: Unable to locate element: {"method":"xpath","selector":"//*[@id='old-submit-btn']"}</textarea>
+                        </div>
+                        <div class="form-group">
+                            <label for="heal-html">New DOM Snapshot Snippet:</label>
+                            <textarea id="heal-html" class="glass-textarea code-area"><div class="login-box">
+  <button id="loginbutton" class="btn btn-primary">Login Now</button>
+</div></textarea>
+                        </div>
+                        <button class="btn btn-primary btn-full" id="trigger-healing-btn">🩹 Repair & Heal Element</button>
+                    </div>
+
+                    <div class="glass-card">
+                        <div class="card-header">
+                            <h4>Healing Log & Code Diff</h4>
+                        </div>
+                        
+                        <div class="healing-summary-container" id="healing-logs-empty">
+                            <div class="empty-state">
+                                <span>🩹</span>
+                                <p>No healing operations executed yet.</p>
+                            </div>
+                        </div>
+
+                        <div id="healing-results-panel" style="display: none;">
+                            <div class="healing-status-banner success">
+                                <strong>Status:</strong> Success! Code updated.
+                            </div>
+                            
+                            <div class="logs-console" style="margin-top: 15px;">
+                                <div class="console-header">
+                                    <span class="console-title">Healing Agent Execution Trail</span>
+                                </div>
+                                <pre class="console-output" id="healing-console-logs" style="height: 120px;"></pre>
+                            </div>
+
+                            <h5 style="margin-top:20px;">Code Patch Diff</h5>
+                            <div class="code-diff-container">
+                                <pre class="diff-output"><span class="diff-removed">- private By loginButton = By.xpath("//*[@id='old-submit-btn']");</span>
+<span class="diff-added">+ private By loginButton = By.xpath("//*[@id='loginbutton']");</span></pre>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>
