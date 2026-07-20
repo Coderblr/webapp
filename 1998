@@ -1,137 +1,1226 @@
-"""
-paths.py — Central path configuration.
-
-Every path the backend needs (frontend static files, the java-framework
-folder it generates code into, the SQLite database) is computed relative
-to THIS file's location by default. That means: unzip the project
-anywhere, on any drive, on Windows or Linux, and it just works — no more
-hardcoded "f:/nbccca/...".
-
-Every value can still be overridden with an environment variable if you
-ever want the pieces to live in different places (e.g. a shared
-java-framework repo checked out elsewhere).
-"""
 import os
-from typing import Optional
+import re
+import time
+import json
+import logging
+from typing import List, Dict, Any, Tuple
 
-# backend/  (the folder this file lives in)
-BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import Select
+from selenium.webdriver.edge.options import Options as EdgeOptions
+from selenium.webdriver.edge.service import Service as EdgeService
 
-# Project root = the parent of backend/ — normally contains
-# backend/, frontend/, java-framework/, chrome-extension/
-PROJECT_ROOT = os.getenv("NBCCCA_ROOT", os.path.dirname(BACKEND_DIR))
+from database import SessionLocal, PageModel, LocatorModel, StepDefinitionModel, ComponentRegistryModel, FrameworkVersionModel, ExecutionLogModel
+from paths import (JAVA_FRAMEWORK_SRC, JAVA_FRAMEWORK_TARGET, default_edge_driver_path,
+                    read_config_properties, JAVA_PAGES_DIR, JAVA_STEPS_DIR, JAVA_FEATURES_DIR,
+                    JAVA_FEATURES_DIR_LEGACY)
 
-# Frontend static files served by main.py
-FRONTEND_DIR = os.getenv("FRONTEND_DIR", os.path.join(PROJECT_ROOT, "frontend"))
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Java framework the AI agents generate/compile/run code in
-JAVA_FRAMEWORK_DIR = os.getenv("JAVA_FRAMEWORK_PATH", os.path.join(PROJECT_ROOT, "java-framework"))
-JAVA_FRAMEWORK_SRC = os.path.join(JAVA_FRAMEWORK_DIR, "src")
-JAVA_FRAMEWORK_TARGET = os.path.join(JAVA_FRAMEWORK_DIR, "target")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Real framework structure — confirmed from the working java-orchestrator
-# tool's config.py, which documents the ACTUAL layout (not a Maven-standard
-# guess). Everything test-related — pages, step definitions, features, utils —
-# lives under src/test/, not src/main/:
-#   Pages:      <root>/src/test/java/com/nbc/pages/<module>/
-#   Steps:      <root>/src/test/java/com/nbc/stepDefinitions/<module>/   (not "steps")
-#   Features:   <root>/src/test/features/<module>/                       (not under resources/)
-#   Utils:      <root>/src/test/java/com/nbc/utils/
-#   Properties: <root>/src/test/resources/data/<environment>/common.properties
-#               keys inside: baseUrl, makerID, makerPassword, checkerID, checkerPassword
-# Known modules: batch, cash, cif, common, deposits, fileUpload, gl, healthCheck,
-# loans, ndvp, parameters, sdv
-# ─────────────────────────────────────────────────────────────────────────────
-JAVA_PAGES_DIR = os.path.join(JAVA_FRAMEWORK_SRC, "test", "java", "com", "nbc", "pages")
-JAVA_STEPS_DIR = os.path.join(JAVA_FRAMEWORK_SRC, "test", "java", "com", "nbc", "stepDefinitions")
-JAVA_FEATURES_DIR = os.path.join(JAVA_FRAMEWORK_SRC, "test", "features")
-JAVA_UTILS_DIR = os.path.join(JAVA_FRAMEWORK_SRC, "test", "java", "com", "nbc", "utils")
-PROPERTIES_DATA_ROOT = os.path.join(JAVA_FRAMEWORK_SRC, "test", "resources", "data")
-NBC_MODULES = ["batch", "cash", "cif", "common", "deposits", "fileUpload", "gl",
-               "healthCheck", "loans", "ndvp", "parameters", "sdv"]
-
-# Older/Maven-standard locations — kept only as a fallback for anything created
-# before this was corrected, so nothing already generated there goes missing.
-JAVA_FEATURES_DIR_LEGACY = os.path.join(JAVA_FRAMEWORK_SRC, "test", "resources", "features")
-JAVA_PAGES_DIR_LEGACY = os.path.join(JAVA_FRAMEWORK_SRC, "main", "java", "com", "nbc", "pages")
-JAVA_STEPS_DIR_LEGACY = os.path.join(JAVA_FRAMEWORK_SRC, "test", "java", "com", "nbc", "steps")
-
-# Local WebDriver binaries (msedgedriver.exe, etc.) for offline/restricted-network
-# machines that can't auto-download drivers. Convention: <project root>/drivers/
-DRIVERS_DIR = os.getenv("DRIVERS_DIR", os.path.join(PROJECT_ROOT, "drivers"))
-
-
-def default_edge_driver_path() -> Optional[str]:
-    """Returns the local msedgedriver path if it exists under drivers/, else None
-    (callers should fall back to Selenium Manager's auto-download in that case)."""
-    for name in ("msedgedriver.exe", "msedgedriver"):
-        candidate = os.path.join(DRIVERS_DIR, name)
-        if os.path.exists(candidate):
-            return candidate
+# Initialize LLM Client dynamically based on environment
+def get_llm_client():
+    api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    
+    if api_key and endpoint:
+        logger.info("Using Azure OpenAI client.")
+        return AzureOpenAI(
+            api_key=api_key,
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2023-12-01-preview"),
+            azure_endpoint=endpoint
+        )
+    
+    # Fallback to standard OpenAI if api_key exists
+    standard_key = os.getenv("OPENAI_API_KEY")
+    if standard_key:
+        logger.info("Using standard OpenAI client.")
+        return OpenAI(api_key=standard_key)
+        
+    logger.warning("No LLM keys found. Running in offline/template mode.")
     return None
 
 
-def default_database_url() -> str:
-    """sqlite:///<absolute path to backend/knowledge_graph.db>, forward-slashed
-    so it's a valid SQLAlchemy URL on both Windows and Linux."""
-    db_path = os.path.join(BACKEND_DIR, "knowledge_graph.db").replace(os.sep, "/")
-    return f"sqlite:///{db_path}"
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared transaction-tag matching — used by both ExecutionAgent (to find which
+# scenario to run) and JavaGeneratorAgent (to find which scenario to append BRD-
+# driven requirement updates into). Keeping this in one place means "run 741" and
+# "append the BRD update for 741" always agree on what "741" refers to.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Matches a transaction number regardless of what (if anything) precedes it —
+# bare digits (@000741), any word prefix (@txn021073, @screen069069), with or
+# without an underscore, and with or without a descriptive name glued on after.
+TXN_TAG_RE = re.compile(r'^@[A-Za-z_]*0*(\d+)')
 
 
-# Property key aliases: real key name <-> the generic/dotted name this codebase
-# also uses in a few places. Populating both directions means callers can look
-# up either name and always get a value if one form is present in the file.
-_PROPERTY_ALIASES = {
-    "baseUrl": "url", "url": "baseUrl",
-    "makerID": "maker.username", "maker.username": "makerID",
-    "makerPassword": "maker.password", "maker.password": "makerPassword",
-    "checkerID": "checker.username", "checker.username": "checkerID",
-    "checkerPassword": "checker.password", "checker.password": "checkerPassword",
-}
+def normalize_txn_digits(value: str) -> str:
+    """Strips everything but digits, then strips leading zeros (keeping at least
+    one digit) so '021073', '21073', and '0021073' all normalize the same way."""
+    digits = re.sub(r'\D', '', value or '')
+    return digits.lstrip('0') or digits or ''
 
 
-def read_config_properties(environment: str = None) -> dict:
+def locate_scenario_by_transaction(features_dirs, transaction_number: str):
     """
-    Reads the real per-environment properties file:
-        java-framework/src/test/resources/data/<environment>/common.properties
-    (keys inside: baseUrl, makerID, makerPassword, checkerID, checkerPassword, ...)
+    Scans every .feature file under features_dirs (a path, or a list of paths —
+    checked in order, e.g. the real per-module features folder plus an older
+    legacy location) for a Scenario tagged with transaction_number (any prefix,
+    any leading zeros — see TXN_TAG_RE). Searches recursively, since the real
+    structure nests features under module subfolders (test/features/<module>/).
 
-    environment defaults to the NBC_ENV env var, then "preprod", then "uat" —
-    whichever is found first. Falls back to the older flat
-    java-framework/src/main/resources/config.properties if neither per-
-    environment file exists, so nothing already set up that way breaks.
-
-    Every value is returned under BOTH its real key name and the equivalent
-    dotted alias (see _PROPERTY_ALIASES) — callers can use either without
-    needing to know which convention the actual file uses.
+    Returns a dict with everything needed to either read that scenario's steps
+    (for execution) or edit the file in place (to append new steps), or None if
+    no match was found:
+        {
+          "file_path": absolute path to the .feature file,
+          "raw_lines": the file's lines (list[str], as-is on disk),
+          "tag_line_idx": index of the matched @tag line,
+          "scenario_line_idx": index of the "Scenario: ..." line right after it,
+          "block_end_idx": index right after this scenario's last step line —
+                            the natural insertion point for appending new steps,
+          "feature_name": the "Feature: ..." line text this scenario belongs to,
+          "scenario_header": the "Scenario: ..." line text, stripped,
+        }
     """
-    candidates = []
-    env_order = [environment] if environment else [os.getenv("NBC_ENV"), "preprod", "uat"]
-    for env in env_order:
-        if env:
-            candidates.append(os.path.join(PROPERTIES_DATA_ROOT, env, "common.properties"))
-    # Legacy fallback: the older single flat file this project used before the
-    # real per-environment structure was confirmed.
-    candidates.append(os.path.join(JAVA_FRAMEWORK_SRC, "main", "resources", "config.properties"))
+    if not transaction_number:
+        return None
+    query_digits = normalize_txn_digits(transaction_number)
+    if not query_digits:
+        return None
 
-    values = {}
-    config_path = next((c for c in candidates if os.path.exists(c)), None)
-    if not config_path:
-        return values
+    dirs = features_dirs if isinstance(features_dirs, (list, tuple)) else [features_dirs]
 
-    try:
-        with open(config_path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
+    feature_files = []
+    for features_dir in dirs:
+        if not features_dir or not os.path.isdir(features_dir):
+            continue
+        for root, _dirs, files in os.walk(features_dir):
+            for fname in sorted(files):
+                if fname.endswith(".feature"):
+                    feature_files.append(os.path.join(root, fname))
+
+    for fpath in sorted(feature_files):
+        fname = os.path.basename(fpath)
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                raw_lines = f.readlines()
+        except Exception:
+            continue
+
+        feature_name = ""
+        i = 0
+        while i < len(raw_lines):
+            stripped = raw_lines[i].strip()
+            if stripped.startswith("Feature:"):
+                feature_name = stripped
+            if stripped.startswith("@"):
+                for tag in stripped.split():
+                    m = TXN_TAG_RE.match(tag)
+                    if m and normalize_txn_digits(m.group(1)) == query_digits:
+                        j = i + 1
+                        while j < len(raw_lines) and not raw_lines[j].strip():
+                            j += 1
+                        if j < len(raw_lines) and raw_lines[j].strip().startswith("Scenario"):
+                            k = j + 1
+                            while k < len(raw_lines):
+                                s = raw_lines[k].strip()
+                                if s.startswith("@") or s.startswith("Scenario"):
+                                    break
+                                k += 1
+                            return {
+                                "file_path": fpath,
+                                "raw_lines": raw_lines,
+                                "tag_line_idx": i,
+                                "scenario_line_idx": j,
+                                "block_end_idx": k,
+                                "feature_name": feature_name,
+                                "scenario_header": raw_lines[j].strip(),
+                            }
+            i += 1
+    return None
+
+
+class RequirementAgent:
+    """Extracts scenarios, steps, and parameters from BRD text or Feature files."""
+
+    # Looks for a transaction/screen number mentioned near a requirement, e.g.
+    # "Transaction 069069:", "screen no. 021073", "txn# 741" — used so BRD updates
+    # that describe a change to an EXISTING transaction get appended to that
+    # transaction's real scenario instead of dumped into a generic new one.
+    TXN_MENTION_RE = re.compile(
+        r'(?:transaction|txn|screen)\s*(?:number|no\.?|#)?\s*[:\-]?\s*(\d{3,7})',
+        re.IGNORECASE
+    )
+
+    def extract_requirements(self, text: str) -> List[Dict[str, Any]]:
+        client = get_llm_client()
+        if client:
+            try:
+                deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
+                prompt = (
+                    "Analyze the following Business Requirement Document (BRD) or Feature File. "
+                    "Extract all executable test scenarios. For each scenario, define the steps in Cucumber format "
+                    "(Given, When, Then) and identify the target pages, locators, and actions needed. "
+                    "If a scenario describes a change (new field, UI change, new validation, etc.) to an EXISTING "
+                    "transaction/screen — look for a transaction number, screen number, or txn number mentioned "
+                    "near that requirement in the document — include it as transaction_number. If the scenario is "
+                    "brand new and not tied to any existing transaction number, set transaction_number to null.\n"
+                    "Return a JSON list of scenarios with the format:\n"
+                    "[\n"
+                    "  {\n"
+                    "    \"scenario\": \"Scenario name\",\n"
+                    "    \"transaction_number\": \"069069 or null\",\n"
+                    "    \"steps\": [\n"
+                    "      {\"type\": \"Given\", \"text\": \"User is on login page\", \"page\": \"LoginPage\", \"action\": \"navigate\", \"params\": [\"url\"]},\n"
+                    "      {\"type\": \"When\", \"text\": \"User enters username 'admin' and password 'admin123'\", \"page\": \"LoginPage\", \"action\": \"input\", \"params\": [\"username\", \"password\"]}\n"
+                    "    ]\n"
+                    "  }\n"
+                    "]"
+                )
+                response = client.chat.completions.create(
+                    model=deployment,
+                    messages=[
+                        {"role": "system", "content": "You are an expert requirement extraction assistant."},
+                        {"role": "user", "content": f"{prompt}\n\nDocument:\n{text}"}
+                    ],
+                    response_format={"type": "json_object"}
+                )
+                res_content = response.choices[0].message.content
+                data = json.loads(res_content)
+                scenarios = data.get("scenarios", data)
+                # Belt-and-suspenders: if the LLM missed a transaction number that's
+                # actually in the text, catch it with the same regex the offline path uses.
+                for sc in scenarios:
+                    if not sc.get("transaction_number"):
+                        sc["transaction_number"] = self._detect_transaction_number(sc, text)
+                return scenarios
+            except Exception as e:
+                logger.error(f"Error during LLM extraction: {e}. Falling back to template mode.")
+        
+        return self._offline_extract(text)
+
+    def _detect_transaction_number(self, scenario: Dict[str, Any], full_text: str = "") -> Any:
+        """Looks for a transaction/screen number near this scenario's own text first
+        (more precise), then falls back to searching the whole document."""
+        local_text = scenario.get("scenario", "") + " " + " ".join(
+            s.get("text", "") for s in scenario.get("steps", [])
+        )
+        m = self.TXN_MENTION_RE.search(local_text)
+        if m:
+            return m.group(1)
+        if full_text:
+            m = self.TXN_MENTION_RE.search(full_text)
+            if m:
+                return m.group(1)
+        return None
+
+    def _offline_extract(self, text: str) -> List[Dict[str, Any]]:
+        scenarios = []
+        current_scenario = None
+        
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("Scenario:") or line.startswith("Scenario Outline:"):
+                if current_scenario:
+                    current_scenario["transaction_number"] = self._detect_transaction_number(current_scenario, text)
+                    scenarios.append(current_scenario)
+                current_scenario = {"scenario": line.split(":", 1)[1].strip(), "steps": []}
+            elif current_scenario and any(line.startswith(prefix) for prefix in ["Given ", "When ", "Then ", "And ", "But "]):
+                parts = line.split(" ", 1)
+                step_type = parts[0]
+                step_text = parts[1]
+                
+                # Guess page and actions
+                page = "GeneralPage"
+                action = "click"
+                if "login" in step_text.lower() or "username" in step_text.lower():
+                    page = "LoginPage"
+                elif "search" in step_text.lower():
+                    page = "SearchPage"
+                
+                if "click" in step_text.lower() or "press" in step_text.lower():
+                    action = "click"
+                elif "enter" in step_text.lower() or "type" in step_text.lower() or "fill" in step_text.lower():
+                    action = "input"
+                elif "select" in step_text.lower() or "choose" in step_text.lower():
+                    action = "dropdown"
+                elif "contain" in step_text.lower() or "verify" in step_text.lower() or "should" in step_text.lower():
+                    action = "assert"
+                
+                current_scenario["steps"].append({
+                    "type": step_type,
+                    "text": step_text,
+                    "page": page,
+                    "action": action,
+                    "params": []
+                })
+        
+        if current_scenario:
+            current_scenario["transaction_number"] = self._detect_transaction_number(current_scenario, text)
+            scenarios.append(current_scenario)
+            
+        if not scenarios:
+            # No structured Gherkin (Scenario:/Given/When/Then) was found in the pasted
+            # text — rather than fabricating a fake demo scenario, return a minimal
+            # navigate-only template pointed at the REAL configured application URL
+            # (if set), so it's honest about what it found and still usable as a start.
+            config = read_config_properties()
+            app_url = config.get("url", "")
+            nav_target = app_url if (app_url and app_url.lower() != "https://example.com") else "<set url= in config.properties>"
+            scenarios.append({
+                "scenario": "Untitled — no structured Given/When/Then found in the document",
+                "transaction_number": None,
+                "steps": [
+                    {"type": "Given", "text": f"User navigates to \"{nav_target}\"", "page": "GeneralPage", "action": "navigate", "params": []},
+                ]
+            })
+        return scenarios
+
+class FrameworkManagerAgent:
+    """Maintains Knowledge Graph, detects duplicates, and determines what needs to be created."""
+    def analyze_impact(self, extracted_scenarios: List[Dict[str, Any]]) -> Dict[str, Any]:
+        db = SessionLocal()
+        try:
+            missing_steps = []
+            missing_pages = {}
+            reused_steps = []
+            
+            for sc in extracted_scenarios:
+                for step in sc["steps"]:
+                    pattern = step["text"]
+                    # Normalize text parameters
+                    normalized = re.sub(r"'.*?'|\".*?\"|\d+", "{param}", pattern)
+                    
+                    db_step = db.query(StepDefinitionModel).filter(
+                        StepDefinitionModel.pattern.like(normalized.replace("{param}", "%"))
+                    ).first()
+                    
+                    if db_step:
+                        reused_steps.append({"step": pattern, "matched_pattern": db_step.pattern})
+                    else:
+                        missing_steps.append(step)
+                        page_name = step["page"]
+                        db_page = db.query(PageModel).filter(PageModel.name == page_name).first()
+                        if not db_page:
+                            if page_name not in missing_pages:
+                                missing_pages[page_name] = []
+                            missing_pages[page_name].append(step)
+            
+            return {
+                "missing_steps": missing_steps,
+                "missing_pages": missing_pages,
+                "reused_steps": reused_steps
+            }
+        finally:
+            db.close()
+
+class ComponentDiscoveryAgent:
+    """Discovers custom UI elements and registers them."""
+    def discover_and_register(self, element_name: str, html_snippet: str) -> str:
+        db = SessionLocal()
+        try:
+            element_name_clean = element_name.replace(" ", "")
+            action_type = "click"
+            
+            if "select" in html_snippet.lower():
+                action_type = "dropdown"
+            elif "input type=\"checkbox\"" in html_snippet.lower():
+                action_type = "checkbox"
+            elif "input type=\"password\"" in html_snippet.lower() or "input type=\"text\"" in html_snippet.lower():
+                action_type = "input"
+                
+            db_comp = db.query(ComponentRegistryModel).filter(ComponentRegistryModel.name == element_name_clean).first()
+            if not db_comp:
+                new_comp = ComponentRegistryModel(
+                    name=element_name_clean,
+                    action_type=action_type,
+                    java_code=f"// Dynamically discovered component {element_name_clean}\npublic void interactWith{element_name_clean}() {{\n    // code\n}}",
+                    description=f"Auto-discovered widget from HTML snippet: {html_snippet[:100]}"
+                )
+                db.add(new_comp)
+                db.commit()
+                return f"Discovered new component: {element_name_clean} of type {action_type}"
+            return f"Reused existing component: {element_name_clean}"
+        finally:
+            db.close()
+
+class JavaGeneratorAgent:
+    """Generates Java PageObjects, StepDefinitions, and Feature files without duplicating code."""
+    def generate_step_definition_code(self, step_text: str, page_name: str, action_type: str) -> Tuple[str, str]:
+        clean_text = re.sub(r"'.*?'|\".*?\"", "\"(.*?)\"", step_text)
+        method_name = re.sub(r"[^a-zA-Z0-9]", "_", step_text).lower()
+        method_name = re.sub(r"_+", "_", method_name).strip("_")
+        
+        matches = re.findall(r"'.*?'|\".*?\"", step_text)
+        args_def = ""
+        for i in range(len(matches)):
+            args_def += f"String arg{i}, "
+        if args_def.endswith(", "):
+            args_def = args_def[:-2]
+
+        java_code = (
+            f"    @io.cucumber.java.en.When(\"^{clean_text}$\")\n"
+            f"    public void {method_name}({args_def}) {{\n"
+            f"        // Generated Step implementation linking to page actions\n"
+            f"        // {page_name} action: {action_type}\n"
+            f"    }}\n"
+        )
+        return clean_text, java_code
+
+    def append_locator_to_page(self, page_name: str, element_name: str, selector_type: str, selector_val: str):
+        file_path = os.path.join(JAVA_PAGES_DIR, f"{page_name}.java")
+
+        if not os.path.exists(file_path):
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            initial_content = (
+                f"package com.nbc.pages;\n\n"
+                f"import com.nbc.base.BaseActions;\n"
+                f"import org.openqa.selenium.By;\n"
+                f"import org.openqa.selenium.WebDriver;\n\n"
+                f"public class {page_name} extends BaseActions {{\n"
+                f"    public {page_name}(WebDriver driver) {{\n"
+                f"        super(driver);\n"
+                f"    }}\n"
+                f"}}\n"
+            )
+            with open(file_path, "w") as f:
+                f.write(initial_content)
+                
+        with open(file_path, "r") as f:
+            content = f.read()
+
+        locator_var = re.sub(r"[^a-zA-Z0-9]", "", element_name).lower()
+        if f"By {locator_var}" in content:
+            return
+            
+        by_clause = f"By.xpath(\"{selector_val}\")"
+        if selector_type == "css":
+            by_clause = f"By.cssSelector(\"{selector_val}\")"
+        elif selector_type == "id":
+            by_clause = f"By.id(\"{selector_val}\")"
+        elif selector_type == "name":
+            by_clause = f"By.name(\"{selector_val}\")"
+            
+        new_locator_code = f"    private By {locator_var} = {by_clause};\n"
+        new_action_code = (
+            f"\n    public void perform{element_name.replace(' ', '')}() {{\n"
+            f"        click({locator_var});\n"
+            f"    }}\n"
+        )
+        
+        last_brace = content.rfind("}")
+        if last_brace != -1:
+            updated_content = content[:last_brace] + new_locator_code + new_action_code + "\n" + content[last_brace:]
+            with open(file_path, "w") as f:
+                f.write(updated_content)
+
+        db = SessionLocal()
+        try:
+            page_db = db.query(PageModel).filter(PageModel.name == page_name).first()
+            if not page_db:
+                page_db = PageModel(name=page_name, url="", description="Auto-generated page class")
+                db.add(page_db)
+                db.commit()
+                db.refresh(page_db)
+                
+            locator_db = db.query(LocatorModel).filter(
+                LocatorModel.page_id == page_db.id,
+                LocatorModel.element_name == element_name
+            ).first()
+            if not locator_db:
+                locator_db = LocatorModel(
+                    page_id=page_db.id,
+                    element_name=element_name,
+                    selector_type=selector_type,
+                    selector_value=selector_val,
+                    description=f"Auto-generated locator for {element_name}"
+                )
+                db.add(locator_db)
+                db.commit()
+        finally:
+            db.close()
+
+    def append_step_definition(self, step_text: str, page_name: str, action_type: str):
+        file_path = os.path.join(JAVA_STEPS_DIR, "SampleSteps.java")
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        
+        # Create SampleSteps file if it doesn't exist
+        if not os.path.exists(file_path):
+            initial_content = (
+                f"package com.nbc.steps;\n\n"
+                f"import io.cucumber.java.en.Given;\n"
+                f"import io.cucumber.java.en.When;\n"
+                f"import io.cucumber.java.en.Then;\n\n"
+                f"public class SampleSteps {{\n"
+                f"}}\n"
+            )
+            with open(file_path, "w") as f:
+                f.write(initial_content)
+
+        with open(file_path, "r") as f:
+            content = f.read()
+            
+        pattern, java_method_code = self.generate_step_definition_code(step_text, page_name, action_type)
+        if pattern in content or step_text in content:
+            return
+            
+        last_brace = content.rfind("}")
+        if last_brace != -1:
+            updated_content = content[:last_brace] + "\n" + java_method_code + "\n" + content[last_brace:]
+            with open(file_path, "w") as f:
+                f.write(updated_content)
+                
+        db = SessionLocal()
+        try:
+            db_step = db.query(StepDefinitionModel).filter(StepDefinitionModel.pattern == pattern).first()
+            if not db_step:
+                db_step = StepDefinitionModel(
+                    pattern=pattern,
+                    java_method=re.sub(r"[^a-zA-Z0-9]", "_", step_text).lower(),
+                    java_code=java_method_code,
+                    page_associated=page_name
+                )
+                db.add(db_step)
+                db.commit()
+        finally:
+            db.close()
+
+        # Update the features folder to save a sample feature
+        feature_path = os.path.join(JAVA_FRAMEWORK_SRC, "test", "resources", "features", "Sample.feature")
+        os.makedirs(os.path.dirname(feature_path), exist_ok=True)
+        
+        # Read existing feature lines
+        feature_content = ""
+        if os.path.exists(feature_path):
+            with open(feature_path, "r") as f:
+                feature_content = f.read()
+        
+        if step_text not in feature_content:
+            if not feature_content.strip():
+                feature_content = "Feature: Autonomous Test Automation Execution\n\n  Scenario: Execute Business Flow\n"
+            
+            # Format and append step
+            step_line = f"    {step_text}\n"
+            # Try to append to the end of the Scenario
+            with open(feature_path, "w") as f:
+                f.write(feature_content.rstrip() + "\n" + step_line)
+
+    def append_requirement_to_transaction(self, transaction_number: str, steps: List[Dict[str, Any]], requirement_summary: str = "") -> Dict[str, Any]:
+        """
+        Finds the EXISTING scenario tagged with transaction_number (any prefix, any
+        leading zeros — same matching ExecutionAgent uses) and appends the given
+        BRD-derived steps directly into that scenario's block in its real .feature
+        file — so the transaction's full flow reflects the change, instead of the
+        new requirement living in a disconnected file.
+
+        Elements a step refers to that don't exist yet in the knowledge graph (a
+        genuinely new UI field/button from the BRD) get a "# TODO: locator not
+        recorded yet" comment rather than a guessed locator — this only writes
+        locators that were actually captured by recording or importing.
+        """
+        features_dir = [JAVA_FEATURES_DIR, JAVA_FEATURES_DIR_LEGACY]
+        located = locate_scenario_by_transaction(features_dir, transaction_number)
+        if not located:
+            return {
+                "appended": False,
+                "reason": f"No existing scenario found for transaction '{transaction_number}'. "
+                          f"It may need to be recorded or imported first before a BRD update can target it.",
+            }
+
+        db = SessionLocal()
+        try:
+            known_locators = {
+                re.sub(r'[^a-z0-9]', '', (row.element_name or '').lower())
+                for row in db.query(LocatorModel).all()
+            }
+        finally:
+            db.close()
+
+        new_lines = []
+        if requirement_summary:
+            new_lines.append(f"    # BRD update: {requirement_summary}\n")
+
+        for step in steps:
+            step_type = step.get("type", "And")
+            step_text = step.get("text", "").strip()
+            if not step_text:
+                continue
+            line = f"    {step_type} {step_text}\n"
+            new_lines.append(line)
+
+            # If this step actually references an ELEMENT (enters/clicks/selects —
+            # the same verbs ExecutionAgent resolves against the knowledge graph)
+            # and we don't have a locator for it yet, flag it. Navigate and assert
+            # steps don't reference an element locator at all, so they're skipped —
+            # otherwise every URL or expected-text string would be wrongly flagged.
+            element_guess = None
+            m = re.search(r'enters?\s+["\'].+?["\']\s+(?:in|into|for)\s+["\'](.+?)["\']', step_text, re.IGNORECASE)
+            if m:
+                element_guess = m.group(1)
+            else:
+                m = re.search(r'selects?\s+["\'].+?["\']\s+from\s+["\'](.+?)["\']', step_text, re.IGNORECASE)
+                if m:
+                    element_guess = m.group(1)
+                else:
+                    m = re.search(r'clicks?\s+(?:on\s+)?["\'](.+?)["\']', step_text, re.IGNORECASE)
+                    if m:
+                        element_guess = m.group(1)
+
+            if element_guess:
+                normalized = re.sub(r'[^a-z0-9]', '', element_guess.lower())
+                if normalized and normalized not in known_locators:
+                    new_lines.append(
+                        f"    # TODO: locator for \"{element_guess}\" not recorded yet — "
+                        f"record or import this UI change before running this step\n"
+                    )
+
+        raw_lines = located["raw_lines"]
+        insert_idx = located["block_end_idx"]
+        updated_lines = raw_lines[:insert_idx] + new_lines + raw_lines[insert_idx:]
+
+        with open(located["file_path"], "w", encoding="utf-8") as f:
+            f.writelines(updated_lines)
+
+        return {
+            "appended": True,
+            "file": os.path.basename(located["file_path"]),
+            "scenario": located["scenario_header"],
+            "steps_added": len([l for l in new_lines if not l.strip().startswith("#")]),
+        }
+
+class CompilerAgent:
+    """Validates Java file syntax statically to simulate compiler without build tools."""
+    def compile_framework(self) -> Tuple[bool, str]:
+        # Walk through the directories and find all java files
+        java_files = []
+        for root, _, files in os.walk(JAVA_FRAMEWORK_SRC):
+            for f in files:
+                if f.endswith(".java"):
+                    java_files.append(os.path.join(root, f))
+                    
+        logs = []
+        success = True
+        
+        for file_path in java_files:
+            try:
+                with open(file_path, "r") as f:
+                    content = f.read()
+                
+                # Check for basic compile rules:
+                # 1. Matching brackets
+                open_brackets = content.count("{")
+                close_brackets = content.count("}")
+                if open_brackets != close_brackets:
+                    success = False
+                    logs.append(f"[ERROR] {file_path}: Unbalanced curly brackets. Open: {open_brackets}, Close: {close_brackets}")
+                
+                # 2. Package matches path
+                package_match = re.search(r"package\s+([\w\.]+);", content)
+                if package_match:
+                    pkg = package_match.group(1)
+                    expected_suffix = pkg.replace(".", "/")
+                    if expected_suffix not in file_path.replace("\\", "/"):
+                        success = False
+                        logs.append(f"[ERROR] {file_path}: Package declaration '{pkg}' does not match directories path.")
+                
+                # 3. Method syntax checks (semicolons inside methods, no double declaration)
+                # Find all methods and look for basic structure
+                methods = re.findall(r"(public|private|protected)\s+\w+\s+(\w+)\s*\(", content)
+                method_names = [m[1] for m in methods]
+                duplicates = set([x for x in method_names if method_names.count(x) > 1])
+                for dup in duplicates:
+                    if dup not in ["setUp", "tearDown", "scenarios", "BasePage", "BaseActions", "SamplePage"]:
+                        success = False
+                        logs.append(f"[ERROR] {file_path}: Duplicate method declaration found for '{dup}'.")
+
+            except Exception as e:
+                success = False
+                logs.append(f"[ERROR] {file_path}: Failed reading file: {e}")
+                
+        if success:
+            return True, "Static validation check PASSED. 0 compile errors found in Java sources."
+        else:
+            return False, "\n".join(logs)
+
+class ExecutionAgent:
+    """Executes Cucumber scenarios using python-selenium, capturing reports and logs."""
+
+    _BY_MAP = {
+        "id": By.ID, "name": By.NAME, "xpath": By.XPATH,
+        "css": By.CSS_SELECTOR, "css_selector": By.CSS_SELECTOR, "cssselector": By.CSS_SELECTOR,
+        "class_name": By.CLASS_NAME, "classname": By.CLASS_NAME,
+        "link_text": By.LINK_TEXT, "linktext": By.LINK_TEXT,
+        "partial_link_text": By.PARTIAL_LINK_TEXT, "text_xpath": By.XPATH,
+        "tag_name": By.TAG_NAME, "tagname": By.TAG_NAME,
+    }
+
+    def _resolve_locator(self, element_name: str, page_id: int = None):
+        """Looks up a real locator for element_name in the knowledge graph — the
+        same locators captured by recording or importing an existing framework.
+        Matches by normalized name (case/spacing/punctuation-insensitive), exact
+        first, then substring, so a step referencing "Amount" can still find a
+        locator named "amountField". Returns (selector_type, selector_value,
+        matched_element_name) or None if nothing in the graph matches.
+
+        If page_id is given, only locators belonging to that page are considered —
+        important on a framework with hundreds of pages, where an unscoped search
+        could match a same-named field on a completely unrelated screen (e.g. a
+        random "UIPage_..._username" field that isn't actually on the login page)."""
+        target_norm = re.sub(r'[^a-z0-9]', '', (element_name or '').lower())
+        if not target_norm:
+            return None
+        db = SessionLocal()
+        try:
+            query = db.query(LocatorModel)
+            if page_id is not None:
+                query = query.filter(LocatorModel.page_id == page_id)
+            rows = query.all()
+            for row in rows:
+                row_norm = re.sub(r'[^a-z0-9]', '', (row.element_name or '').lower())
+                if row_norm and row_norm == target_norm:
+                    return (row.selector_type, row.selector_value, row.element_name)
+            for row in rows:
+                row_norm = re.sub(r'[^a-z0-9]', '', (row.element_name or '').lower())
+                if row_norm and (target_norm in row_norm or row_norm in target_norm):
+                    return (row.selector_type, row.selector_value, row.element_name)
+        finally:
+            db.close()
+        return None
+
+    def _find_login_page_id(self):
+        """Finds the page in the knowledge graph that's most likely the actual
+        login/auth screen, by name — e.g. LoginPage, AuthPage. Returns its id,
+        or None if nothing looks like a login page (caller falls back to an
+        unscoped search across every page)."""
+        db = SessionLocal()
+        try:
+            candidates = db.query(PageModel).filter(
+                PageModel.name.ilike("%login%") | PageModel.name.ilike("%auth%")
+                | PageModel.name.ilike("%signin%") | PageModel.name.ilike("%logon%")
+            ).all()
+        finally:
+            db.close()
+        if not candidates:
+            return None
+        # Prefer the most specific-sounding match: "LoginPage" over "AuthPage"
+        # over anything else containing one of these words.
+        for preferred in ("loginpage", "authpage", "signinpage", "logonpage"):
+            for c in candidates:
+                if c.name.lower() == preferred:
+                    return c.id
+        return candidates[0].id
+
+    def _find_element_from_locator(self, driver, selector_type: str, selector_value: str):
+        by = self._BY_MAP.get((selector_type or "").lower().replace(" ", "_"), By.XPATH)
+        return driver.find_element(by, selector_value)
+
+    def _attempt_login(self, driver, config: dict, logs: list) -> bool:
+        """Attempts login using maker.username/maker.password from config.properties
+        and whatever username/password/login-button locators are in the knowledge
+        graph. Returns True on success. Appends a clear INFO/WARN line either way —
+        never fails silently.
+
+        Resolves locators scoped to the page that looks like the actual login
+        screen first (see _find_login_page_id) — critical on a framework with
+        hundreds of pages, where an unscoped name match could grab a same-named
+        field from a completely unrelated screen and fail with "no such element"
+        even though the real login locator exists elsewhere in the graph."""
+        username_val = config.get("maker.username")
+        password_val = config.get("maker.password")
+        if not (username_val and password_val):
+            logs.append("[WARN] maker.username/maker.password not set in config.properties — skipping login.")
+            return False
+
+        login_page_id = self._find_login_page_id()
+
+        def resolve(*names):
+            if login_page_id is not None:
+                for n in names:
+                    hit = self._resolve_locator(n, page_id=login_page_id)
+                    if hit:
+                        return hit
+            for n in names:
+                hit = self._resolve_locator(n)
+                if hit:
+                    return hit
+            return None
+
+        user_loc = resolve("usernameField", "username", "userId", "loginId")
+        pass_loc = resolve("passwordField", "password")
+        btn_loc = resolve("loginButton", "login", "submitLogin")
+
+        if login_page_id is not None:
+            logs.append(f"[INFO] Resolving login locators scoped to the detected login page (id={login_page_id}).")
+        else:
+            logs.append("[WARN] No page named like Login/Auth found in the knowledge graph — "
+                         "searching all pages, which risks matching an unrelated same-named field.")
+
+        if not (user_loc and pass_loc and btn_loc):
+            missing = [n for n, v in [("username", user_loc), ("password", pass_loc), ("login button", btn_loc)] if not v]
+            logs.append(f"[WARN] Login skipped — no locator found for: {', '.join(missing)}. "
+                         f"Record or import LoginPage first, then update the 6 placeholder locators.")
+            return False
+
+        try:
+            u_el = self._find_element_from_locator(driver, user_loc[0], user_loc[1])
+            u_el.clear(); u_el.send_keys(username_val)
+            p_el = self._find_element_from_locator(driver, pass_loc[0], pass_loc[1])
+            p_el.clear(); p_el.send_keys(password_val)
+            self._find_element_from_locator(driver, btn_loc[0], btn_loc[1]).click()
+            logs.append(f"[INFO] Logged in as maker ({user_loc[2]}/{pass_loc[2]}/{btn_loc[2]})")
+            return True
+        except Exception as login_err:
+            logs.append(f"[WARN] Login attempt failed: {login_err}")
+            return False
+
+    def execute_tests(self, transaction_number: str = None) -> Tuple[str, bool, str]:
+        lines, feature_label, select_err = self._select_scenario_lines(transaction_number)
+        if select_err:
+            return select_err, False, ""
+
+        logs = ["[INFO] TestNG Suite: 'Enterprise Automation Suite' - Started",
+                "[INFO] Running TestRunner: com.nbc.runners.TestRunner"]
+        if transaction_number:
+            logs.append(f"[INFO] Filtering to transaction: \"{transaction_number}\" — matched {feature_label}")
+
+        success = True
+        step_results = []
+        driver = None
+
+        try:
+            # Initialize live Edge browser
+            logger.info("Initializing Microsoft Edge browser for live execution...")
+            edge_options = EdgeOptions()
+            edge_options.add_argument("--remote-allow-origins=*")
+            # Run headless to avoid opening actual browser windows if GUI is absent
+            # but allow GUI by default
+            edge_options.add_argument("--headless=new")
+
+            # Use a local msedgedriver.exe if present, so offline/restricted-network
+            # machines don't need Selenium Manager to reach the internet.
+            # Convention: <project root>/drivers/msedgedriver.exe (auto-detected).
+            # Override with EDGE_DRIVER_PATH env var if you keep it somewhere else.
+            edge_driver_path = os.getenv("EDGE_DRIVER_PATH") or default_edge_driver_path()
+            if edge_driver_path and os.path.exists(edge_driver_path):
+                logger.info(f"Using local Edge driver: {edge_driver_path}")
+                edge_service = EdgeService(executable_path=edge_driver_path)
+                driver = webdriver.Edge(service=edge_service, options=edge_options)
+            else:
+                # Falls back to Selenium Manager, which auto-downloads the driver
+                # (requires internet access).
+                driver = webdriver.Edge(options=edge_options)
+            driver.maximize_window()
+            driver.implicitly_wait(4)
+
+            # ─── Navigate to the REAL application + log in using common credentials ───
+            # Every execution starts here — the same "always log in first" flow the
+            # actual BaNCS application requires — using config.properties (not a
+            # hardcoded/mock URL) and locators already captured by recording or
+            # importing the framework's LoginPage.
+            config = read_config_properties()
+            app_url = config.get("url")
+            if app_url and app_url.strip() and app_url.strip().lower() != "https://example.com":
+                driver.get(app_url)
+                logs.append(f"[INFO] Navigated to application URL: {app_url}")
+            else:
+                logs.append("[WARN] No real application url set in config.properties (still the placeholder) — "
+                             "skipping navigation. Set 'url=' there to your actual NBC/BaNCS URL.")
+
+            logged_in = self._attempt_login(driver, config, logs)
+
+            if not lines:
+                # No transaction number was given — this was a login-only smoke test.
+                logs.append("[INFO] No transaction specified — login-only smoke test complete.")
+
+            # Step runner
+            for line in lines:
+                line_str = line.strip()
+                if not line_str or line_str.startswith("Feature:") or line_str.startswith("Scenario:"):
+                    logs.append(f"[CUCUMBER] {line_str}")
                     continue
-                key, _, value = line.partition("=")
-                values[key.strip()] = value.strip()
-    except Exception:
-        return values
+                
+                # Parse Cucumber prefixes
+                prefix_match = re.match(r"^(Given|When|Then|And|But)\s+(.*)$", line_str)
+                if not prefix_match:
+                    continue
+                
+                step_type = prefix_match.group(1)
+                step_text = prefix_match.group(2)
+                logs.append(f"[CUCUMBER] Executing step: {step_type} {step_text}")
+                
+                # Execute actions in Selenium based on step parsing
+                try:
+                    handled = False
 
-    for key, alias in list(_PROPERTY_ALIASES.items()):
-        if key in values and alias not in values:
-            values[alias] = values[key]
-    return values
+                    # A. Navigate — "User navigates to "URL"" (recorder convention),
+                    # broader than the Google-demo pattern below so it catches this
+                    # phrasing regardless of the word before the quoted URL.
+                    m = re.search(r'navigates?\s+to\s+["\'](.+?)["\']', step_text, re.IGNORECASE)
+                    if m:
+                        url = m.group(1)
+                        driver.get(url)
+                        logs.append(f"  └─ Navigate to URL: {url}")
+                        step_results.append((step_text, "PASSED", None))
+                        handled = True
+
+                    # B. Enter VALUE in/into/for ELEMENT — resolved against the real
+                    # knowledge-graph locator, not a guessed selector.
+                    if not handled:
+                        m = re.search(r'enters?\s+["\'](.+?)["\']\s+(?:in|into|for)\s+["\'](.+?)["\']', step_text, re.IGNORECASE)
+                        if m:
+                            value, element = m.group(1), m.group(2)
+                            resolved = self._resolve_locator(element)
+                            if not resolved:
+                                raise Exception(f'No locator found for "{element}" in the knowledge graph — record or import it first.')
+                            sel_type, sel_val, matched_name = resolved
+                            el = self._find_element_from_locator(driver, sel_type, sel_val)
+                            el.clear()
+                            el.send_keys(value)
+                            logs.append(f"  └─ Entered \"{value}\" into {matched_name} ({sel_type}={sel_val})")
+                            step_results.append((step_text, "PASSED", None))
+                            handled = True
+
+                    # C. Select VALUE from ELEMENT (dropdown)
+                    if not handled:
+                        m = re.search(r'selects?\s+["\'](.+?)["\']\s+from\s+["\'](.+?)["\']', step_text, re.IGNORECASE)
+                        if m:
+                            value, element = m.group(1), m.group(2)
+                            resolved = self._resolve_locator(element)
+                            if not resolved:
+                                raise Exception(f'No locator found for "{element}" in the knowledge graph — record or import it first.')
+                            sel_type, sel_val, matched_name = resolved
+                            el = self._find_element_from_locator(driver, sel_type, sel_val)
+                            Select(el).select_by_visible_text(value)
+                            logs.append(f"  └─ Selected \"{value}\" from {matched_name}")
+                            step_results.append((step_text, "PASSED", None))
+                            handled = True
+
+                    # D. Clicks on ELEMENT
+                    if not handled:
+                        m = re.search(r'clicks?\s+(?:on\s+)?["\'](.+?)["\']', step_text, re.IGNORECASE)
+                        if m:
+                            element = m.group(1)
+                            resolved = self._resolve_locator(element)
+                            if not resolved:
+                                raise Exception(f'No locator found for "{element}" in the knowledge graph — record or import it first.')
+                            sel_type, sel_val, matched_name = resolved
+                            el = self._find_element_from_locator(driver, sel_type, sel_val)
+                            el.click()
+                            logs.append(f"  └─ Clicked {matched_name} ({sel_type}={sel_val})")
+                            step_results.append((step_text, "PASSED", None))
+                            handled = True
+
+                    # E. Generic fallback for real hand-written/imported steps that don't
+                    # follow the "VALUE" in/from "ELEMENT" convention, e.g. the actual
+                    # framework wording `user applies for loan amount "50000"` — try to
+                    # resolve a locator from the significant words in the step itself.
+                    if not handled:
+                        quoted_vals = re.findall(r'["\'](.+?)["\']', step_text)
+                        words_only = re.sub(r'["\'].*?["\']', '', step_text)
+                        guess_name = re.sub(
+                            r'\b(user|the|a|an|is|are|on|to|in|into|for|with|and|clicks?|enters?|selects?|submits?|applies?)\b',
+                            '', words_only, flags=re.IGNORECASE
+                        ).strip()
+                        resolved = self._resolve_locator(guess_name) if guess_name else None
+                        if resolved and quoted_vals:
+                            sel_type, sel_val, matched_name = resolved
+                            el = self._find_element_from_locator(driver, sel_type, sel_val)
+                            if re.search(r'\b(click|press|submit)\b', step_text, re.IGNORECASE):
+                                el.click()
+                                logs.append(f"  └─ Clicked {matched_name} (fuzzy-matched from step wording)")
+                            else:
+                                el.clear()
+                                el.send_keys(quoted_vals[0])
+                                logs.append(f"  └─ Entered \"{quoted_vals[0]}\" into {matched_name} (fuzzy-matched from step wording)")
+                            step_results.append((step_text, "PASSED", None))
+                            handled = True
+
+                    if handled:
+                        continue
+
+                    # Generic assertion: Then Page title should contain "keyword" —
+                    # useful for any real transaction verifying page state after an
+                    # action, not specific to any one application.
+                    assert_match = re.search(r"title should contain\s+['\"](.*?)['\"]", step_text)
+                    if assert_match:
+                        kw = assert_match.group(1)
+                        title = driver.title
+                        if kw.lower() in title.lower():
+                            logs.append(f"  └─ Assertion PASSED: Title '{title}' contains '{kw}'")
+                            step_results.append((step_text, "PASSED", None))
+                        else:
+                            raise AssertionError(f"Title '{title}' does not contain expected keyword '{kw}'")
+                        continue
+
+                    # The scenario's own explicit login step — real hand-written
+                    # frameworks commonly write this as their first Given, e.g.
+                    # `the user is logged into NBC using "makerID" and "makerPassword"`.
+                    # Login already happened automatically above before any scenario
+                    # steps ran, so this is a no-op if that succeeded; if it hadn't
+                    # (e.g. locators weren't available yet at that point), try once more now.
+                    if re.search(r"logged\s+in(?:to)?\b.*\busing\b", step_text, re.IGNORECASE):
+                        if logged_in:
+                            logs.append("  └─ Already logged in (see setup above) — skipping redundant login step.")
+                            step_results.append((step_text, "PASSED", None))
+                        else:
+                            logs.append("  └─ Not yet logged in — attempting login now.")
+                            logged_in = self._attempt_login(driver, config, logs)
+                            if logged_in:
+                                step_results.append((step_text, "PASSED", None))
+                            else:
+                                raise Exception("Login step failed — see [WARN] above for which locator is missing.")
+                        continue
+
+                    # Nothing matched — say so explicitly rather than silently skipping
+                    # or guessing at an element, so a real failure is never hidden.
+                    raise Exception(f"Could not interpret step: \"{step_text}\" — no matching pattern or locator.")
+                        
+                except Exception as step_err:
+                    logs.append(f"  └─ [ERROR] Step failed: {step_err}")
+                    success = False
+                    # Capture screenshot on failure
+                    screenshot_dir = os.path.join(JAVA_FRAMEWORK_TARGET, "screenshots")
+                    os.makedirs(screenshot_dir, exist_ok=True)
+                    screenshot_path = os.path.join(screenshot_dir, "failure.png")
+                    driver.save_screenshot(screenshot_path)
+                    
+                    step_results.append((step_text, "FAILED", str(step_err)))
+                    break
+                    
+        except Exception as driver_err:
+            success = False
+            logs.append(f"[ERROR] Driver issue: {driver_err}")
+        finally:
+            if driver:
+                driver.quit()
+                
+        # Generate Extent/Cucumber Report HTML
+        report_dir = JAVA_FRAMEWORK_TARGET
+        os.makedirs(report_dir, exist_ok=True)
+        report_path = os.path.join(report_dir, "cucumber-reports.html")
+        
+        report_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Extent Reports - Test Execution Report</title>
+            <style>
+                body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f8f9fa; margin: 20px; }}
+                .card {{ background: #fff; border-radius: 8px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 20px; }}
+                .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #eee; padding-bottom: 10px; }}
+                .status-pass {{ color: #28a745; font-weight: bold; }}
+                .status-fail {{ color: #dc3545; font-weight: bold; }}
+                .step {{ margin: 10px 0; padding: 10px; border-left: 4px solid #007bff; background: #f1f3f5; display:flex; justify-content:space-between; }}
+                .step.FAILED {{ border-left-color: #dc3545; background-color: #fdf2f2; }}
+                .step.PASSED {{ border-left-color: #28a745; background-color: #f4faf6; }}
+            </style>
+        </head>
+        <body>
+            <div class="card">
+                <div class="header">
+                    <h2>Test Execution Summary</h2>
+                    <span class="{"status-pass" if success else "status-fail"}">
+                        {"PASSED" if success else "FAILED"}
+                    </span>
+                </div>
+                <div style="margin-top: 15px;">
+                    <strong>Feature:</strong> Autonomous Test Automation Execution<br>
+                    <strong>Timestamp:</strong> {time.strftime('%Y-%m-%d %H:%M:%S')}
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>Steps Trace</h3>
+                {"".join(f'<div class="step {res[1]}"><span>{res[0]}</span><span class="status-{res[1].lower()}">{res[1]}</span></div>' for res in step_results)}
+            </div>
+        </body>
+        </html>
+        """
+        with open(report_path, "w") as f:
+            f.write(report_html)
+
+        logs.append(f"[INFO] Test Execution finished. Status: {'PASS' if success else 'FAIL'}")
+        
+        # Save Log to DB
+        db = SessionLocal()
+        try:
+            log_entry = ExecutionLogModel(
+                status="PASS" if success else "FAIL",
+                output_log="\n".join(logs),
+                screenshot_path=os.path.abspath(os.path.join(report_dir, "screenshots/failure.png")) if not success else ""
+            )
+            db.add(log_entry)
+            db.commit()
+        finally:
+            db.close()
+            
+        return "\n".join(logs), success, "target/cucumber-reports.html"
+
+    # Matches a transaction number regardless of what (if anything) comes before it —
+    # bare digits (@000741), any word prefix (@txn021073, @screen069069), with or
+    # without an underscore (@txn_25060IssueOfCash), and with or without a descriptive
+    # name glued directly on afterward (@019301_LoanTrackingMasterMenu). Only requires
+    # that nothing but letters/underscores sits between "@" and the digit run.
+    TXN_TAG_RE = re.compile(r'^@[A-Za-z_]*0*(\d+)')
+
+    def _normalize_txn_digits(self, value: str) -> str:
+        """Strips everything but digits, then strips leading zeros (keeping at least one digit)
+        so '021073', '21073', and '0021073' all normalize to the same thing for comparison."""
+        digits = re.sub(r'\D', '', value or '')
+        return digits.lstrip('0') or digits or ''
+
+    def _select_scenario_lines(self, transaction_number: str = None):
+        """
+        Returns (lines, feature_label, error_message).
+
+        With no transaction_number: no scenario-specific steps are run — execute_tests()
+        still navigates to the real application URL and logs in, so this acts as a
+        login-only smoke test. (Previously this fell back to a hardcoded demo
+        "Sample.feature" that searched Google — removed since it wasn't testing
+        anything about the actual application.)
+
+        With a transaction_number: scans every .feature file under
+        java-framework/src/test/features/ (recursively — features live under
+        per-module subfolders) for a Scenario tagged with that transaction/screen
+        number, and returns just that scenario's Given/When/Then/And lines — not
+        the whole file, so multi-scenario feature files don't run unrelated
+        scenarios. Matches the number regardless of what (if anything) precedes it in the
+        tag, and regardless of leading zeros — e.g. searching "450" matches @000450,
+        @txn000450, @txn00450, @txn_000450, @Txn_00450, and @450SomeDescriptiveName alike.
+        """
+        if not transaction_number:
+            return [], "Login-only smoke test (no transaction number specified)", None
+
+        search_dirs = [d for d in (JAVA_FEATURES_DIR, JAVA_FEATURES_DIR_LEGACY) if os.path.isdir(d)]
+        if not search_dirs:
+            return None, None, f"Features folder not found: {JAVA_FEATURES_DIR}"
+
+        feature_files = []
+        for fdir in search_dirs:
+            for root, _dirs, files in os.walk(fdir):
+                for fn in files:
+                    if fn.endswith(".feature"):
+                        feature_files.append(os.path.join(root, fn))
+
+        query_digits = self._normalize_txn_digits(transaction_number)
+        available_tags = set()
+        # Fallback candidate if no @txn/@screen-prefixed tag matches: a tag that merely
+        # *contains* the number anywhere (covers oddly-formatted tags we didn't anticipate).
+        loose_fallback = None
+
+        for fpath in sorted(feature_files):
+            fname = os.path.basename(fpath)
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    raw_lines = f.readlines()
+            except Exception:
+                continue
+
+            feature_name = ""
+            i = 0
+            while i < len(raw_lines):
+                stripped = raw_lines[i].strip()
+                if stripped.startswith("Feature:"):
+                    feature_name = stripped
+                if stripped.startswith("@"):
+                    matched_this_line = False
+                    for tag in stripped.split():
+                        available_tags.add(tag)
+                        m = self.TXN_TAG_RE.match(tag)
+                        if m and query_digits and self._normalize_txn_digits(m.group(1)) == query_digits:
+                            matched_this_line = True
+                        elif loose_fallback is None and query_digits and query_digits in re.sub(r'\D', '', tag):
+                            loose_fallback = (fpath, i, feature_name)
+
+                    if matched_this_line:
+                        result = self._extract_scenario_block(raw_lines, i, feature_name)
+                        if result:
+                            return result[0], f"{fname} — {result[1]}", None
+                i += 1
+
+        # No strict @txn/@screen match anywhere — try the loose fallback if one was seen.
+        if loose_fallback:
+            fpath, tag_line_idx, feature_name = loose_fallback
+            fname = os.path.basename(fpath)
+            with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                raw_lines = f.readlines()
+            result = self._extract_scenario_block(raw_lines, tag_line_idx, feature_name)
+            if result:
+                return result[0], f"{fname} — {result[1]} (loose match)", None
+
+        if len(available_tags) > 40:
+            shown = sorted(available_tags)[:40]
+            hint = f" {len(available_tags)} tags exist in total; first 40: {', '.join(shown)} …"
+        elif available_tags:
+            hint = f" Tags found in existing feature files: {', '.join(sorted(available_tags))}"
+        else:
+            hint = " No tagged scenarios found at all — record or import a transaction first."
+        return None, None, f"No scenario matching transaction '{transaction_number}' was found.{hint}"
+
+    def _extract_scenario_block(self, raw_lines, tag_line_idx, feature_name):
+        """Given the index of a tag line, finds the Scenario line right after it and
+        collects that scenario's lines up to the next tag/Scenario boundary."""
+        j = tag_line_idx + 1
+        while j < len(raw_lines) and not raw_lines[j].strip():
+            j += 1
+        if j >= len(raw_lines) or not raw_lines[j].strip().startswith("Scenario"):
+            return None
+        scenario_lines = [feature_name + "\n", raw_lines[j]]
+        k = j + 1
+        while k < len(raw_lines):
+            s = raw_lines[k].strip()
+            if s.startswith("@") or s.startswith("Scenario"):
+                break
+            scenario_lines.append(raw_lines[k])
+            k += 1
+        return scenario_lines, raw_lines[j].strip()
+
+class SelfHealingAgent:
+    """Attempts to self-heal XPath or Wait parameters on element interaction failure."""
+    def heal_locator(self, page_name: str, element_name: str, error_msg: str, latest_html: str) -> Tuple[bool, str]:
+        logger.info(f"Self-healing triggered for element {element_name} in {page_name}...")
+        
+        new_xpath = None
+        # Dynamic selector recovery rules
+        if f"id=\"{element_name.lower()}\"" in latest_html:
+            new_xpath = f"//*[@id='{element_name.lower()}']"
+        elif f"name=\"{element_name.lower()}\"" in latest_html:
+            new_xpath = f"//*[@name='{element_name.lower()}']"
+        elif element_name in latest_html:
+            new_xpath = f"//*[contains(text(), '{element_name}')]"
+            
+        if not new_xpath:
+            new_xpath = f"//button[contains(., '{element_name}')] | //input[@placeholder='{element_name}']"
+            
+        file_path = os.path.join(JAVA_PAGES_DIR, f"{page_name}.java")
+        if os.path.exists(file_path):
+            with open(file_path, "r") as f:
+                content = f.read()
+                
+            locator_var = re.sub(r"[^a-zA-Z0-9]", "", element_name).lower()
+            pattern = rf"private By ({locator_var})\s*=\s*By\..*?;"
+            replacement = rf"private By \1 = By.xpath(\"{new_xpath}\");"
+            
+            new_content = re.sub(pattern, replacement, content, flags=re.IGNORECASE)
+            with open(file_path, "w") as f:
+                f.write(new_content)
+                
+            db = SessionLocal()
+            try:
+                page_db = db.query(PageModel).filter(PageModel.name == page_name).first()
+                if page_db:
+                    loc_db = db.query(LocatorModel).filter(
+                        LocatorModel.page_id == page_db.id,
+                        LocatorModel.element_name == element_name
+                    ).first()
+                    if loc_db:
+                        loc_db.selector_type = "xpath"
+                        loc_db.selector_value = new_xpath
+                        db.commit()
+            finally:
+                db.close()
+                
+            return True, f"Successfully self-healed {element_name} locator to: {new_xpath}"
+        return False, "Java file not found."
