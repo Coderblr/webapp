@@ -1,2771 +1,500 @@
 """
-CR Pipeline — treats an uploaded BRD as a CHANGE REQUEST that may touch one or
-HUNDREDS of transactions, per the "Autonomous Senior QA Automation Engineer"
-spec. This is additive on top of the existing single-feature/BRD flow.
+Phase 2: AI-driven framework updates.
 
-Spec phases -> implementation map:
-  PHASE 1  BRD understanding      analyze_brd(): regex + one LLM extraction call
-  PHASE 2  Transaction discovery  regex sweep UNION LLM extraction, deduped by
-                                  canonical number (leading zeros stripped, same
-                                  rule as indexer._canon)
-  PHASE 3  Execution pipeline     CRRun holds an ordered queue of TxnItem work
-                                  items; the BRD is parsed ONCE, never re-read
-  PHASE 4  Per-transaction flow   _process_item(): SEARCH (indexer, never
-                                  generate before searching) -> UNDERSTAND (read
-                                  existing feature/page/steps) -> COMPARE (LLM
-                                  emits ONLY the delta as new/changed scenario
-                                  blocks, or NO_CHANGES) -> UPDATE (deterministic
-                                  merge_engine append/replace — existing
-                                  scenarios/tags/order are preserved byte-for-
-                                  byte, never regenerated) -> dry-run ->
-                                  locator gate -> generate+compile (quarantine)
-  FAILURE HANDLING                every item wrapped in try/except; one failed
-                                  transaction NEVER stops the queue; one retry
-                                  for recoverable (network/timeout) failures
-  SELF VALIDATION                 _self_validate() before staging
-  FINAL OUTPUT                    build_report(): consolidated CR report
-
-One deliberate divergence, allowed by spec principle 15 ("If human intervention
-is unavoidable ... produce a precise action list"): this project's critical
-invariant (README §1) is that framework files are NEVER written without the
-compile check + human Approve. So the pipeline runs every transaction fully
-autonomously up to STAGED changes, then pauses at ONE consolidated review gate
-covering all transactions. Items needing no framework writes skip review.
-After approval: archive -> commit -> compile -> sequential execution (one at a
-time, per the shared-Edge-session invariant) -> consolidated report.
+Flow (called from executor._run when the user enables AI on an upload):
+  1. dry-run already told us which steps are undefined
+  2. build a context pack: uploaded feature + old feature + existing Steps/Page java
+  3. ask Azure OpenAI for COMPLETE updated java files
+  4. javac them into an isolated classes dir (compile errors go back to the
+     model for up to AI_MAX_FIX_ROUNDS repair rounds)
+  5. return {rel_path: code} + the classes dir; the executor prepends that dir
+     to the classpath so the JVM uses the new classes WITHOUT touching the
+     framework. Commit-to-framework only happens after a green run.
 """
-import json
 import re
 import subprocess
-import threading
-import uuid
-from dataclasses import dataclass, field
 from pathlib import Path
+
+import requests
 
 from . import config
 
-CR_RUNS: dict[str, "CRRun"] = {}
-_CR_LOCK = threading.Lock()
+FILE_RE = re.compile(r"===FILE:\s*(.+?)\s*===\s*\n(.*?)===END===", re.S)
+PKG_RE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.M)
+CLS_RE = re.compile(r"(?:public\s+)?class\s+(\w+)")
 
-# ── data model ──────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """You are a senior Java test-automation engineer maintaining an enterprise
+Cucumber + Selenium + TestNG framework (package root com.nbc).
+Your job: update step-definition and/or page-object classes so a modified Gherkin feature executes.
 
-
-@dataclass
-class TxnItem:
-    txn: str                                  # canonical number, zeros stripped
-    status: str = "queued"                    # queued|searching|comparing|merging|dry_run|
-                                              # generating|staged|unchanged|not_found|
-                                              # locator_required|failed|skipped|committing|
-                                              # ready|executing|passed|exec_failed|stopped|error
-    hit: dict | None = None                   # indexer entry {feature,page,steps,module,txn}
-    delta_notes: str = ""                     # what the BRD says changed for this txn
-    delta_fragment: str = ""                  # LLM's new/changed scenario blocks (Gherkin)
-    merged_feature: str = ""                  # deterministic merge result (full file)
-    scenarios_added: list = field(default_factory=list)
-    scenarios_replaced: list = field(default_factory=list)
-    undefined_steps: list = field(default_factory=list)
-    gen_files: dict = field(default_factory=dict)   # {rel_path: java code}
-    error: str = ""
-    action_required: str = ""                 # precise reviewer action list on failure
-    archive_dir: str = ""
-    exec_summary: dict = field(default_factory=dict)
-    retried: bool = False
-
-    def public(self) -> dict:
-        return {
-            "txn": self.txn, "status": self.status,
-            "module": (self.hit or {}).get("module"),
-            "delta_notes": self.delta_notes,
-            "scenarios_added": self.scenarios_added,
-            "scenarios_replaced": self.scenarios_replaced,
-            "undefined_steps": self.undefined_steps,
-            "java_files": list(self.gen_files.keys()),
-            "error": self.error, "action_required": self.action_required,
-            "exec_summary": self.exec_summary,
-        }
-
-
-@dataclass
-class CRRun:
-    id: str
-    status: str = "analyzing"     # analyzing|processing|review|committing|ready|
-                                  # executing|done|error|discarded
-    brd_name: str = ""
-    cr_number: str = ""
-    parent_cr: str = ""
-    brd_text: str = ""            # kept in memory only; parsed ONCE
-    items: list[TxnItem] = field(default_factory=list)
-    log_file: Path = None
-    error: str = ""
-    report: dict = field(default_factory=dict)
-    proc: object = None           # currently running JVM (for stop)
-    stop_requested: bool = False
-
-    def log(self, msg: str):
-        try:
-            with open(self.log_file, "a", encoding="utf-8", errors="ignore") as f:
-                f.write(msg.rstrip() + "\n")
-        except OSError:
-            pass
-
-    def item(self, txn: str) -> TxnItem | None:
-        canon = txn.lstrip("0") or "0"
-        return next((i for i in self.items if i.txn == canon), None)
-
-    def public(self) -> dict:
-        return {
-            "cr_run_id": self.id, "status": self.status, "brd": self.brd_name,
-            "cr_number": self.cr_number, "parent_cr": self.parent_cr,
-            "transactions": [i.public() for i in self.items],
-            "needs_review": self.status == "review",
-            "error": self.error,
-        }
-
-
-# ── PHASE 1 + 2: BRD understanding + transaction discovery ──────────────────
-
-# Regex sweep — transaction numbers can hide anywhere (scope, tables, XML,
-# notes...). Two deliberate patterns: Txn-prefixed anywhere, and bare numbers
-# only when preceded by transaction-ish wording (a bare 4-6 digit sweep alone
-# would drown in amounts/dates).
-_TXN_PREFIXED = re.compile(r"\bTxn\s*[#:]?\s*0*(\d{3,6})\b", re.I)
-_TXN_WORDED = re.compile(
-    r"\b(?:transaction|txn|screen)s?\s*(?:no\.?|number|#|id|code)?\s*[:\-]?\s*0*(\d{3,6})\b", re.I)
-
-_ANALYZE_SYSTEM = """You are a senior QA analyst reading a banking Business Requirement Document
-that describes a CHANGE REQUEST against existing, already-automated transactions.
-
-Extract ONLY functional information. IGNORE revision history, CAB, approvals, signoff,
-release info, effort estimation, timelines, contacts, headers/footers and formatting.
-
-Return STRICT JSON only (no markdown fences, no commentary) with this shape:
-{
-  "cr_number": "<CR number or empty string>",
-  "parent_cr": "<parent CR number or empty string>",
-  "transactions": [
-    {"txn": "<digits only, e.g. 1045>",
-     "changes": "<concise summary of EVERY change this BRD makes to this transaction:
-                  new/removed/modified fields, mandatory/optional flags, dropdown/radio/checkbox
-                  values, validations, error messages, tooltips, business rules, XML/parameter
-                  changes, acceptance scenarios>"}
-  ],
-  "global_changes": "<changes that apply across all listed transactions, or empty string>"
-}
-Search the ENTIRE document — transaction numbers may appear in scope, change description,
-solution details, acceptance scenarios, tables, XML, screen lists, references, notes, or the
-parent CR. Never assume only one transaction exists. Never invent transaction numbers that are
-not in the document."""
-
-
-def analyze_brd(brd_text: str, log=lambda m: None) -> dict:
-    """Parse the BRD ONCE. Returns {cr_number, parent_cr, txn_changes:{canon:notes},
-    global_changes}. LLM extraction UNION regex sweep so no transaction is missed;
-    regex-only numbers are kept only when they exist in the automation index
-    (guards against amounts/dates matching the worded pattern)."""
-    from . import generator, indexer
-
-    llm = {"cr_number": "", "parent_cr": "", "transactions": [], "global_changes": ""}
-    try:
-        reply = generator._azure_chat([
-            {"role": "system", "content": _ANALYZE_SYSTEM},
-            {"role": "user", "content": brd_text[:24000]},
-        ])
-        reply = re.sub(r"^```(?:json)?\s*|\s*```$", "", reply.strip())
-        llm = json.loads(reply)
-    except Exception as e:  # noqa: BLE001 — regex sweep still provides discovery
-        log(f">>> CR analysis: LLM extraction unavailable ({e}); relying on pattern sweep only.")
-
-    txn_changes: dict[str, str] = {}
-    for t in llm.get("transactions", []) or []:
-        num = re.sub(r"\D", "", str(t.get("txn", "")))
-        if num:
-            txn_changes[num.lstrip("0") or "0"] = (t.get("changes") or "").strip()
-
-    regex_hits = {m.lstrip("0") or "0" for m in _TXN_PREFIXED.findall(brd_text)}
-    worded_hits = {m.lstrip("0") or "0" for m in _TXN_WORDED.findall(brd_text)}
-    for canon in sorted(regex_hits | worded_hits, key=lambda s: (len(s), s)):
-        if canon in txn_changes:
-            continue
-        if canon in regex_hits or indexer.lookup(canon):
-            txn_changes[canon] = ""      # discovered but LLM gave no notes; delta LLM gets full BRD
-
-    return {
-        "cr_number": (llm.get("cr_number") or "").strip(),
-        "parent_cr": (llm.get("parent_cr") or "").strip(),
-        "txn_changes": txn_changes,
-        "global_changes": (llm.get("global_changes") or "").strip(),
+Rules:
+- Keep existing package declarations, imports, naming and coding style.
+- REUSE existing methods, steps and locators wherever possible; change only what the feature requires.
+- Cucumber matches steps by their exact sentence text - annotation strings must match the feature lines exactly.
+- NEVER invent application locators. If a genuinely new UI element is needed, copy the locator style
+  of the provided Page class and mark it with: // TODO QA: verify locator
+- RADIO BUTTONS and CHECKBOXES: first REUSE any existing radio/checkbox helper method shown in the
+  context (the framework usually already has one - search the catalogs before writing your own).
+  If you must write new selection code, enterprise UIs typically hide the real <input> under a
+  styled span/label, so a plain input.click() often does NOT register. Use this defensive pattern:
+    WebElement rb = driver.findElement(locator);
+    if (!rb.isSelected()) {
+        try { rb.click(); }
+        catch (Exception e) { ((JavascriptExecutor) driver).executeScript("arguments[0].click();", rb); }
     }
+    // verify: if still !rb.isSelected(), click the associated <label> (label[for='<id>'] or the
+    // input's parent label) and re-check - selecting a radio must END in isSelected()==true.
+  For a radio identified by its option text (e.g. selecting "Court Order"), prefer a locator that
+  targets the input via its value/id, or the label with that exact visible text, following the
+  Page class's existing locator style.
+- APPEND-ONLY mindset: PRESERVE every existing method, field, locator and import exactly as given;
+  add the new step methods / page methods / locators needed by the new or changed scenarios.
+- NEVER call a method (on a Page object, a CommonSteps/shared class, a utility class, or anything
+  else) unless that exact method signature is EITHER shown to you verbatim in the context below OR
+  defined by you, in full, within one of the files you return in this same response. If you need a
+  helper action that doesn't exist yet, either reuse an EXACT existing method shown in the context,
+  or write the new method's full implementation yourself in the appropriate file — never invent a
+  call to a method you have not seen and are not also defining.
+- CRITICAL: NEVER implement a step (a @Given/@When/@Then/@And/@But method) whose exact sentence
+  already appears ANYWHERE in the EXISTING STEP SENTENCES catalog below (including CommonSteps and
+  any other shared class) — even when returning a "complete" file that also needs that step to run.
+  Cucumber throws a hard runtime error if the same step sentence is implemented in two classes.
+  Only implement methods for the steps explicitly listed as UNDEFINED.
+- If an AUTO-DISCOVERED LOCATOR is provided below for a step, it was extracted directly from the
+  REAL live captured page for that exact step — use it EXACTLY as given. Do not invent an
+  alternative locator (e.g. a text-contains xpath) for a step that already has a discovered locator.
+- This framework's shared/common classes (login helpers, property readers, file utilities) often do
+  file I/O and throw CHECKED exceptions (e.g. IOException) from their constructors or methods. Every
+  time you call such a constructor or method, wrap the call in try/catch (matching this framework's
+  existing style, typically catching the exception and calling printStackTrace()) — do not let a
+  checked exception propagate unhandled, and do not just add a blanket "throws Exception" unless the
+  real code you were shown does the same.
+- Return COMPLETE files (never fragments), and ONLY the files that change.
+- Output format, with NOTHING else before, between, or after the blocks:
+===FILE: com/nbc/stepDefinitions/<module>/<ClassName>.java===
+<entire file content>
+===END===
+"""
 
 
-# ── PHASE 4 STEP 3: delta comparison (LLM emits ONLY new/changed scenarios) ─
-
-_DELTA_SYSTEM = """You are a senior QA automation engineer maintaining an existing enterprise
-banking Cucumber framework. The EXISTING automation is the source of truth; the BRD below is a
-CHANGE REQUEST describing only what changed for ONE transaction.
-
-Compare the BRD's changes for the target transaction against the EXISTING FEATURE FILE and output
-ONLY the delta, as one of:
-
-1. Exactly the text NO_CHANGES  — when the existing feature already covers everything the BRD
-   requires for this transaction (already implemented).
-2. A Gherkin FRAGMENT containing ONLY:
-   - NEW scenarios to append (full Scenario/Scenario Outline blocks with tag lines), and/or
-   - MODIFIED existing scenarios (repeat the scenario with its EXACT existing name and tags,
-     body updated) — the merge engine replaces by exact name match.
-   Never output unchanged scenarios. Never output the Feature: header.
-
-STRICT RULES:
-- REUSE the exact wording of EXISTING STEP SENTENCES provided below wherever behaviour matches —
-  identical wording means zero new Java is needed. Create new step wording only when truly new.
-- Match the tag style and formatting of the existing feature.
-- Generate scenarios for every BRD change: mandatory/optional fields, radio buttons, checkboxes,
-  dropdowns, tooltips, error messages, default values, length validation, business rules, submit
-  validation, maker-checker/authorization validation, field visibility, enable/disable and
-  conditional/dynamic behaviour — but ONLY where the BRD changes them for this transaction.
-- Quote ONLY dynamic values ("value" or "<placeholder>"), never a whole step sentence.
-- Output raw Gherkin or NO_CHANGES. No markdown fences, no commentary."""
-
-
-def _delta_for_txn(run: CRRun, item: TxnItem, existing_feature: str) -> str:
-    """One LLM call scoped to one transaction. Returns '' when NO_CHANGES."""
-    from . import generator, knowledge
+def _azure_chat(messages: list[dict]) -> str:
+    url = (f"{config.AZURE_OPENAI_ENDPOINT.rstrip('/')}/openai/deployments/"
+           f"{config.AZURE_OPENAI_DEPLOYMENT}/chat/completions"
+           f"?api-version={config.AZURE_OPENAI_API_VERSION}")
+    if "YOUR-RESOURCE" in config.AZURE_OPENAI_ENDPOINT or "PASTE" in config.AZURE_OPENAI_KEY:
+        raise RuntimeError("Azure OpenAI is not configured yet - fill AZURE_OPENAI_ENDPOINT / "
+                           "AZURE_OPENAI_KEY / AZURE_OPENAI_DEPLOYMENT in app/config.py.")
     try:
-        catalog = knowledge.step_catalog((item.hit or {}).get("module"), cap=200)
-    except Exception:  # noqa: BLE001
-        catalog = "(knowledge base unavailable)"
+        r = requests.post(url,
+                          headers={"api-key": config.AZURE_OPENAI_KEY,
+                                   "Content-Type": "application/json"},
+                          json={"messages": messages, "temperature": 0.1, "max_tokens": 8000},
+                          timeout=240)
+    except requests.RequestException as e:
+        raise RuntimeError(f"Cannot reach Azure OpenAI at {config.AZURE_OPENAI_ENDPOINT} "
+                           f"({e.__class__.__name__}: {e}). Check the endpoint URL and whether "
+                           "the office network/proxy allows it.")
+    if r.status_code == 401:
+        raise RuntimeError("Azure OpenAI rejected the API key (401). Re-check AZURE_OPENAI_KEY.")
+    if r.status_code == 404:
+        raise RuntimeError(f"Azure OpenAI returned 404 - deployment '{config.AZURE_OPENAI_DEPLOYMENT}' "
+                           "not found on this resource. Use the DEPLOYMENT NAME from Azure Portal "
+                           "(not the model name), and check AZURE_OPENAI_API_VERSION.")
+    if r.status_code != 200:
+        raise RuntimeError(f"Azure OpenAI error {r.status_code}: {r.text[:400]}")
+    return r.json()["choices"][0]["message"]["content"]
 
-    notes = item.delta_notes or "(no per-transaction summary extracted — derive the changes for " \
-                                f"transaction {item.txn} from the full BRD text)"
-    user = f"""## TARGET TRANSACTION: {item.txn}
 
-## BRD CHANGES EXTRACTED FOR THIS TRANSACTION:
-{notes}
-
-## FULL BRD TEXT (for context; apply ONLY what concerns transaction {item.txn}):
-{run.brd_text[:12000]}
-
-## EXISTING FEATURE FILE (source of truth — never rewrite what is unchanged):
-```gherkin
-{existing_feature[:12000]}
-```
-
-## EXISTING STEP SENTENCES in the framework (reuse EXACT wording where behaviour matches):
-{catalog or '(none found)'}
-
-Output the delta fragment or NO_CHANGES now."""
-    reply = generator._azure_chat([{"role": "system", "content": _DELTA_SYSTEM},
-                                   {"role": "user", "content": user}]).strip()
-    reply = re.sub(r"^```(?:gherkin)?\s*|\s*```$", "", reply).strip()
-    if not reply or reply.upper().startswith("NO_CHANGES"):
+def _read(path, cap=16000) -> str:
+    try:
+        t = Path(path).read_text(encoding="utf-8", errors="ignore")
+        return t[:cap] + ("\n// ...truncated..." if len(t) > cap else "")
+    except (OSError, TypeError):
         return ""
-    return reply + "\n"
 
 
-def _fragment_to_feature(fragment: str, existing_feature: str) -> str:
-    """Wrap the delta fragment in the existing file's Feature header so the
-    normalizer/merger (which expect complete feature files) can process it."""
-    header = "Feature: CR delta"
-    for line in existing_feature.splitlines():
-        if line.strip().lower().startswith("feature:"):
-            header = line.rstrip()
-            break
-    return header + "\n\n" + fragment
-
-
-# ── SELF VALIDATION (spec checklist, mechanically enforced) ─────────────────
-
-
-def _self_validate(item: TxnItem, existing_feature: str, log) -> list[str]:
-    """Returns a list of violations (empty = pass). The deterministic merge
-    already guarantees most of the checklist; this verifies rather than trusts."""
-    from . import framework_scanner
-    problems = []
-    old = framework_scanner.parse_feature_text(existing_feature) or {"scenarios": []}
-    new = framework_scanner.parse_feature_text(item.merged_feature) or {"scenarios": []}
-    old_names = [s["name"] for s in old["scenarios"]]
-    new_names = [s["name"] for s in new["scenarios"]]
-    for name in old_names:                                   # existing scenarios preserved
-        if name not in new_names:
-            problems.append(f"existing scenario dropped by merge: '{name}'")
-    if new_names[:len(old_names)] != old_names and not item.scenarios_replaced:
-        problems.append("existing scenario order changed")
-    seen = set()
-    for name in new_names:                                   # no duplicate scenarios
-        if name in seen:
-            problems.append(f"duplicate scenario: '{name}'")
-        seen.add(name)
-    for rel, code in item.gen_files.items():                 # no duplicate methods per file
-        names = re.findall(r"(?:public|private|protected)\s+[\w<>\[\]]+\s+(\w+)\s*\(", code)
-        dupes = {n for n in names if names.count(n) > 1}
-        if dupes:
-            problems.append(f"duplicate method(s) in {rel}: {sorted(dupes)}")
-    for p in problems:
-        log(f">>> [Txn{item.txn}] SELF-VALIDATION FAILED: {p}")
-    return problems
-
-
-# ── PHASE 4: process one transaction (fully isolated) ───────────────────────
-
-
-def _process_item(run: CRRun, item: TxnItem):
-    from . import executor, feature_normalizer, generator, indexer, locator_gate, merge_engine
-
-    def log(msg):
-        run.log(msg if msg.startswith(">>>") else f">>> [Txn{item.txn}] {msg}")
-
-    # STEP 1 — SEARCH the repository first. Never generate before searching.
-    item.status = "searching"
-    item.hit = indexer.lookup(item.txn)
-    if not item.hit or not item.hit.get("feature"):
-        item.status = "not_found"
-        item.error = "No existing automation found in the framework index for this transaction."
-        item.action_required = (
-            f"Transaction {item.txn}: no feature/page/steps exist in the framework. "
-            "This CR pipeline only UPDATES existing automation. To scaffold brand-new "
-            "automation for this transaction, use the single Framework Intelligence "
-            "BRD upload (which drafts a new feature), or add it manually, then rerun.")
-        log("no existing automation found — isolated as an action item; queue continues.")
-        return
-    log(f"found existing automation (module={item.hit['module']}): "
-        f"feature={Path(item.hit['feature']).name}"
-        + (f", page={Path(item.hit['page']).name}" if item.hit.get("page") else ", page=NONE")
-        + (f", steps={Path(item.hit['steps']).name}" if item.hit.get("steps") else ", steps=NONE"))
-
-    # STEP 2 — UNDERSTAND the existing implementation.
-    existing_feature = Path(item.hit["feature"]).read_text(encoding="utf-8", errors="ignore")
-
-    # STEP 3 — COMPARE BRD vs existing; only the difference becomes scope.
-    item.status = "comparing"
-    log("comparing BRD delta against the existing implementation...")
-    item.delta_fragment = _delta_for_txn(run, item, existing_feature)
-    if not item.delta_fragment:
-        item.status = "unchanged"
-        log("already implemented — no delta for this transaction. Will execute as-is for regression.")
-        return
-    frag_count = len(re.findall(r"^\s*Scenario(?: Outline)?:", item.delta_fragment, re.M))
-    log(f"delta identified: {frag_count} new/changed scenario block(s).")
-
-    # STEP 4 — UPDATE the feature: normalize wording to framework conventions,
-    # then DETERMINISTIC merge (append new / replace changed by exact name —
-    # existing scenarios, tags, order and formatting are preserved, never
-    # regenerated).
-    item.status = "merging"
-    delta_feature = _fragment_to_feature(item.delta_fragment, existing_feature)
-    try:
-        norm = feature_normalizer.normalize_feature(delta_feature, existing_feature)
-        delta_feature = norm["normalized_text"]
-        snapped = norm["summary"].get("steps_normalized", 0)
-        if snapped:
-            log(f"snapped {snapped} drafted step(s) to exact framework wording (reuse, not regenerate).")
-    except Exception as e:  # noqa: BLE001 — best-effort
-        log(f"normalization skipped ({e}).")
-    merge_result = merge_engine.merge(existing_feature, delta_feature)
-    item.merged_feature = merge_result["merged_text"]
-    item.scenarios_added = merge_result["appended_scenarios"]
-    item.scenarios_replaced = merge_result["replaced_scenarios"]
-    log(f"merge: +{len(item.scenarios_added)} appended, ~{len(item.scenarios_replaced)} replaced, "
-        f"{len(merge_result['unreferenced_scenarios'])} existing untouched (kept).")
-
-    # STEPS 5-7 need Java glue knowledge — ground truth via cucumber dry-run.
-    item.status = "dry_run"
-    tmp = config.UPLOADS_DIR / f"cr_{run.id}_txn{item.txn}.feature"
-    tmp.write_text(item.merged_feature, encoding="utf-8")
-    try:
-        item.undefined_steps = executor._dry_run_sync(str(tmp), log)
-    finally:
-        tmp.unlink(missing_ok=True)
-
-    if item.undefined_steps:
-        gate = locator_gate.evaluate(item.undefined_steps, item.txn, item.hit.get("module"))
-        if gate["blocked"]:
-            item.status = "locator_required"
-            item.error = gate["message"]
-            item.action_required = ("Capture/record locators for: "
-                                    + "; ".join(gate["unresolved_steps"]))
-            log(f"locator gate blocked this transaction: {gate['message']} — queue continues.")
-            return
-        # STEPS 5+6+7 — generate ONLY the missing glue (generator's prompt is
-        # already append-only: reuse locators/methods/regex, never duplicate),
-        # compiled in quarantine with auto-repair rounds. STEP 8 (compile) for
-        # the real framework happens at commit time.
-        item.status = "generating"
-        log(f"generating java glue for {len(item.undefined_steps)} undefined step(s)...")
-        item.gen_files, _ = generator.generate_and_compile(
-            {"hit": item.hit, "uploaded_text": item.merged_feature,
-             "module": item.hit.get("module"), "txn": item.txn,
-             "filename": Path(item.hit["feature"]).name},
-            item.undefined_steps, executor._effective_classpath(),
-            config.GEN_DIR / f"cr_{run.id}_txn{item.txn}", log)
-        log(f"generated + quarantine-compiled {len(item.gen_files)} java file(s).")
-
-    problems = _self_validate(item, existing_feature, log)
-    if problems:
-        item.status = "failed"
-        item.error = "Self-validation failed: " + "; ".join(problems)
-        item.action_required = "Review and correct manually: " + "; ".join(problems)
-        return
-
-    item.status = "staged"
-    log("staged for review: feature merge"
-        + (f" + {len(item.gen_files)} java file(s)" if item.gen_files else " (no java changes)") + ".")
-
-
-def _process_item_isolated(run: CRRun, item: TxnItem):
-    """FAILURE HANDLING: one failed transaction never stops the queue; one
-    automatic retry for recoverable (network/timeout/transient) failures."""
-    recoverable = ("timeout", "timed out", "connection", "network", "unreachable",
-                   "429", "502", "503", "rate limit")
-    for attempt in (1, 2):
-        try:
-            _process_item(run, item)
-            return
-        except Exception as e:  # noqa: BLE001 — isolation is the whole point
-            msg = str(e)
-            if attempt == 1 and any(k in msg.lower() for k in recoverable):
-                item.retried = True
-                run.log(f">>> [Txn{item.txn}] recoverable failure ({msg[:200]}) — retrying once...")
-                continue
-            item.status = "failed"
-            item.error = msg[:1000]
-            item.action_required = f"Automatic processing failed: {msg[:300]}"
-            run.log(f">>> [Txn{item.txn}] FAILED: {msg[:300]} — continuing with remaining transactions.")
-            return
-
-
-# ── run lifecycle ───────────────────────────────────────────────────────────
-
-
-def start_cr(brd_filename: str, brd_text: str) -> CRRun:
-    run = CRRun(id=uuid.uuid4().hex[:12], brd_name=brd_filename, brd_text=brd_text)
-    config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    run.log_file = config.LOGS_DIR / f"cr_{run.id}.log"
-    run.log_file.write_text("", encoding="utf-8")
-    with _CR_LOCK:
-        CR_RUNS[run.id] = run
-    threading.Thread(target=_run_pipeline, args=(run,), daemon=True).start()
-    return run
-
-
-def _run_pipeline(run: CRRun):
-    try:
-        run.log(f">>> CR PIPELINE: analyzing BRD '{run.brd_name}' (parsed ONCE)...")
-        analysis = analyze_brd(run.brd_text, run.log)
-        run.cr_number, run.parent_cr = analysis["cr_number"], analysis["parent_cr"]
-        notes_suffix = ("\n\nGLOBAL CHANGES (apply to every transaction in this CR): "
-                        + analysis["global_changes"]) if analysis["global_changes"] else ""
-        run.items = [TxnItem(txn=t, delta_notes=(n + notes_suffix).strip())
-                     for t, n in analysis["txn_changes"].items()]
-        run.log(f">>> CR {run.cr_number or '(no number found)'}"
-                + (f" (parent {run.parent_cr})" if run.parent_cr else "")
-                + f": {len(run.items)} unique transaction(s) discovered: "
-                + ", ".join(i.txn for i in run.items))
-        if not run.items:
-            run.status = "error"
-            run.error = ("No transaction numbers could be discovered in this BRD. "
-                         "Add explicit transaction/screen numbers, or use the single "
-                         "Framework Intelligence BRD upload instead.")
-            run.log(">>> " + run.error)
-            return
-
-        run.status = "processing"
-        for n, item in enumerate(run.items, 1):     # PHASE 3: independent work items
-            run.log(f">>> ── transaction {n}/{len(run.items)}: Txn{item.txn} ──")
-            _process_item_isolated(run, item)
-
-        if any(i.status == "staged" for i in run.items):
-            run.status = "review"
-            run.log(">>> All transactions processed. STAGED changes are waiting for one "
-                    "consolidated REVIEW — approve or skip per transaction in the browser.")
+def _parse_files(text: str) -> dict[str, str]:
+    """{relative java path: full code}. Path is normalised from the package line
+    when the header path looks wrong."""
+    out = {}
+    for raw_path, code in FILE_RE.findall(text):
+        code = code.strip()
+        pkg = PKG_RE.search(code)
+        cls = CLS_RE.search(code)
+        if pkg and cls:
+            rel = pkg.group(1).replace(".", "/") + "/" + cls.group(1) + ".java"
         else:
-            for i in run.items:
-                if i.status == "unchanged":
-                    i.status = "ready"
-            run.status = "ready"
-            run.log(">>> All transactions processed; none require framework changes. "
-                    "Use the per-transaction Run buttons (or Run all) to execute.")
-    except Exception as e:  # noqa: BLE001
-        run.status = "error"
-        run.error = str(e)[:1000]
-        run.log(f">>> CR PIPELINE ERROR: {e}")
-    finally:
-        if run.status not in ("review", "ready", "error", "discarded"):
-            run.report = build_report(run)
-            run.status = "done"
-            run.log(">>> CR pipeline finished. Consolidated report is ready.")
-        else:
-            run.report = build_report(run)
-
-
-def approve_cr(run_id: str, approved_txns: list[str] | None,
-               edits: dict | None = None) -> CRRun:
-    """Commit ONLY (archive -> write -> compile). Execution is NOT started here —
-    each committed transaction becomes 'ready' and is run explicitly, one at a
-    time or all together, via execute_txns(). approved_txns=None approves every
-    staged item; a provided list approves those, skipping the rest. edits:
-    {txn: {feature_text, files:{rel:code}}} — reviewer-edited content replaces
-    the staged content."""
-    run = CR_RUNS.get(run_id)
-    if not run:
-        raise KeyError("unknown CR run")
-    if run.status != "review":
-        raise ValueError(f"CR run is '{run.status}', not awaiting review")
-
-    approved = []
-    for item in run.items:
-        if item.status == "unchanged":
-            item.status = "ready"        # regression-runnable without commit
-            continue
-        if item.status != "staged":
-            continue
-        if approved_txns is not None and item.txn not in [t.lstrip("0") or "0" for t in approved_txns]:
-            item.status = "skipped"
-            run.log(f">>> [Txn{item.txn}] skipped by reviewer.")
-            continue
-        edit = (edits or {}).get(item.txn) or (edits or {}).get("Txn" + item.txn) or {}
-        if edit.get("feature_text"):
-            item.merged_feature = edit["feature_text"]
-        for rel, code in (edit.get("files") or {}).items():
-            item.gen_files[rel] = code
-        approved.append(item)
-
-    run.status = "committing"
-    threading.Thread(target=_commit_approved, args=(run, approved), daemon=True).start()
-    return run
-
-
-def discard_cr(run_id: str) -> CRRun:
-    run = CR_RUNS.get(run_id)
-    if not run:
-        raise KeyError("unknown CR run")
-    for item in run.items:
-        if item.status == "staged":
-            item.status = "skipped"
-    run.status = "discarded"
-    run.report = build_report(run)
-    run.log(">>> CR discarded — the framework was not modified.")
-    return run
-
-
-def _commit_item(run: CRRun, item: TxnItem):
-    """STEP 8 + 10 for one approved transaction: archive originals permanently,
-    write feature + java into the framework, compile into target/test-classes."""
-    from . import executor
-
-    def log(msg):
-        run.log(f">>> [Txn{item.txn}] {msg}" if not msg.startswith(">>>") else msg)
-
-    item.status = "committing"
-    hit = item.hit
-    to_archive = {"feature": hit.get("feature")}
-    if hit.get("page"):
-        to_archive["page"] = hit["page"]
-    if hit.get("steps"):
-        to_archive["steps"] = hit["steps"]
-    for rel in item.gen_files:
-        tgt = config.JAVA_SRC_ROOT / rel
-        if tgt.exists():
-            to_archive[Path(rel).name] = str(tgt)
-    item.archive_dir = executor._archive(to_archive, f"Txn{item.txn}", log)
-
-    Path(hit["feature"]).write_text(item.merged_feature, encoding="utf-8")
-    log(f"updated feature file: {hit['feature']}")
-    for rel, code in item.gen_files.items():
-        tgt = config.JAVA_SRC_ROOT / rel
-        tgt.parent.mkdir(parents=True, exist_ok=True)
-        tgt.write_text(code, encoding="utf-8")
-        log(f"updated java source: {tgt}")
-    if item.gen_files:
-        srcs = [str(config.JAVA_SRC_ROOT / rel) for rel in item.gen_files]
-        config.TEST_CLASSES_DIR.mkdir(parents=True, exist_ok=True)
-        rc = subprocess.run([config.JAVAC, "-encoding", "UTF-8",
-                             "-cp", executor._effective_classpath(),
-                             "-d", str(config.TEST_CLASSES_DIR), *srcs],
-                            capture_output=True, text=True, timeout=300)
-        if rc.returncode != 0:
-            raise RuntimeError("commit compile failed:\n" + (rc.stdout + rc.stderr)[:1500])
-        log("compiled updated classes into target/test-classes.")
-
-
-def _execute_item_sync(run: CRRun, item: TxnItem):
-    """STEP 9: run this transaction's (committed) feature file on the real
-    browser. Sequential by design — one shared Edge session (README §8) — so
-    the executor's global run lock is honored. Stoppable: the JVM handle is
-    kept on the run so stop_cr() can tree-kill it mid-flight."""
-    import os
-    from . import executor
-    item.status = "executing"
-    run.log(f">>> [Txn{item.txn}] executing on Edge...")
-    rep = config.REPORTS_DIR / f"cr_{run.id}_txn{item.txn}.json"
-    cmd = executor._build_command(item.hit["feature"], rep, dry_run=False)
-    with executor._RUN_LOCK:
-        if run.stop_requested:                 # stopped while waiting for the lock
-            item.status = "ready"
-            run.log(f">>> [Txn{item.txn}] not started — stop was requested.")
-            return
-        with open(run.log_file, "a", encoding="utf-8", errors="ignore") as lf:
-            lf.write("\n>>> " + executor._mask(cmd) + "\n\n")
-            lf.flush()
-            proc = subprocess.Popen(cmd, cwd=str(config.FRAMEWORK_ROOT),
-                                    stdout=lf, stderr=subprocess.STDOUT, shell=False)
-            run.proc = proc
-            rc = proc.wait()
-            run.proc = None
-    if run.stop_requested:
-        item.status = "stopped"
-        item.exec_summary = executor._parse_report(rep)
-        run.log(f">>> [Txn{item.txn}] execution STOPPED by user.")
-        return
-    item.exec_summary = executor._parse_report(rep)
-    ok = (rc == 0 and item.exec_summary.get("scenarios_failed", 0) == 0
-          and item.exec_summary.get("scenarios_total", 0) > 0
-          and not item.exec_summary.get("undefined_steps"))
-    item.status = "passed" if ok else "exec_failed"
-    run.log(f">>> [Txn{item.txn}] execution {'PASSED' if ok else 'FAILED'}: "
-            f"{item.exec_summary.get('scenarios_passed', 0)}/"
-            f"{item.exec_summary.get('scenarios_total', 0)} scenario(s) passed.")
-
-
-def _commit_approved(run: CRRun, approved: list[TxnItem]):
-    """Commit every approved item (archive -> write -> compile), so a shared
-    Steps/Page file gets all updates before any browser run. NO execution
-    happens here — committed items become 'ready' for explicit execution.
-    Per-item failures never stop the remaining items."""
-    from . import indexer
-    try:
-        for item in approved:
-            try:
-                _commit_item(run, item)
-                item.status = "ready"
-                run.log(f">>> [Txn{item.txn}] committed — ready to run.")
-            except Exception as e:  # noqa: BLE001
-                item.status = "failed"
-                item.error = f"commit failed: {e}"[:1000]
-                item.action_required = ("Commit/compile failed; originals archived at "
-                                        f"{item.archive_dir or '(pre-archive)'}: {str(e)[:300]}")
-                run.log(f">>> [Txn{item.txn}] COMMIT FAILED: {str(e)[:300]} — continuing.")
-        if any(i.gen_files for i in approved if i.status == "ready"):
-            indexer.build_index()   # STEP 10: refresh repository metadata
-    finally:
-        run.report = build_report(run)
-        if any(i.status == "ready" for i in run.items):
-            run.status = "ready"
-            run.log(">>> Commit phase finished. Use the per-transaction Run buttons "
-                    "(or Run all) to execute; Stop is available during any run.")
-        else:
-            run.status = "done"
-            run.log(">>> CR pipeline finished. Consolidated report is ready.")
-
-
-def execute_txns(run_id: str, txns: list[str] | None = None) -> CRRun:
-    """Execute selected 'ready' transactions (txns=None -> all ready), one at a
-    time, in a background thread. Callable repeatedly — run one, inspect, run
-    the next. A stop request halts the current JVM and skips the rest, leaving
-    unexecuted items 'ready' for a later run."""
-    run = CR_RUNS.get(run_id)
-    if not run:
-        raise KeyError("unknown CR run")
-    if run.status == "executing":
-        raise ValueError("an execution is already in progress for this CR - stop it "
-                         "or wait for it to finish")
-    if run.status not in ("ready", "done"):
-        raise ValueError(f"CR run is '{run.status}' - nothing is ready to execute")
-    wanted = None if txns is None else {t.lstrip("0") or "0" for t in txns}
-    queue = [i for i in run.items
-             if i.status in ("ready", "stopped", "exec_failed")
-             and (wanted is None or i.txn in wanted)]
-    if not queue:
-        raise ValueError("no matching transaction is ready to execute")
-
-    run.stop_requested = False
-    run.status = "executing"
-
-    def worker():
-        try:
-            for item in queue:
-                if run.stop_requested:
-                    if item.status == "executing":
-                        continue
-                    run.log(f">>> [Txn{item.txn}] skipped — stop was requested; still ready.")
-                    continue
-                try:
-                    _execute_item_sync(run, item)
-                except Exception as e:  # noqa: BLE001
-                    item.status = "exec_failed"
-                    item.error = str(e)[:1000]
-                    run.log(f">>> [Txn{item.txn}] EXECUTION ERROR: {str(e)[:300]} — continuing.")
-        finally:
-            run.report = build_report(run)
-            remaining = [i.txn for i in run.items if i.status in ("ready", "stopped")]
-            run.status = "ready" if remaining else "done"
-            run.log(">>> Execution batch finished."
-                    + (f" Still ready: Txn{', Txn'.join(remaining)}." if remaining
-                       else " Consolidated report is ready."))
-
-    threading.Thread(target=worker, daemon=True).start()
-    return run
-
-
-def stop_cr(run_id: str) -> CRRun:
-    """Stop the currently running transaction (tree-kill: java -> msedgedriver
-    -> Edge, same mechanism as executor.stop_job) and skip the rest of the
-    batch. Unexecuted transactions stay 'ready' and can be run again later."""
-    import os
-    run = CR_RUNS.get(run_id)
-    if not run:
-        raise KeyError("unknown CR run")
-    if run.status != "executing":
-        raise ValueError(f"CR run is '{run.status}' - nothing is executing")
-    run.stop_requested = True
-    proc = run.proc
-    if proc is not None:
-        try:
-            if os.name == "nt":
-                # /T kills the whole tree: java -> msedgedriver -> Edge
-                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                               capture_output=True)
-            else:
-                proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
-    run.log(">>> STOP requested — killing the current run; remaining transactions stay ready.")
-    return run
-
-
-# ── FINAL OUTPUT: consolidated report ───────────────────────────────────────
-
-
-def build_report(run: CRRun) -> dict:
-    items = run.items
-    updated = [i for i in items if i.status in ("passed", "exec_failed", "ready", "stopped")
-               and (i.scenarios_added or i.scenarios_replaced or i.gen_files)]
-    failed = [i for i in items if i.status in ("failed", "not_found", "locator_required", "exec_failed")]
-    passed = [i for i in items if i.status == "passed"]
-    pending = [i for i in items if i.status in ("ready", "stopped")]
-    methods_added, locators_added = 0, 0
-    for i in items:
-        for code in i.gen_files.values():
-            methods_added += len(re.findall(r"@(?:Given|When|Then|And|But)\b", code)) \
-                + len(re.findall(r"public\s+(?:void|\w+)\s+\w+\s*\(", code))
-            locators_added += len(re.findall(r"\bBy\.\w+\s*\(|@FindBy\b", code))
-    return {
-        "cr_number": run.cr_number, "parent_cr": run.parent_cr, "brd": run.brd_name,
-        "transactions_identified": [i.txn for i in items],
-        "transactions_updated": [i.txn for i in updated],
-        "transactions_unchanged": [i.txn for i in items if i.status in ("unchanged", "passed")
-                                   and not (i.scenarios_added or i.scenarios_replaced or i.gen_files)],
-        "transactions_failed": [{"txn": i.txn, "reason": i.error,
-                                 "recovery_action": i.action_required,
-                                 "retried": i.retried} for i in failed],
-        "transactions_skipped": [i.txn for i in items if i.status == "skipped"],
-        "feature_files_modified": [i.hit["feature"] for i in updated
-                                   if i.hit and (i.scenarios_added or i.scenarios_replaced)],
-        "java_files_modified": sorted({rel for i in updated for rel in i.gen_files}),
-        "scenarios_added": {i.txn: i.scenarios_added for i in items if i.scenarios_added},
-        "scenarios_replaced": {i.txn: i.scenarios_replaced for i in items if i.scenarios_replaced},
-        "methods_added_estimate": methods_added,
-        "locators_added_estimate": locators_added,
-        "archives": {i.txn: i.archive_dir for i in items if i.archive_dir},
-        "execution": {i.txn: i.exec_summary for i in items if i.exec_summary},
-        "transactions_pending_execution": [i.txn for i in pending],
-        "overall_status": ("PENDING_EXECUTION" if pending
-            else "PASSED" if items and all(
-            i.status in ("passed", "skipped", "unchanged") for i in items)
-            else "PARTIAL" if passed else "FAILED"),
-    }
-
-
-def read_log(run_id: str, offset: int = 0) -> tuple[str, int]:
-    run = CR_RUNS.get(run_id)
-    if not run or not run.log_file or not run.log_file.exists():
-        return "", offset
-    data = run.log_file.read_bytes()
-    return data[offset:].decode("utf-8", errors="ignore"), len(data)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-"""
-FastAPI orchestrator for the Java Cucumber framework.
-
-Flow 1 (manager's primary flow):
-    POST /execute/txn/{txn_no}      -> looks up the feature in the index, runs it on Edge
-
-Flow 2 (alternate flow):
-    POST /execute/upload            -> user uploads a .feature file; we detect its module,
-                                       dry-run to verify glue code exists, then execute it
-
-Common:
-    GET  /jobs/{job_id}             -> status + pass/fail summary
-    GET  /jobs/{job_id}/logs        -> live console log (poll with ?offset=)
-    GET  /txns?q=0104               -> search the index (for an autocomplete box in Next.js)
-    POST /index/rebuild             -> rescan the framework after new features are added
-
-Run with:  uvicorn app.main:app --reload --port 8000
-"""
-import re
-
-from pathlib import Path
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-
-from . import config, executor, indexer, knowledge, framework_scanner, feature_matcher, feature_comparator, feature_normalizer, merge_engine, knowledge_graph, brd_processor, recorder, capture, runtime_capture, cr_pipeline
-
-
-class RunParams(BaseModel):
-    """Target environment + credentials for one execution.
-    All optional — omit any value to keep whatever the properties file already has."""
-    url: str | None = None
-    maker_id: str | None = None
-    maker_password: str | None = None
-    checker_id: str | None = None
-    checker_password: str | None = None
-
-app = FastAPI(title="Java Framework Orchestrator")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # your Next.js dev server
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.on_event("startup")
-def _startup():
-    if config.FRAMEWORK_ROOT.exists():
-        indexer.build_index()
-        try:
-            knowledge.build_knowledge()
-        except Exception:  # noqa: BLE001
-            pass
-
-
-# ─────────────────────────── index endpoints ────────────────────────────────
-@app.post("/index/rebuild")
-def rebuild_index():
-    idx = indexer.build_index()
-    return {"indexed_txns": len(idx)}
-
-
-@app.post("/knowledge/rebuild")
-def rebuild_knowledge(embed: bool = False):
-    """Rescan the WHOLE framework into the AI knowledge base. With ?embed=1,
-    also (re)build the RAG embeddings via Azure (needs an embedding deployment)."""
-    kb = knowledge.build_knowledge()
-    stats = dict(kb["stats"])
-    if embed:
-        stats.update(knowledge.build_embeddings())
-    stats["rag_embeddings"] = knowledge.embeddings_available()
-    return stats
-
-
-@app.get("/knowledge/stats")
-def knowledge_stats():
-    stats = dict(knowledge.get_knowledge()["stats"])
-    stats["rag_embeddings"] = knowledge.embeddings_available()
-    return stats
-
-
-# ═══════════════ Phase 1 — Framework Scanner (additive, new) ═══════════════
-# Separate from /knowledge/* (app/knowledge.py), which continues to power the
-# existing AI-generation RAG exactly as before. These endpoints expose the
-# richer, feature/scenario-level scan for future phases (matching, comparison,
-# normalization) and for direct browsing/search.
-@app.post("/framework/scan")
-def framework_scan():
-    kb = framework_scanner.scan_framework()
-    return kb["stats"]
-
-
-@app.get("/framework/stats")
-def framework_stats():
-    return framework_scanner.get_framework_knowledge()["stats"]
-
-
-@app.get("/framework/features/search")
-def framework_search(q: str, limit: int = 20):
-    return {"results": framework_scanner.search_features(q, limit)}
-
-
-# ═══════════════ Phase 6 — Intelligent Feature Matching (additive, new) ═════
-class MatchRequest(BaseModel):
-    text: str
-    filename: str | None = None
-    module_hint: str | None = None
-    txn_hint: str | None = None
-    top_k: int = 5
-
-
-@app.post("/framework/match")
-def framework_match(body: MatchRequest):
-    """Rank every framework feature against the given text — five signals
-    (txn/module/tags/scenario-lexical/semantic). Standalone + testable; not
-    yet wired into /execute/upload (that comes with Phase 7 Comparison)."""
-    return {"matches": feature_matcher.find_matches(
-        body.text, body.filename, body.module_hint, body.txn_hint, body.top_k)}
-
-
-@app.post("/framework/embeddings/rebuild")
-def framework_embeddings_rebuild():
-    """Embed every feature (name + scenario names) for the semantic_similarity
-    signal in /framework/match. Requires AZURE_OPENAI_EMBED_DEPLOYMENT."""
-    return feature_matcher.build_feature_embeddings()
-
-
-# ═══════════════ Phase 7 — Intelligent Feature Comparison (additive, new) ══
-class CompareRequest(BaseModel):
-    uploaded_text: str
-    existing_text: str | None = None   # if omitted, auto-matched via Phase 6
-    filename: str | None = None
-    module_hint: str | None = None
-    txn_hint: str | None = None
-
-
-@app.post("/framework/compare")
-def framework_compare(body: CompareRequest):
-    """Structured diff: unchanged / new / deleted / modified scenarios, with
-    step-level, Examples-level, and data-table-level detail for each modified
-    scenario. If existing_text is omitted, the best match is found
-    automatically (Phase 6). Not yet wired into /execute/upload."""
-    try:
-        if body.existing_text is not None:
-            return feature_comparator.compare_features(body.existing_text, body.uploaded_text)
-        return feature_comparator.compare_with_best_match(
-            body.uploaded_text, body.filename, body.module_hint, body.txn_hint)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-
-# ═══════════════ Phase 8 — Feature Normalization (additive, new) ════════════
-class NormalizeRequest(BaseModel):
-    uploaded_text: str
-
-
-@app.post("/framework/normalize")
-def framework_normalize(body: NormalizeRequest):
-    """Rewrite an uploaded feature to the framework's conventions: step wording
-    canonicalized to existing glue (so no Java is generated for steps the
-    framework can already run), tags recased/deduped, formatting standardized.
-    Deterministic; every rewrite is listed in `changes` for human review."""
-    try:
-        return feature_normalizer.normalize_feature(body.uploaded_text)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-
-# ═══════════════ Phase 8 — Feature Normalization (additive, new) ═══════════
-class NormalizeRequest(BaseModel):
-    uploaded_text: str
-    existing_text: str | None = None   # if omitted, auto-matched via Phase 6
-    filename: str | None = None
-    module_hint: str | None = None
-    txn_hint: str | None = None
-
-
-@app.post("/framework/normalize")
-def framework_normalize(body: NormalizeRequest):
-    """Rewrite the uploaded feature to match framework conventions (tag
-    casing, step wording, scenario naming, Examples headers) BEFORE any Java
-    generation. If existing_text is omitted, the best match is auto-found
-    (Phase 6). Not yet wired into /execute/upload."""
-    try:
-        if body.existing_text is not None:
-            return feature_normalizer.normalize_feature(body.uploaded_text, body.existing_text)
-        return feature_normalizer.normalize_with_best_match(
-            body.uploaded_text, body.filename, body.module_hint, body.txn_hint)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-
-# ═══════════════ Phase 9 — Intelligent Merge Engine (additive, new) ═════════
-class MergeRequest(BaseModel):
-    existing_text: str
-    normalized_text: str
-
-
-@app.post("/framework/merge")
-def framework_merge(body: MergeRequest):
-    """Merge a normalized upload into an existing feature's text: keep
-    unchanged, replace modified, append new, never delete, formatting/comments
-    of untouched content preserved. Pass Phase 8's normalized_text here."""
-    return merge_engine.merge(body.existing_text, body.normalized_text)
-
-
-class PipelineRequest(BaseModel):
-    uploaded_text: str
-    filename: str | None = None
-    module_hint: str | None = None
-    txn_hint: str | None = None
-
-
-@app.post("/framework/pipeline")
-def framework_pipeline(body: PipelineRequest):
-    """Convenience: Match (Phase 6) -> Normalize (Phase 8) -> Merge (Phase 9)
-    in one call, with full transparency into each step. Not yet wired into
-    /execute/upload."""
-    return merge_engine.merge_pipeline(body.uploaded_text, body.filename,
-                                       body.module_hint, body.txn_hint)
-
-
-@app.get("/framework/archive/status")
-def archive_status():
-    """Browse the permanent archive (data/archive/<Txn>/<timestamp>/...) —
-    every file version ever replaced by an approved AI commit, never deleted."""
-    if not config.ARCHIVE_DIR.exists():
-        return {"count": 0, "entries": []}
-    entries = []
-    for txn_dir in sorted(config.ARCHIVE_DIR.iterdir()):
-        if not txn_dir.is_dir():
-            continue
-        for ts_dir in sorted(txn_dir.iterdir(), reverse=True):
-            if not ts_dir.is_dir():
-                continue
-            files = sorted(f.name for f in ts_dir.iterdir() if f.is_file())
-            entries.append({"txn": txn_dir.name, "timestamp": ts_dir.name,
-                           "files": files, "file_count": len(files)})
-    return {"count": len(entries), "entries": entries}
-
-
-# ═══════════════ Phase 3 — Knowledge Graph (additive, new) ══════════════════
-@app.post("/framework/graph/build")
-def graph_build():
-    """Scan the whole framework and build the Feature->Scenario->Step->
-    StepDefinition->PageMethod->Locator->TestData relationship graph."""
-    g = knowledge_graph.build_graph()
-    return g["stats"]
-
-
-@app.get("/framework/graph/stats")
-def graph_stats():
-    return knowledge_graph.get_graph()["stats"]
-
-
-@app.get("/framework/graph/trace")
-def graph_trace(step: str, keyword: str | None = None):
-    """'What does this step actually do?' — resolves a step sentence all the
-    way down to the page methods, locators, and test-data keys it touches."""
-    result = knowledge_graph.trace_step(step, keyword)
-    if result is None:
-        raise HTTPException(404, "No step definition matches this step text.")
-    return result
-
-
-@app.get("/framework/graph/impact")
-def graph_impact(locator: str):
-    """'What breaks if I change this locator?' — reverse lookup across every
-    page method, step definition, and scenario that touches it."""
-    return knowledge_graph.impact_of_locator(locator)
-
-
-@app.post("/execute/brd")
-async def execute_brd(file: UploadFile = File(...)):
-    """Upload a BRD (.pdf/.docx/.txt): AI drafts a feature file in the
-    framework's own conventions, then the draft enters the SAME Framework
-    Intelligence pipeline as a normal feature upload (match -> normalize ->
-    merge -> dry-run -> generate -> human review -> approve -> execute)."""
-    data = await file.read()
-    try:
-        brd_text = brd_processor.extract_text(file.filename, data)
-        result = brd_processor.brd_to_feature(brd_text, file.filename)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    except RuntimeError as e:          # Azure config/network errors, already user-facing
-        raise HTTPException(502, str(e))
-
-    feature_text = result["feature_text"]
-    stem = Path(file.filename).stem
-    dest = config.UPLOADS_DIR / f"{stem}.feature"
-    dest.write_text(feature_text, encoding="utf-8")
-
-    hit = indexer.lookup(result["txn"]) if result["txn"] else None
-    job = executor.start_job(str(dest), ai_ctx={
-        "uploaded_text": feature_text, "filename": dest.name,
-        "hit": hit, "module": result["module"] or (hit or {}).get("module"),
-    })
-    out = job.public()
-    out["generated_feature"] = feature_text
-    out["brd_conversion"] = {"txn": result["txn"], "module": result["module"]}
+            rel = raw_path.strip().replace("\\", "/")
+        out[rel] = code + "\n"
     return out
 
 
-# ═══════════ CR Pipeline — multi-transaction BRD change requests (additive) ══
-class CRApproval(BaseModel):
-    """approved_txns=None approves everything staged; a list approves those and
-    skips the rest. edits: {txn: {feature_text, files:{rel_path: java}}}."""
-    approved_txns: list[str] | None = None
-    edits: dict | None = None
-
-
-@app.post("/execute/cr")
-async def execute_cr(file: UploadFile = File(...)):
-    """Upload a BRD as a CHANGE REQUEST that may span MANY transactions.
-    The BRD is parsed ONCE; every transaction number is discovered; each becomes
-    an independent work item (search -> compare -> delta-only merge -> dry-run ->
-    generate -> quarantine-compile). One failed transaction never stops the
-    queue. All staged changes pause at ONE consolidated review; approval then
-    archives, commits, compiles, and executes each transaction sequentially,
-    ending in a consolidated CR report."""
-    data = await file.read()
+def _compile(files: dict[str, str], job_dir: Path, classpath: str) -> tuple[bool, str, Path]:
+    """Write sources under job_dir/src, javac into job_dir/classes."""
+    src, classes = job_dir / "src", job_dir / "classes"
+    classes.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for rel, code in files.items():
+        f = src / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(code, encoding="utf-8")
+        paths.append(str(f))
+    cmd = [config.JAVAC, "-encoding", "UTF-8", "-cp", classpath,
+           "-d", str(classes), *paths]
     try:
-        brd_text = brd_processor.extract_text(file.filename, data)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    if len(brd_text.strip()) < 40:
-        raise HTTPException(400, "The BRD appears to be empty or unreadable after text extraction.")
-    run = cr_pipeline.start_cr(file.filename, brd_text)
-    return run.public()
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except FileNotFoundError:
+        return False, ("javac not found at '" + config.JAVAC + "'. Point JAVAC_CMD (or config.JAVAC) "
+                       "at a JDK's bin\\javac.exe - a plain JRE cannot compile."), classes
+    return r.returncode == 0, (r.stdout + r.stderr).strip(), classes
 
 
-@app.get("/cr/{run_id}")
-def cr_status(run_id: str):
-    run = cr_pipeline.CR_RUNS.get(run_id)
-    if not run:
-        raise HTTPException(404, "unknown CR run")
-    return run.public()
-
-
-@app.get("/cr/{run_id}/logs")
-def cr_logs(run_id: str, offset: int = 0):
-    text, new_offset = cr_pipeline.read_log(run_id, offset)
-    return {"log": text, "offset": new_offset}
-
-
-@app.get("/cr/{run_id}/pending")
-def cr_pending(run_id: str):
-    """Consolidated review payload: every staged transaction's merged feature +
-    generated java, editable before approval."""
-    run = cr_pipeline.CR_RUNS.get(run_id)
-    if not run:
-        raise HTTPException(404, "unknown CR run")
-    staged = [{
-        "txn": i.txn, "module": (i.hit or {}).get("module"),
-        "feature_path": (i.hit or {}).get("feature"),
-        "feature_text": i.merged_feature, "files": i.gen_files,
-        "scenarios_added": i.scenarios_added, "scenarios_replaced": i.scenarios_replaced,
-        "undefined_steps": i.undefined_steps, "delta_notes": i.delta_notes,
-    } for i in run.items if i.status == "staged"]
-    action_items = [{"txn": i.txn, "status": i.status, "action": i.action_required}
-                    for i in run.items if i.action_required]
-    return {"cr_run_id": run.id, "status": run.status, "cr_number": run.cr_number,
-            "staged": staged, "action_items": action_items}
-
-
-@app.post("/cr/{run_id}/approve")
-def cr_approve(run_id: str, body: CRApproval):
-    """Commits (archive -> write -> compile) the approved transactions ONLY.
-    Nothing executes here — committed transactions become 'ready'; run them
-    per-transaction or all together via /cr/{id}/execute."""
+def _common_steps_context() -> str:
+    """Full source of every step-definition file in the 'common' module —
+    login/logout/navigation helpers that nearly every generated step relies
+    on. Sent in FULL (not just the sentence catalog) so the model calls real
+    method names instead of guessing them."""
     try:
-        run = cr_pipeline.approve_cr(run_id, body.approved_txns, body.edits)
-    except KeyError:
-        raise HTTPException(404, "unknown CR run")
-    except ValueError as e:
-        raise HTTPException(409, str(e))
-    return run.public()
+        from . import framework_scanner
+        kb = framework_scanner.get_framework_knowledge()
+        blobs = []
+        for sd in kb["step_defs"]:
+            if sd.get("module") == "common":
+                blobs.append(_read(sd["path"], cap=6000))
+        return "\n\n".join(blobs)
+    except Exception:  # noqa: BLE001 — best-effort context, never blocks generation
+        return ""
 
 
-class CRExecute(BaseModel):
-    """txns=None executes every 'ready' transaction; a list executes only those
-    (a single-element list = run just that one transaction)."""
-    txns: list[str] | None = None
+_MISSING_SYMBOL_RE = re.compile(
+    r'cannot find symbol.*?symbol:\s*method\s+(\w+)\([^\n]*\n\s*location:\s*variable\s+\w+\s+of\s+type\s+(\w+)',
+    re.S)
 
 
-@app.post("/cr/{run_id}/execute")
-def cr_execute(run_id: str, body: CRExecute | None = None):
-    try:
-        run = cr_pipeline.execute_txns(run_id, body.txns if body else None)
-    except KeyError:
-        raise HTTPException(404, "unknown CR run")
-    except ValueError as e:
-        raise HTTPException(409, str(e))
-    return run.public()
-
-
-@app.post("/cr/{run_id}/stop")
-def cr_stop(run_id: str):
-    """Tree-kill the currently running transaction (java -> msedgedriver ->
-    Edge) and skip the rest of the batch; unexecuted transactions stay 'ready'."""
-    try:
-        run = cr_pipeline.stop_cr(run_id)
-    except KeyError:
-        raise HTTPException(404, "unknown CR run")
-    except ValueError as e:
-        raise HTTPException(409, str(e))
-    return run.public()
-
-
-@app.post("/cr/{run_id}/discard")
-def cr_discard(run_id: str):
-    try:
-        run = cr_pipeline.discard_cr(run_id)
-    except KeyError:
-        raise HTTPException(404, "unknown CR run")
-    return run.public()
-
-
-@app.get("/cr/{run_id}/report")
-def cr_report(run_id: str):
-    run = cr_pipeline.CR_RUNS.get(run_id)
-    if not run:
-        raise HTTPException(404, "unknown CR run")
-    return run.report or cr_pipeline.build_report(run)
-
-
-# ═══════════ Locator Intelligence — human-workflow recorder (additive) ══════
-class RecorderStart(BaseModel):
-    url: str | None = None
-
-
-@app.post("/recorder/start")
-def recorder_start(body: RecorderStart):
-    """Launch Edge with the event recorder injected. A human then performs the
-    workflow MANUALLY in that window; every click/typed field captures the
-    element's DOM identity (never the typed values)."""
-    try:
-        return recorder.start(body.url or getattr(config, "RECORDER_DEFAULT_URL", ""))
-    except RuntimeError as e:
-        raise HTTPException(409 if "already running" in str(e) else 502, str(e))
-
-
-@app.get("/recorder/status")
-def recorder_status():
-    return recorder.status()
-
-
-@app.post("/recorder/stop")
-def recorder_stop():
-    """Close the recording browser and return every captured element with its
-    prioritized locator candidates + suggested Java field name, for review."""
-    return recorder.stop()
-
-
-class RecorderSave(BaseModel):
-    entries: list[dict]
-
-
-@app.post("/recorder/save")
-def recorder_save(body: RecorderSave):
-    """Persist reviewed locators to the Locator Knowledge Repository. They are
-    injected into every future AI generation, replacing TODO guesses."""
-    added = recorder.save_entries(body.entries)
-    return {"added": added, "total": len(recorder.load_repository())}
-
-
-@app.post("/jobs/{job_id}/heal")
-def job_heal(job_id: str):
-    """Self-healing: use the captured DOM of the failed screen to repair
-    locators, then route through review/approve (auto under CI policy)."""
-    try:
-        return executor.heal_job(job_id).public()
-    except KeyError as e:
-        raise HTTPException(409, str(e))
-
-
-@app.get("/jobs/{job_id}/captures")
-def job_captures(job_id: str):
-    idx = runtime_capture.capture_dir_for(job_id) / "index.json"
-    if not idx.exists():
-        raise HTTPException(404, "No captures for this job.")
-    import json as _json
-    return {"checkpoints": _json.loads(idx.read_text())}
-
-
-# ═══════════ Capture Mode — runtime inspection ingestion (additive) ═════════
-class CaptureIn(BaseModel):
-    run_id: str | None = None
-    txn: str | None = None
-    checkpoint: str
-    html: str | None = None
-    screenshot_b64: str | None = None
-    metadata: dict | None = None
-
-
-@app.post("/capture/ingest")
-def capture_ingest(body: CaptureIn):
-    """Receive one runtime capture pushed by the Java framework when it reaches
-    a checkpoint screen. The framework navigates; this only stores what it
-    saw. Screenshot+HTML+metadata are persisted for AI reasoning."""
-    return capture.store_capture(body.run_id, body.txn, body.checkpoint,
-                                 body.html or "", body.screenshot_b64 or "", body.metadata)
-
-
-@app.get("/capture/list")
-def capture_list(run_id: str | None = None, txn: str | None = None):
-    return {"captures": capture.list_captures(run_id, txn)}
-
-
-@app.get("/txns")
-def search_txns(q: str = "", all: bool = False):
-    """Returns [{txn, module, file}] — the full list when all=1 so the UI can
-    offer a scrollable, searchable dropdown of every feature."""
-    idx = indexer.get_index()
-    q = q.lower()
-    items = []
-    from pathlib import Path as _P
-    for k, v in idx.items():
-        if not v.get("feature"):
-            continue  # java-only entries can't be executed — keep them out of the picker
-        name = v.get("txn") or k
-        if q and q not in name.lower() and q not in (v.get("feature") or "").lower():
+def _find_class_source(class_name: str) -> str | None:
+    """Search steps/pages/utils folders for the file defining `class_name`
+    and return its real current content, or None if not found."""
+    for base in (getattr(config, "STEPS_DIR", None), getattr(config, "PAGES_DIR", None),
+                getattr(config, "UTILS_DIR", None)):
+        if not base or not Path(base).exists():
             continue
-        items.append({"txn": name, "module": v.get("module") or "",
-                      "file": _P(v["feature"]).name})
-    items.sort(key=lambda x: int(re.sub(r"\D", "", x["txn"]) or 0))
-    if not all:
-        items = items[:50]
-    return {"count": len(items), "txns": items}
+        for f in Path(base).rglob(f"{class_name}.java"):
+            return f.read_text(encoding="utf-8", errors="ignore")
+    return None
 
 
-# ───────────────────────── flow 1: run by txn number ────────────────────────
-@app.post("/execute/txn/{txn_no}")
-def execute_txn(txn_no: str, capture: bool = False, params: RunParams | None = None):
-    """txn_no arrives as e.g. 'Txn36048' or 'txn69069' (prefix chosen in the UI).
-    We locate the feature via the index, VERIFY the matching @tag exists inside
-    the feature file, then run with cucumber.filter.tags=<that exact tag> —
-    same effect as replacing the number in TestRunner's tags, but with no
-    Java edit and no recompile."""
-    hit = indexer.lookup(txn_no)
-    if not hit:
-        raise HTTPException(404, f"Txn '{txn_no}' not found in index. Try POST /index/rebuild.")
-    if not hit.get("feature"):
-        raise HTTPException(409,
-            f"{hit['txn']} has step-definition/page Java files but NO .feature file was found "
-            f"for this number anywhere under {config.FEATURES_DIR.name}. This transaction is "
-            f"not automatable until its feature file exists (check the filename's Txn number).")
-
-    # find the matching tag inside the feature file. Frameworks tag in several
-    # styles, so we accept (in priority order):
-    #   1. @Txn012000                              (exact, any casing)
-    #   2. @Txn012000_LoansCreateLoanDetails       (starts with the txn id)
-    #   3. @12000                                  (bare number, zero-padding ignored)
-    from pathlib import Path as _P
-    text = _P(hit["feature"]).read_text(encoding="utf-8", errors="ignore")
-    tags_in_file = re.findall(r"@[\w]+", text)
-    digits = re.sub(r"\D", "", txn_no)
-
-    def _match_rank(t: str) -> int:
-        low = t.lower().lstrip("@")
-        if low == f"txn{digits}".lower():
-            return 1
-        if low.startswith(f"txn{digits}".lower()) and not low[len(f"txn{digits}"):][:1].isdigit():
-            return 2
-        if low.isdigit() and low.lstrip("0") == digits.lstrip("0"):
-            return 3
-        return 99
-
-    tag = min(tags_in_file, key=_match_rank, default=None)
-    if tag is not None and _match_rank(tag) == 99:
-        tag = None
-    if not tag:
-        raise HTTPException(409,
-            f"Feature found ({_P(hit['feature']).name}) but it has no @{txn_no} tag. "
-            f"Tags present in the file: {sorted(set(tags_in_file)) or 'none'}. "
-            f"Add the tag above the Scenario/Feature line, or run without tag matching.")
-
-    job = executor.start_job(hit["feature"],
-                             run_params=params.model_dump() if params else None,
-                             tag_filter=tag)
-    return {"txn": hit["txn"], "module": hit["module"], "tag": tag, **job.public()}
+_STEP_ANN_FULL_RE = re.compile(r'@(Given|When|Then|And|But)\s*\(\s*"((?:[^"\\]|\\.)*)"\s*\)')
+_METHOD_SIG_RE = re.compile(
+    r'(?:public|protected)\s+(?!class\b)[\w<>\[\], ]+?\s+(\w+)\s*\(([^)]*)\)\s*'
+    r'(?:throws\s+[\w,.\s]+)?\s*\{')
 
 
-# ───────────────────── flow 2: run an uploaded feature ──────────────────────
-@app.post("/execute/upload")
-async def execute_upload(
-    file: UploadFile = File(...),
-    dry_run: bool = False,
-    ai: bool = False,
-    capture: bool = False,
-    url: str | None = Form(None),
-    maker_id: str | None = Form(None),
-    maker_password: str | None = Form(None),
-    checker_id: str | None = Form(None),
-    checker_password: str | None = Form(None),
-):
-    if not file.filename.endswith(".feature"):
-        raise HTTPException(400, "Please upload a .feature file.")
-    text = (await file.read()).decode("utf-8", errors="ignore")
-    import re as _re
-    has_feature = _re.search(r"^\s*(?:@\S+\s*)*Feature:", text, _re.M)
-    has_scenario = _re.search(r"^\s*Scenario(?: Outline)?:", text, _re.M)
-    has_step = _re.search(r"^\s*(?:Given|When|Then|And|But)\s+\S", text, _re.M)
-    if not (has_feature and has_scenario and has_step):
-        missing = [n for ok, n in [(has_feature, "a 'Feature:' header"),
-                                    (has_scenario, "a 'Scenario:' line"),
-                                    (has_step, "Given/When/Then steps")] if not ok]
-        raise HTTPException(400,
-            f"'{file.filename}' is not valid Gherkin — it is missing {', '.join(missing)}. "
-            "Cucumber needs: Feature: <title>, then Scenario: <name>, then Given/When/Then steps. "
-            "If this is a solution/requirements document, a proper .feature must be written from it first.")
-
-    module = indexer.detect_module(text)
-    dest = config.UPLOADS_DIR / file.filename
-    dest.write_text(text, encoding="utf-8")
-
-    run_params = {
-        "url": url,
-        "maker_id": maker_id,
-        "maker_password": maker_password,
-        "checker_id": checker_id,
-        "checker_password": checker_password,
-    }
-    ai_ctx = None
-    if ai:
-        # identify the transaction from the filename first, then the content
-        m = indexer.TXN_RE.search(file.filename) or indexer.TXN_RE.search(text)
-        hit = indexer.lookup(m.group(1)) if m else None
-        ai_ctx = {"uploaded_text": text, "filename": file.filename,
-                  "hit": hit, "module": (hit or {}).get("module") or module}
-    job = executor.start_job(str(dest), dry_run=dry_run, run_params=run_params,
-                             ai_ctx=ai_ctx)
-    closest = indexer.closest_feature(text, module)
-    return {
-        "module_detected": module,
-        "closest_existing_feature": closest,
-        "hint": "If the run reports undefined_steps, the framework has no Java glue "
-                "for those lines — reuse the closest_existing_feature's wording, "
-                "or generate new step definitions (phase 2).",
-        **job.public(),
-    }
+def _remove_step_method(code: str, keyword: str, sentence: str) -> tuple[str, bool]:
+    """Excise ONE step method (its annotation through its matching closing
+    brace) from generated source, identified by its exact keyword+sentence."""
+    ann_pat = re.compile(r'@' + re.escape(keyword) + r'\s*\(\s*"' + re.escape(sentence) + r'"\s*\)')
+    am = ann_pat.search(code)
+    if not am:
+        return code, False
+    mm = _METHOD_SIG_RE.search(code, am.end())
+    if not mm:
+        return code, False
+    depth, i, n = 0, mm.end() - 1, len(code)
+    while i < n:
+        if code[i] == '{':
+            depth += 1
+        elif code[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return (code[:am.start()] + code[i + 1:]).strip() + "\n", True
+        i += 1
+    return code, False
 
 
-# ─────────────────────────── job status / logs ──────────────────────────────
-@app.get("/jobs/{job_id}/pending")
-def job_pending(job_id: str):
-    """The proposed changes for the in-browser review editor."""
-    job = executor.JOBS.get(job_id)
-    if not job or job.status != "review" or not job.pending:
-        raise HTTPException(404, "No changes awaiting review for this job.")
-    p = job.pending
-    hit = p.get("hit") or {}
-
-    old_feature_text = ""
-    if hit.get("feature"):
-        try:
-            old_feature_text = Path(hit["feature"]).read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            pass
-
-    old_files: dict[str, str | None] = {}
-    for rel in p["files"]:
-        f = config.JAVA_SRC_ROOT / rel
-        if f.exists():
-            try:
-                old_files[rel] = f.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                old_files[rel] = None
-        else:
-            old_files[rel] = None  # brand-new file — every line is "added"
-
-    return {
-        "feature_text": p["feature_text"], "files": p["files"], "meta": p["meta"],
-        "old_feature_text": old_feature_text, "old_files": old_files,
-        "match": {
-            "txn": hit.get("txn"), "module": hit.get("module"),
-            "confidence": p["meta"].get("matched_via_fallback_score"),  # None = direct/exact match
-            "is_new_feature": not bool(hit.get("feature")),
-        },
-    }
-
-
-class Approval(BaseModel):
-    feature_text: str | None = None
-    files: dict[str, str] | None = None
-
-
-@app.post("/jobs/{job_id}/approve")
-def job_approve(job_id: str, body: Approval):
+def _strip_duplicate_steps(files: dict[str, str], log) -> dict[str, str]:
+    """Safety net for a real failure mode: Cucumber throws
+    DuplicateStepDefinitionException at RUNTIME (glue-loading, before any
+    scenario executes) if the same step sentence is implemented in two
+    classes — javac cannot catch this, so prompting alone is not reliable
+    enough to prevent it. Deterministically detect and remove any generated
+    step method that duplicates a sentence already owned by a DIFFERENT
+    existing class in the framework. A generated file legitimately keeping/
+    updating one of ITS OWN pre-existing steps is correctly left alone."""
     try:
-        job = executor.approve_job(job_id, body.feature_text, body.files)
-    except KeyError as e:
-        raise HTTPException(409, str(e))
-    except ValueError as e:
-        raise HTTPException(422, "Your edited java does not compile:\n" + str(e))
-    return job.public()
-
-
-@app.post("/jobs/{job_id}/discard")
-def job_discard(job_id: str):
-    if not executor.discard_job(job_id):
-        raise HTTPException(409, "Job is not awaiting review.")
-    return {"job_id": job_id, "status": "discarded"}
-
-
-@app.post("/jobs/{job_id}/stop")
-def stop_job(job_id: str):
-    ok = executor.stop_job(job_id)
-    if not ok:
-        raise HTTPException(409, "Job is not running (or unknown id).")
-    return {"job_id": job_id, "status": "stopping"}
-
-
-@app.get("/jobs/{job_id}")
-def job_status(job_id: str):
-    job = executor.JOBS.get(job_id)
-    if not job:
-        raise HTTPException(404, "Unknown job id.")
-    return job.public()
-
-
-@app.get("/jobs/{job_id}/logs")
-def job_logs(job_id: str, offset: int = 0):
-    chunk, new_offset = executor.read_log(job_id, offset)
-    job = executor.JOBS.get(job_id)
-    return {
-        "log": chunk,
-        "next_offset": new_offset,
-        "status": job.status if job else "unknown",
-    }
-
-
-# ───────────────────────── serve the frontend ───────────────────────────────
-# Must be mounted LAST so it doesn't shadow the API routes above.
-# Open http://localhost:8000 in a browser after starting uvicorn.
-from pathlib import Path as _Path
-from fastapi.staticfiles import StaticFiles
-
-_FRONTEND_DIR = _Path(__file__).resolve().parent.parent / "frontend"
-if _FRONTEND_DIR.exists():
-    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIR), html=True), name="frontend")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Txn Automation Console</title>
-<style>
-  :root{
-    --bg:#eef2f9; --card:#ffffff; --ink:#101a2e; --muted:#64748b; --line:#e2e8f2;
-    --a1:#4f46e5; --a2:#0ea5e9; --grad:linear-gradient(135deg,#4f46e5 0%,#0ea5e9 100%);
-    --pass:#16a34a; --pass-soft:#e7f6ec; --fail:#dc2626; --fail-soft:#fdecec;
-    --warn:#b45309; --warn-soft:#fef3d8;
-    --console:#0b1220; --console-ink:#cfe0f4;
-    --mono:"Consolas","Cascadia Mono",monospace; --sans:"Segoe UI",system-ui,Arial,sans-serif;
-    --shadow:0 10px 30px rgba(16,26,46,.08), 0 2px 6px rgba(16,26,46,.05);
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:
-       radial-gradient(1200px 400px at 80% -100px, rgba(79,70,229,.10), transparent 60%),
-       radial-gradient(900px 380px at 10% -80px, rgba(14,165,233,.10), transparent 60%),
-       var(--bg);
-       color:var(--ink);font-family:var(--sans);min-height:100vh;font-size:15px}
-  /* ── header ── */
-  header{display:flex;align-items:center;gap:16px;padding:16px 28px}
-  .logo{width:38px;height:38px;border-radius:11px;background:var(--grad);display:grid;place-items:center;
-        color:#fff;font-weight:800;font-size:16px;box-shadow:0 6px 16px rgba(79,70,229,.35)}
-  header h1{font-size:18px;margin:0;letter-spacing:.2px}
-  header .sub{font-size:12px;color:var(--muted)}
-  .spacer{flex:1}
-  .btn{font:inherit;border:1px solid var(--line);background:#fff;color:var(--ink);
-       padding:9px 16px;border-radius:10px;cursor:pointer;transition:.15s;box-shadow:0 1px 2px rgba(16,26,46,.05)}
-  .btn:hover{border-color:var(--a1);transform:translateY(-1px)}
-  .btn:focus-visible{outline:2px solid var(--a1);outline-offset:2px}
-  .btn.primary{background:var(--grad);border:0;color:#fff;font-weight:700;letter-spacing:.3px;
-               box-shadow:0 8px 20px rgba(79,70,229,.35)}
-  .btn.primary:disabled{opacity:.55;cursor:not-allowed;transform:none}
-  .btn.stop{background:linear-gradient(135deg,#ef4444,#b91c1c);border:0;color:#fff;font-weight:700;
-            box-shadow:0 8px 20px rgba(220,38,38,.30);display:none}
-  /* ── layout per sketch: [new execution | execution] then reports full width ── */
-  main{display:grid;grid-template-columns:400px 1fr;gap:20px;padding:6px 28px 28px;max-width:1600px;margin:0 auto}
-  #reportcard{grid-column:1 / -1}
-  @media(max-width:1020px){main{grid-template-columns:1fr}}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px;box-shadow:var(--shadow)}
-  .card h2{display:flex;align-items:center;gap:8px;font-size:13.5px;text-transform:uppercase;
-           letter-spacing:1.2px;color:var(--muted);margin:0 0 16px;font-weight:700}
-  .card h2::before{content:"";width:8px;height:8px;border-radius:3px;background:var(--grad)}
-  /* tabs — Upload first & default */
-  .tabs{display:flex;background:#f1f4fa;border-radius:12px;padding:4px;margin-bottom:18px}
-  .tabs button{flex:1;font:inherit;font-weight:600;padding:10px;border:0;border-radius:9px;
-               background:transparent;color:var(--muted);cursor:pointer;transition:.15s}
-  .tabs button.active{background:#fff;color:var(--a1);box-shadow:0 2px 8px rgba(16,26,46,.10)}
-  label{display:block;font-size:13px;color:var(--muted);margin:12px 0 6px;font-weight:600}
-  input[type=file]{width:100%;font:inherit;padding:10px;border:1.5px dashed var(--line);border-radius:10px;background:#fafbfe}
-  .check{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px;color:var(--muted)}
-  .hintbox{font-size:13px;color:var(--muted);background:#f6f8fd;border:1px solid var(--line);
-           border-radius:10px;padding:10px 12px;margin-top:12px;line-height:1.5}
-  .hintbox.ai{background:#f6f0ff;border-color:#e4d4fb;color:#5b21b6}
-  .tabs button#tab-ai.active{background:linear-gradient(135deg,#7c3aed,#a855f7);color:#fff}
-  .mono{font-family:var(--mono)}
-  /* ── Txn combo: fixed label + searchable scrollable dropdown ── */
-  .combo{position:relative}
-  .combo .row{display:flex;border:1.5px solid var(--line);border-radius:10px;overflow:hidden;background:#fff;transition:.15s}
-  .combo .row:focus-within{border-color:var(--a1);box-shadow:0 0 0 3px rgba(79,70,229,.12)}
-  .chip{background:var(--grad);color:#fff;font-weight:700;padding:11px 16px;font-size:14px;letter-spacing:.5px}
-  .combo input{flex:1;border:0;outline:0;font:inherit;padding:11px 12px;font-family:var(--mono)}
-  .ddl{position:absolute;z-index:30;top:calc(100% + 6px);left:0;right:0;background:#fff;
-       border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);
-       max-height:280px;overflow-y:auto;display:none}
-  .ddl.open{display:block}
-  .ddl .item{padding:10px 14px;cursor:pointer;display:flex;gap:10px;align-items:baseline;border-bottom:1px solid #f3f5fa}
-  .ddl .item:hover,.ddl .item.hl{background:#f4f6ff}
-  .ddl .num{font-family:var(--mono);font-weight:700;color:var(--a1);min-width:74px}
-  .ddl .fname{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
-  .ddl .mod{font-size:10px;font-weight:700;text-transform:uppercase;color:#fff;background:#94a3b8;
-            border-radius:20px;padding:2px 8px;letter-spacing:.5px}
-  .ddl .empty{padding:14px;color:var(--muted);font-size:13px;text-align:center}
-  /* ── execution panel ── */
-  .rail{display:flex;margin:4px 0 16px}
-  .stage{flex:1;text-align:center;font-size:12px;color:var(--muted);position:relative;padding-top:20px}
-  .stage::before{content:"";width:13px;height:13px;border-radius:50%;background:#d3dced;
-                 position:absolute;top:0;left:50%;transform:translateX(-50%);transition:.25s}
-  .stage::after{content:"";position:absolute;top:6px;left:-50%;width:100%;height:2.5px;background:#d3dced;z-index:0;transition:.25s}
-  .stage:first-child::after{display:none}
-  .stage.on::before{background:var(--a1);box-shadow:0 0 0 4px rgba(79,70,229,.18)}
-  .stage.on::after{background:var(--a1)}
-  .stage.done::before{background:var(--pass)} .stage.done::after{background:var(--pass)}
-  .stage.bad::before{background:var(--fail)}
-  .badge{font-size:13px;font-weight:700;padding:4px 12px;border-radius:20px;text-transform:capitalize}
-  .badge.idle,.badge.queued{background:#eef1f7;color:var(--muted)}
-  .badge.running{background:#e6efff;color:var(--a1);animation:pulse 1.4s infinite}
-  .badge.passed{background:var(--pass-soft);color:var(--pass)}
-  .badge.failed,.badge.error{background:var(--fail-soft);color:var(--fail)}
-  .badge.stopped,.badge.discarded{background:var(--warn-soft);color:var(--warn)}
-  .badge.review{background:#f3e8ff;color:#7c3aed;animation:pulse 1.4s infinite}
-  /* review editor */
-  .rfile{margin:16px 0}
-  .rfile .fhead{display:flex;align-items:center;gap:10px;font-family:var(--mono);font-size:13px;
-                font-weight:700;color:var(--a1);margin-bottom:6px}
-  .rfile .ftag{font-size:10px;font-weight:800;letter-spacing:.6px;color:#fff;background:var(--grad);
-               border-radius:20px;padding:2px 10px;text-transform:uppercase}
-  textarea.code{width:100%;min-height:230px;resize:vertical;font-family:var(--mono);font-size:13px;
-                line-height:1.55;color:var(--console-ink);background:var(--console);border:1px solid #223049;
-                border-radius:12px;padding:14px;box-shadow:inset 0 2px 10px rgba(0,0,0,.4);tab-size:4}
-  textarea.code:focus-visible{outline:2px solid var(--a1)}
-  .diffview{width:100%;font-family:var(--mono);font-size:12.5px;line-height:1.6;color:var(--console-ink);
-            background:var(--console);border:1px solid #223049;border-radius:12px;padding:10px 0;
-            box-shadow:inset 0 2px 10px rgba(0,0,0,.4);max-height:420px;overflow-y:auto}
-  .diffview .dline{padding:1px 14px;white-space:pre-wrap;word-break:break-word;border-left:3px solid transparent}
-  .diffview .dline.added{background:rgba(34,197,94,.16);border-left-color:#22c55e;color:#c9f7d9}
-  .diffview .dline.added::before{content:"+ ";color:#4ade80;font-weight:700}
-  .diffview .dline.removed{background:rgba(239,68,68,.14);border-left-color:#ef4444;color:#f8b4b4;
-                           text-decoration:line-through;text-decoration-color:rgba(248,180,180,.5)}
-  .diffview .dline.removed::before{content:"- ";color:#f87171;font-weight:700}
-  .diffview .dline.same{color:#8391a8}
-  .diffview .dline.same::before{content:"  "}
-  .diffsummary{font-size:11.5px;color:var(--muted);margin:4px 0 8px;display:flex;gap:14px;align-items:center}
-  .diffsummary b.added{color:var(--pass)} .diffsummary b.removed{color:var(--fail)}
-  .edittoggle{font-size:11.5px;font-weight:700;padding:3px 12px;border-radius:20px;border:1px solid var(--line);
-             background:#fff;color:var(--muted);cursor:pointer;margin-left:auto}
-  .edittoggle:hover{border-color:var(--a1);color:var(--a1)}
-  .rmeta{font-size:13.5px;background:#f3f0ff;border:1px solid #e4dcfb;color:#5b21b6;
-         border-radius:10px;padding:10px 14px;margin-bottom:6px}
-  .matchbar{display:flex;align-items:center;gap:10px;font-size:13.5px;background:#eef6ff;
-            border:1px solid #d3e6fb;color:#1e40af;border-radius:10px;padding:10px 14px;margin-bottom:14px}
-  .matchbar.newfeat{background:#fff8e6;border-color:#fbe4b0;color:#92600a}
-  .compare-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
-  .ccard{border-radius:10px;padding:10px 12px;text-align:center;border:1px solid var(--line)}
-  .ccard b{display:block;font-size:22px} .ccard span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
-  .ccard.unchanged{background:#f4f6fb} .ccard.new{background:var(--pass-soft)}
-  .ccard.kept{background:#fff8e6} .ccard.modified{background:#eef2ff}
-  .ai-decisions{font-size:12.5px;background:#fafbff;border:1px solid var(--line);border-radius:10px;
-                padding:10px 14px;margin-bottom:16px;max-height:160px;overflow-y:auto}
-  .ai-decisions .row{padding:3px 0;border-bottom:1px dashed #eef1f7;display:flex;gap:8px;align-items:baseline}
-  .ai-decisions .row:last-child{border-bottom:0}
-  .ai-decisions .tag{font-size:10px;font-weight:800;text-transform:uppercase;color:#fff;
-                     background:#7c3aed;border-radius:12px;padding:1px 8px;flex-shrink:0}
-  .ai-decisions code{font-family:var(--mono);font-size:11.5px}
-  .compilebadge{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;font-weight:700;
-                padding:5px 12px;border-radius:20px;background:var(--pass-soft);color:var(--pass);margin-bottom:14px}
-  @keyframes pulse{50%{opacity:.55}}
-  #console{background:var(--console);color:var(--console-ink);font-family:var(--mono);font-size:13px;
-           line-height:1.6;border-radius:12px;padding:14px 16px;height:300px;overflow:auto;
-           white-space:pre-wrap;word-break:break-word;box-shadow:inset 0 2px 12px rgba(0,0,0,.45)}
-  #console:empty::before{content:"Console output will stream here once a run starts.";color:#5b6b85}
-  /* ── reports ── */
-  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:22px}
-  .kpi{border:1px solid var(--line);border-radius:14px;padding:16px 18px;background:linear-gradient(180deg,#fff, #fafbff)}
-  .kpi b{display:block;font-size:36px;line-height:1.1;font-variant-numeric:tabular-nums}
-  .kpi span{font-size:12.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.7px;font-weight:600}
-  .kpi.p b{color:var(--pass)} .kpi.f b{color:var(--fail)} .kpi.a b{background:var(--grad);
-    -webkit-background-clip:text;background-clip:text;color:transparent}
-  .charts{display:grid;grid-template-columns:1fr 1fr 1fr;gap:26px;align-items:start}
-  .cols{display:flex;justify-content:center;align-items:flex-end;gap:44px;height:210px;padding-top:10px}
-  .col{display:flex;flex-direction:column;align-items:center;gap:8px}
-  .col .val{font-size:26px;font-weight:800;font-variant-numeric:tabular-nums}
-  .col .bar{width:64px;border-radius:10px 10px 4px 4px;transition:height .7s ease;box-shadow:inset 0 -3px 8px rgba(0,0,0,.12)}
-  .col .lab{font-size:13px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.6px}
-  @media(max-width:1100px){.charts{grid-template-columns:1fr}}
-  .chart-title{font-size:14px;color:var(--muted);font-weight:700;text-transform:uppercase;
-               letter-spacing:.8px;margin-bottom:12px;text-align:center}
-  .legend{font-size:13.5px;color:var(--muted);display:flex;gap:16px;justify-content:center;margin-top:10px}
-  .dot{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
-  .barrow{display:grid;grid-template-columns:minmax(120px,260px) 1fr 58px;gap:12px;align-items:center;font-size:12px;margin:8px 0}
-  .barrow .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#334155}
-  .bartrack{background:#eef1f8;border-radius:6px;height:16px;overflow:hidden}
-  .barfill{height:100%;border-radius:6px;min-width:5px;transition:width .6s ease}
-  .stack{height:26px;border-radius:8px;overflow:hidden;display:flex;box-shadow:inset 0 1px 3px rgba(0,0,0,.08)}
-  .stack div{transition:width .6s ease}
-  .note{border-radius:10px;padding:10px 14px;font-size:13px;margin-top:18px;background:var(--warn-soft);color:var(--warn);display:none}
-  #toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--ink);color:#fff;
-         padding:11px 20px;border-radius:12px;font-size:13px;display:none;z-index:99;box-shadow:var(--shadow)}
-</style>
-</head>
-<body>
-<header>
-  <div class="logo">Tx</div>
-  <div>
-    <h1>Txn Automation Console</h1>
-    <div class="sub">NBC Cucumber framework &middot; executes via TestRunner on Microsoft Edge</div>
-  </div>
-  <div class="spacer"></div>
-  <span id="idxinfo" class="sub"></span>
-  <button class="btn" onclick="rebuildIndex()">&#8635; Rebuild index</button>
-</header>
-
-<main>
-  <!-- ═════════ NEW EXECUTION (sketch: top-left) ═════════ -->
-  <section class="card">
-    <h2>New Execution</h2>
-    <div class="tabs">
-      <button id="tab-up" class="active" onclick="setTab('up')">Upload Feature</button>
-      <button id="tab-ai" onclick="setTab('ai')">+ Framework Intelligence (Feature / BRD)</button>
-      <button id="tab-cr" onclick="setTab('cr')">CR Pipeline (multi-Txn BRD)</button>
-      <button id="tab-txn" onclick="setTab('txn')">Run by Txn No</button>
-    </div>
-
-    <div id="pane-up">
-      <label for="file">Feature file (.feature)</label>
-      <input id="file" type="file" accept=".feature">
-      <label class="check"><input id="dry" type="checkbox" checked>
-        Verify steps first (dry run &mdash; no browser, seconds)</label>
-      <label class="check"><input id="capup" type="checkbox">
-        <b>Capture Mode</b>&nbsp;&mdash; save screenshot + HTML at every step (feeds locator repository &amp; self-healing)</label>
-      <div class="hintbox">Runs from the server's uploads folder as-is — the framework source is never modified.</div>
-    </div>
-
-    <div id="pane-ai" style="display:none">
-      <label for="fileai"><b>Upload a Feature file or a BRD</b> &nbsp;<span style="color:var(--muted);font-weight:400">(.feature, .pdf, .docx, .txt)</span></label>
-      <input id="fileai" type="file" accept=".feature,.pdf,.docx,.txt">
-      <div class="sub" style="text-transform:none;letter-spacing:0;color:var(--muted);font-size:12px;margin-top:4px">
-        <b>.feature</b> &rarr; used directly &nbsp;&middot;&nbsp; <b>.pdf / .docx / .txt (BRD)</b> &rarr; AI drafts the feature first, in your framework's wording</div>
-      <div class="hintbox ai">
-        <b>Framework Intelligence</b> accepts a ready feature file <i>or a BRD document</i>
-        (AI drafts the feature from the BRD first, using your framework's own step wording). It will:
-        find the closest matching existing feature (even
-        without a transaction number) &middot; normalize your wording to framework conventions
-        &middot; merge non-destructively &middot; generate only the missing Java, reusing
-        existing steps/locators &middot; compile-verify &middot; then <b>pause for your review
-        and approval</b> before anything touches the framework.
-      </div>
-    </div>
-
-    <div id="pane-cr" style="display:none">
-      <label for="filecr"><b>Upload a BRD as a Change Request</b> &nbsp;<span style="color:var(--muted);font-weight:400">(.pdf, .docx, .txt)</span></label>
-      <input id="filecr" type="file" accept=".pdf,.docx,.txt">
-      <div class="hintbox ai">
-        <b>CR Pipeline</b> treats the BRD as a change request against your EXISTING automation
-        (which stays the source of truth). It parses the BRD <b>once</b>, discovers <b>every</b>
-        transaction number, and processes each one independently: locate existing
-        feature/page/steps &middot; compute only the delta &middot; append/replace scenarios
-        non-destructively &middot; generate only the missing Java (reusing existing
-        steps/locators) &middot; compile-verify in quarantine. One failed transaction never
-        stops the rest. All changes pause at <b>one consolidated review</b>; after approval each
-        transaction is archived, committed, compiled and executed sequentially, ending in a
-        consolidated CR report below.
-      </div>
-    </div>
-
-    <div id="pane-txn" style="display:none">
-      <label>Transaction number</label>
-      <div class="combo" id="combo">
-        <div class="row">
-          <span class="chip">Txn</span>
-          <input id="txn" placeholder="type a number or click to browse&hellip;" autocomplete="off"
-                 oninput="filterDdl()" onfocus="openDdl()">
-        </div>
-      <label class="check" style="margin-top:10px"><input id="captxn" type="checkbox">
-        <b>Capture Mode</b>&nbsp;&mdash; save screenshot + HTML at every step</label>
-        <div class="ddl" id="ddl"></div>
-      </div>
-      <div class="hintbox">All <b id="featcount">&hellip;</b> feature files are listed — scroll or type to search.
-        The backend verifies the matching tag exists inside the feature before launching.</div>
-    </div>
-
-    <button id="runbtn" class="btn primary" style="width:100%;margin-top:18px;padding:13px" onclick="run()">&#9654;&nbsp; Run on Edge</button>
-    <button id="stopbtn" class="btn stop" style="width:100%;margin-top:10px;padding:13px" onclick="stopRun()">&#9632;&nbsp; Stop execution</button>
-  </section>
-
-  <!-- ═════════ EXECUTION (sketch: top-right) ═════════ -->
-  <section class="card">
-    <h2>Execution <span id="jobmeta" class="sub" style="text-transform:none;letter-spacing:0"></span>
-        <span class="spacer"></span><span id="status" class="badge idle">idle</span></h2>
-    <div class="rail">
-      <div class="stage" id="s1">Lookup</div>
-      <div class="stage" id="s2">Launch JVM</div>
-      <div class="stage" id="s3">Edge run</div>
-      <div class="stage" id="s4">Report</div>
-    </div>
-    <div id="console" role="log" aria-live="polite"></div>
-  </section>
-
-  <!-- ═════════ LOCATOR RECORDER (human workflow -> real locators) ═════════ -->
-  <section class="card" style="grid-column:1 / -1">
-    <h2>Locator Recorder <span class="sub" style="text-transform:none;letter-spacing:0">
-      &mdash; do the workflow manually in Edge; every click/field captures a real locator (typed values are never recorded)</span></h2>
-    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-      <input id="recurl" placeholder="application URL (leave empty for configured default)" style="flex:1;min-width:260px">
-      <button class="btn primary" id="recstart" onclick="recStart()">&#9210;&nbsp; Start recording</button>
-      <button class="btn" id="recstop" onclick="recStop()" style="display:none">&#9209;&nbsp; Stop &amp; review</button>
-      <span id="recstatus" class="sub" style="text-transform:none;letter-spacing:0"></span>
-    </div>
-    <div id="reccaptured" style="margin-top:14px"></div>
-  </section>
-
-  <!-- ═════════ CR PIPELINE (multi-transaction BRD change request) ═════════ -->
-  <section class="card" id="crcard" style="grid-column:1 / -1;display:none">
-    <h2>CR Pipeline <span id="crmeta" class="sub" style="text-transform:none;letter-spacing:0"></span>
-        <span class="spacer"></span>
-        <button id="crrunall" class="btn primary" style="display:none;padding:7px 14px;font-size:12.5px;text-transform:none;letter-spacing:0"
-                onclick="crExec(null)">&#9654;&nbsp; Run all ready</button>
-        <button id="crstop" class="btn stop" style="display:none;padding:7px 14px;font-size:12.5px;text-transform:none;letter-spacing:0"
-                onclick="crStop()">&#9632;&nbsp; Stop execution</button>
-        <span id="crstatus" class="badge idle">idle</span></h2>
-    <div id="crtable" style="overflow-x:auto"></div>
-    <div id="crconsole" role="log" aria-live="polite"
-         style="margin-top:12px;max-height:260px;overflow:auto;background:#0b1020;color:#cfe3ff;
-                font:12px/1.5 ui-monospace,Consolas,monospace;padding:12px;border-radius:8px;
-                white-space:pre-wrap"></div>
-    <div id="crreview" style="display:none;margin-top:16px">
-      <h2 style="font-size:15px">Consolidated Review <span class="sub" style="text-transform:none;letter-spacing:0">
-        &mdash; untick a transaction to skip it; edit any feature text before approving</span></h2>
-      <div id="crstaged"></div>
-      <div id="cractions"></div>
-      <div style="display:flex;gap:12px;margin-top:16px">
-        <button class="btn primary" style="padding:12px 26px" onclick="crApprove()">&#10003;&nbsp; Approve selected &amp; Run on Edge</button>
-        <button class="btn" style="padding:12px 22px" onclick="crDiscard()">&#10005;&nbsp; Discard entire CR</button>
-      </div>
-    </div>
-    <div id="crreport" style="display:none;margin-top:16px">
-      <h2 style="font-size:15px">Consolidated CR Report
-        <span class="spacer"></span>
-        <button class="btn" style="text-transform:none;letter-spacing:0;font-size:13.5px"
-                onclick="crDownload()">&#8681;&nbsp; Download JSON report</button></h2>
-      <div class="kpis" id="crkpis"></div>
-      <div id="crreportbody"></div>
-    </div>
-  </section>
-
-  <!-- ═════════ REVIEW & EDIT (AI changes await approval) ═════════ -->
-  <section class="card" id="reviewcard" style="grid-column:1 / -1;display:none">
-    <h2>Review Framework Intelligence Changes <span class="sub" style="text-transform:none;letter-spacing:0">
-        &mdash; edit anything below, then approve to update the framework and run</span></h2>
-    <div class="matchbar" id="matchbar"></div>
-    <div id="compilebadge"></div>
-    <div class="compare-cards" id="comparecards"></div>
-    <div id="aidecisions"></div>
-    <div class="rmeta" id="rmeta"></div>
-    <div id="rfiles"></div>
-    <div style="display:flex;gap:12px;margin-top:16px">
-      <button class="btn primary" style="padding:12px 26px" onclick="approve()">&#10003;&nbsp; Approve &amp; Run on Edge</button>
-      <button class="btn" style="padding:12px 22px" onclick="discard()">&#10005;&nbsp; Discard changes</button>
-    </div>
-  </section>
-
-  <!-- ═════════ REPORTS (sketch: full width below) ═════════ -->
-  <section class="card" id="reportcard" style="display:none">
-    <h2>Result Report <span class="spacer"></span>
-      <button class="btn" style="text-transform:none;letter-spacing:0;font-size:13.5px"
-              onclick="downloadReport()">&#8681;&nbsp; Download HTML report</button></h2>
-    <div class="kpis" id="kpis"></div>
-    <div class="charts">
-      <div>
-        <div class="chart-title">Scenario pass rate</div>
-        <div style="text-align:center"><svg id="donut" width="210" height="210" viewBox="0 0 200 200" role="img"></svg></div>
-        <div class="legend">
-          <span><span class="dot" style="background:var(--pass)"></span>Passed</span>
-          <span><span class="dot" style="background:var(--fail)"></span>Failed</span>
-        </div>
-      </div>
-      <div>
-        <div class="chart-title">Steps breakdown</div>
-        <div style="text-align:center"><svg id="stepdonut" width="210" height="210" viewBox="0 0 200 200" role="img"></svg></div>
-        <div class="legend">
-          <span><span class="dot" style="background:var(--pass)"></span>Passed</span>
-          <span><span class="dot" style="background:var(--fail)"></span>Failed</span>
-          <span><span class="dot" style="background:#f59e0b"></span>Skipped</span>
-        </div>
-      </div>
-      <div>
-        <div class="chart-title">Scenario results</div>
-        <div id="columns" class="cols"></div>
-      </div>
-    </div>
-    <div class="note" id="undefnote"></div>
-    <div class="note" id="errnote" style="background:var(--fail-soft);color:var(--fail)"></div>
-  </section>
-</main>
-<div id="toast"></div>
-
-<script>
-const API = "";
-let tab = "up", job = null, offset = 0, timer = null, allTxns = [];
-
-function toast(m){ const t = document.getElementById("toast");
-  t.textContent = m; t.style.display = "block"; setTimeout(() => t.style.display = "none", 4200); }
-function v(id){ return document.getElementById(id).value.trim() || null; }
-
-function setTab(t){ tab = t;
-  for (const k of ["up","ai","cr","txn"]){
-    document.getElementById("tab-" + k).classList.toggle("active", t === k);
-    document.getElementById("pane-" + k).style.display = t === k ? "" : "none";
-  }
-  closeDdl(); }
-
-/* ── index + searchable dropdown ─────────────────────────────────────── */
-async function loadTxns(){
-  try{
-    const r = await fetch(API + "/txns?all=1"); const d = await r.json();
-    allTxns = d.txns || [];
-    document.getElementById("idxinfo").textContent = d.count + " txns indexed";
-    document.getElementById("featcount").textContent = d.count;
-    renderDdl(allTxns);
-  }catch(e){}
-}
-function renderDdl(items){
-  const ddl = document.getElementById("ddl");
-  if (!items.length){ ddl.innerHTML = `<div class="empty">No matching transaction</div>`; return; }
-  ddl.innerHTML = items.slice(0, 400).map(x => {
-    const num = x.txn.replace(/^txn/i, "");
-    return `<div class="item" onmousedown="pick('${num}')">
-      <span class="num">${num}</span><span class="fname">${x.file}</span>
-      <span class="mod">${x.module}</span></div>`; }).join("")
-    + (items.length > 400 ? `<div class="empty">&hellip; ${items.length - 400} more — keep typing to narrow</div>` : "");
-}
-function filterDdl(){
-  const q = document.getElementById("txn").value.trim().toLowerCase().replace(/^txn/, "");
-  openDdl();
-  renderDdl(!q ? allTxns : allTxns.filter(x =>
-    x.txn.toLowerCase().includes(q) || (x.file || "").toLowerCase().includes(q)));
-}
-function openDdl(){ document.getElementById("ddl").classList.add("open"); }
-function closeDdl(){ document.getElementById("ddl").classList.remove("open"); }
-function pick(num){ document.getElementById("txn").value = num; closeDdl(); }
-document.addEventListener("click", e => { if (!document.getElementById("combo").contains(e.target)) closeDdl(); });
-
-async function rebuildIndex(){
-  const r = await fetch(API + "/index/rebuild", {method:"POST"}); const d = await r.json();
-  toast("Index rebuilt: " + d.indexed_txns + " transactions"); loadTxns(); }
-
-/* ── run / stop ──────────────────────────────────────────────────────── */
-async function run(){
-  resetPanels();
-  const btn = document.getElementById("runbtn"); btn.disabled = true;
-  try{
-    let res;
-    if (tab === "txn"){
-      const num = v("txn");
-      if (!num){ toast("Enter or select a transaction number."); btn.disabled = false; return; }
-      const txn = "Txn" + num.replace(/^txn/i, "");
-      stage("s1", "on");
-      res = await fetch(API + "/execute/txn/" + encodeURIComponent(txn) + "?capture=" + document.getElementById("captxn").checked,
-        {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
-    } else if (tab === "cr"){
-      const f = document.getElementById("filecr").files[0];
-      if (!f){ toast("Choose a BRD (.pdf/.docx/.txt)."); btn.disabled = false; return; }
-      const fd = new FormData(); fd.append("file", f);
-      const r = await fetch(API + "/execute/cr", {method:"POST", body:fd});
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.detail || "CR upload failed");
-      startCr(d); btn.disabled = false; return;
-    } else if (tab === "ai"){
-      const f = document.getElementById("fileai").files[0];
-      if (!f){ toast("Choose a .feature file or BRD."); btn.disabled = false; return; }
-      stage("s1", "on");
-      const fd = new FormData(); fd.append("file", f);
-      const isBrd = !f.name.toLowerCase().endsWith(".feature");
-      res = await fetch(API + (isBrd ? "/execute/brd" : "/execute/upload?ai=true"), {method:"POST", body:fd});
-    } else {
-      const f = document.getElementById("file").files[0];
-      if (!f){ toast("Choose a .feature file."); btn.disabled = false; return; }
-      stage("s1", "on");
-      const fd = new FormData(); fd.append("file", f);
-      res = await fetch(API + "/execute/upload?ai=false&capture=" + document.getElementById("capup").checked + "&dry_run=" + document.getElementById("dry").checked,
-        {method:"POST", body:fd});
-    }
-    const d = await res.json();
-    if (!res.ok) throw new Error(d.detail || "Request failed");
-    job = d.job_id; offset = 0;
-    stage("s1", "done"); stage("s2", "on");
-    document.getElementById("jobmeta").textContent =
-      "— " + (d.txn ? d.txn + " (" + d.module + ")" : d.feature.split(/[\\\/]/).pop()) +
-      (d.tag ? "  ·  " + d.tag : "");
-    document.getElementById("stopbtn").style.display = "block";
-    timer = setInterval(poll, 1500);
-  }catch(err){ toast(err.message); setBadge("error"); btn.disabled = false; }
-}
-
-async function stopRun(){
-  if (!job) return;
-  try{
-    const r = await fetch(API + `/jobs/${job}/stop`, {method:"POST"});
-    if (r.ok) toast("Stopping execution — closing Edge…");
-  }catch(e){}
-}
-
-let reviewShown = false;
-const RAIL_LABELS = {
-  up:  ["Lookup", "Launch JVM", "Edge run", "Report"],
-  txn: ["Lookup", "Launch JVM", "Edge run", "Report"],
-  ai:  ["Match & Compare", "Normalize & Generate", "Compile & Review", "Execute"],
-};
-function resetPanels(){
-  reviewShown = false;
-  document.getElementById("reviewcard").style.display = "none";
-  document.getElementById("console").textContent = "";
-  document.getElementById("reportcard").style.display = "none";
-  document.getElementById("stopbtn").style.display = "none";
-  const labels = RAIL_LABELS[tab] || RAIL_LABELS.up;
-  ["s1","s2","s3","s4"].forEach((id, i) => {
-    const el = document.getElementById(id);
-    el.className = "stage"; el.textContent = labels[i];
-  });
-  setBadge("queued"); }
-function stage(id, cls){ document.getElementById(id).className = "stage " + cls; }
-function setBadge(s){ const b = document.getElementById("status"); b.className = "badge " + s; b.textContent = s; }
-
-/* ── polling ─────────────────────────────────────────────────────────── */
-async function poll(){
-  const r = await fetch(API + `/jobs/${job}/logs?offset=${offset}`);
-  const d = await r.json();
-  if (d.log){
-    const c = document.getElementById("console");
-    c.textContent += d.log; c.scrollTop = c.scrollHeight; offset = d.next_offset;
-    if (/Scenario|cucumber/i.test(d.log)){ stage("s3", "on"); stage("s2", "done"); }
-  }
-  setBadge(d.status);
-  if (d.status === "review" && !reviewShown){
-    reviewShown = true;
-    clearInterval(timer);
-    document.getElementById("stopbtn").style.display = "none";
-    await showReview();
-    return;
-  }
-  if (["passed","failed","error","stopped","discarded"].includes(d.status)){
-    clearInterval(timer);
-    document.getElementById("runbtn").disabled = false;
-    document.getElementById("stopbtn").style.display = "none";
-    stage("s2", "done");
-    stage("s3", d.status === "passed" ? "done" : d.status === "failed" ? "done" : "bad");
-    stage("s4", d.status === "passed" ? "done" : "bad");
-    const jr = await fetch(API + "/jobs/" + job); renderReport(await jr.json());
-  }
-}
-
-/* ── report (no error dumps — counts + 3 graphics only) ──────────────── */
-function renderReport(j){
-  const s = j.summary || {};
-  document.getElementById("reportcard").style.display = "block";
-  const total = s.scenarios_total ?? 0, pass = s.scenarios_passed ?? 0, fail = s.scenarios_failed ?? 0;
-  const sp = s.steps_passed ?? 0, sf = s.steps_failed ?? 0, sk = s.steps_skipped ?? 0;
-  const dur = (s.scenarios || []).reduce((a, x) => a + (x.duration_sec || 0), 0);
-  const rate = total ? Math.round(100 * pass / total) : 0;
-  const kpi = (n, label, cls="") => `<div class="kpi ${cls}"><b>${n}</b><span>${label}</span></div>`;
-  document.getElementById("kpis").innerHTML =
-    kpi(total, "scenarios") + kpi(pass, "passed", "p") + kpi(fail, "failed", "f") +
-    kpi(rate + "%", "pass rate", "a") + kpi(sp, "steps passed", "p") +
-    kpi(sf, "steps failed", "f") + kpi(sk, "steps skipped") +
-    kpi(dur ? dur.toFixed(1) + "s" : "—", "total time", "a");
-
-  lastReport = {summary: s, meta: document.getElementById("jobmeta").textContent,
-                status: j.status, when: new Date().toLocaleString()};
-  drawDonut(pass, fail);
-  drawStepsDonut(sp, sf, sk);
-  drawColumns(pass, fail);
-
-  const en = document.getElementById("errnote");
-  if (s.error){ en.style.display = "block"; en.textContent = s.error; }
-  else en.style.display = "none";
-  const hb = document.getElementById("healbtn");
-  if (hb) hb.remove();
-  if (String(document.getElementById("status").textContent) === "failed" && s.captures && s.captures.checkpoints > 0){
-    const b = document.createElement("button");
-    b.id = "healbtn"; b.className = "btn primary"; b.style.marginTop = "10px";
-    b.innerHTML = "&#128295;&nbsp; Self-heal locators with AI (uses captured DOM)";
-    b.onclick = async () => {
-      b.disabled = true; b.textContent = "Healing…";
-      const r = await fetch(API + `/jobs/${job}/heal`, {method: "POST"});
-      if (!r.ok){ toast((await r.json()).detail || "Heal failed."); b.disabled = false; return; }
-      toast("Self-heal started — watch the console.");
-      resetPanelsSoft && resetPanelsSoft(); pollTimer = setInterval(poll, 1200);
-    };
-    en.parentNode.insertBefore(b, en.nextSibling);
-  }
-  const u = document.getElementById("undefnote");
-  if (s.undefined_steps && s.undefined_steps.length){
-    u.style.display = "block";
-    u.textContent = s.undefined_steps.length +
-      " step(s) in this feature have no matching step definition in the framework — they were skipped.";
-  } else u.style.display = "none";
-}
-
-function drawDonut(pass, fail){
-  const total = pass + fail, svg = document.getElementById("donut");
-  if (!total){ svg.innerHTML = `<text x="100" y="105" text-anchor="middle" fill="#64748b" font-size="13">no scenarios</text>`; return; }
-  const R = 78, C = 2 * Math.PI * R, passLen = C * pass / total;
-  svg.innerHTML = `
-    <circle cx="100" cy="100" r="${R}" fill="none" stroke="#dc2626" stroke-width="26"/>
-    <circle cx="100" cy="100" r="${R}" fill="none" stroke="#16a34a" stroke-width="26"
-      stroke-linecap="${pass && fail ? "butt" : "round"}"
-      stroke-dasharray="${passLen} ${C - passLen}" stroke-dashoffset="${C / 4}"
-      style="transition:stroke-dasharray .8s ease"/>
-    <circle cx="100" cy="100" r="52" fill="#fff"/>
-    <text x="100" y="97" text-anchor="middle" font-size="30" font-weight="800" fill="#101a2e">${Math.round(100 * pass / total)}%</text>
-    <text x="100" y="119" text-anchor="middle" font-size="11" fill="#64748b" letter-spacing="1">PASSED</text>`;
-}
-
-function drawStepsDonut(p, f, k){
-  const svg = document.getElementById("stepdonut"), tot = p + f + k;
-  if (!tot){ svg.innerHTML = `<text x="100" y="105" text-anchor="middle" fill="#64748b" font-size="13">no steps</text>`; return; }
-  const R = 78, C = 2 * Math.PI * R, off = C / 4;
-  const arc = (len, color) =>
-    `<circle cx="100" cy="100" r="${R}" fill="none" stroke="${color}" stroke-width="26"
-      stroke-dasharray="${len} ${C - len}" stroke-dashoffset="${off}" style="transition:stroke-dasharray .8s ease"/>`;
-  // layered rings: skipped as the base, failed over [0, p+f), passed over [0, p)
-  svg.innerHTML =
-    `<circle cx="100" cy="100" r="${R}" fill="none" stroke="#f59e0b" stroke-width="26"/>` +
-    arc(C * (p + f) / tot, "#dc2626") + arc(C * p / tot, "#16a34a") +
-    `<circle cx="100" cy="100" r="52" fill="#fff"/>` +
-    `<text x="100" y="93" text-anchor="middle" font-size="26" font-weight="800" fill="#101a2e">${tot}</text>` +
-    `<text x="100" y="115" text-anchor="middle" font-size="11" fill="#64748b" letter-spacing="1">TOTAL STEPS</text>`;
-}
-
-function drawColumns(pass, fail){
-  const max = Math.max(pass, fail, 1);
-  const col = (v, color, lab) => `
-    <div class="col">
-      <span class="val" style="color:${color}">${v}</span>
-      <div class="bar" style="height:${Math.max(10, 150 * v / max)}px;background:linear-gradient(180deg,${color},${color}cc)"></div>
-      <span class="lab">${lab}</span>
-    </div>`;
-  document.getElementById("columns").innerHTML =
-    col(pass, "#16a34a", "Passed") + col(fail, "#dc2626", "Failed");
-}
-
-let lastReport = null;
-function downloadReport(){
-  if (!lastReport) return;
-  const s = lastReport.summary;
-  const donut = document.getElementById("donut").outerHTML;
-  const sdonut = document.getElementById("stepdonut").outerHTML;
-  const detail = (s.scenarios || []).map((sc, i) => {
-    const steps = (sc.steps || []).map((st, n) => {
-      const cls = st.status === "passed" ? "passed" : st.status === "failed" ? "failed"
-                : st.status === "skipped" ? "skipped" : "other";
-      let row = `<tr><td class="n">${n + 1}</td><td>${esc(st.keyword)} ${esc(st.name)}</td>
-        <td class="${cls}">${esc(st.status).toUpperCase()}</td>
-        <td class="t">${st.duration_sec ? st.duration_sec.toFixed(1) + "s" : "&mdash;"}</td></tr>`;
-      if (st.status === "failed" && st.error)
-        row += `<tr class="whyrow"><td></td><td colspan="3">
-          <div class="why"><b>Why it failed:</b><pre>${esc(st.error)}</pre></div></td></tr>`;
-      return row;
-    }).join("");
-    return `<div class="scen">
-      <h3><span class="idx">Scenario ${i + 1}</span> ${esc(sc.name)}
-        <span class="pill ${sc.status}">${sc.status.toUpperCase()}</span>
-        <span class="dur">${(sc.duration_sec || 0).toFixed(1)}s</span></h3>
-      <table><tr><th>#</th><th>Step</th><th>Result</th><th>Time</th></tr>${steps}</table>
-    </div>`;
-  }).join("");
-  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Execution Report</title>
-<style>
- body{font-family:"Segoe UI",Arial,sans-serif;color:#101a2e;margin:40px auto;max-width:1000px;padding:0 20px}
- h1{font-size:22px} h2{font-size:16px;margin:36px 0 10px;text-transform:uppercase;letter-spacing:.8px;color:#64748b}
- .meta{color:#64748b;font-size:14px;margin-bottom:26px}
- .kpis{display:flex;flex-wrap:wrap;gap:14px;margin:20px 0 30px}
- .kpi{border:1px solid #e2e8f2;border-radius:12px;padding:14px 22px;min-width:130px}
- .kpi b{display:block;font-size:30px} .kpi span{font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.6px}
- .charts{display:flex;gap:60px;justify-content:center;margin:10px 0 34px;flex-wrap:wrap;text-align:center}
- .ct{font-size:13px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px}
- .scen{border:1px solid #e2e8f2;border-radius:12px;padding:16px 20px;margin:16px 0;page-break-inside:avoid}
- .scen h3{display:flex;align-items:center;gap:12px;font-size:15px;margin:0 0 12px;flex-wrap:wrap}
- .idx{color:#64748b;font-size:12px;text-transform:uppercase;letter-spacing:.6px}
- .pill{font-size:11px;font-weight:800;padding:3px 12px;border-radius:20px;letter-spacing:.5px}
- .pill.passed{background:#e7f6ec;color:#16a34a} .pill.failed{background:#fdecec;color:#dc2626}
- .dur{margin-left:auto;color:#64748b;font-size:13px;font-family:Consolas,monospace}
- table{border-collapse:collapse;width:100%;font-size:13.5px}
- th,td{border-bottom:1px solid #eef1f7;text-align:left;padding:8px 10px;vertical-align:top}
- th{color:#64748b;font-size:11.5px;text-transform:uppercase;letter-spacing:.6px}
- td.n{color:#94a3b8;width:30px} td.t{color:#64748b;font-family:Consolas,monospace;width:70px;white-space:nowrap}
- td.passed{color:#16a34a;font-weight:700;width:90px} td.failed{color:#dc2626;font-weight:700;width:90px}
- td.skipped{color:#b45309;font-weight:700;width:90px} td.other{color:#64748b;font-weight:700;width:90px}
- .whyrow td{border-bottom:1px solid #eef1f7;background:#fff8f8}
- .why{border-left:3px solid #dc2626;padding:8px 14px;font-size:13px;color:#7f1d1d}
- .why pre{white-space:pre-wrap;word-break:break-word;font-family:Consolas,monospace;font-size:12px;margin:6px 0 0;color:#8f2c2c}
- .foot{color:#94a3b8;font-size:12px;margin-top:34px}
- @media print{.scen{box-shadow:none}}
-</style></head><body>
-<h1>Txn Automation &mdash; Execution Report</h1>
-<div class="meta">${esc(lastReport.meta)} &nbsp;&bull;&nbsp; Status: <b>${esc(lastReport.status)}</b>
- &nbsp;&bull;&nbsp; Generated: ${esc(lastReport.when)}</div>
-<div class="kpis">
- <div class="kpi"><b>${s.scenarios_total ?? 0}</b><span>Scenarios</span></div>
- <div class="kpi"><b style="color:#16a34a">${s.scenarios_passed ?? 0}</b><span>Passed</span></div>
- <div class="kpi"><b style="color:#dc2626">${s.scenarios_failed ?? 0}</b><span>Failed</span></div>
- <div class="kpi"><b style="color:#16a34a">${s.steps_passed ?? 0}</b><span>Steps passed</span></div>
- <div class="kpi"><b style="color:#dc2626">${s.steps_failed ?? 0}</b><span>Steps failed</span></div>
- <div class="kpi"><b style="color:#b45309">${s.steps_skipped ?? 0}</b><span>Steps skipped</span></div>
-</div>
-<div class="charts">
- <div><div class="ct">Scenario pass rate</div>${donut}</div>
- <div><div class="ct">Steps breakdown</div>${sdonut}</div>
-</div>
-<h2>Detailed step results</h2>
-${detail || "<p>No scenario data in this run.</p>"}
-<div class="foot">Generated by Txn Automation Console</div>
-</body></html>`;
-  const blob = new Blob([html], {type: "text/html"});
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = "execution-report-" + (job || "run") + ".html";
-  a.click(); URL.revokeObjectURL(a.href);
-}
-
-/* ── review editor ───────────────────────────────────────────────────── */
-async function showReview(){
-  const r = await fetch(API + `/jobs/${job}/pending`);
-  if (!r.ok){ toast("Could not load pending changes."); return; }
-  const p = await r.json();
-  const m = p.meta || {};
-  const match = p.match || {};
-
-  // ── match banner: which existing feature this was compared against ──
-  const mb = document.getElementById("matchbar");
-  if (match.is_new_feature){
-    mb.className = "matchbar newfeat";
-    mb.innerHTML = `&#9888;&nbsp; No existing feature matched — treated as a <b>brand-new transaction</b>. `
-      + `Locators for any new UI elements will need manual verification.`;
-  } else {
-    const conf = match.confidence != null ? ` &middot; matched by content (confidence ${Math.round(match.confidence * 100)}%)` : ` &middot; exact transaction match`;
-    mb.className = "matchbar";
-    mb.innerHTML = `&#128269;&nbsp; Compared against <b>${esc(match.txn || "")}</b> `
-      + `(module: ${esc(match.module || "")})${conf}`;
-  }
-
-  // ── compile status badge ──
-  const cb = document.getElementById("compilebadge");
-  const fileCount = Object.keys(p.files || {}).length;
-  cb.innerHTML = fileCount
-    ? `<span class="compilebadge">&#10003; ${fileCount} java file(s) generated &amp; compiled successfully</span>`
-    : `<span class="compilebadge" style="background:#eef1f7;color:var(--muted)">No new java needed — all steps already have glue</span>`;
-
-  // ── comparison summary cards ──
-  const cs = m.comparison_summary || {};
-  const untouchedCount = (m.scenarios_unreferenced || []).length;
-  document.getElementById("comparecards").innerHTML = [
-    ["unchanged", cs.unchanged ?? 0, "Unchanged"],
-    ["new", (m.scenarios_added || []).length, "New"],
-    ["modified", (m.scenarios_replaced || []).length, "Modified"],
-    ["kept", untouchedCount, "Kept (not deleted)"],
-  ].map(([cls, n, label]) => `<div class="ccard ${cls}"><b>${n}</b><span>${label}</span></div>`).join("");
-
-  // ── AI decisions: what normalization changed before generation ran ──
-  const norm = m.normalization || {};
-  const rows = [];
-  (norm.tags_normalized || []).forEach(x => rows.push(
-    `<span class="tag">tag</span> <code>${esc(x.from)}</code> &rarr; <code>${esc(x.to)}</code> (matched framework convention)`));
-  (norm.scenarios_renamed || []).forEach(x => rows.push(
-    `<span class="tag" style="background:#0ea5e9">rename</span> "${esc(x.from)}" &rarr; "${esc(x.to)}" (${Math.round(x.similarity*100)}% match to existing scenario)`));
-  (norm.steps_normalized || []).forEach(x => rows.push(
-    `<span class="tag" style="background:#16a34a">step</span> <code>${esc(x.from)}</code> &rarr; <code>${esc(x.to)}</code>`));
-  (norm.examples_headers_normalized || []).forEach(x => rows.push(
-    `<span class="tag" style="background:#f59e0b">examples</span> [${x.from.join(", ")}] &rarr; [${x.to.join(", ")}]`));
-  document.getElementById("aidecisions").innerHTML = rows.length
-    ? `<div class="ai-decisions"><b style="font-size:12px;color:var(--muted)">AI DECISIONS &mdash; wording aligned to framework conventions before generation:</b>`
-      + rows.map(r => `<div class="row">${r}</div>`).join("") + `</div>` : "";
-
-  document.getElementById("rmeta").innerHTML =
-    `<b>${(m.scenarios_added || []).length}</b> new scenario(s) &nbsp;&middot;&nbsp; ` +
-    `<b>${(m.scenarios_replaced || []).length}</b> changed scenario(s) &nbsp;&middot;&nbsp; ` +
-    `<b>${(m.undefined_steps || []).length}</b> step(s) got new java glue` +
-    ((m.undefined_steps || []).length ? " — look for <b>// TODO QA: verify locator</b> markers in the java below" : "");
-  const wrap = document.getElementById("rfiles");
-  wrap.innerHTML = "";
-  const addEditor = (label, tag, key, content, oldContent) => {
-    const div = document.createElement("div"); div.className = "rfile";
-    const head = document.createElement("div"); head.className = "fhead";
-    head.innerHTML = `<span class="ftag">${tag}</span> ${esc(label)}`;
-    const editBtn = document.createElement("button");
-    editBtn.className = "edittoggle"; editBtn.type = "button"; editBtn.textContent = "Edit";
-    head.appendChild(editBtn);
-
-    const ta = document.createElement("textarea");
-    ta.className = "code"; ta.spellcheck = false; ta.value = content;
-    ta.dataset.key = key; ta.style.display = "none";
-
-    const ops = diffLines(oldContent || "", content || "");
-    const added = ops.filter(o => o.type === "added").length;
-    const removed = ops.filter(o => o.type === "removed").length;
-    const summary = document.createElement("div"); summary.className = "diffsummary";
-    summary.innerHTML = (oldContent == null)
-      ? `<span>New file — every line added</span>`
-      : `<b class="added">+${added}</b> <span>added</span> &nbsp; <b class="removed">-${removed}</b> <span>removed</span>`;
-
-    const dv = document.createElement("div"); dv.className = "diffview";
-    dv.innerHTML = ops.map(o =>
-      `<div class="dline ${o.type}">${esc(o.line)}</div>`).join("") || `<div class="dline same">(empty)</div>`;
-
-    editBtn.onclick = () => {
-      const editing = ta.style.display !== "none";
-      ta.style.display = editing ? "none" : "block";
-      dv.style.display = editing ? "block" : "none";
-      summary.style.display = editing ? "flex" : "none";
-      editBtn.textContent = editing ? "Edit" : "Done editing";
-    };
-
-    div.appendChild(head); div.appendChild(summary); div.appendChild(dv); div.appendChild(ta);
-    wrap.appendChild(div);
-  };
-  addEditor("merged feature file (will replace the framework copy)", "feature", "__feature__",
-           p.feature_text || "", p.old_feature_text || "");
-  for (const [rel, code] of Object.entries(p.files || {}))
-    addEditor(rel, rel.includes("stepDefinitions") ? "steps" : "page/java", rel, code,
-             (p.old_files || {})[rel]);
-  document.getElementById("reviewcard").style.display = "block";
-  document.getElementById("reviewcard").scrollIntoView({behavior: "smooth"});
-  toast("Framework Intelligence changes are ready — review, edit if needed, then approve.");
-}
-
-/* ── Locator Recorder ─────────────────────────────────────────────────── */
-let recPoll = null;
-async function recStart(){
-  const r = await fetch(API + "/recorder/start", {method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({url: document.getElementById("recurl").value || null})});
-  if (!r.ok){ toast((await r.json()).detail || "Could not start recorder."); return; }
-  document.getElementById("recstart").style.display = "none";
-  document.getElementById("recstop").style.display = "";
-  document.getElementById("reccaptured").innerHTML = "";
-  recPoll = setInterval(async () => {
-    const st = await (await fetch(API + "/recorder/status")).json();
-    document.getElementById("recstatus").textContent =
-      st.running ? `recording… ${st.captured} element(s) captured` : "";
-  }, 1500);
-  toast("Edge launched — perform the workflow manually, then click Stop & review.");
-}
-async function recStop(){
-  clearInterval(recPoll);
-  const data = await (await fetch(API + "/recorder/stop", {method:"POST"})).json();
-  document.getElementById("recstart").style.display = "";
-  document.getElementById("recstop").style.display = "none";
-  document.getElementById("recstatus").textContent = `${data.captured} element(s) captured`;
-  const wrap = document.getElementById("reccaptured");
-  if (!data.events.length){ wrap.innerHTML = '<div class="note">No elements captured.</div>'; return; }
-  wrap.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:12.5px">
-    <tr style="text-align:left;color:var(--muted);text-transform:uppercase;font-size:10.5px;letter-spacing:.5px">
-      <th style="padding:6px">Keep</th><th>Element</th><th>Field name (edit)</th><th>Locator</th><th>Screen</th></tr>` +
-    data.events.map((e, i) => {
-      const top = e.candidates[0] || {};
-      return `<tr style="border-top:1px solid var(--line)">
-        <td style="padding:6px"><input type="checkbox" class="reckeep" data-i="${i}" checked></td>
-        <td>${esc(e.kind)} &middot; &lt;${esc(e.tag)}&gt; ${esc((e.text || "").slice(0, 30))}</td>
-        <td><input class="recname" data-i="${i}" value="${esc(e.suggested_name)}" style="width:95%"></td>
-        <td><code style="font-family:var(--mono);font-size:11.5px">${esc(top.java || "")}</code>
-            ${top.note ? `<div style="color:var(--fail);font-size:10.5px">${esc(top.note)}</div>` : ""}</td>
-        <td style="color:var(--muted)">${esc((e.title || "").slice(0, 30))}</td></tr>`;
-    }).join("") + `</table>
-    <button class="btn primary" style="margin-top:12px" onclick="recSave()">&#128190;&nbsp; Save selected to locator repository</button>`;
-  window.__recEvents = data.events;
-}
-async function recSave(){
-  const entries = [];
-  document.querySelectorAll(".reckeep:checked").forEach(cb => {
-    const i = +cb.dataset.i, e = window.__recEvents[i];
-    const top = e.candidates[0] || {};
-    entries.push({name: document.querySelector(`.recname[data-i="${i}"]`).value,
-                  java: top.java, locator_type: top.locator_type,
-                  locator_value: top.locator_value, screen: e.title, url: e.url});
-  });
-  const r = await (await fetch(API + "/recorder/save", {method:"POST",
-    headers:{"Content-Type":"application/json"}, body: JSON.stringify({entries})})).json();
-  toast(`Saved ${r.added} locator(s) — repository now has ${r.total}. Future AI generations will use them.`);
-}
-
-/* ── vanilla-JS line diff (LCS-based) — highlights added/removed lines ─── */
-function diffLines(oldText, newText){
-  const a = oldText ? oldText.split("\n") : [];
-  const b = newText ? newText.split("\n") : [];
-  const n = a.length, m = b.length;
-  const dp = Array.from({length: n + 1}, () => new Int32Array(m + 1));
-  for (let i = n - 1; i >= 0; i--)
-    for (let j = m - 1; j >= 0; j--)
-      dp[i][j] = a[i] === b[j] ? dp[i+1][j+1] + 1 : Math.max(dp[i+1][j], dp[i][j+1]);
-  const ops = [];
-  let i = 0, j = 0;
-  while (i < n && j < m){
-    if (a[i] === b[j]){ ops.push({type:"same", line:a[i]}); i++; j++; }
-    else if (dp[i+1][j] >= dp[i][j+1]){ ops.push({type:"removed", line:a[i]}); i++; }
-    else { ops.push({type:"added", line:b[j]}); j++; }
-  }
-  while (i < n){ ops.push({type:"removed", line:a[i]}); i++; }
-  while (j < m){ ops.push({type:"added", line:b[j]}); j++; }
-  return ops;
-}
-
-async function approve(){
-  const files = {}; let feature = null;
-  document.querySelectorAll("#rfiles textarea.code").forEach(ta => {
-    if (ta.dataset.key === "__feature__") feature = ta.value;
-    else files[ta.dataset.key] = ta.value;
-  });
-  const r = await fetch(API + `/jobs/${job}/approve`, {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({feature_text: feature, files})});
-  const d = await r.json();
-  if (r.status === 422){
-    toast("Edited java does not compile — see console for errors.");
-    const c = document.getElementById("console");
-    c.textContent += "\n" + (d.detail || ""); c.scrollTop = c.scrollHeight;
-    return;                                   // stay in review, user can fix
-  }
-  if (!r.ok){ toast(d.detail || "Approve failed"); return; }
-  document.getElementById("reviewcard").style.display = "none";
-  document.getElementById("stopbtn").style.display = "block";
-  setBadge("running");
-  timer = setInterval(poll, 1500);
-}
-
-async function discard(){
-  const r = await fetch(API + `/jobs/${job}/discard`, {method: "POST"});
-  if (r.ok){
-    document.getElementById("reviewcard").style.display = "none";
-    setBadge("discarded");
-    document.getElementById("runbtn").disabled = false;
-    toast("Changes discarded — the framework was not modified.");
-  }
-}
-
-function esc(x){ return String(x ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
-
-/* ── CR Pipeline (multi-transaction BRD change request) ─────────────── */
-let crRun = null, crOffset = 0, crTimer = null, crReportData = null;
-
-const CR_BADGE = {queued:"idle", searching:"running", comparing:"running", merging:"running",
-  dry_run:"running", generating:"running", staged:"review", unchanged:"passed",
-  not_found:"failed", locator_required:"failed", failed:"failed", skipped:"idle",
-  committing:"running", ready:"review", executing:"running", passed:"passed",
-  exec_failed:"failed", stopped:"stopped", error:"failed"};
-
-function esc(s){ return String(s == null ? "" : s).replace(/[&<>"]/g,
-  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
-
-function startCr(d){
-  crRun = d.cr_run_id; crOffset = 0; crReportData = null;
-  document.getElementById("crcard").style.display = "";
-  document.getElementById("crreview").style.display = "none";
-  document.getElementById("crreport").style.display = "none";
-  document.getElementById("crconsole").textContent = "";
-  document.getElementById("crcard").scrollIntoView({behavior:"smooth"});
-  crRender(d);
-  if (crTimer) clearInterval(crTimer);
-  crTimer = setInterval(crPoll, 1500);
-}
-
-async function crPoll(){
-  try{
-    const lg = await (await fetch(API + `/cr/${crRun}/logs?offset=${crOffset}`)).json();
-    if (lg.log){
-      const c = document.getElementById("crconsole");
-      c.textContent += lg.log; crOffset = lg.offset; c.scrollTop = c.scrollHeight;
-    }
-    const d = await (await fetch(API + `/cr/${crRun}`)).json();
-    crRender(d);
-    if (d.status === "review" && document.getElementById("crreview").style.display === "none")
-      crLoadReview();
-    if (["ready","done","error","discarded"].includes(d.status)){
-      clearInterval(crTimer); crTimer = null;
-      if (d.status === "error") toast(d.error || "CR pipeline error");
-      else crLoadReport();
-    }
-  }catch(e){}
-}
-
-function crRender(d){
-  const badgeCls = {analyzing:"running", processing:"running", review:"review",
-                    committing:"running", ready:"review", executing:"running",
-                    done:"passed", error:"failed",
-                    discarded:"discarded"}[d.status] || "idle";
-  const st = document.getElementById("crstatus");
-  st.textContent = d.status; st.className = "badge " + badgeCls;
-  document.getElementById("crmeta").textContent =
-    ` — ${esc(d.brd)}${d.cr_number ? " · CR " + esc(d.cr_number) : ""}` +
-    `${d.parent_cr ? " (parent " + esc(d.parent_cr) + ")" : ""}` +
-    ` · ${d.transactions.length} transaction(s)`;
-  const canLaunch = ["ready","done"].includes(d.status);
-  const nReady = d.transactions.filter(t => ["ready","stopped","exec_failed"].includes(t.status)).length;
-  document.getElementById("crrunall").style.display = (canLaunch && nReady) ? "" : "none";
-  document.getElementById("crrunall").textContent = `\u25B6\u00A0 Run all ready (${nReady})`;
-  document.getElementById("crstop").style.display = d.status === "executing" ? "" : "none";
-  if (!d.transactions.length){ document.getElementById("crtable").innerHTML = ""; return; }
-  document.getElementById("crtable").innerHTML =
-    `<table style="width:100%;border-collapse:collapse;font-size:13px">
-     <tr style="text-align:left;color:var(--muted)">
-       <th style="padding:6px 10px">Txn</th><th>Module</th><th>Status</th>
-       <th>+Scen</th><th>~Scen</th><th>Java files</th><th>Notes / action required</th><th></th></tr>` +
-    d.transactions.map(t => {
-      const runnable = canLaunch && ["ready","stopped","exec_failed"].includes(t.status);
-      return `<tr style="border-top:1px solid rgba(128,128,128,.2)">
-       <td style="padding:6px 10px"><b>Txn${esc(t.txn)}</b></td>
-       <td>${esc(t.module || "—")}</td>
-       <td><span class="badge ${CR_BADGE[t.status] || "idle"}">${esc(t.status)}</span></td>
-       <td>${t.scenarios_added.length}</td><td>${t.scenarios_replaced.length}</td>
-       <td>${t.java_files.length}</td>
-       <td style="max-width:380px;color:var(--muted)">${esc(t.action_required || t.error ||
-          (t.exec_summary && t.exec_summary.scenarios_total != null
-            ? `${t.exec_summary.scenarios_passed || 0}/${t.exec_summary.scenarios_total} scenarios passed` : ""))}</td>
-       <td style="text-align:right;white-space:nowrap">${runnable
-          ? `<button class="btn primary" style="padding:5px 12px;font-size:12px"
-               onclick="crExec('${esc(t.txn)}')">\u25B6\u00A0 Run${t.status !== "ready" ? " again" : ""}</button>` : ""}</td>
-     </tr>`; }).join("") + "</table>";
-}
-
-async function crExec(txn){
-  const r = await fetch(API + `/cr/${crRun}/execute`, {method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({txns: txn ? [txn] : null})});
-  const d = await r.json();
-  if (!r.ok){ toast(d.detail || "Could not start execution"); return; }
-  if (!crTimer) crTimer = setInterval(crPoll, 1500);
-}
-
-async function crStop(){
-  const r = await fetch(API + `/cr/${crRun}/stop`, {method:"POST"});
-  const d = await r.json();
-  if (!r.ok){ toast(d.detail || "Nothing is executing"); return; }
-  toast("Stopping — the current transaction is being killed; the rest stay ready.");
-}
-
-async function crLoadReview(){
-  const d = await (await fetch(API + `/cr/${crRun}/pending`)).json();
-  const box = document.getElementById("crstaged");
-  box.innerHTML = d.staged.map((s, i) => `
-    <div style="border:1px solid rgba(128,128,128,.25);border-radius:10px;padding:12px;margin-top:12px">
-      <label class="check"><input type="checkbox" class="crchk" data-txn="${esc(s.txn)}" checked>
-        <b>Txn${esc(s.txn)}</b> &nbsp;(${esc(s.module || "?")}) — ${s.scenarios_added.length} new,
-        ${s.scenarios_replaced.length} changed scenario(s), ${Object.keys(s.files).length} java file(s)</label>
-      <div class="sub" style="text-transform:none;letter-spacing:0;margin:6px 0">${esc(s.delta_notes).slice(0, 400)}</div>
-      <details><summary style="cursor:pointer">Merged feature (editable)</summary>
-        <textarea class="crfeat" data-txn="${esc(s.txn)}" spellcheck="false"
-          style="width:100%;min-height:220px;font:12px ui-monospace,Consolas,monospace">${esc(s.feature_text)}</textarea>
-      </details>
-      ${Object.entries(s.files).map(([rel, code]) => `
-        <details><summary style="cursor:pointer">${esc(rel)} (editable)</summary>
-          <textarea class="crjava" data-txn="${esc(s.txn)}" data-rel="${esc(rel)}" spellcheck="false"
-            style="width:100%;min-height:220px;font:12px ui-monospace,Consolas,monospace">${esc(code)}</textarea>
-        </details>`).join("")}
-    </div>`).join("") || `<div class="hintbox">Nothing staged — no framework changes required.</div>`;
-  document.getElementById("cractions").innerHTML = d.action_items.length
-    ? `<div class="hintbox" style="margin-top:12px"><b>Action items (isolated, did not stop the queue):</b><ul>`
-      + d.action_items.map(a => `<li><b>Txn${esc(a.txn)}</b> (${esc(a.status)}): ${esc(a.action)}</li>`).join("")
-      + `</ul></div>` : "";
-  document.getElementById("crreview").style.display = "";
-}
-
-async function crApprove(){
-  const approved = [...document.querySelectorAll(".crchk")].filter(c => c.checked).map(c => c.dataset.txn);
-  const edits = {};
-  document.querySelectorAll(".crfeat").forEach(t => {
-    edits[t.dataset.txn] = edits[t.dataset.txn] || {files:{}};
-    edits[t.dataset.txn].feature_text = t.value; });
-  document.querySelectorAll(".crjava").forEach(t => {
-    edits[t.dataset.txn] = edits[t.dataset.txn] || {files:{}};
-    edits[t.dataset.txn].files[t.dataset.rel] = t.value; });
-  const r = await fetch(API + `/cr/${crRun}/approve`, {method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({approved_txns: approved, edits})});
-  const d = await r.json();
-  if (!r.ok){ toast(d.detail || "Approve failed"); return; }
-  document.getElementById("crreview").style.display = "none";
-  toast("Committing approved changes — nothing runs until you press a Run button.");
-  if (!crTimer) crTimer = setInterval(crPoll, 1500);
-}
-
-async function crDiscard(){
-  const r = await fetch(API + `/cr/${crRun}/discard`, {method:"POST"});
-  if (r.ok){ document.getElementById("crreview").style.display = "none";
-    toast("CR discarded — framework untouched."); crPoll(); }
-}
-
-async function crLoadReport(){
-  const rep = await (await fetch(API + `/cr/${crRun}/report`)).json();
-  crReportData = rep;
-  const kpi = (label, val, cls) => `<div class="kpi${cls ? " " + cls : ""}"><b>${esc(val)}</b><span>${esc(label)}</span></div>`;
-  document.getElementById("crkpis").innerHTML =
-    kpi("Overall", rep.overall_status, rep.overall_status === "PASSED" ? "p" : "f") +
-    kpi("Identified", rep.transactions_identified.length) +
-    kpi("Updated", rep.transactions_updated.length) +
-    kpi("Unchanged", rep.transactions_unchanged.length) +
-    kpi("Failed", rep.transactions_failed.length, rep.transactions_failed.length ? "f" : "") +
-    kpi("Not run yet", (rep.transactions_pending_execution || []).length) +
-    kpi("Skipped", rep.transactions_skipped.length) +
-    kpi("Methods +", rep.methods_added_estimate) +
-    kpi("Locators +", rep.locators_added_estimate);
-  document.getElementById("crreportbody").innerHTML =
-    (rep.transactions_failed.length ? `<div class="hintbox"><b>Failure summary:</b><ul>` +
-      rep.transactions_failed.map(f => `<li><b>Txn${esc(f.txn)}</b>: ${esc(f.reason)}<br>
-        <i>Recovery:</i> ${esc(f.recovery_action || "—")}${f.retried ? " (auto-retried once)" : ""}</li>`).join("")
-      + `</ul></div>` : "") +
-    (rep.feature_files_modified.length ? `<div class="sub" style="text-transform:none;letter-spacing:0;margin-top:8px">
-      <b>Feature files modified:</b> ${rep.feature_files_modified.map(esc).join(" · ")}</div>` : "") +
-    (rep.java_files_modified.length ? `<div class="sub" style="text-transform:none;letter-spacing:0;margin-top:4px">
-      <b>Java files modified:</b> ${rep.java_files_modified.map(esc).join(" · ")}</div>` : "");
-  document.getElementById("crreport").style.display = "";
-}
-
-function crDownload(){
-  if (!crReportData) return;
-  const blob = new Blob([JSON.stringify(crReportData, null, 2)], {type:"application/json"});
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = `CR_report_${crReportData.cr_number || crRun}.json`;
-  a.click(); URL.revokeObjectURL(a.href);
-}
-
-loadTxns();
-</script>
-</body>
-</html>
+        from . import framework_scanner
+        kb = framework_scanner.get_framework_knowledge()
+    except Exception:  # noqa: BLE001 — best-effort; never block generation
+        return files
+
+    existing_owner: dict[str, str] = {}
+    for sd in kb["step_defs"]:
+        for m in sd["methods"]:
+            key = re.sub(r"\s+", " ", m["sentence"]).strip().lower()
+            existing_owner.setdefault(key, sd["class"])
+
+    out = {}
+    for rel, code in files.items():
+        cls_m = re.search(r'class\s+(\w+)', code)
+        this_class = cls_m.group(1) if cls_m else None
+        new_code = code
+        for kw, sentence in _STEP_ANN_FULL_RE.findall(code):
+            key = re.sub(r"\s+", " ", sentence).strip().lower()
+            owner = existing_owner.get(key)
+            if owner and owner != this_class:
+                new_code, removed = _remove_step_method(new_code, kw, sentence)
+                if removed:
+                    log(f'>>> AI safety check: removed duplicate step "{sentence}" from {rel} '
+                       f'(already implemented in {owner}) — prevents DuplicateStepDefinitionException')
+        out[rel] = new_code
+    return out
+
+
+_UNREPORTED_EXCEPTION_RE = re.compile(
+    r'unreported exception ([\w.]+); must be caught or declared to be thrown')
+
+
+def _exception_handling_hint(err: str) -> str:
+    """javac's 'unreported exception X; must be caught or declared to be
+    thrown' is a purely mechanical Java rule the model keeps failing to
+    satisfy blindly on retry — give it the exact fix instead of hoping it
+    guesses. Different failure category from a missing/hallucinated method:
+    the class and method here are REAL, the code just doesn't satisfy Java's
+    checked-exception handling requirement."""
+    exceptions = sorted(set(_UNREPORTED_EXCEPTION_RE.findall(err)))
+    if not exceptions:
+        return ""
+    exc_list = ", ".join(e.rsplit(".", 1)[-1] for e in exceptions)
+    return (f"\n\nJava CHECKED EXCEPTION error: your code throws {exc_list} without handling it. "
+           f"Java requires every checked exception to be either caught or declared. Fix this by "
+           f"wrapping ONLY the specific line(s) that throw it in a try/catch that catches "
+           f"{exc_list} and rethrows as an unchecked exception, for example:\n"
+           f"    try {{ ... }} catch ({exc_list} e) {{ throw new RuntimeException(e); }}\n"
+           f"Do not add `throws {exc_list}` to a Cucumber step method's signature — Cucumber step "
+           f"methods must not declare checked exceptions. Return the corrected COMPLETE file(s).")
+
+
+def _extra_context_for_compile_errors(err: str) -> str:
+    """Parse javac's 'cannot find symbol: method X ... location: variable v
+    of type ClassName' pattern and, for every ClassName we can find on disk,
+    inject its REAL current source — this is what lets the retry round fix a
+    hallucinated method call instead of just guessing again. Also appends a
+    mechanical fix hint for unhandled checked exceptions, a separate and
+    common failure category."""
+    found = {}
+    for method, cls in _MISSING_SYMBOL_RE.findall(err):
+        if cls in found:
+            continue
+        src = _find_class_source(cls)
+        if src:
+            found[cls] = src
+    parts = []
+    if found:
+        parts.append("\n\nThe methods you called do not exist. Here is the REAL current source of "
+                     "the class(es) involved — use an exact existing method from here, or if the "
+                     "needed behaviour genuinely doesn't exist yet, define it yourself in full:")
+        for cls, src in found.items():
+            parts.append(f"\n## Real current source of {cls}:\n```java\n{src}\n```")
+    parts.append(_exception_handling_hint(err))
+    return "".join(parts)
+
+
+def generate_and_compile(ai_ctx: dict, undefined_steps: list[str],
+                         classpath: str, job_dir: Path, log) -> tuple[dict, Path]:
+    """Returns ({rel_path: code}, classes_dir). Raises RuntimeError with a
+    readable message on unrecoverable failure."""
+    hit = ai_ctx.get("hit") or {}
+    old_feature = _read(hit.get("feature")) if hit.get("feature") else ""
+    steps_java = _read(hit.get("steps")) if hit.get("steps") else ""
+    page_java = _read(hit.get("page")) if hit.get("page") else ""
+
+    try:
+        from . import capture as _cap
+        _txn_for_capture = ai_ctx.get("txn") or (ai_ctx.get("hit") or {}).get("txn")
+        _runtime_dom = _cap.runtime_dom_for_prompt(_txn_for_capture)
+    except Exception:  # noqa: BLE001
+        _runtime_dom = ""
+    _discovered_text = ""
+    try:
+        from . import locator_discovery as _ld
+        _latest = _cap.latest_capture_for(_txn_for_capture)
+        if _latest and _latest.get("folder"):
+            _html_file = Path(_latest["folder"]) / "page.html"
+            if _html_file.exists():
+                _raw_html = _html_file.read_text(encoding="utf-8", errors="ignore")
+                _discoveries = _ld.discover_for_steps(undefined_steps, _raw_html)
+                _discovered_text = _ld.format_for_prompt(_discoveries)
+                if _discoveries:
+                    log(f">>> Autonomous locator discovery: found {len(_discoveries)}/{len(undefined_steps)} "
+                       "real locator(s) in the captured page — using these instead of guessing.")
+    except Exception as e:  # noqa: BLE001 — discovery is best-effort, never blocks generation
+        log(f">>> Locator discovery unavailable ({e}).")
+    try:
+        from . import recorder as _rec
+        _captured_locators = _rec.repository_for_prompt()
+    except Exception:  # noqa: BLE001 — repository is best-effort
+        _captured_locators = ""
+    try:
+        from . import knowledge
+        # RAG: semantic retrieval when embeddings exist, module catalogs otherwise
+        hits = None
+        try:
+            hits = knowledge.retrieve([ai_ctx["uploaded_text"], *undefined_steps])
+        except Exception as e:  # noqa: BLE001 — embeddings are best-effort
+            log(f">>> RAG retrieval unavailable ({e}); using module catalogs.")
+        if hits:
+            cat_steps, cat_pages = hits
+            log(">>> RAG: retrieved the most similar existing steps/pages for context.")
+        else:
+            cat_steps = knowledge.step_catalog(ai_ctx.get("module"))
+            cat_pages = knowledge.page_catalog(ai_ctx.get("module"))
+    except Exception:  # noqa: BLE001 — knowledge is best-effort
+        cat_steps = cat_pages = "(knowledge base unavailable)"
+
+    user = f"""The QA engineer uploaded a modified feature file. Update the framework so it runs.
+
+## Uploaded feature (the one that must execute):
+```gherkin
+{ai_ctx['uploaded_text'][:12000]}
+```
+
+## Previous version of this feature in the framework{' (none - this txn had no feature)' if not old_feature else ''}:
+```gherkin
+{old_feature or '(none)'}
+```
+
+## Steps reported UNDEFINED by a cucumber dry run (these have no matching @Given/@When/@Then):
+{chr(10).join('- ' + u for u in undefined_steps) or '- (none - only wording/data changed)'}
+
+## EXISTING STEP SENTENCES across the framework (module + common) — REUSE these
+## (by keeping the feature wording identical) instead of writing new step methods:
+{cat_steps or '(none found)'}
+
+## EXISTING PAGE CLASSES in this module (locator names + method signatures) —
+## call these instead of inventing duplicates:
+{cat_pages or '(none found)'}
+
+## Existing step-definition class for this transaction:
+```java
+{steps_java or '(none exists yet - create one in com.nbc.stepDefinitions.<module>)'}
+```
+
+## Existing page-object class for this transaction:
+```java
+{page_java or '(none provided - reuse steps/pages patterns and add TODO markers for locators)'}
+```
+
+## RUNTIME DOM captured by the framework at the live screen (the ACTUAL page
+## the automation reached — generate locators ONLY from elements present here;
+## never invent an id/xpath that is not in this DOM):
+{_runtime_dom or '(no runtime capture available - reuse existing locators or add a // TODO QA: verify locator marker)'}
+
+## CAPTURED LOCATORS from recorded manual sessions (REAL locators verified on
+## the live application by a human - ALWAYS use these instead of a TODO guess
+## when the element matches; keep the suggested field name):
+{_captured_locators or '(none recorded yet)'}
+
+{_discovered_text}
+
+## FULL SOURCE of shared/common step definitions (login, logout, navigation —
+## call these EXACT method names if you need this behaviour; do not invent your own):
+```java
+{_common_steps_context() or '(none found)'}
+```
+
+Produce the updated file(s) now, in the required ===FILE / ===END format."""
+    if locals().get("extra_user_context"):
+        user += "\n\n" + extra_user_context
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user}]
+
+    log(f">>> AI: sending context to Azure OpenAI ({config.AZURE_OPENAI_DEPLOYMENT})...")
+    reply = _azure_chat(messages)
+    files = _parse_files(reply)
+    if not files:
+        raise RuntimeError("AI returned no file blocks - response did not follow the required format.")
+    log(">>> AI: received " + ", ".join(files.keys()))
+    files = _strip_duplicate_steps(files, log)
+
+    for attempt in range(config.AI_MAX_FIX_ROUNDS + 1):
+        ok, err, classes = _compile(files, job_dir, classpath)
+        if ok:
+            log(">>> AI: compilation OK")
+            return files, classes
+        if attempt == config.AI_MAX_FIX_ROUNDS:
+            raise RuntimeError("Generated java failed to compile after "
+                               f"{config.AI_MAX_FIX_ROUNDS + 1} attempts:\n{err[:1500]}")
+        undefined_method_hint = bool(_MISSING_SYMBOL_RE.search(err))
+        exception_hint = bool(_UNREPORTED_EXCEPTION_RE.search(err))
+        extra = _extra_context_for_compile_errors(err)
+        if undefined_method_hint and exception_hint:
+            log(f">>> AI: compile errors include an undefined method AND an unhandled checked "
+               f"exception — injecting real source + a fix hint (round {attempt + 1})...")
+        elif undefined_method_hint:
+            log(f">>> AI: compile errors reference undefined methods — injecting the REAL source "
+               f"of the class(es) involved, then asking the model to fix (round {attempt + 1})...")
+        elif exception_hint:
+            log(f">>> AI: compile errors are an unhandled checked exception — injecting a "
+               f"mechanical fix hint (round {attempt + 1})...")
+        else:
+            log(f">>> AI: compile errors, asking the model to fix (round {attempt + 1})...")
+        messages += [{"role": "assistant", "content": reply},
+                     {"role": "user", "content":
+                      "javac failed with these errors. Fix them and return the corrected "
+                      "complete files in the same ===FILE/===END format:\n\n" + err[:6000] + extra}]
+        reply = _azure_chat(messages)
+        new_files = _parse_files(reply)
+        if new_files:
+            files.update(_strip_duplicate_steps(new_files, log))
+    raise RuntimeError("unreachable")
+
+
+# ─────────────────────── deterministic feature merge ────────────────────────
+SC_LINE = re.compile(r"\s*(?:Scenario Outline:|Scenario:)\s*(.+)")
+TAG_LINE = re.compile(r"\s*@")
+
+
+def _blocks(text: str):
+    """Split a feature into (head, {scenario_name: block_text}, order).
+    A block starts at its tag lines (if any) and runs to the next scenario."""
+    lines = text.splitlines(keepends=True)
+    starts = []           # (block_start_line, scenario_name)
+    for i, l in enumerate(lines):
+        m = SC_LINE.match(l)
+        if m:
+            j = i
+            while j > 0 and TAG_LINE.match(lines[j - 1]):
+                j -= 1
+            starts.append((j, m.group(1).strip()))
+    if not starts:
+        return text, {}, []
+    head = "".join(lines[:starts[0][0]])
+    blocks, order = {}, []
+    for n, (b, name) in enumerate(starts):
+        end = starts[n + 1][0] if n + 1 < len(starts) else len(lines)
+        blocks[name] = "".join(lines[b:end])
+        order.append(name)
+    return head, blocks, order
+
+
+def merge_feature(old_text: str, new_text: str) -> tuple[str, list[str], list[str]]:
+    """Merge the uploaded feature into the existing one.
+    - scenario with a NEW name -> appended at the end
+    - scenario with an EXISTING name but different body -> replaced in place
+    Returns (merged_text, added_names, replaced_names)."""
+    if not old_text.strip():
+        _, sc, order = _blocks(new_text)
+        return new_text, order, []
+    old_head, old_sc, old_order = _blocks(old_text)
+    _, new_sc, new_order = _blocks(new_text)
+    added, replaced = [], []
+    for name in new_order:
+        if name not in old_sc:
+            added.append(name)
+        elif old_sc[name].strip() != new_sc[name].strip():
+            old_sc[name] = new_sc[name]
+            replaced.append(name)
+    merged = old_head + "".join(old_sc[n] for n in old_order)
+    for name in added:
+        merged = merged.rstrip("\n") + "\n\n" + new_sc[name].rstrip("\n") + "\n"
+    return merged, added, replaced
