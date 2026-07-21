@@ -71,6 +71,7 @@ class TxnItem:
     exec_summary: dict = field(default_factory=dict)
     retried: bool = False
     heal_attempts: int = 0                    # Step 14: bounded self-heal retry counter
+    warnings: list = field(default_factory=list)   # non-blocking review flags (e.g. contradictory sequencing)
 
     def public(self) -> dict:
         return {
@@ -83,6 +84,7 @@ class TxnItem:
             "java_files": list(self.gen_files.keys()),
             "error": self.error, "action_required": self.action_required,
             "exec_summary": self.exec_summary, "heal_attempts": self.heal_attempts,
+            "warnings": self.warnings,
         }
 
 
@@ -224,6 +226,24 @@ STRICT RULES:
   validation, maker-checker/authorization validation, field visibility, enable/disable and
   conditional/dynamic behaviour — but ONLY where the BRD changes them for this transaction.
 - Quote ONLY dynamic values ("value" or "<placeholder>"), never a whole step sentence.
+- CRITICAL SEQUENCING RULE: a NEGATIVE/VALIDATION requirement (a missing or invalid field causing
+  an ERROR, a rejected submission, a blocked transaction) describes a DIFFERENT terminal outcome
+  than an existing SUCCESS-path scenario. NEVER insert an error-validation step into the middle of
+  an existing scenario that continues on to success-only steps afterward (supervisor override,
+  confirmation, post-transaction verification) — that produces a self-contradictory scenario that
+  validates a rejection and then proceeds as if it succeeded, which will fail at execution.
+  WRONG (mixes rejection and success in one scenario):
+    And click on the submit button in Deposit Transfer screen
+    And validate the error message for field as "Court Order" as "Please enter Court Order"
+    And we accept supervisor override success alert          <- contradicts the rejection above
+  RIGHT — output a NEW, separate scenario dedicated to the negative case instead: repeat only the
+  steps needed to reach submission (deliberately leaving the field under test unselected/invalid),
+  click submit, validate the error, and STOP THERE. Do not add any of the existing scenario's
+  success-only steps (supervisor override, confirmation, post-verification) after an error
+  validation step.
+- A step that validates the RESULT of an action (an error message, a success confirmation, a
+  screen transition) must be placed immediately after the action that produces it, and no further
+  step should assume an outcome different from what was just validated.
 - Output raw Gherkin or NO_CHANGES. No markdown fences, no commentary."""
 
 
@@ -274,6 +294,39 @@ def _fragment_to_feature(fragment: str, existing_feature: str) -> str:
 
 
 # ── SELF VALIDATION (spec checklist, mechanically enforced) ─────────────────
+
+
+_ERROR_VALIDATION_RE = re.compile(
+    r"\bvalidate\b.*\b(error|reject|invalid|mandatory)\b", re.I)
+_SUCCESS_AFTER_RE = re.compile(
+    r"\b(supervisor override|success alert|confirmation|accept.*success|"
+    r"authoriz|approved successfully)\b", re.I)
+
+
+def _flag_contradictory_sequencing(scenario_name: str, steps: list[str]) -> list[str]:
+    """Non-blocking safety net for the exact failure mode this project has
+    seen in practice: a delta wrongly inserts an error/rejection validation
+    into the MIDDLE of an existing success-path scenario, which then
+    continues on to success-only steps (supervisor override, confirmation)
+    as if nothing was rejected — a self-contradictory sequence that WILL fail
+    at execution. Prompting alone cannot guarantee this never happens (same
+    lesson as every other generator-side fix in this project), so this is
+    checked deterministically and surfaced for human review rather than
+    silently trusted."""
+    warnings = []
+    error_idx = None
+    for i, step in enumerate(steps):
+        if _ERROR_VALIDATION_RE.search(step):
+            error_idx = i
+        elif error_idx is not None and _SUCCESS_AFTER_RE.search(step):
+            warnings.append(
+                f"Scenario '{scenario_name}': step {error_idx + 1} validates an error/rejection "
+                f"(\"{steps[error_idx][:110]}\") but step {i + 1} afterward implies success "
+                f"(\"{step[:110]}\") — this looks like a negative-path requirement that should be "
+                "its own separate scenario, not appended into a success-path scenario. "
+                "Review before approving.")
+            error_idx = None  # one warning per contradiction is enough
+    return warnings
 
 
 def _self_validate(item: TxnItem, existing_feature: str, log) -> list[str]:
@@ -382,6 +435,17 @@ def _process_item(run: CRRun, item: TxnItem):
     item.scenarios_replaced = merge_result["replaced_scenarios"]
     log(f"merge: +{len(item.scenarios_added)} appended, ~{len(item.scenarios_replaced)} replaced, "
         f"{len(merge_result['unreferenced_scenarios'])} existing untouched (kept).")
+
+    try:
+        from . import framework_scanner
+        parsed = framework_scanner.parse_feature_text(item.merged_feature) or {"scenarios": []}
+        for sc in parsed["scenarios"]:
+            step_texts = [f'{st["keyword"]} {st["text"]}' for st in sc["steps"]]
+            item.warnings.extend(_flag_contradictory_sequencing(sc["name"], step_texts))
+        for w in item.warnings:
+            log(f"WARNING: {w}")
+    except Exception as e:  # noqa: BLE001 — this check is a safety net, never blocks the pipeline
+        log(f"contradictory-sequencing check skipped ({e}).")
 
     # STEPS 5-7 need Java glue knowledge — ground truth via cucumber dry-run.
     item.status = "dry_run"
