@@ -1,807 +1,543 @@
 """
-Runs the Java framework via Maven as a subprocess.
+Phase 2: AI-driven framework updates.
 
-Key trick (why no Java knowledge is needed):
-  Cucumber system properties OVERRIDE whatever is hardcoded in @CucumberOptions
-  inside TestRunner.java. So we can point the SAME TestRunner at any single
-  feature file — including one sitting in our own uploads folder — with:
-
-      mvn test -Dtest=TestRunner
-               -Dcucumber.features=<absolute path to .feature>
-               -Dcucumber.plugin=json:<report path>
-               -Dbrowser=edge
-
-  Nothing inside the framework is modified, so nothing needs restoring.
+Flow (called from executor._run when the user enables AI on an upload):
+  1. dry-run already told us which steps are undefined
+  2. build a context pack: uploaded feature + old feature + existing Steps/Page java
+  3. ask Azure OpenAI for COMPLETE updated java files
+  4. javac them into an isolated classes dir (compile errors go back to the
+     model for up to AI_MAX_FIX_ROUNDS repair rounds)
+  5. return {rel_path: code} + the classes dir; the executor prepends that dir
+     to the classpath so the JVM uses the new classes WITHOUT touching the
+     framework. Commit-to-framework only happens after a green run.
 """
-import json
-import os
 import re
 import subprocess
-import threading
-import uuid
-from dataclasses import dataclass, field
 from pathlib import Path
+
+import requests
 
 from . import config
 
-JOBS: dict[str, "Job"] = {}
+FILE_RE = re.compile(r"===FILE:\s*(.+?)\s*===\s*\n(.*?)===END===", re.S)
+PKG_RE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.M)
+CLS_RE = re.compile(r"(?:public\s+)?class\s+(\w+)")
 
-# The properties file is shared state -> only one execution at a time.
-_RUN_LOCK = threading.Lock()
+SYSTEM_PROMPT = """You are a senior Java test-automation engineer maintaining an enterprise
+Cucumber + Selenium + TestNG framework (package root com.nbc).
+Your job: update step-definition and/or page-object classes so a modified Gherkin feature executes.
 
-_SECRET_RE = re.compile(r"(-D\w*[Pp]assword=)(\S+)")
+Rules:
+- Keep existing package declarations, imports, naming and coding style.
+- REUSE existing methods, steps and locators wherever possible; change only what the feature requires.
+- Cucumber matches steps by their exact sentence text - annotation strings must match the feature lines exactly.
+- NEVER invent application locators. If a genuinely new UI element is needed, copy the locator style
+  of the provided Page class and mark it with: // TODO QA: verify locator
+- RADIO BUTTONS and CHECKBOXES: first REUSE any existing radio/checkbox helper method shown in the
+  context (the framework usually already has one - search the catalogs before writing your own).
+  If you must write new selection code, enterprise UIs typically hide the real <input> under a
+  styled span/label, so a plain input.click() often does NOT register. Use this defensive pattern:
+    WebElement rb = driver.findElement(locator);
+    if (!rb.isSelected()) {
+        try { rb.click(); }
+        catch (Exception e) { ((JavascriptExecutor) driver).executeScript("arguments[0].click();", rb); }
+    }
+    // verify: if still !rb.isSelected(), click the associated <label> (label[for='<id>'] or the
+    // input's parent label) and re-check - selecting a radio must END in isSelected()==true.
+  For a radio identified by its option text (e.g. selecting "Court Order"), prefer a locator that
+  targets the input via its value/id, or the label with that exact visible text, following the
+  Page class's existing locator style.
+- APPEND-ONLY mindset: PRESERVE every existing method, field, locator and import exactly as given;
+  add the new step methods / page methods / locators needed by the new or changed scenarios.
+- NEVER call a method (on a Page object, a CommonSteps/shared class, a utility class, or anything
+  else) unless that exact method signature is EITHER shown to you verbatim in the context below OR
+  defined by you, in full, within one of the files you return in this same response. If you need a
+  helper action that doesn't exist yet, either reuse an EXACT existing method shown in the context,
+  or write the new method's full implementation yourself in the appropriate file — never invent a
+  call to a method you have not seen and are not also defining.
+- CRITICAL: NEVER implement a step (a @Given/@When/@Then/@And/@But method) whose exact sentence
+  already appears ANYWHERE in the EXISTING STEP SENTENCES catalog below (including CommonSteps and
+  any other shared class) — even when returning a "complete" file that also needs that step to run.
+  Cucumber throws a hard runtime error if the same step sentence is implemented in two classes.
+  Only implement methods for the steps explicitly listed as UNDEFINED.
+- If an AUTO-DISCOVERED LOCATOR is provided below for a step, it was extracted directly from the
+  REAL live captured page for that exact step — use it EXACTLY as given. Do not invent an
+  alternative locator (e.g. a text-contains xpath) for a step that already has a discovered locator.
+- This framework's shared/common classes (login helpers, property readers, file utilities) often do
+  file I/O and throw CHECKED exceptions (e.g. IOException) from their constructors or methods. Every
+  time you call such a constructor or method, wrap the call in try/catch (matching this framework's
+  existing style, typically catching the exception and calling printStackTrace()) — do not let a
+  checked exception propagate unhandled, and do not just add a blanket "throws Exception" unless the
+  real code you were shown does the same.
+- Return COMPLETE files (never fragments), and ONLY the files that change.
+- Output format, with NOTHING else before, between, or after the blocks:
+===FILE: com/nbc/stepDefinitions/<module>/<ClassName>.java===
+<entire file content>
+===END===
+"""
 
 
-def _effective_classpath() -> str:
-    """Assemble the classpath. If it involves recursively-scanned jar folders
-    or would exceed the Windows command-line limit, pack everything into a
-    'pathing jar' (a jar whose manifest Class-Path lists all entries) and
-    return just that jar's path."""
-    import glob
-    from urllib.request import pathname2url
+def _azure_chat(messages: list[dict]) -> str:
+    url = (f"{config.AZURE_OPENAI_ENDPOINT.rstrip('/')}/openai/deployments/"
+           f"{config.AZURE_OPENAI_DEPLOYMENT}/chat/completions"
+           f"?api-version={config.AZURE_OPENAI_API_VERSION}")
+    if "YOUR-RESOURCE" in config.AZURE_OPENAI_ENDPOINT or "PASTE" in config.AZURE_OPENAI_KEY:
+        raise RuntimeError("Azure OpenAI is not configured yet - fill AZURE_OPENAI_ENDPOINT / "
+                           "AZURE_OPENAI_KEY / AZURE_OPENAI_DEPLOYMENT in app/config.py.")
+    try:
+        r = requests.post(url,
+                          headers={"api-key": config.AZURE_OPENAI_KEY,
+                                   "Content-Type": "application/json"},
+                          json={"messages": messages, "temperature": 0.1, "max_tokens": 8000},
+                          timeout=240)
+    except requests.RequestException as e:
+        raise RuntimeError(f"Cannot reach Azure OpenAI at {config.AZURE_OPENAI_ENDPOINT} "
+                           f"({e.__class__.__name__}: {e}). Check the endpoint URL and whether "
+                           "the office network/proxy allows it.")
+    if r.status_code == 401:
+        raise RuntimeError("Azure OpenAI rejected the API key (401). Re-check AZURE_OPENAI_KEY.")
+    if r.status_code == 404:
+        raise RuntimeError(f"Azure OpenAI returned 404 - deployment '{config.AZURE_OPENAI_DEPLOYMENT}' "
+                           "not found on this resource. Use the DEPLOYMENT NAME from Azure Portal "
+                           "(not the model name), and check AZURE_OPENAI_API_VERSION.")
+    if r.status_code != 200:
+        raise RuntimeError(f"Azure OpenAI error {r.status_code}: {r.text[:400]}")
+    return r.json()["choices"][0]["message"]["content"]
 
-    entries: list[str] = []
-    override = getattr(config, "CLASSPATH_OVERRIDE", "")
-    if override:
-        entries.extend(x for x in override.split(config.CP_SEP) if x.strip())
-    else:
-        entries.extend(config.CLASSPATH_ENTRIES)
 
-    # expand wildcards like  lib/*  into real jar paths
-    expanded: list[str] = []
-    for e in entries:
-        if e.endswith("*"):
-            expanded.extend(glob.glob(e + ".jar") + glob.glob(e))
+def _read(path, cap=16000) -> str:
+    try:
+        t = Path(path).read_text(encoding="utf-8", errors="ignore")
+        return t[:cap] + ("\n// ...truncated..." if len(t) > cap else "")
+    except (OSError, TypeError):
+        return ""
+
+
+def _parse_files(text: str) -> dict[str, str]:
+    """{relative java path: full code}. Path is normalised from the package line
+    when the header path looks wrong."""
+    out = {}
+    for raw_path, code in FILE_RE.findall(text):
+        code = code.strip()
+        pkg = PKG_RE.search(code)
+        cls = CLS_RE.search(code)
+        if pkg and cls:
+            rel = pkg.group(1).replace(".", "/") + "/" + cls.group(1) + ".java"
         else:
-            expanded.append(e)
-
-    # recursive jar folders (Maven cache, nested lib dirs)
-    for d in getattr(config, "RECURSIVE_JAR_DIRS", []):
-        base = Path(d)
-        if base.is_dir():
-            expanded.extend(str(j) for j in base.rglob("*.jar"))
-
-    expanded = [e for e in dict.fromkeys(expanded) if Path(e).exists()]
-    flat = config.CP_SEP.join(expanded)
-    if len(flat) < 4000 and not any(Path(d).is_dir() for d in getattr(config, "RECURSIVE_JAR_DIRS", [])):
-        return flat
-
-    # build the pathing jar
-    urls = []
-    for e in expanded:
-        pth = Path(e).resolve()
-        u = "file:" + pathname2url(str(pth))
-        if pth.is_dir() and not u.endswith("/"):
-            u += "/"
-        urls.append(u)
-    raw = ("Manifest-Version: 1.0\r\nClass-Path: " + " ".join(urls) + "\r\n").encode("utf-8")
-    # manifest lines max 72 bytes; continuation lines start with one space
-    wrapped = bytearray()
-    line = bytearray()
-    for token in raw.split(b"\r\n"):
-        line = bytearray(token)
-        while len(line) > 70:
-            wrapped += line[:70] + b"\r\n"
-            line = bytearray(b" ") + line[70:]
-        wrapped += line + b"\r\n"
-    import zipfile
-    jar = config.DATA_DIR / "classpath.jar"
-    with zipfile.ZipFile(jar, "w") as z:
-        z.writestr("META-INF/MANIFEST.MF", bytes(wrapped))
-    return str(jar)
+            rel = raw_path.strip().replace("\\", "/")
+        out[rel] = code + "\n"
+    return out
 
 
-def _mask(cmd: list[str]) -> str:
-    return _SECRET_RE.sub(r"\1*****", " ".join(cmd))
-
-
-def _patch_properties(run_params: dict | None) -> bytes | None:
-    """Write url / maker / checker into the framework's properties file.
-    Returns the ORIGINAL bytes so the caller can restore them afterwards."""
-    if not run_params or not any(run_params.get(f) for f in config.RUNTIME_PROPERTY_KEYS):
-        return None
-    pf = config.PROPERTIES_FILE
-    if not pf.exists():
-        return None
-    original = pf.read_bytes()
-    lines = original.decode("utf-8", errors="ignore").splitlines()
-    wanted = {key: run_params[fld]
-              for fld, key in config.RUNTIME_PROPERTY_KEYS.items()
-              if run_params.get(fld)}
-    out, seen = [], set()
-    for line in lines:
-        stripped = line.strip()
-        replaced = False
-        if stripped and not stripped.startswith(("#", "!")) and "=" in stripped:
-            key = stripped.split("=", 1)[0].strip()
-            if key in wanted:
-                out.append(f"{key}={wanted[key]}")
-                seen.add(key)
-                replaced = True
-        if not replaced:
-            out.append(line)
-    for key, val in wanted.items():          # keys not present yet -> append
-        if key not in seen:
-            out.append(f"{key}={val}")
-    pf.write_text("\n".join(out) + "\n", encoding="utf-8")
-    return original
-
-
-@dataclass
-class Job:
-    id: str
-    feature_path: str
-    status: str = "queued"          # queued | running | passed | failed | error | stopped
-    return_code: int | None = None
-    log_file: Path = None
-    report_file: Path = None
-    summary: dict = field(default_factory=dict)
-    proc: object = None
-    stop_requested: bool = False
-    ai_ctx: dict | None = None
-    pending: dict | None = None          # proposed changes awaiting user review
-    run_params: dict | None = None
-    tag_filter: str | None = None
-    heal_attempts: int = 0                # Step 14: bounded self-heal retry counter
-
-    def public(self) -> dict:
-        return {
-            "job_id": self.id,
-            "feature": self.feature_path,
-            "status": self.status,
-            "return_code": self.return_code,
-            "summary": self.summary,
-            "needs_review": self.status == "review",
-        }
-
-
-def _capture_props(job) -> list[str]:
-    if not getattr(job, "capture", False):
-        return []
-    from . import runtime_capture
-    cap = runtime_capture.capture_dir_for(job.id)
-    cap.mkdir(parents=True, exist_ok=True)
-    return [f"-Dorchestrator.capture.dir={cap}", "-Dorchestrator.capture.all=true"]
-
-
-def _cucumber_props(feature_path: str, report_file: Path, dry_run: bool,
-                    run_params: dict | None, tag_filter: str | None = None) -> list[str]:
-    """System properties that OVERRIDE @CucumberOptions in TestRunner.java."""
-    if config.CUCUMBER_STYLE == "options":
-        # Cucumber 4.x: one combined option string
-        opts = f"{feature_path} --plugin json:{report_file}"
-        if dry_run:
-            opts += " --dry-run"
-        props = [f"-Dcucumber.options={opts}"]
-    else:
-        # Cucumber 5/6/7
-        props = [
-            f"-Dcucumber.features={feature_path}",
-            f"-Dcucumber.plugin=json:{report_file}",
-        ]
-        if dry_run:
-            props.append("-Dcucumber.execution.dry-run=true")
-    props.append(f"-D{config.BROWSER_SYSPROP}={config.BROWSER_VALUE}")
-    tag = tag_filter if tag_filter is not None else getattr(config, "CUCUMBER_TAG_FILTER", None)
-    if tag is not None:
-        if not tag.strip():
-            # An EMPTY value is ignored by some cucumber versions, letting the
-            # hardcoded tags="@400_pass" in TestRunner re-apply and filter
-            # everything out (Total tests run: 0). "not @<nonexistent>" is an
-            # explicit expression that matches every scenario.
-            tag = "not @__orchestrator_no_filter__"
-        props.append(f"-Dcucumber.filter.tags={tag}")
-    for k, v in getattr(config, "EXTRA_SYSTEM_PROPS", {}).items():
-        props.append(f"-D{k}={v}")
-    # Also expose url / maker / checker as system properties, in case
-    # PropertiesUtil checks System.getProperty() before the file.
-    for field, key in config.RUNTIME_PROPERTY_KEYS.items():
-        if run_params and run_params.get(field):
-            props.append(f"-D{key}={run_params[field]}")
-    return props
-
-
-def _build_command(feature_path: str, report_file: Path, dry_run: bool = False,
-                   run_params: dict | None = None, tag_filter: str | None = None) -> list[str]:
-    props = _cucumber_props(feature_path, report_file, dry_run, run_params, tag_filter)
-
-    if config.RUN_MODE == "java":
-        # No build tool: launch the already-compiled TestRunner directly.
-        # NOTE: -D properties must come BEFORE the main class.
-        base = [config.JAVA, *props, "-cp", _effective_classpath()]
-        if config.RUNNER_KIND == "testng":
-            return [*base, "org.testng.TestNG", "-testclass", config.TEST_RUNNER_CLASS]
-        return [*base, "org.junit.runner.JUnitCore", config.TEST_RUNNER_CLASS]
-
-    if config.RUN_MODE == "gradle":
-        return [
-            config.GRADLE, "test",
-            "--tests", config.TEST_RUNNER_CLASS,
-            *props,
-        ]
-
-    # maven
-    return [
-        config.MVN, "test",
-        f"-Dtest={config.TEST_RUNNER_CLASS}",
-        *props,
-        "-DfailIfNoTests=false",
-    ]
-
-
-def _parse_report(report_file: Path) -> dict:
-    """Turn cucumber's JSON report into a small pass/fail summary + undefined steps."""
-    if not report_file.exists():
-        return {}
+def _compile(files: dict[str, str], job_dir: Path, classpath: str) -> tuple[bool, str, Path]:
+    """Write sources under job_dir/src, javac into job_dir/classes."""
+    src, classes = job_dir / "src", job_dir / "classes"
+    classes.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for rel, code in files.items():
+        f = src / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(code, encoding="utf-8")
+        paths.append(str(f))
+    cmd = [config.JAVAC, "-encoding", "UTF-8", "-cp", classpath,
+           "-d", str(classes), *paths]
     try:
-        data = json.loads(report_file.read_text(errors="ignore"))
-    except (json.JSONDecodeError, OSError):
-        return {}
-    total = passed = failed = skipped = 0
-    undefined: list[str] = []
-    failures: list[dict] = []
-    scenarios: list[dict] = []
-    steps_passed = steps_failed = 0
-    for feat in data:
-        for el in feat.get("elements", []):
-            if el.get("type") == "background":
-                continue
-            total += 1
-            scenario_failed = False
-            duration_ns = 0
-            step_rows = []
-            for step in el.get("steps", []):
-                res = step.get("result", {})
-                st = res.get("status")
-                duration_ns += res.get("duration", 0) or 0
-                step_rows.append({
-                    "keyword": (step.get("keyword") or "").strip(),
-                    "name": step.get("name", ""),
-                    "status": st or "unknown",
-                    "duration_sec": round((res.get("duration", 0) or 0) / 1e9, 2),
-                    "error": (res.get("error_message") or "")[:2000],
-                })
-                if st == "passed":
-                    steps_passed += 1
-                if st == "undefined":
-                    undefined.append(step.get("name", ""))
-                if st in ("failed", "undefined"):
-                    scenario_failed = True
-                    steps_failed += 1
-                    if st == "failed":
-                        failures.append({
-                            "scenario": el.get("name"),
-                            "step": step.get("name"),
-                            "error": (res.get("error_message") or "")[:500],
-                        })
-                if st == "skipped":
-                    skipped += 1
-            if scenario_failed:
-                failed += 1
-            else:
-                passed += 1
-            scenarios.append({
-                "name": el.get("name") or "(unnamed scenario)",
-                "status": "failed" if scenario_failed else "passed",
-                "duration_sec": round(duration_ns / 1e9, 2),
-                "steps": step_rows,
-            })
-    return {
-        "scenarios_total": total,
-        "scenarios_passed": passed,
-        "scenarios_failed": failed,
-        "steps_passed": steps_passed,
-        "steps_failed": steps_failed,
-        "steps_skipped": skipped,
-        "scenarios": scenarios,
-        "undefined_steps": sorted(set(undefined)),
-        "failures": failures,
-    }
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except FileNotFoundError:
+        return False, ("javac not found at '" + config.JAVAC + "'. Point JAVAC_CMD (or config.JAVAC) "
+                       "at a JDK's bin\\javac.exe - a plain JRE cannot compile."), classes
+    return r.returncode == 0, (r.stdout + r.stderr).strip(), classes
 
 
-def _dry_run_sync(feature_path: str, log) -> list[str]:
-    """Run cucumber's dry-run (no browser) and return the undefined steps."""
-    rep = config.REPORTS_DIR / ("dry_" + uuid.uuid4().hex[:8] + ".json")
-    cmd = _build_command(feature_path, rep, dry_run=True)
-    log(">>> Phase 1/3 — dry run (no browser): checking which steps have java glue...")
-    r = subprocess.run(cmd, cwd=str(config.FRAMEWORK_ROOT),
-                       capture_output=True, text=True, timeout=600)
-    summary = _parse_report(rep)
-    und = summary.get("undefined_steps", [])
-    log(f">>> Dry run done: {len(und)} undefined step(s)" + (":" if und else "."))
-    for u in und:
-        log("      - " + u)
-    return und
-
-
-def _archive(paths: dict, txn_label: str, log) -> str:
-    """Copy the CURRENT versions of the given files into a permanent,
-    timestamped reference folder before they are modified."""
-    import shutil
-    from datetime import datetime
-    dest = config.ARCHIVE_DIR / txn_label / datetime.now().strftime("%Y%m%d_%H%M%S")
-    dest.mkdir(parents=True, exist_ok=True)
-    for kind, src in paths.items():
-        if src and Path(src).exists():
-            shutil.copy2(src, dest / Path(src).name)
-            log(f">>> Archived old {kind}: {Path(src).name}  ->  {dest}")
-    return str(dest)
-
-
-def _ai_prepare(job: Job, log) -> str | None:
-    """Compare + normalize + merge + generate + compile-verify, then STOP for
-    user review. Returns a feature path to run immediately when nothing
-    changed, or None when job.pending was filled and approval is required.
-
-    Integrates Phases 6-9 (feature_matcher, feature_normalizer, merge_engine,
-    feature_comparator) into the live pipeline:
-      - feature_matcher is used ONLY as a FALLBACK — it never overrides an
-        existing hit found by the simple filename/content txn lookup (main.py),
-        it only fires when that lookup found NOTHING. This means the path that
-        already worked cannot regress; the new capability (finding a likely
-        existing feature even without a clean txn number) is strictly additive.
-        A higher confidence threshold (0.25) is used here than the module's
-        general-purpose default, because a wrong match here means committing
-        to the wrong framework file — mitigated further by the mandatory
-        human review gate downstream, which shows the match score.
-      - feature_normalizer runs BEFORE the dry-run (not after), so wording/tag
-        fixes are reflected in an ACCURATE undefined-steps count. Running the
-        dry-run on the raw upload (the old order) would wrongly flag a step
-        that's really just typo'd/differently-phrased as "undefined" and send
-        it to the LLM to regenerate as an unwanted duplicate.
-      - merge_engine replaces the old text-block merge, adding visibility into
-        scenarios present in the existing feature but untouched by this
-        upload (never deleted, only reported).
-      - feature_comparator supplies a richer summary for job.pending["meta"]
-        (additive keys only — the three original keys/semantics the frontend
-        already reads are unchanged, so the existing review screen keeps
-        working without modification).
-    """
-    from . import generator, feature_matcher, feature_normalizer, merge_engine, feature_comparator, indexer
-
-    ctx = job.ai_ctx
-    hit = ctx.get("hit") or {}
-    uploaded = ctx["uploaded_text"]
-    filename = ctx.get("filename")
-    module_hint = ctx.get("module")
-
-    match = None
-    if not hit:
-        # The simple filename/content txn lookup (main.py) found nothing —
-        # try the smarter multi-signal matcher as a fallback ONLY (never as
-        # an override of an already-found hit).
-        try:
-            match = feature_matcher.best_match(uploaded, filename, module_hint, min_score=0.25)
-        except Exception as e:  # noqa: BLE001 — matching is best-effort, never fatal
-            log(f">>> Feature matching unavailable ({e}).")
-        if match:
-            matched_hit = indexer.lookup(match["txn"]) if match.get("txn") else None
-            if matched_hit:
-                hit = matched_hit
-                log(f">>> No exact transaction number found in the upload, but matching found a "
-                   f"likely existing feature: {hit['txn']} (module={hit['module']}, "
-                   f"confidence={match['score']}). Using it as the comparison baseline.")
-
-    old_text = Path(hit["feature"]).read_text(encoding="utf-8", errors="ignore") if hit.get("feature") else ""
-
+def _common_steps_context() -> str:
+    """Full source of every step-definition file in the 'common' module —
+    login/logout/navigation helpers that nearly every generated step relies
+    on. Sent in FULL (not just the sentence catalog) so the model calls real
+    method names instead of guessing them."""
     try:
-        norm = feature_normalizer.normalize_feature(uploaded, old_text)
-        normalized_text, norm_changes = norm["normalized_text"], norm["changes"]
-        s = norm["summary"]
-        log(f">>> Normalization: {s['tags_normalized']} tag(s), {s['steps_normalized']} step(s), "
-           f"{s['scenarios_renamed']} scenario name(s) aligned to framework conventions.")
-    except Exception as e:  # noqa: BLE001 — normalization is best-effort, never fatal
-        log(f">>> Normalization unavailable ({e}); using the upload as-is.")
-        normalized_text, norm_changes = uploaded, {}
+        from . import framework_scanner
+        kb = framework_scanner.get_framework_knowledge()
+        blobs = []
+        for sd in kb["step_defs"]:
+            if sd.get("module") == "common":
+                blobs.append(_read(sd["path"], cap=6000))
+        return "\n\n".join(blobs)
+    except Exception:  # noqa: BLE001 — best-effort context, never blocks generation
+        return ""
 
-    # dry-run the NORMALIZED text via a sibling temp file — the accurate
-    # undefined-steps count reflects the wording/tag fixes above.
-    norm_path = str(Path(job.feature_path).with_name(Path(job.feature_path).stem + "__normalized.feature"))
-    Path(norm_path).write_text(normalized_text, encoding="utf-8")
-    try:
-        undefined = _dry_run_sync(norm_path, log)
-    finally:
-        Path(norm_path).unlink(missing_ok=True)
 
-    merge_result = merge_engine.merge(old_text, normalized_text)
-    added, replaced, unreferenced = (merge_result["appended_scenarios"],
-                                     merge_result["replaced_scenarios"],
-                                     merge_result["unreferenced_scenarios"])
-    log(f">>> Merge: {len(added)} new scenario(s) {added or ''}, "
-       f"{len(replaced)} changed scenario(s) {replaced or ''}, "
-       f"{len(unreferenced)} existing scenario(s) untouched by this upload {unreferenced or ''} "
-       f"(kept, not deleted).")
-    merged = merge_result["merged_text"]
+_MISSING_SYMBOL_RE = re.compile(
+    r'cannot find symbol.*?symbol:\s*method\s+(\w+)\([^\n]*\n\s*location:\s*variable\s+\w+\s+of\s+type\s+(\w+)',
+    re.S)
 
-    if not undefined and not added and not replaced and old_text:
-        # Nothing to do — run the REAL existing framework file directly
-        # (not the raw/possibly-typo'd upload: the dry-run above only proved
-        # the NORMALIZED wording has glue, not necessarily the raw upload's).
-        log(">>> No differences and all steps defined — executing the existing framework feature as-is.")
-        return hit["feature"]
 
-    comparison_summary = None
-    try:
-        comparison_summary = feature_comparator.compare_features(old_text, normalized_text)["summary"]
-    except Exception:  # noqa: BLE001 — comparison summary is a nice-to-have only
-        pass
-
-    # ── Locator Discovery Gate (spec: mandatory before code generation) ──
-    from . import locator_gate
-    txn_for_locators = (hit or {}).get("txn") or ctx.get("txn")
-    gate = locator_gate.evaluate(undefined, txn_for_locators, module_hint)
-    if gate["ui_steps"]:
-        log(f">>> Locator gate ({gate['policy']}): {gate['message']}")
-    if gate["blocked"]:
-        job.status = "locator_required"
-        job.summary = {
-            "error": gate["message"],
-            "locator_required": True,
-            "unresolved_steps": gate["unresolved_steps"],
-            "ui_steps": gate["ui_steps"],
-        }
-        _log_error(job, gate["message"] + " Unresolved: " + "; ".join(gate["unresolved_steps"]))
-        return None
-
-    gen_files = {}
-    if undefined:
-        log(">>> Generating framework updates with Azure OpenAI...")
-        gen_files, _ = generator.generate_and_compile(
-            {**ctx, "hit": hit, "uploaded_text": normalized_text}, undefined,
-            _effective_classpath(), config.GEN_DIR / job.id, log)
-
-    job.pending = {
-        "feature_text": merged,
-        "files": gen_files,
-        "meta": {
-            # unchanged keys/semantics — the existing review screen keeps working as-is
-            "undefined_steps": undefined, "scenarios_added": added, "scenarios_replaced": replaced,
-            # new, additive keys for a future review-screen upgrade
-            "scenarios_unreferenced": unreferenced, "normalization": norm_changes,
-            "matched_via_fallback_score": match["score"] if match else None,
-            "comparison_summary": comparison_summary,
-        },
-        "txn_label": hit.get("txn") or Path(ctx.get("filename", "feature")).stem,
-        "hit": hit, "module": ctx.get("module"), "filename": ctx.get("filename"),
-    }
-    log(">>> Changes are ready for REVIEW — edit or approve them in the browser to continue.")
+def _find_class_source(class_name: str) -> str | None:
+    """Search steps/pages/utils folders for the file defining `class_name`
+    and return its real current content, or None if not found."""
+    for base in (getattr(config, "STEPS_DIR", None), getattr(config, "PAGES_DIR", None),
+                getattr(config, "UTILS_DIR", None)):
+        if not base or not Path(base).exists():
+            continue
+        for f in Path(base).rglob(f"{class_name}.java"):
+            return f.read_text(encoding="utf-8", errors="ignore")
     return None
 
 
-def _commit_pending(job: Job, log):
-    """Archive current versions, then write the (possibly user-edited)
-    feature + java into the framework and compile the java."""
-    from . import indexer
-    pen = job.pending
-    hit = pen["hit"]
-
-    to_archive = {"feature": hit.get("feature")}
-    for rel in pen["files"]:
-        tgt = config.JAVA_SRC_ROOT / rel
-        if tgt.exists():
-            to_archive[Path(rel).name] = str(tgt)
-    if hit.get("page"):
-        to_archive.setdefault("page", hit["page"])
-    if hit.get("steps"):
-        to_archive.setdefault("steps", hit["steps"])
-    archive_dir = _archive(to_archive, pen["txn_label"], log)
-
-    if hit.get("feature"):
-        feature_target = Path(hit["feature"])
-    else:
-        module = pen.get("module") or "common"
-        feature_target = config.FEATURES_DIR / module / (pen.get("filename") or (pen["txn_label"] + ".feature"))
-        feature_target.parent.mkdir(parents=True, exist_ok=True)
-    feature_target.write_text(pen["feature_text"], encoding="utf-8")
-    log(f">>> Updated feature file: {feature_target}")
-
-    for rel, code in pen["files"].items():
-        tgt = config.JAVA_SRC_ROOT / rel
-        tgt.parent.mkdir(parents=True, exist_ok=True)
-        tgt.write_text(code, encoding="utf-8")
-        log(f">>> Updated java source: {tgt}")
-    if pen["files"]:
-        srcs = [str(config.JAVA_SRC_ROOT / rel) for rel in pen["files"]]
-        config.TEST_CLASSES_DIR.mkdir(parents=True, exist_ok=True)
-        rc = subprocess.run([config.JAVAC, "-encoding", "UTF-8",
-                             "-cp", _effective_classpath(),
-                             "-d", str(config.TEST_CLASSES_DIR), *srcs],
-                            capture_output=True, text=True, timeout=300)
-        if rc.returncode != 0:
-            raise RuntimeError("commit compile failed:\n" + (rc.stdout + rc.stderr)[:1500])
-        log(">>> Compiled updated classes into target/test-classes")
-
-    job.summary["ai"] = {**pen["meta"],
-                         "java_files_updated": list(pen["files"].keys()),
-                         "archive": archive_dir}
-    indexer.build_index()
-    return str(feature_target)
+_STEP_ANN_FULL_RE = re.compile(r'@(Given|When|Then|And|But)\s*\(\s*"((?:[^"\\]|\\.)*)"\s*\)')
+_METHOD_SIG_RE = re.compile(
+    r'(?:public|protected)\s+(?!class\b)[\w<>\[\], ]+?\s+(\w+)\s*\(([^)]*)\)\s*'
+    r'(?:throws\s+[\w,.\s]+)?\s*\{')
 
 
-def _execute(job: Job, log_mode: str = "w", dry_run: bool = False):
-    """Launch the JVM for job.feature_path, stream to the log, parse the report."""
-    original_props = None
+def _remove_step_method(code: str, keyword: str, sentence: str) -> tuple[str, bool]:
+    """Excise ONE step method (its annotation through its matching closing
+    brace) from generated source, identified by its exact keyword+sentence."""
+    ann_pat = re.compile(r'@' + re.escape(keyword) + r'\s*\(\s*"' + re.escape(sentence) + r'"\s*\)')
+    am = ann_pat.search(code)
+    if not am:
+        return code, False
+    mm = _METHOD_SIG_RE.search(code, am.end())
+    if not mm:
+        return code, False
+    depth, i, n = 0, mm.end() - 1, len(code)
+    while i < n:
+        if code[i] == '{':
+            depth += 1
+        elif code[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return (code[:am.start()] + code[i + 1:]).strip() + "\n", True
+        i += 1
+    return code, False
+
+
+def _strip_duplicate_steps(files: dict[str, str], log) -> dict[str, str]:
+    """Safety net for a real failure mode: Cucumber throws
+    DuplicateStepDefinitionException at RUNTIME (glue-loading, before any
+    scenario executes) if the same step sentence is implemented in two
+    classes — javac cannot catch this, so prompting alone is not reliable
+    enough to prevent it. Deterministically detect and remove any generated
+    step method that duplicates a sentence already owned by a DIFFERENT
+    existing class in the framework. A generated file legitimately keeping/
+    updating one of ITS OWN pre-existing steps is correctly left alone."""
     try:
-        with _RUN_LOCK:
-            original_props = _patch_properties(job.run_params)
+        from . import framework_scanner
+        kb = framework_scanner.get_framework_knowledge()
+    except Exception:  # noqa: BLE001 — best-effort; never block generation
+        return files
+
+    existing_owner: dict[str, str] = {}
+    for sd in kb["step_defs"]:
+        for m in sd["methods"]:
+            key = re.sub(r"\s+", " ", m["sentence"]).strip().lower()
+            existing_owner.setdefault(key, sd["class"])
+
+    out = {}
+    for rel, code in files.items():
+        cls_m = re.search(r'class\s+(\w+)', code)
+        this_class = cls_m.group(1) if cls_m else None
+        new_code = code
+        for kw, sentence in _STEP_ANN_FULL_RE.findall(code):
+            key = re.sub(r"\s+", " ", sentence).strip().lower()
+            owner = existing_owner.get(key)
+            if owner and owner != this_class:
+                new_code, removed = _remove_step_method(new_code, kw, sentence)
+                if removed:
+                    log(f'>>> AI safety check: removed duplicate step "{sentence}" from {rel} '
+                       f'(already implemented in {owner}) — prevents DuplicateStepDefinitionException')
+        out[rel] = new_code
+    return out
+
+
+_UNREPORTED_EXCEPTION_RE = re.compile(
+    r'unreported exception ([\w.]+); must be caught or declared to be thrown')
+
+
+def _exception_handling_hint(err: str) -> str:
+    """javac's 'unreported exception X; must be caught or declared to be
+    thrown' is a purely mechanical Java rule the model keeps failing to
+    satisfy blindly on retry — give it the exact fix instead of hoping it
+    guesses. Different failure category from a missing/hallucinated method:
+    the class and method here are REAL, the code just doesn't satisfy Java's
+    checked-exception handling requirement."""
+    exceptions = sorted(set(_UNREPORTED_EXCEPTION_RE.findall(err)))
+    if not exceptions:
+        return ""
+    exc_list = ", ".join(e.rsplit(".", 1)[-1] for e in exceptions)
+    return (f"\n\nJava CHECKED EXCEPTION error: your code throws {exc_list} without handling it. "
+           f"Java requires every checked exception to be either caught or declared. Fix this by "
+           f"wrapping ONLY the specific line(s) that throw it in a try/catch that catches "
+           f"{exc_list} and rethrows as an unchecked exception, for example:\n"
+           f"    try {{ ... }} catch ({exc_list} e) {{ throw new RuntimeException(e); }}\n"
+           f"Do not add `throws {exc_list}` to a Cucumber step method's signature — Cucumber step "
+           f"methods must not declare checked exceptions. Return the corrected COMPLETE file(s).")
+
+
+def _extra_context_for_compile_errors(err: str) -> str:
+    """Parse javac's 'cannot find symbol: method X ... location: variable v
+    of type ClassName' pattern and, for every ClassName we can find on disk,
+    inject its REAL current source — this is what lets the retry round fix a
+    hallucinated method call instead of just guessing again. Also appends a
+    mechanical fix hint for unhandled checked exceptions, a separate and
+    common failure category."""
+    found = {}
+    for method, cls in _MISSING_SYMBOL_RE.findall(err):
+        if cls in found:
+            continue
+        src = _find_class_source(cls)
+        if src:
+            found[cls] = src
+    parts = []
+    if found:
+        parts.append("\n\nThe methods you called do not exist. Here is the REAL current source of "
+                     "the class(es) involved — use an exact existing method from here, or if the "
+                     "needed behaviour genuinely doesn't exist yet, define it yourself in full:")
+        for cls, src in found.items():
+            parts.append(f"\n## Real current source of {cls}:\n```java\n{src}\n```")
+    parts.append(_exception_handling_hint(err))
+    return "".join(parts)
+
+
+def _apply_java_merge(files: dict[str, str], log) -> dict[str, str]:
+    """For every generated file that corresponds to a REAL existing file on
+    disk, run it through the deterministic Java merge engine instead of
+    trusting the AI's 'complete file' reproduction verbatim — protects every
+    untouched method/field from silent drift, and surfaces exactly what
+    changed. Brand-new files (no existing counterpart) pass through as-is."""
+    try:
+        from . import java_merge
+    except Exception:  # noqa: BLE001 — merge engine is a safety upgrade, never blocks generation
+        return files
+    out = {}
+    for rel, code in files.items():
+        disk_path = config.JAVA_SRC_ROOT / rel
+        old_text = ""
+        if disk_path.exists():
             try:
-                with open(job.log_file, log_mode, encoding="utf-8", errors="ignore") as log:
-                    cmd = _build_command(job.feature_path, job.report_file,
-                                         dry_run, job.run_params, job.tag_filter)
-                    log.write("\n>>> " + _mask(cmd) + "\n\n")   # never log passwords
-                    log.flush()
-                    proc = subprocess.Popen(cmd, cwd=str(config.FRAMEWORK_ROOT),
-                                            stdout=log, stderr=subprocess.STDOUT, shell=False)
-                    job.proc = proc
-                    job.return_code = proc.wait()
-            finally:
-                if original_props is not None:
-                    config.PROPERTIES_FILE.write_bytes(original_props)
-        _ai_info = job.summary.get("ai")
-        _prior_heals = job.summary.get("self_heal_attempts")
-        job.summary = _parse_report(job.report_file)
-        if _ai_info:
-            job.summary["ai"] = _ai_info
-        if _prior_heals:
-            job.summary["self_heal_attempts"] = _prior_heals
-        if not dry_run:
-            try:
-                from . import locator_learning
-                step_results = [{"text": st["name"], "keyword": st["keyword"], "status": st["status"]}
-                                for sc in job.summary.get("scenarios", []) for st in sc["steps"]]
-                if step_results:
-                    def _log(m):
-                        with open(job.log_file, "a", encoding="utf-8", errors="ignore") as f:
-                            f.write(m + "\n")
-                    job.summary["learning"] = locator_learning.learn_from_report(step_results, _log)
-            except Exception:  # noqa: BLE001 — learning is best-effort, never blocks a run
-                pass
-        if job.stop_requested:
-            job.status = "stopped"
-            return
-        if job.summary.get("scenarios_total", 0) == 0:
-            job.status = "failed"
-            job.summary["error"] = ("Cucumber found 0 scenarios in this feature. The file is "
-                "probably not valid Gherkin (check for a missing 'Feature:' header, prose text, "
-                "or Word formatting), or every scenario was filtered out. Scroll up in the "
-                "console for gherkin parse errors.")
-            return
-        if job.summary.get("undefined_steps"):
-            job.status = "failed"
-        elif job.return_code == 0 and job.summary.get("scenarios_failed", 0) == 0:
-            job.status = "passed"
+                old_text = disk_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                old_text = ""
+        if not old_text.strip():
+            out[rel] = code
+            continue
+        result = java_merge.merge_java_file(old_text, code)
+        out[rel] = result["merged_text"]
+        if result["added_methods"] or result["replaced_methods"] or result["added_fields"]:
+            log(f">>> Java merge ({rel}): +{len(result['added_methods'])} new method(s), "
+               f"~{len(result['replaced_methods'])} changed method(s), "
+               f"+{len(result['added_fields'])} new field(s) — "
+               f"{len(result['unchanged_methods'])} existing method(s) left byte-untouched.")
+    return out
+
+
+def generate_and_compile(ai_ctx: dict, undefined_steps: list[str],
+                         classpath: str, job_dir: Path, log) -> tuple[dict, Path]:
+    """Returns ({rel_path: code}, classes_dir). Raises RuntimeError with a
+    readable message on unrecoverable failure."""
+    hit = ai_ctx.get("hit") or {}
+    old_feature = _read(hit.get("feature")) if hit.get("feature") else ""
+    steps_java = _read(hit.get("steps")) if hit.get("steps") else ""
+    page_java = _read(hit.get("page")) if hit.get("page") else ""
+
+    try:
+        from . import capture as _cap
+        _txn_for_capture = ai_ctx.get("txn") or (ai_ctx.get("hit") or {}).get("txn")
+        _runtime_dom = _cap.runtime_dom_for_prompt(_txn_for_capture)
+    except Exception:  # noqa: BLE001
+        _runtime_dom = ""
+    _discovered_text = ""
+    try:
+        from . import locator_discovery as _ld
+        _latest = _cap.latest_capture_for(_txn_for_capture)
+        if _latest and _latest.get("folder"):
+            _html_file = Path(_latest["folder"]) / "page.html"
+            if _html_file.exists():
+                _raw_html = _html_file.read_text(encoding="utf-8", errors="ignore")
+                _discoveries = _ld.discover_for_steps(undefined_steps, _raw_html)
+                _discovered_text = _ld.format_for_prompt(_discoveries)
+                if _discoveries:
+                    log(f">>> Autonomous locator discovery: found {len(_discoveries)}/{len(undefined_steps)} "
+                       "real locator(s) in the captured page — using these instead of guessing.")
+    except Exception as e:  # noqa: BLE001 — discovery is best-effort, never blocks generation
+        log(f">>> Locator discovery unavailable ({e}).")
+    try:
+        from . import locator_learning as _ll
+        _proven_locators = _ll.proven_locators_for_prompt()
+    except Exception:  # noqa: BLE001
+        _proven_locators = ""
+    try:
+        from . import recorder as _rec
+        _captured_locators = _rec.repository_for_prompt()
+    except Exception:  # noqa: BLE001 — repository is best-effort
+        _captured_locators = ""
+    try:
+        from . import knowledge
+        # RAG: semantic retrieval when embeddings exist, module catalogs otherwise
+        hits = None
+        try:
+            hits = knowledge.retrieve([ai_ctx["uploaded_text"], *undefined_steps])
+        except Exception as e:  # noqa: BLE001 — embeddings are best-effort
+            log(f">>> RAG retrieval unavailable ({e}); using module catalogs.")
+        if hits:
+            cat_steps, cat_pages = hits
+            log(">>> RAG: retrieved the most similar existing steps/pages for context.")
         else:
-            job.status = "failed"
-            if (not dry_run and getattr(config, "AUTO_HEAL", False)
-                    and job.summary.get("scenarios_failed", 0) > 0
-                    and job.heal_attempts < getattr(config, "AUTO_HEAL_MAX_RETRIES", 2)):
-                job.heal_attempts += 1
+            cat_steps = knowledge.step_catalog(ai_ctx.get("module"))
+            cat_pages = knowledge.page_catalog(ai_ctx.get("module"))
+    except Exception:  # noqa: BLE001 — knowledge is best-effort
+        cat_steps = cat_pages = "(knowledge base unavailable)"
 
-                def _heal_log(m):
-                    with open(job.log_file, "a", encoding="utf-8", errors="ignore") as f:
-                        f.write(m + "\n")
+    user = f"""The QA engineer uploaded a modified feature file. Update the framework so it runs.
 
-                _heal_log(f"\n>>> Self-heal attempt {job.heal_attempts}/"
-                         f"{getattr(config, 'AUTO_HEAL_MAX_RETRIES', 2)}: diagnosing failure...")
-                try:
-                    from . import self_heal
-                    result = self_heal.attempt_heal(job, _heal_log)
-                except Exception as e:  # noqa: BLE001 — self-heal is best-effort, never crash the job
-                    result = {"healed": False, "reason": f"Self-heal internal error: {e}"}
-                job.summary.setdefault("self_heal_attempts", []).append(
-                    {"attempt": job.heal_attempts, **result})
-                if result["healed"]:
-                    _heal_log(f">>> Self-heal succeeded: {result['reason']} Re-running from the top "
-                             "(a fresh execution, not a resumed session — see self_heal.py).")
-                    _execute(job, "a", dry_run=False)   # bounded recursion: re-checks the cap each time
-                    return
-                _heal_log(f">>> Self-heal did not resolve this attempt: {result['reason']}")
-    except FileNotFoundError as e:
-        job.status = "error"
-        job.summary = {"error": f"Could not start the launcher ({e}). Check JAVA_CMD/MVN_CMD and PATH."}
-    except Exception as e:  # noqa: BLE001
-        job.status = "error"
-        job.summary = {"error": str(e)}
-        _log_error(job, str(e))
-
-
-def _log_error(job: Job, msg: str):
-    try:
-        with open(job.log_file, "a", encoding="utf-8", errors="ignore") as f:
-            f.write("\n>>> ERROR: " + msg + "\n")
-    except OSError:
-        pass
-
-
-def _run(job: Job, dry_run: bool, run_params: dict | None, tag_filter: str | None = None):
-    job.status = "running"
-    job.run_params, job.tag_filter = run_params, tag_filter
-    if not job.ai_ctx:
-        _execute(job, "w", dry_run)
-        return
-    # AI flow: prepare (dry-run + merge + generate) -> pause for review
-    try:
-        with _RUN_LOCK:
-            with open(job.log_file, "w", encoding="utf-8", errors="ignore") as log:
-                def L(m):
-                    log.write(m + "\n"); log.flush()
-                run_now = _ai_prepare(job, L)
-        if run_now is not None:            # nothing changed -> straight to execution
-            job.feature_path = run_now
-            _execute(job, "a")
-        elif job.status == "locator_required":
-            pass                            # gate halted before generation; status already set
-        else:
-            policy = getattr(config, "AUTO_APPROVE_POLICY", "never")
-            pending_blob = (job.pending.get("feature_text", "") +
-                            "".join(job.pending.get("files", {}).values()))
-            has_todos = "TODO QA" in pending_blob or "TODO:" in pending_blob
-            if policy == "always" or (policy == "no_todos" and not has_todos):
-                _log_error  # noqa: B018 — keep symbol referenced for clarity
-                with open(job.log_file, "a", encoding="utf-8", errors="ignore") as f:
-                    f.write(f"\n>>> AUTO-APPROVE (policy: {policy}"
-                            f"{', no TODO markers found' if policy == 'no_todos' else ''}) — "
-                            "committing without human review (CI mode)...\n")
-                _finalize(job)
-            else:
-                if policy == "no_todos" and has_todos:
-                    with open(job.log_file, "a", encoding="utf-8", errors="ignore") as f:
-                        f.write("\n>>> AUTO-APPROVE withheld: generated code contains TODO locator "
-                                "markers — pausing for human review (policy: no_todos).\n")
-                job.status = "review"          # frontend shows the editor; approval resumes
-    except Exception as e:  # noqa: BLE001
-        job.status = "error"
-        job.summary = {"error": str(e)}
-        _log_error(job, str(e))
-
-
-def _finalize(job: Job):
-    """Runs after user approval: commit the (edited) changes, then execute."""
-    job.status = "running"
-    try:
-        with _RUN_LOCK:
-            with open(job.log_file, "a", encoding="utf-8", errors="ignore") as log:
-                def L(m):
-                    log.write(m + "\n"); log.flush()
-                L("\n>>> Changes APPROVED by user — committing to the framework...")
-                job.feature_path = _commit_pending(job, L)
-        _execute(job, "a")
-    except Exception as e:  # noqa: BLE001
-        job.status = "error"
-        job.summary = {"error": str(e)}
-        _log_error(job, str(e))
-
-
-def heal_job(job_id: str) -> Job:
-    """Self-healing (capture-mode runs): feed the FAILED screen's captured DOM
-    + the failing steps' errors + existing page/steps java to Azure, get
-    repaired locator/page code, and route it through the SAME pending ->
-    approve machinery as any AI change. AUTO_APPROVE_POLICY applies: under
-    no_todos/always a clean repair auto-commits and RE-RUNS; under never it
-    pauses in the review screen like any other change."""
-    from . import generator, runtime_capture
-    job = JOBS.get(job_id)
-    if not job or job.status != "failed":
-        raise KeyError("Healing needs a FAILED job.")
-    evidence = runtime_capture.failing_evidence(job.id)
-    if not evidence:
-        raise KeyError("No runtime captures for this job - re-run it in Capture Mode first.")
-    failed_steps = [f'{st.get("keyword", "")}{st.get("name", "")}: {st.get("error", "")[:400]}'
-                    for sc in job.summary.get("detail", []) for st in sc.get("steps", [])
-                    if st.get("status") == "failed"]
-    ctx = job.ai_ctx or {"uploaded_text": Path(job.feature_path).read_text(encoding="utf-8", errors="ignore"),
-                         "filename": Path(job.feature_path).name,
-                         "hit": None, "module": None}
-    with open(job.log_file, "a", encoding="utf-8", errors="ignore") as f:
-        f.write("\n>>> SELF-HEAL: analysing captured DOM of the failed screen "
-                f"({evidence['checkpoint']}) with Azure OpenAI...\n")
-    heal_prompt = f"""A Selenium test failed. Repair ONLY the broken locator(s)/page code.
-
-## FAILED STEPS AND ERRORS:
-{chr(10).join(failed_steps) or '(see report)'}
-
-## ACTUAL HTML OF THE SCREEN AT FAILURE (captured live - the locator you produce
-## MUST exist in this HTML; never invent attributes not present here):
-```html
-{evidence['html']}
+## Uploaded feature (the one that must execute):
+```gherkin
+{ai_ctx['uploaded_text'][:12000]}
 ```
 
-Return the corrected complete file(s) in the ===FILE/===END format."""
-    files, _ = generator.generate_and_compile(
-        ctx, [], _effective_classpath(), config.GEN_DIR / job.id / "heal",
-        lambda m: open(job.log_file, "a", encoding="utf-8", errors="ignore").write(m + "\n"),
-        extra_user_context=heal_prompt)
-    job.pending = {"feature_text": Path(job.feature_path).read_text(encoding="utf-8", errors="ignore"),
-                   "files": files, "hit": ctx.get("hit"),
-                   "meta": {"healing": True, "undefined_steps": [],
-                            "scenarios_added": [], "scenarios_replaced": [],
-                            "checkpoint": evidence["checkpoint"]}}
-    policy = getattr(config, "AUTO_APPROVE_POLICY", "never")
-    blob = "".join(files.values())
-    if policy == "always" or (policy == "no_todos" and "TODO QA" not in blob and "TODO:" not in blob):
-        with open(job.log_file, "a", encoding="utf-8", errors="ignore") as f:
-            f.write(f">>> SELF-HEAL: auto-approving repair (policy: {policy}) and re-running...\n")
-        job.status = "review"
-        return approve_job(job.id, None, None)
-    job.status = "review"
-    with open(job.log_file, "a", encoding="utf-8", errors="ignore") as f:
-        f.write(">>> SELF-HEAL: repair ready - review and approve in the browser to re-run.\n")
-    return job
+## Previous version of this feature in the framework{' (none - this txn had no feature)' if not old_feature else ''}:
+```gherkin
+{old_feature or '(none)'}
+```
 
+## Steps reported UNDEFINED by a cucumber dry run (these have no matching @Given/@When/@Then):
+{chr(10).join('- ' + u for u in undefined_steps) or '- (none - only wording/data changed)'}
 
-def approve_job(job_id: str, feature_text: str | None, files: dict | None) -> Job:
-    """Accept (possibly edited) changes. Edited java is compile-checked in
-    quarantine first; compile errors raise ValueError and the job STAYS in review."""
-    from . import generator
-    job = JOBS.get(job_id)
-    if not job or job.status != "review" or not job.pending:
-        raise KeyError("Job is not awaiting review.")
-    if feature_text is not None:
-        job.pending["feature_text"] = feature_text
-    if files:
-        merged_files = dict(job.pending["files"])
-        merged_files.update({k: v for k, v in files.items() if v and v.strip()})
-        ok, err, _ = generator._compile(merged_files, config.GEN_DIR / job.id / "approved",
-                                        _effective_classpath())
-        if not ok:
-            raise ValueError(err[:2000])
-        job.pending["files"] = merged_files
-    threading.Thread(target=_finalize, args=(job,), daemon=True).start()
-    return job
+## EXISTING STEP SENTENCES across the framework (module + common) — REUSE these
+## (by keeping the feature wording identical) instead of writing new step methods:
+{cat_steps or '(none found)'}
 
+## EXISTING PAGE CLASSES in this module (locator names + method signatures) —
+## call these instead of inventing duplicates:
+{cat_pages or '(none found)'}
 
-def discard_job(job_id: str) -> bool:
-    job = JOBS.get(job_id)
-    if not job or job.status != "review":
-        return False
-    job.status = "discarded"
-    with open(job.log_file, "a", encoding="utf-8", errors="ignore") as log:
-        log.write("\n>>> Changes DISCARDED by user. The framework was not modified.\n")
-    job.pending = None
-    return True
+## Existing step-definition class for this transaction:
+```java
+{steps_java or '(none exists yet - create one in com.nbc.stepDefinitions.<module>)'}
+```
 
+## Existing page-object class for this transaction:
+```java
+{page_java or '(none provided - reuse steps/pages patterns and add TODO markers for locators)'}
+```
 
-def start_job(feature_path: str, dry_run: bool = False, capture: bool = False,
-              run_params: dict | None = None, tag_filter: str | None = None,
-              ai_ctx: dict | None = None) -> Job:
-    job_id = uuid.uuid4().hex[:12]
-    job = Job(
-        id=job_id,
-        feature_path=str(feature_path),
-        log_file=config.LOGS_DIR / f"{job_id}.log",
-        report_file=config.REPORTS_DIR / f"{job_id}.json",
-        ai_ctx=ai_ctx,
-    )
-    job.run_params, job.tag_filter = run_params, tag_filter
-    JOBS[job_id] = job
-    threading.Thread(target=_run, args=(job, dry_run, run_params, tag_filter), daemon=True).start()
-    return job
+## RUNTIME DOM captured by the framework at the live screen (the ACTUAL page
+## the automation reached — generate locators ONLY from elements present here;
+## never invent an id/xpath that is not in this DOM):
+{_runtime_dom or '(no runtime capture available - reuse existing locators or add a // TODO QA: verify locator marker)'}
 
+## LOCATORS PROVEN BY REAL PASSING EXECUTIONS (the HIGHEST-trust source — these
+## were actually exercised by scenarios that PASSED on the live application;
+## always prefer these over any other source when the element matches):
+{_proven_locators or '(none proven yet — no completed runs to learn from)'}
 
-def stop_job(job_id: str) -> bool:
-    """Kill a running execution (java + its Edge/driver children)."""
-    job = JOBS.get(job_id)
-    if not job or job.status != "running" or job.proc is None:
-        return False
-    job.stop_requested = True
-    try:
-        if os.name == "nt":
-            # /T kills the whole tree: java -> msedgedriver -> Edge
-            subprocess.run(["taskkill", "/PID", str(job.proc.pid), "/T", "/F"],
-                           capture_output=True)
+## CAPTURED LOCATORS from recorded manual sessions (REAL locators verified on
+## the live application by a human - ALWAYS use these instead of a TODO guess
+## when the element matches; keep the suggested field name):
+{_captured_locators or '(none recorded yet)'}
+
+{_discovered_text}
+
+## FULL SOURCE of shared/common step definitions (login, logout, navigation —
+## call these EXACT method names if you need this behaviour; do not invent your own):
+```java
+{_common_steps_context() or '(none found)'}
+```
+
+Produce the updated file(s) now, in the required ===FILE / ===END format."""
+    if locals().get("extra_user_context"):
+        user += "\n\n" + extra_user_context
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user}]
+
+    log(f">>> AI: sending context to Azure OpenAI ({config.AZURE_OPENAI_DEPLOYMENT})...")
+    reply = _azure_chat(messages)
+    files = _parse_files(reply)
+    if not files:
+        raise RuntimeError("AI returned no file blocks - response did not follow the required format.")
+    log(">>> AI: received " + ", ".join(files.keys()))
+    files = _strip_duplicate_steps(files, log)
+    files = _apply_java_merge(files, log)
+
+    for attempt in range(config.AI_MAX_FIX_ROUNDS + 1):
+        ok, err, classes = _compile(files, job_dir, classpath)
+        if ok:
+            log(">>> AI: compilation OK")
+            return files, classes
+        if attempt == config.AI_MAX_FIX_ROUNDS:
+            raise RuntimeError("Generated java failed to compile after "
+                               f"{config.AI_MAX_FIX_ROUNDS + 1} attempts:\n{err[:1500]}")
+        undefined_method_hint = bool(_MISSING_SYMBOL_RE.search(err))
+        exception_hint = bool(_UNREPORTED_EXCEPTION_RE.search(err))
+        extra = _extra_context_for_compile_errors(err)
+        if undefined_method_hint and exception_hint:
+            log(f">>> AI: compile errors include an undefined method AND an unhandled checked "
+               f"exception — injecting real source + a fix hint (round {attempt + 1})...")
+        elif undefined_method_hint:
+            log(f">>> AI: compile errors reference undefined methods — injecting the REAL source "
+               f"of the class(es) involved, then asking the model to fix (round {attempt + 1})...")
+        elif exception_hint:
+            log(f">>> AI: compile errors are an unhandled checked exception — injecting a "
+               f"mechanical fix hint (round {attempt + 1})...")
         else:
-            job.proc.kill()
-    except Exception:  # noqa: BLE001
-        pass
-    return True
+            log(f">>> AI: compile errors, asking the model to fix (round {attempt + 1})...")
+        messages += [{"role": "assistant", "content": reply},
+                     {"role": "user", "content":
+                      "javac failed with these errors. Fix them and return the corrected "
+                      "complete files in the same ===FILE/===END format:\n\n" + err[:6000] + extra}]
+        reply = _azure_chat(messages)
+        new_files = _parse_files(reply)
+        if new_files:
+            files.update(_apply_java_merge(_strip_duplicate_steps(new_files, log), log))
+    raise RuntimeError("unreachable")
 
 
-def read_log(job_id: str, offset: int = 0) -> tuple[str, int]:
-    """Return log text from byte offset, plus the new offset (for live polling)."""
-    job = JOBS.get(job_id)
-    if not job or not job.log_file.exists():
-        return "", offset
-    with open(job.log_file, "r", encoding="utf-8", errors="ignore") as f:
-        f.seek(offset)
-        chunk = f.read()
-        return chunk, f.tell()
+# ─────────────────────── deterministic feature merge ────────────────────────
+SC_LINE = re.compile(r"\s*(?:Scenario Outline:|Scenario:)\s*(.+)")
+TAG_LINE = re.compile(r"\s*@")
+
+
+def _blocks(text: str):
+    """Split a feature into (head, {scenario_name: block_text}, order).
+    A block starts at its tag lines (if any) and runs to the next scenario."""
+    lines = text.splitlines(keepends=True)
+    starts = []           # (block_start_line, scenario_name)
+    for i, l in enumerate(lines):
+        m = SC_LINE.match(l)
+        if m:
+            j = i
+            while j > 0 and TAG_LINE.match(lines[j - 1]):
+                j -= 1
+            starts.append((j, m.group(1).strip()))
+    if not starts:
+        return text, {}, []
+    head = "".join(lines[:starts[0][0]])
+    blocks, order = {}, []
+    for n, (b, name) in enumerate(starts):
+        end = starts[n + 1][0] if n + 1 < len(starts) else len(lines)
+        blocks[name] = "".join(lines[b:end])
+        order.append(name)
+    return head, blocks, order
+
+
+def merge_feature(old_text: str, new_text: str) -> tuple[str, list[str], list[str]]:
+    """Merge the uploaded feature into the existing one.
+    - scenario with a NEW name -> appended at the end
+    - scenario with an EXISTING name but different body -> replaced in place
+    Returns (merged_text, added_names, replaced_names)."""
+    if not old_text.strip():
+        _, sc, order = _blocks(new_text)
+        return new_text, order, []
+    old_head, old_sc, old_order = _blocks(old_text)
+    _, new_sc, new_order = _blocks(new_text)
+    added, replaced = [], []
+    for name in new_order:
+        if name not in old_sc:
+            added.append(name)
+        elif old_sc[name].strip() != new_sc[name].strip():
+            old_sc[name] = new_sc[name]
+            replaced.append(name)
+    merged = old_head + "".join(old_sc[n] for n in old_order)
+    for name in added:
+        merged = merged.rstrip("\n") + "\n\n" + new_sc[name].rstrip("\n") + "\n"
+    return merged, added, replaced
