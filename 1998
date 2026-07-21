@@ -806,27 +806,21 @@ def _commit_approved(run: CRRun, approved: list[TxnItem]):
                 item.action_required = ("Commit/compile failed; originals archived at "
                                         f"{item.archive_dir or '(pre-archive)'}: {str(e)[:300]}")
                 run.log(f">>> [Txn{item.txn}] COMMIT FAILED: {str(e)[:300]} — continuing.")
-        if any(i.gen_files for i in approved if i.status == "ready"):
-            indexer.build_index()   # STEP 10: refresh repository metadata
-            try:
-                from . import framework_scanner, knowledge_graph
-                framework_scanner._cache = {}
-                framework_scanner.scan_framework()
-                knowledge_graph._cache = {}
-                knowledge_graph.build_graph()
-                run.log(">>> Framework knowledge + graph refreshed post-commit — self-heal and "
-                       "learning for the upcoming execution phase will trace against the real, "
-                       "just-committed code, not the pre-batch snapshot.")
-            except Exception as e:  # noqa: BLE001 — refresh is best-effort, never blocks commit
-                run.log(f">>> Post-commit knowledge refresh skipped ({e}).")
+    except Exception as e:  # noqa: BLE001 — never let an unexpected error strand the status
+        run.log(f">>> Commit phase encountered an unexpected error: {e} — some transactions "
+               "may not have been fully processed; check individual statuses above.")
     finally:
-        # CRITICAL: this status transition must ALWAYS happen, no matter what
-        # fails above — a silent exception here previously left run.status
-        # stuck at "committing" forever with zero error visible anywhere,
-        # even though every individual transaction had actually finished.
+        # CRITICAL: this status transition MUST happen right here, immediately
+        # after commits finish — nothing slow or fallible is allowed between
+        # the commit loop and this point. A previous version ran the framework
+        # knowledge refresh (potentially scanning THOUSANDS of files across an
+        # 865-transaction real framework) before this, and a hang there — not
+        # just an exception — left run.status stuck at "committing" forever,
+        # since a hang never reaches a finally block at all. Nothing after
+        # this point may block this transition again.
         try:
             run.report = build_report(run)
-        except Exception as e:  # noqa: BLE001 — never let report-building kill the thread
+        except Exception as e:  # noqa: BLE001 — never let report-building strand run.status
             run.log(f">>> Could not build the consolidated report ({e}) — the transaction "
                    "statuses above are still accurate; the report/HTML download may be "
                    "incomplete until you retry.")
@@ -838,6 +832,27 @@ def _commit_approved(run: CRRun, approved: list[TxnItem]):
         else:
             run.status = "done"
             run.log(">>> CR pipeline finished. Consolidated report is ready.")
+
+    # Framework knowledge refresh — best-effort, fire-and-forget, in its OWN
+    # thread, started only AFTER run.status is already "ready"/"done" above.
+    # This can take a real amount of time on a large real framework (or even
+    # hang on a pathological file) and must never again be allowed to block
+    # the user from seeing their committed transactions are ready to run.
+    if any(i.gen_files for i in approved if i.status == "ready"):
+        def _refresh():
+            try:
+                indexer.build_index()
+                from . import framework_scanner, knowledge_graph
+                framework_scanner._cache = {}
+                framework_scanner.scan_framework()
+                knowledge_graph._cache = {}
+                knowledge_graph.build_graph()
+                run.log(">>> Framework knowledge + graph refreshed post-commit — self-heal and "
+                       "learning for the upcoming execution phase will trace against the real, "
+                       "just-committed code, not the pre-batch snapshot.")
+            except Exception as e:  # noqa: BLE001 — refresh is best-effort, never blocks anything
+                run.log(f">>> Post-commit knowledge refresh skipped ({e}).")
+        threading.Thread(target=_refresh, daemon=True).start()
 
 
 def execute_txns(run_id: str, txns: list[str] | None = None) -> CRRun:
