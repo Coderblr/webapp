@@ -1,202 +1,865 @@
 """
-Central configuration. Everything you need to change for YOUR machine is here.
-No other file should need editing to get started.
+CR Pipeline — treats an uploaded BRD as a CHANGE REQUEST that may touch one or
+HUNDREDS of transactions, per the "Autonomous Senior QA Automation Engineer"
+spec. This is additive on top of the existing single-feature/BRD flow.
+
+Spec phases -> implementation map:
+  PHASE 1  BRD understanding      analyze_brd(): regex + one LLM extraction call
+  PHASE 2  Transaction discovery  regex sweep UNION LLM extraction, deduped by
+                                  canonical number (leading zeros stripped, same
+                                  rule as indexer._canon)
+  PHASE 3  Execution pipeline     CRRun holds an ordered queue of TxnItem work
+                                  items; the BRD is parsed ONCE, never re-read
+  PHASE 4  Per-transaction flow   _process_item(): SEARCH (indexer, never
+                                  generate before searching) -> UNDERSTAND (read
+                                  existing feature/page/steps) -> COMPARE (LLM
+                                  emits ONLY the delta as new/changed scenario
+                                  blocks, or NO_CHANGES) -> UPDATE (deterministic
+                                  merge_engine append/replace — existing
+                                  scenarios/tags/order are preserved byte-for-
+                                  byte, never regenerated) -> dry-run ->
+                                  locator gate -> generate+compile (quarantine)
+  FAILURE HANDLING                every item wrapped in try/except; one failed
+                                  transaction NEVER stops the queue; one retry
+                                  for recoverable (network/timeout) failures
+  SELF VALIDATION                 _self_validate() before staging
+  FINAL OUTPUT                    build_report(): consolidated CR report
+
+One deliberate divergence, allowed by spec principle 15 ("If human intervention
+is unavoidable ... produce a precise action list"): this project's critical
+invariant (README §1) is that framework files are NEVER written without the
+compile check + human Approve. So the pipeline runs every transaction fully
+autonomously up to STAGED changes, then pauses at ONE consolidated review gate
+covering all transactions. Items needing no framework writes skip review.
+After approval: archive -> commit -> compile -> sequential execution (one at a
+time, per the shared-Edge-session invariant) -> consolidated report.
 """
+import json
+import re
+import subprocess
+import threading
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
-import os
 
-# ── 1. Where the Java Cucumber framework lives (folder containing pom.xml) ──
-FRAMEWORK_ROOT = Path(os.getenv("FRAMEWORK_ROOT", r"D:\NBC_Pankaj"))
+from . import config
 
-# ── 2. Source folders inside the framework (adjust if yours differ) ─────────
-# Common layouts: src/test/resources/features  OR  src/test/java/features
-FEATURES_DIR = FRAMEWORK_ROOT / "src" / "test" / "features"
-PAGES_DIR = FRAMEWORK_ROOT / "src" / "test" / "java" / "com" / "nbc" / "pages"
-STEPS_DIR = FRAMEWORK_ROOT / "src" / "test" / "java" / "com" / "nbc" / "stepDefinitions"
+CR_RUNS: dict[str, "CRRun"] = {}
+_CR_LOCK = threading.Lock()
 
-# ── 3. The fully-qualified TestRunner class Maven should run ────────────────
-# Find it with:  search the framework for a class containing @RunWith(Cucumber.class)
-# If it's  src/test/java/runners/TestRunner.java  ->  "runners.TestRunner"
-# If it has no package line at the top              ->  "TestRunner"
-TEST_RUNNER_CLASS = os.getenv("TEST_RUNNER_CLASS", "com.nbc.runners.TestRunner")
+# ── data model ──────────────────────────────────────────────────────────────
 
-# ── 4. How the framework is launched ────────────────────────────────────────
-# "java"   -> no build tool; run TestRunner directly with a classpath (most likely for you)
-# "gradle" -> framework has build.gradle / gradlew.bat
-# "maven"  -> framework has pom.xml
-RUN_MODE = os.getenv("RUN_MODE", "java")
 
-MVN = os.getenv("MVN_CMD", "mvn.cmd" if os.name == "nt" else "mvn")
-GRADLE = os.getenv("GRADLE_CMD", str(FRAMEWORK_ROOT / ("gradlew.bat" if os.name == "nt" else "gradlew")))
-JAVA = os.getenv("JAVA_CMD", "java")
+@dataclass
+class TxnItem:
+    txn: str                                  # canonical number, zeros stripped
+    status: str = "queued"                    # queued|searching|comparing|merging|dry_run|
+                                              # generating|staged|unchanged|not_found|
+                                              # locator_required|failed|skipped|committing|
+                                              # ready|executing|passed|exec_failed|stopped|error
+    hit: dict | None = None                   # indexer entry {feature,page,steps,module,txn}
+    delta_notes: str = ""                     # what the BRD says changed for this txn
+    delta_fragment: str = ""                  # LLM's new/changed scenario blocks (Gherkin)
+    merged_feature: str = ""                  # deterministic merge result (full file)
+    scenarios_added: list = field(default_factory=list)
+    scenarios_replaced: list = field(default_factory=list)
+    undefined_steps: list = field(default_factory=list)
+    gen_files: dict = field(default_factory=dict)   # {rel_path: java code}
+    error: str = ""
+    action_required: str = ""                 # precise reviewer action list on failure
+    archive_dir: str = ""
+    exec_summary: dict = field(default_factory=dict)
+    retried: bool = False
+    heal_attempts: int = 0                    # Step 14: bounded self-heal retry counter
 
-# For RUN_MODE="java": folders whose .class files and jars make up the classpath.
-# Wildcard 'lib/*' means "every jar in lib". Adjust to where your jars live
-# (look in Eclipse: right-click project -> Properties -> Java Build Path -> Libraries).
-CLASSPATH_ENTRIES = [
-    str(FRAMEWORK_ROOT / "target" / "test-classes"),
-    str(FRAMEWORK_ROOT / "target" / "classes"),
-    str(FRAMEWORK_ROOT / "target" / "nbc-automation-1.0.0.jar"),
-]
+    def public(self) -> dict:
+        return {
+            "txn": self.txn, "status": self.status,
+            "module": (self.hit or {}).get("module"),
+            "delta_notes": self.delta_notes,
+            "scenarios_added": self.scenarios_added,
+            "scenarios_replaced": self.scenarios_replaced,
+            "undefined_steps": self.undefined_steps,
+            "java_files": list(self.gen_files.keys()),
+            "error": self.error, "action_required": self.action_required,
+            "exec_summary": self.exec_summary, "heal_attempts": self.heal_attempts,
+        }
 
-# Folders to scan RECURSIVELY for dependency .jar files (e.g. a Maven cache
-# copied from another machine, or a lib folder with subfolders). Every jar
-# found is added to the classpath via an auto-generated "pathing jar", which
-# also sidesteps the Windows command-line length limit.
-RECURSIVE_JAR_DIRS = [
-    os.path.expanduser(r"~\.m2\repository"),   # remove/adjust if not present
-    str(FRAMEWORK_ROOT / "lib"),
-]
-CP_SEP = ";" if os.name == "nt" else ":"
 
-# EASIEST OPTION (IntelliJ): run TestRunner once in IntelliJ, expand the first
-# line of the Run console, copy everything after "-classpath", and paste it
-# here as one raw string. If set, it wins over CLASSPATH_ENTRIES above.
-CLASSPATH_OVERRIDE = os.getenv("CLASSPATH_OVERRIDE", r"")
+@dataclass
+class CRRun:
+    id: str
+    status: str = "analyzing"     # analyzing|processing|review|committing|ready|
+                                  # executing|done|error|discarded
+    brd_name: str = ""
+    cr_number: str = ""
+    parent_cr: str = ""
+    brd_text: str = ""            # kept in memory only; parsed ONCE
+    items: list[TxnItem] = field(default_factory=list)
+    log_file: Path = None
+    error: str = ""
+    report: dict = field(default_factory=dict)
+    proc: object = None           # currently running JVM (for stop)
+    stop_requested: bool = False
 
-CLASSPATH = CLASSPATH_OVERRIDE or CP_SEP.join(CLASSPATH_ENTRIES)
+    def log(self, msg: str):
+        try:
+            with open(self.log_file, "a", encoding="utf-8", errors="ignore") as f:
+                f.write(msg.rstrip() + "\n")
+        except OSError:
+            pass
 
-# For RUN_MODE="java": is TestRunner JUnit or TestNG?
-#   "junit"  -> TestRunner has @RunWith(Cucumber.class)   <- yours
-#   "testng" -> TestRunner extends AbstractTestNGCucumberTests
-RUNNER_KIND = os.getenv("RUNNER_KIND", "testng")
+    def item(self, txn: str) -> TxnItem | None:
+        canon = txn.lstrip("0") or "0"
+        return next((i for i in self.items if i.txn == canon), None)
 
-# ── 4b. Cucumber version style ───────────────────────────────────────────────
-# Check the cucumber jar filename in your lib folder (e.g. cucumber-java-7.11.0.jar):
-#   version 5/6/7 -> "properties"  (uses -Dcucumber.features=...)
-#   version 4.x   -> "options"     (uses -Dcucumber.options=...)
-CUCUMBER_STYLE = os.getenv("CUCUMBER_STYLE", "properties")
+    def public(self) -> dict:
+        return {
+            "cr_run_id": self.id, "status": self.status, "brd": self.brd_name,
+            "cr_number": self.cr_number, "parent_cr": self.parent_cr,
+            "transactions": [i.public() for i in self.items],
+            "needs_review": self.status == "review",
+            "error": self.error,
+        }
 
-# TestRunner hardcodes tags = "@400_pass". An injected feature without that tag
-# would run 0 scenarios, so by default we CLEAR the tag filter ("" = run all
-# scenarios of the injected feature). Set to e.g. "@smoke" to filter, or None
-# to leave the annotation's @400_pass in force.
-CUCUMBER_TAG_FILTER = os.getenv("CUCUMBER_TAG_FILTER", "")
 
-# ── 4d. Fixed extra -D system properties added to every run ─────────────────
-# Selenium natively reads "webdriver.edge.driver" — set the msedgedriver path
-# here if the framework doesn't handle drivers itself (WebDriverManager /
-# Selenium Manager 4.6+ need nothing). Add any other fixed -D values too.
-EXTRA_SYSTEM_PROPS = {
-    # "webdriver.edge.driver": r"C:\drivers\msedgedriver.exe",
+# ── PHASE 1 + 2: BRD understanding + transaction discovery ──────────────────
+
+# Regex sweep — transaction numbers can hide anywhere (scope, tables, XML,
+# notes...). Two deliberate patterns: Txn-prefixed anywhere, and bare numbers
+# only when preceded by transaction-ish wording (a bare 4-6 digit sweep alone
+# would drown in amounts/dates).
+_TXN_PREFIXED = re.compile(r"\bTxn\s*[#:]?\s*0*(\d{3,6})\b", re.I)
+_TXN_WORDED = re.compile(
+    r"\b(?:transaction|txn|screen)s?\s*(?:no\.?|number|#|id|code)?\s*[:\-]?\s*0*(\d{3,6})\b", re.I)
+
+_ANALYZE_SYSTEM = """You are a senior QA analyst reading a banking Business Requirement Document
+that describes a CHANGE REQUEST against existing, already-automated transactions.
+
+Extract ONLY functional information. IGNORE revision history, CAB, approvals, signoff,
+release info, effort estimation, timelines, contacts, headers/footers and formatting.
+
+Return STRICT JSON only (no markdown fences, no commentary) with this shape:
+{
+  "cr_number": "<CR number or empty string>",
+  "parent_cr": "<parent CR number or empty string>",
+  "transactions": [
+    {"txn": "<digits only, e.g. 1045>",
+     "changes": "<concise summary of EVERY change this BRD makes to this transaction:
+                  new/removed/modified fields, mandatory/optional flags, dropdown/radio/checkbox
+                  values, validations, error messages, tooltips, business rules, XML/parameter
+                  changes, acceptance scenarios>"}
+  ],
+  "global_changes": "<changes that apply across all listed transactions, or empty string>"
 }
-
-# ── 4c. Runtime inputs: target URL + maker/checker credentials ──────────────
-# The framework reads these from a properties file via PropertiesUtil.java.
-# Open PropertiesUtil.java to find (a) which file it loads and (b) the key names,
-# then correct the two settings below.
-# The framework keeps one properties folder PER ENVIRONMENT (preprod / uat).
-# PropertiesUtil reads these SOURCE files directly at runtime (via user.dir),
-# so patching them needs NO recompile. Credentials/URL live in common.properties.
-ENVIRONMENT = os.getenv("NBC_ENV", "preprod")   # "preprod" or "uat"
-PROPERTIES_FILE = FRAMEWORK_ROOT / "src" / "test" / "resources" / "data" / ENVIRONMENT / "common.properties"
-
-# Map: API field name -> property key name used INSIDE the properties file.
-# Only the right-hand side needs to match your framework.
-RUNTIME_PROPERTY_KEYS = {
-    "url": "baseUrl",
-    "maker_id": "makerID",          # capital ID — matches common.properties
-    "maker_password": "makerPassword",
-    "checker_id": "checkerID",
-    "checker_password": "checkerPassword",
-}
-
-# ── 5. How your framework selects the browser ───────────────────────────────
-# Look inside PropertiesUtil.java / config.properties for the property name.
-# It is usually something like  browser=chrome . We override it per run:
-BROWSER_SYSPROP = os.getenv("BROWSER_SYSPROP", "browser")   # the KEY name
-BROWSER_VALUE = os.getenv("BROWSER_VALUE", "edge")          # the VALUE
-
-# ── 6. Where this backend stores its own data ───────────────────────────────
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-UPLOADS_DIR = DATA_DIR / "uploads"        # uploaded .feature files
-LOGS_DIR = DATA_DIR / "logs"              # live console logs per job
-REPORTS_DIR = DATA_DIR / "reports"        # cucumber JSON reports per job
-INDEX_FILE = DATA_DIR / "index.json"      # the Txn -> files index
-
-for d in (DATA_DIR, UPLOADS_DIR, LOGS_DIR, REPORTS_DIR):
-    d.mkdir(parents=True, exist_ok=True)
-
-# ── 6b. Phase 1 scanner: extra folders (optional — skipped gracefully if absent)
-UTILS_DIR = FRAMEWORK_ROOT / "src" / "test" / "java" / "com" / "nbc" / "utils"
-PROPERTIES_ROOT = FRAMEWORK_ROOT / "src" / "test" / "resources" / "data"  # <env>/<module>.properties
-
-# ── 7. Known modules (used to detect which folder an uploaded feature targets)
-MODULES = ["batch", "cash", "cif", "common", "deposits", "fileUpload", "gl",
-           "healthCheck", "loans", "ndvp", "parameters", "sdv"]
+Search the ENTIRE document — transaction numbers may appear in scope, change description,
+solution details, acceptance scenarios, tables, XML, screen lists, references, notes, or the
+parent CR. Never assume only one transaction exists. Never invent transaction numbers that are
+not in the document."""
 
 
-# ── 8. Phase 2: AI framework updates (Azure OpenAI) ──────────────────────────
-# Fill these from your Azure OpenAI resource (Portal -> Keys and Endpoint).
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://YOUR-RESOURCE.openai.azure.com")
-AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY", "PASTE-YOUR-KEY")
-AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")  # your deployment NAME
-AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
+def analyze_brd(brd_text: str, log=lambda m: None) -> dict:
+    """Parse the BRD ONCE. Returns {cr_number, parent_cr, txn_changes:{canon:notes},
+    global_changes}. LLM extraction UNION regex sweep so no transaction is missed;
+    regex-only numbers are kept only when they exist in the automation index
+    (guards against amounts/dates matching the worded pattern)."""
+    from . import generator, indexer
 
-# Locator Intelligence Level 4 (vision-assisted disambiguation): a MULTIMODAL
-# deployment (e.g. gpt-4o) — leave empty to reuse AZURE_OPENAI_DEPLOYMENT if
-# that deployment itself accepts image input. Vision is a FALLBACK only, used
-# when DOM-text matching can't confidently resolve a step's locator.
-AZURE_OPENAI_VISION_DEPLOYMENT = os.getenv("AZURE_OPENAI_VISION_DEPLOYMENT", "")
+    llm = {"cr_number": "", "parent_cr": "", "transactions": [], "global_changes": ""}
+    try:
+        reply = generator._azure_chat([
+            {"role": "system", "content": _ANALYZE_SYSTEM},
+            {"role": "user", "content": brd_text[:24000]},
+        ])
+        reply = re.sub(r"^```(?:json)?\s*|\s*```$", "", reply.strip())
+        llm = json.loads(reply)
+    except Exception as e:  # noqa: BLE001 — regex sweep still provides discovery
+        log(f">>> CR analysis: LLM extraction unavailable ({e}); relying on pattern sweep only.")
 
-# CI/CD: automatic approval policy for AI-generated framework changes.
-#   "never"    - always pause for human review (default; interactive use)
-#   "no_todos" - auto-commit ONLY when generated code has zero TODO-locator
-#                markers (every locator resolved from real knowledge); anything
-#                uncertain still pauses -> CI marks the build "review required"
-#   "always"   - auto-commit everything that compiles (full zero-touch; use
-#                only once the locator repository has good coverage)
-AUTO_APPROVE_POLICY = os.getenv("AUTO_APPROVE_POLICY", "never")
+    txn_changes: dict[str, str] = {}
+    for t in llm.get("transactions", []) or []:
+        num = re.sub(r"\D", "", str(t.get("txn", "")))
+        if num:
+            txn_changes[num.lstrip("0") or "0"] = (t.get("changes") or "").strip()
 
-# Locator discovery policy (before AI generates step/page code):
-#   "todo"   - if a required locator can't be resolved from the repository /
-#              captured DOM / recorder, generate anyway with a
-#              "// TODO QA: verify locator" marker (lenient; good for desk use)
-#   "strict" - HALT before generating any Java when locators can't be resolved;
-#              the job stops with status "locator_required" listing exactly
-#              which screens/elements need a recording or capture session first
-#              (matches the mandatory-locator-gate spec; use for CI/CD)
-LOCATOR_POLICY = os.getenv("LOCATOR_POLICY", "todo")
+    regex_hits = {m.lstrip("0") or "0" for m in _TXN_PREFIXED.findall(brd_text)}
+    worded_hits = {m.lstrip("0") or "0" for m in _TXN_WORDED.findall(brd_text)}
+    for canon in sorted(regex_hits | worded_hits, key=lambda s: (len(s), s)):
+        if canon in txn_changes:
+            continue
+        if canon in regex_hits or indexer.lookup(canon):
+            txn_changes[canon] = ""      # discovered but LLM gave no notes; delta LLM gets full BRD
 
-# Step 14: Self-Healing Execution Loop. If a run fails on a locator-shaped
-# exception (NoSuchElement/Timeout/StaleElement/NotInteractable), automatically
-# trace the failure to its exact page-locator field, re-discover it from the
-# failure-point capture (requires Capture Mode + the Java capture hook), patch
-# ONLY that field, recompile, and re-launch the run — up to AUTO_HEAL_MAX_RETRIES
-# times. Off by default: this changes framework files without a human review
-# gate, so turn it on deliberately (e.g. for CI) once you trust the pipeline.
-AUTO_HEAL = os.getenv("AUTO_HEAL", "false").lower() == "true"
-AUTO_HEAL_MAX_RETRIES = int(os.getenv("AUTO_HEAL_MAX_RETRIES", "2"))
+    return {
+        "cr_number": (llm.get("cr_number") or "").strip(),
+        "parent_cr": (llm.get("parent_cr") or "").strip(),
+        "txn_changes": txn_changes,
+        "global_changes": (llm.get("global_changes") or "").strip(),
+    }
 
-# Locator Recorder: path to msedgedriver.exe (the framework bundles one) and
-# the URL the recording browser opens on (empty = user types it in the UI).
-EDGE_DRIVER_PATH = os.getenv("EDGE_DRIVER_PATH",
-                             str(FRAMEWORK_ROOT / "drivers" / "edgeDriver" / "msedgedriver.exe"))
-RECORDER_DEFAULT_URL = os.getenv("RECORDER_DEFAULT_URL", "")
 
-# RAG embeddings (optional but recommended): deploy an embedding model on the
-# SAME Azure resource (Deployments -> Create -> text-embedding-3-small) and put
-# its DEPLOYMENT NAME here. Empty = fall back to module catalogs (no embeddings).
-AZURE_OPENAI_EMBED_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT", "")
+# ── PHASE 4 STEP 3: delta comparison (LLM emits ONLY new/changed scenarios) ─
 
-# Where java sources live (for committing updated classes after a green run)
-JAVA_SRC_ROOT = FRAMEWORK_ROOT / "src" / "test" / "java"
-TEST_CLASSES_DIR = FRAMEWORK_ROOT / "target" / "test-classes"
+_DELTA_SYSTEM = """You are a senior QA automation engineer maintaining an existing enterprise
+banking Cucumber framework. The EXISTING automation is the source of truth; the BRD below is a
+CHANGE REQUEST describing only what changed for ONE transaction.
 
-# javac: derived from JAVA by default (JDK required; a bare JRE has no javac)
-JAVAC = os.getenv("JAVAC_CMD", "")
-if not JAVAC:
-    JAVAC = JAVA[:-len("java.exe")] + "javac.exe" if JAVA.lower().endswith("java.exe") \
-            else (JAVA[:-4] + "javac" if JAVA.endswith("java") else "javac")
+Compare the BRD's changes for the target transaction against the EXISTING FEATURE FILE and output
+ONLY the delta, as one of:
 
-AI_MAX_FIX_ROUNDS = 2          # compile-error repair attempts
-# Capture Mode: the Java framework writes runtime screenshots/HTML/metadata here
-# at checkpoints (see CaptureAgent.java). Python reads them to feed the AI.
-RUNTIME_CAPTURE_DIR = DATA_DIR / "runtime_capture"
-CAPTURE_MODE_PROP = "capture.mode"          # -Dcapture.mode=true passed to java in capture runs
-CAPTURE_DIR_PROP = "capture.dir"            # -Dcapture.dir=<abs path> tells the framework where to write
+1. Exactly the text NO_CHANGES  — when the existing feature already covers everything the BRD
+   requires for this transaction (already implemented).
+2. A Gherkin FRAGMENT containing ONLY:
+   - NEW scenarios to append (full Scenario/Scenario Outline blocks with tag lines), and/or
+   - MODIFIED existing scenarios (repeat the scenario with its EXACT existing name and tags,
+     body updated) — the merge engine replaces by exact name match.
+   Never output unchanged scenarios. Never output the Feature: header.
 
-GEN_DIR = DATA_DIR / "gen"         # per-job generated sources/classes (quarantine)
-ARCHIVE_DIR = DATA_DIR / "archive" # permanent reference copies of replaced files
-for _d in (GEN_DIR, ARCHIVE_DIR, RUNTIME_CAPTURE_DIR):
-    _d.mkdir(parents=True, exist_ok=True)
+STRICT RULES:
+- REUSE the exact wording of EXISTING STEP SENTENCES provided below wherever behaviour matches —
+  identical wording means zero new Java is needed. Create new step wording only when truly new.
+- Match the tag style and formatting of the existing feature.
+- Generate scenarios for every BRD change: mandatory/optional fields, radio buttons, checkboxes,
+  dropdowns, tooltips, error messages, default values, length validation, business rules, submit
+  validation, maker-checker/authorization validation, field visibility, enable/disable and
+  conditional/dynamic behaviour — but ONLY where the BRD changes them for this transaction.
+- Quote ONLY dynamic values ("value" or "<placeholder>"), never a whole step sentence.
+- Output raw Gherkin or NO_CHANGES. No markdown fences, no commentary."""
+
+
+def _delta_for_txn(run: CRRun, item: TxnItem, existing_feature: str) -> str:
+    """One LLM call scoped to one transaction. Returns '' when NO_CHANGES."""
+    from . import generator, knowledge
+    try:
+        catalog = knowledge.step_catalog((item.hit or {}).get("module"), cap=200)
+    except Exception:  # noqa: BLE001
+        catalog = "(knowledge base unavailable)"
+
+    notes = item.delta_notes or "(no per-transaction summary extracted — derive the changes for " \
+                                f"transaction {item.txn} from the full BRD text)"
+    user = f"""## TARGET TRANSACTION: {item.txn}
+
+## BRD CHANGES EXTRACTED FOR THIS TRANSACTION:
+{notes}
+
+## FULL BRD TEXT (for context; apply ONLY what concerns transaction {item.txn}):
+{run.brd_text[:12000]}
+
+## EXISTING FEATURE FILE (source of truth — never rewrite what is unchanged):
+```gherkin
+{existing_feature[:12000]}
+```
+
+## EXISTING STEP SENTENCES in the framework (reuse EXACT wording where behaviour matches):
+{catalog or '(none found)'}
+
+Output the delta fragment or NO_CHANGES now."""
+    reply = generator._azure_chat([{"role": "system", "content": _DELTA_SYSTEM},
+                                   {"role": "user", "content": user}]).strip()
+    reply = re.sub(r"^```(?:gherkin)?\s*|\s*```$", "", reply).strip()
+    if not reply or reply.upper().startswith("NO_CHANGES"):
+        return ""
+    return reply + "\n"
+
+
+def _fragment_to_feature(fragment: str, existing_feature: str) -> str:
+    """Wrap the delta fragment in the existing file's Feature header so the
+    normalizer/merger (which expect complete feature files) can process it."""
+    header = "Feature: CR delta"
+    for line in existing_feature.splitlines():
+        if line.strip().lower().startswith("feature:"):
+            header = line.rstrip()
+            break
+    return header + "\n\n" + fragment
+
+
+# ── SELF VALIDATION (spec checklist, mechanically enforced) ─────────────────
+
+
+def _self_validate(item: TxnItem, existing_feature: str, log) -> list[str]:
+    """Returns a list of violations (empty = pass). The deterministic merge
+    already guarantees most of the checklist; this verifies rather than trusts."""
+    from . import framework_scanner
+    problems = []
+    old = framework_scanner.parse_feature_text(existing_feature) or {"scenarios": []}
+    new = framework_scanner.parse_feature_text(item.merged_feature) or {"scenarios": []}
+    old_names = [s["name"] for s in old["scenarios"]]
+    new_names = [s["name"] for s in new["scenarios"]]
+    for name in old_names:                                   # existing scenarios preserved
+        if name not in new_names:
+            problems.append(f"existing scenario dropped by merge: '{name}'")
+    if new_names[:len(old_names)] != old_names and not item.scenarios_replaced:
+        problems.append("existing scenario order changed")
+    seen = set()
+    for name in new_names:                                   # no duplicate scenarios
+        if name in seen:
+            problems.append(f"duplicate scenario: '{name}'")
+        seen.add(name)
+    for rel, code in item.gen_files.items():                 # no duplicate methods per file
+        names = re.findall(r"(?:public|private|protected)\s+[\w<>\[\]]+\s+(\w+)\s*\(", code)
+        dupes = {n for n in names if names.count(n) > 1}
+        if dupes:
+            problems.append(f"duplicate method(s) in {rel}: {sorted(dupes)}")
+    for p in problems:
+        log(f">>> [Txn{item.txn}] SELF-VALIDATION FAILED: {p}")
+    return problems
+
+
+# ── PHASE 4: process one transaction (fully isolated) ───────────────────────
+
+
+def _process_item(run: CRRun, item: TxnItem):
+    from . import executor, feature_normalizer, generator, indexer, locator_gate, merge_engine
+
+    def log(msg):
+        run.log(msg if msg.startswith(">>>") else f">>> [Txn{item.txn}] {msg}")
+
+    # STEP 1 — SEARCH the repository first. Never generate before searching.
+    item.status = "searching"
+    item.hit = indexer.lookup(item.txn)
+    if not item.hit or not item.hit.get("feature"):
+        # Fallback: multi-signal matching (txn/module/tags/wording/semantic) —
+        # mirrors what the single-transaction Framework Intelligence BRD path
+        # already does, for the same reason: a transaction whose existing
+        # feature doesn't cleanly index by filename/number can often still be
+        # found this way, rather than giving up immediately.
+        try:
+            from . import feature_matcher
+            fm_match = feature_matcher.best_match(
+                item.delta_notes or f"Txn {item.txn}", txn_hint=item.txn)
+        except Exception:  # noqa: BLE001 — fallback is best-effort
+            fm_match = None
+        if fm_match:
+            log(f"exact index lookup missed; found via multi-signal matching "
+               f"(confidence {fm_match['score']}) instead.")
+            item.hit = indexer.lookup(fm_match["txn"])
+    if not item.hit or not item.hit.get("feature"):
+        item.status = "not_found"
+        item.error = "No existing automation found in the framework index for this transaction."
+        item.action_required = (
+            f"Transaction {item.txn}: no feature/page/steps exist in the framework. "
+            "This CR pipeline only UPDATES existing automation. To scaffold brand-new "
+            "automation for this transaction, use the single Framework Intelligence "
+            "BRD upload (which drafts a new feature), or add it manually, then rerun.")
+        log("no existing automation found — isolated as an action item; queue continues.")
+        return
+    log(f"found existing automation (module={item.hit['module']}): "
+        f"feature={Path(item.hit['feature']).name}"
+        + (f", page={Path(item.hit['page']).name}" if item.hit.get("page") else ", page=NONE")
+        + (f", steps={Path(item.hit['steps']).name}" if item.hit.get("steps") else ", steps=NONE"))
+
+    # STEP 2 — UNDERSTAND the existing implementation.
+    existing_feature = Path(item.hit["feature"]).read_text(encoding="utf-8", errors="ignore")
+
+    # STEP 3 — COMPARE BRD vs existing; only the difference becomes scope.
+    item.status = "comparing"
+    log("comparing BRD delta against the existing implementation...")
+    item.delta_fragment = _delta_for_txn(run, item, existing_feature)
+    if not item.delta_fragment:
+        item.status = "unchanged"
+        log("already implemented — no delta for this transaction. Will execute as-is for regression.")
+        return
+    frag_count = len(re.findall(r"^\s*Scenario(?: Outline)?:", item.delta_fragment, re.M))
+    log(f"delta identified: {frag_count} new/changed scenario block(s).")
+
+    # STEP 4 — UPDATE the feature: normalize wording to framework conventions,
+    # then DETERMINISTIC merge (append new / replace changed by exact name —
+    # existing scenarios, tags, order and formatting are preserved, never
+    # regenerated).
+    item.status = "merging"
+    delta_feature = _fragment_to_feature(item.delta_fragment, existing_feature)
+    try:
+        norm = feature_normalizer.normalize_feature(delta_feature, existing_feature)
+        delta_feature = norm["normalized_text"]
+        snapped = norm["summary"].get("steps_normalized", 0)
+        if snapped:
+            log(f"snapped {snapped} drafted step(s) to exact framework wording (reuse, not regenerate).")
+    except Exception as e:  # noqa: BLE001 — best-effort
+        log(f"normalization skipped ({e}).")
+    merge_result = merge_engine.merge(existing_feature, delta_feature)
+    item.merged_feature = merge_result["merged_text"]
+    item.scenarios_added = merge_result["appended_scenarios"]
+    item.scenarios_replaced = merge_result["replaced_scenarios"]
+    log(f"merge: +{len(item.scenarios_added)} appended, ~{len(item.scenarios_replaced)} replaced, "
+        f"{len(merge_result['unreferenced_scenarios'])} existing untouched (kept).")
+
+    # STEPS 5-7 need Java glue knowledge — ground truth via cucumber dry-run.
+    item.status = "dry_run"
+    tmp = config.UPLOADS_DIR / f"cr_{run.id}_txn{item.txn}.feature"
+    tmp.write_text(item.merged_feature, encoding="utf-8")
+    try:
+        item.undefined_steps = executor._dry_run_sync(str(tmp), log)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    if item.undefined_steps:
+        gate = locator_gate.evaluate(item.undefined_steps, item.txn, item.hit.get("module"))
+        if gate["blocked"]:
+            item.status = "locator_required"
+            item.error = gate["message"]
+            item.action_required = ("Capture/record locators for: "
+                                    + "; ".join(gate["unresolved_steps"]))
+            log(f"locator gate blocked this transaction: {gate['message']} — queue continues.")
+            return
+        # STEPS 5+6+7 — generate ONLY the missing glue (generator's prompt is
+        # already append-only: reuse locators/methods/regex, never duplicate),
+        # compiled in quarantine with auto-repair rounds. STEP 8 (compile) for
+        # the real framework happens at commit time.
+        item.status = "generating"
+        log(f"generating java glue for {len(item.undefined_steps)} undefined step(s)...")
+        item.gen_files, _ = generator.generate_and_compile(
+            {"hit": item.hit, "uploaded_text": item.merged_feature,
+             "module": item.hit.get("module"), "txn": item.txn,
+             "filename": Path(item.hit["feature"]).name},
+            item.undefined_steps, executor._effective_classpath(),
+            config.GEN_DIR / f"cr_{run.id}_txn{item.txn}", log)
+        log(f"generated + quarantine-compiled {len(item.gen_files)} java file(s).")
+
+    problems = _self_validate(item, existing_feature, log)
+    if problems:
+        item.status = "failed"
+        item.error = "Self-validation failed: " + "; ".join(problems)
+        item.action_required = "Review and correct manually: " + "; ".join(problems)
+        return
+
+    item.status = "staged"
+    log("staged for review: feature merge"
+        + (f" + {len(item.gen_files)} java file(s)" if item.gen_files else " (no java changes)") + ".")
+
+
+def _process_item_isolated(run: CRRun, item: TxnItem):
+    """FAILURE HANDLING: one failed transaction never stops the queue; one
+    automatic retry for recoverable (network/timeout/transient) failures."""
+    recoverable = ("timeout", "timed out", "connection", "network", "unreachable",
+                   "429", "502", "503", "rate limit")
+    for attempt in (1, 2):
+        try:
+            _process_item(run, item)
+            return
+        except Exception as e:  # noqa: BLE001 — isolation is the whole point
+            msg = str(e)
+            if attempt == 1 and any(k in msg.lower() for k in recoverable):
+                item.retried = True
+                run.log(f">>> [Txn{item.txn}] recoverable failure ({msg[:200]}) — retrying once...")
+                continue
+            item.status = "failed"
+            item.error = msg[:1000]
+            item.action_required = f"Automatic processing failed: {msg[:300]}"
+            run.log(f">>> [Txn{item.txn}] FAILED: {msg[:300]} — continuing with remaining transactions.")
+            return
+
+
+# ── run lifecycle ───────────────────────────────────────────────────────────
+
+
+def start_cr(brd_filename: str, brd_text: str) -> CRRun:
+    run = CRRun(id=uuid.uuid4().hex[:12], brd_name=brd_filename, brd_text=brd_text)
+    config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    run.log_file = config.LOGS_DIR / f"cr_{run.id}.log"
+    run.log_file.write_text("", encoding="utf-8")
+    with _CR_LOCK:
+        CR_RUNS[run.id] = run
+    threading.Thread(target=_run_pipeline, args=(run,), daemon=True).start()
+    return run
+
+
+def _run_pipeline(run: CRRun):
+    try:
+        run.log(f">>> CR PIPELINE: analyzing BRD '{run.brd_name}' (parsed ONCE)...")
+        analysis = analyze_brd(run.brd_text, run.log)
+        run.cr_number, run.parent_cr = analysis["cr_number"], analysis["parent_cr"]
+        notes_suffix = ("\n\nGLOBAL CHANGES (apply to every transaction in this CR): "
+                        + analysis["global_changes"]) if analysis["global_changes"] else ""
+        run.items = [TxnItem(txn=t, delta_notes=(n + notes_suffix).strip())
+                     for t, n in analysis["txn_changes"].items()]
+        run.log(f">>> CR {run.cr_number or '(no number found)'}"
+                + (f" (parent {run.parent_cr})" if run.parent_cr else "")
+                + f": {len(run.items)} unique transaction(s) discovered: "
+                + ", ".join(i.txn for i in run.items))
+        if not run.items:
+            run.status = "error"
+            run.error = ("No transaction numbers could be discovered in this BRD. "
+                         "Add explicit transaction/screen numbers, or use the single "
+                         "Framework Intelligence BRD upload instead.")
+            run.log(">>> " + run.error)
+            return
+
+        run.status = "processing"
+        for n, item in enumerate(run.items, 1):     # PHASE 3: independent work items
+            run.log(f">>> ── transaction {n}/{len(run.items)}: Txn{item.txn} ──")
+            _process_item_isolated(run, item)
+
+        if any(i.status == "staged" for i in run.items):
+            run.status = "review"
+            run.log(">>> All transactions processed. STAGED changes are waiting for one "
+                    "consolidated REVIEW — approve or skip per transaction in the browser.")
+        else:
+            for i in run.items:
+                if i.status == "unchanged":
+                    i.status = "ready"
+            run.status = "ready"
+            run.log(">>> All transactions processed; none require framework changes. "
+                    "Use the per-transaction Run buttons (or Run all) to execute.")
+    except Exception as e:  # noqa: BLE001
+        run.status = "error"
+        run.error = str(e)[:1000]
+        run.log(f">>> CR PIPELINE ERROR: {e}")
+    finally:
+        if run.status not in ("review", "ready", "error", "discarded"):
+            run.report = build_report(run)
+            run.status = "done"
+            run.log(">>> CR pipeline finished. Consolidated report is ready.")
+        else:
+            run.report = build_report(run)
+
+
+def approve_cr(run_id: str, approved_txns: list[str] | None,
+               edits: dict | None = None) -> CRRun:
+    """Commit ONLY (archive -> write -> compile). Execution is NOT started here —
+    each committed transaction becomes 'ready' and is run explicitly, one at a
+    time or all together, via execute_txns(). approved_txns=None approves every
+    staged item; a provided list approves those, skipping the rest. edits:
+    {txn: {feature_text, files:{rel:code}}} — reviewer-edited content replaces
+    the staged content."""
+    run = CR_RUNS.get(run_id)
+    if not run:
+        raise KeyError("unknown CR run")
+    if run.status != "review":
+        raise ValueError(f"CR run is '{run.status}', not awaiting review")
+
+    approved = []
+    for item in run.items:
+        if item.status == "unchanged":
+            item.status = "ready"        # regression-runnable without commit
+            continue
+        if item.status != "staged":
+            continue
+        if approved_txns is not None and item.txn not in [t.lstrip("0") or "0" for t in approved_txns]:
+            item.status = "skipped"
+            run.log(f">>> [Txn{item.txn}] skipped by reviewer.")
+            continue
+        edit = (edits or {}).get(item.txn) or (edits or {}).get("Txn" + item.txn) or {}
+        if edit.get("feature_text"):
+            item.merged_feature = edit["feature_text"]
+        for rel, code in (edit.get("files") or {}).items():
+            item.gen_files[rel] = code
+        approved.append(item)
+
+    run.status = "committing"
+    threading.Thread(target=_commit_approved, args=(run, approved), daemon=True).start()
+    return run
+
+
+def discard_cr(run_id: str) -> CRRun:
+    run = CR_RUNS.get(run_id)
+    if not run:
+        raise KeyError("unknown CR run")
+    for item in run.items:
+        if item.status == "staged":
+            item.status = "skipped"
+    run.status = "discarded"
+    run.report = build_report(run)
+    run.log(">>> CR discarded — the framework was not modified.")
+    return run
+
+
+def _commit_item(run: CRRun, item: TxnItem):
+    """STEP 8 + 10 for one approved transaction: archive originals permanently,
+    write feature + java into the framework, compile into target/test-classes."""
+    from . import executor
+
+    def log(msg):
+        run.log(f">>> [Txn{item.txn}] {msg}" if not msg.startswith(">>>") else msg)
+
+    item.status = "committing"
+    hit = item.hit
+    to_archive = {"feature": hit.get("feature")}
+    if hit.get("page"):
+        to_archive["page"] = hit["page"]
+    if hit.get("steps"):
+        to_archive["steps"] = hit["steps"]
+    for rel in item.gen_files:
+        tgt = config.JAVA_SRC_ROOT / rel
+        if tgt.exists():
+            to_archive[Path(rel).name] = str(tgt)
+    item.archive_dir = executor._archive(to_archive, f"Txn{item.txn}", log)
+
+    Path(hit["feature"]).write_text(item.merged_feature, encoding="utf-8")
+    log(f"updated feature file: {hit['feature']}")
+    for rel, code in item.gen_files.items():
+        tgt = config.JAVA_SRC_ROOT / rel
+        tgt.parent.mkdir(parents=True, exist_ok=True)
+        tgt.write_text(code, encoding="utf-8")
+        log(f"updated java source: {tgt}")
+    if item.gen_files:
+        srcs = [str(config.JAVA_SRC_ROOT / rel) for rel in item.gen_files]
+        config.TEST_CLASSES_DIR.mkdir(parents=True, exist_ok=True)
+        rc = subprocess.run([config.JAVAC, "-encoding", "UTF-8",
+                             "-cp", executor._effective_classpath(),
+                             "-d", str(config.TEST_CLASSES_DIR), *srcs],
+                            capture_output=True, text=True, timeout=300)
+        if rc.returncode != 0:
+            raise RuntimeError("commit compile failed:\n" + (rc.stdout + rc.stderr)[:1500])
+        log("compiled updated classes into target/test-classes.")
+
+
+def _execute_item_sync(run: CRRun, item: TxnItem):
+    """STEP 9: run this transaction's (committed) feature file on the real
+    browser. Sequential by design — one shared Edge session (README §8) — so
+    the executor's global run lock is honored. Stoppable: the JVM handle is
+    kept on the run so stop_cr() can tree-kill it mid-flight."""
+    import os
+    from . import executor
+    item.status = "executing"
+    run.log(f">>> [Txn{item.txn}] executing on Edge...")
+    rep = config.REPORTS_DIR / f"cr_{run.id}_txn{item.txn}.json"
+    cmd = executor._build_command(item.hit["feature"], rep, dry_run=False)
+    with executor._RUN_LOCK:
+        if run.stop_requested:                 # stopped while waiting for the lock
+            item.status = "ready"
+            run.log(f">>> [Txn{item.txn}] not started — stop was requested.")
+            return
+        with open(run.log_file, "a", encoding="utf-8", errors="ignore") as lf:
+            lf.write("\n>>> " + executor._mask(cmd) + "\n\n")
+            lf.flush()
+            proc = subprocess.Popen(cmd, cwd=str(config.FRAMEWORK_ROOT),
+                                    stdout=lf, stderr=subprocess.STDOUT, shell=False)
+            run.proc = proc
+            rc = proc.wait()
+            run.proc = None
+    if run.stop_requested:
+        item.status = "stopped"
+        item.exec_summary = executor._parse_report(rep)
+        run.log(f">>> [Txn{item.txn}] execution STOPPED by user.")
+        return
+    _prior_heals = item.exec_summary.get("self_heal_attempts")
+    _prior_learning = item.exec_summary.get("learning")
+    item.exec_summary = executor._parse_report(rep)
+    if _prior_heals:
+        item.exec_summary["self_heal_attempts"] = _prior_heals
+    if _prior_learning:
+        item.exec_summary["learning"] = _prior_learning
+    ok = (rc == 0 and item.exec_summary.get("scenarios_failed", 0) == 0
+          and item.exec_summary.get("scenarios_total", 0) > 0
+          and not item.exec_summary.get("undefined_steps"))
+    item.status = "passed" if ok else "exec_failed"
+    run.log(f">>> [Txn{item.txn}] execution {'PASSED' if ok else 'FAILED'}: "
+            f"{item.exec_summary.get('scenarios_passed', 0)}/"
+            f"{item.exec_summary.get('scenarios_total', 0)} scenario(s) passed.")
+
+    # Level 6 — self-learning: correlate every executed step's real pass/fail
+    # with the locator(s) it touches (via the knowledge graph), regardless of
+    # outcome, so future generations trust proven locators over guesses.
+    try:
+        from . import locator_learning
+        step_results = [{"text": st["name"], "keyword": st["keyword"], "status": st["status"]}
+                        for sc in item.exec_summary.get("scenarios", []) for st in sc["steps"]]
+        if step_results:
+            item.exec_summary["learning"] = locator_learning.learn_from_report(
+                step_results, lambda m: run.log(f">>> [Txn{item.txn}] {m}"))
+    except Exception:  # noqa: BLE001 — learning is best-effort, never blocks a run
+        pass
+
+    # Step 14 — self-healing: a locator-shaped failure gets automatically
+    # diagnosed, traced to its exact page field, re-discovered from the
+    # failure-point capture, patched, recompiled, and this transaction is
+    # AUTOMATICALLY RE-RUN — bounded by AUTO_HEAL_MAX_RETRIES, off unless
+    # AUTO_HEAL is explicitly enabled. "Re-run" means a fresh execution from
+    # the top, not a resumed session (see self_heal.py — same architectural
+    # constraint as the single-job path).
+    if (not ok and getattr(config, "AUTO_HEAL", False)
+            and item.heal_attempts < getattr(config, "AUTO_HEAL_MAX_RETRIES", 2)):
+        item.heal_attempts += 1
+        run.log(f">>> [Txn{item.txn}] self-heal attempt {item.heal_attempts}/"
+               f"{getattr(config, 'AUTO_HEAL_MAX_RETRIES', 2)}: diagnosing failure...")
+        try:
+            from . import self_heal
+
+            class _JobShim:
+                """self_heal.attempt_heal expects a Job-like object with
+                .feature_path/.ai_ctx/.summary — CR items track the same
+                data under different attribute names, so adapt rather than
+                duplicate the healing logic for this pipeline."""
+                feature_path = item.hit["feature"]
+                ai_ctx = {"txn": item.txn}
+                summary = item.exec_summary
+
+            heal_result = self_heal.attempt_heal(_JobShim(), lambda m: run.log(f">>> [Txn{item.txn}] {m}"))
+        except Exception as e:  # noqa: BLE001 — self-heal is best-effort, never crash the run
+            heal_result = {"healed": False, "reason": f"Self-heal internal error: {e}"}
+        item.exec_summary.setdefault("self_heal_attempts", []).append(
+            {"attempt": item.heal_attempts, **heal_result})
+        if heal_result["healed"]:
+            run.log(f">>> [Txn{item.txn}] self-heal succeeded: {heal_result['reason']} "
+                   "Re-running this transaction...")
+            _execute_item_sync(run, item)   # bounded recursion — re-checks the cap each time
+            return
+        run.log(f">>> [Txn{item.txn}] self-heal did not resolve this attempt: {heal_result['reason']}")
+
+
+def _commit_approved(run: CRRun, approved: list[TxnItem]):
+    """Commit every approved item (archive -> write -> compile), so a shared
+    Steps/Page file gets all updates before any browser run. NO execution
+    happens here — committed items become 'ready' for explicit execution.
+    Per-item failures never stop the remaining items."""
+    from . import indexer
+    try:
+        for item in approved:
+            try:
+                _commit_item(run, item)
+                item.status = "ready"
+                run.log(f">>> [Txn{item.txn}] committed — ready to run.")
+            except Exception as e:  # noqa: BLE001
+                item.status = "failed"
+                item.error = f"commit failed: {e}"[:1000]
+                item.action_required = ("Commit/compile failed; originals archived at "
+                                        f"{item.archive_dir or '(pre-archive)'}: {str(e)[:300]}")
+                run.log(f">>> [Txn{item.txn}] COMMIT FAILED: {str(e)[:300]} — continuing.")
+        if any(i.gen_files for i in approved if i.status == "ready"):
+            indexer.build_index()   # STEP 10: refresh repository metadata
+            try:
+                from . import framework_scanner, knowledge_graph
+                framework_scanner._cache = {}
+                framework_scanner.scan_framework()
+                knowledge_graph._cache = {}
+                knowledge_graph.build_graph()
+                run.log(">>> Framework knowledge + graph refreshed post-commit — self-heal and "
+                       "learning for the upcoming execution phase will trace against the real, "
+                       "just-committed code, not the pre-batch snapshot.")
+            except Exception as e:  # noqa: BLE001 — refresh is best-effort, never blocks commit
+                run.log(f">>> Post-commit knowledge refresh skipped ({e}).")
+    finally:
+        run.report = build_report(run)
+        if any(i.status == "ready" for i in run.items):
+            run.status = "ready"
+            run.log(">>> Commit phase finished. Use the per-transaction Run buttons "
+                    "(or Run all) to execute; Stop is available during any run.")
+        else:
+            run.status = "done"
+            run.log(">>> CR pipeline finished. Consolidated report is ready.")
+
+
+def execute_txns(run_id: str, txns: list[str] | None = None) -> CRRun:
+    """Execute selected 'ready' transactions (txns=None -> all ready), one at a
+    time, in a background thread. Callable repeatedly — run one, inspect, run
+    the next. A stop request halts the current JVM and skips the rest, leaving
+    unexecuted items 'ready' for a later run."""
+    run = CR_RUNS.get(run_id)
+    if not run:
+        raise KeyError("unknown CR run")
+    if run.status == "executing":
+        raise ValueError("an execution is already in progress for this CR - stop it "
+                         "or wait for it to finish")
+    if run.status not in ("ready", "done"):
+        raise ValueError(f"CR run is '{run.status}' - nothing is ready to execute")
+    wanted = None if txns is None else {t.lstrip("0") or "0" for t in txns}
+    queue = [i for i in run.items
+             if i.status in ("ready", "stopped", "exec_failed")
+             and (wanted is None or i.txn in wanted)]
+    if not queue:
+        raise ValueError("no matching transaction is ready to execute")
+
+    run.stop_requested = False
+    run.status = "executing"
+
+    def worker():
+        try:
+            for item in queue:
+                if run.stop_requested:
+                    if item.status == "executing":
+                        continue
+                    run.log(f">>> [Txn{item.txn}] skipped — stop was requested; still ready.")
+                    continue
+                try:
+                    _execute_item_sync(run, item)
+                except Exception as e:  # noqa: BLE001
+                    item.status = "exec_failed"
+                    item.error = str(e)[:1000]
+                    run.log(f">>> [Txn{item.txn}] EXECUTION ERROR: {str(e)[:300]} — continuing.")
+        finally:
+            run.report = build_report(run)
+            remaining = [i.txn for i in run.items if i.status in ("ready", "stopped")]
+            run.status = "ready" if remaining else "done"
+            run.log(">>> Execution batch finished."
+                    + (f" Still ready: Txn{', Txn'.join(remaining)}." if remaining
+                       else " Consolidated report is ready."))
+
+    threading.Thread(target=worker, daemon=True).start()
+    return run
+
+
+def stop_cr(run_id: str) -> CRRun:
+    """Stop the currently running transaction (tree-kill: java -> msedgedriver
+    -> Edge, same mechanism as executor.stop_job) and skip the rest of the
+    batch. Unexecuted transactions stay 'ready' and can be run again later."""
+    import os
+    run = CR_RUNS.get(run_id)
+    if not run:
+        raise KeyError("unknown CR run")
+    if run.status != "executing":
+        raise ValueError(f"CR run is '{run.status}' - nothing is executing")
+    run.stop_requested = True
+    proc = run.proc
+    if proc is not None:
+        try:
+            if os.name == "nt":
+                # /T kills the whole tree: java -> msedgedriver -> Edge
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                               capture_output=True)
+            else:
+                proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+    run.log(">>> STOP requested — killing the current run; remaining transactions stay ready.")
+    return run
+
+
+# ── FINAL OUTPUT: consolidated report ───────────────────────────────────────
+
+
+def build_report(run: CRRun) -> dict:
+    items = run.items
+    updated = [i for i in items if i.status in ("passed", "exec_failed", "ready", "stopped")
+               and (i.scenarios_added or i.scenarios_replaced or i.gen_files)]
+    failed = [i for i in items if i.status in ("failed", "not_found", "locator_required", "exec_failed")]
+    passed = [i for i in items if i.status == "passed"]
+    pending = [i for i in items if i.status in ("ready", "stopped")]
+    methods_added, locators_added = 0, 0
+    for i in items:
+        for code in i.gen_files.values():
+            methods_added += len(re.findall(r"@(?:Given|When|Then|And|But)\b", code)) \
+                + len(re.findall(r"public\s+(?:void|\w+)\s+\w+\s*\(", code))
+            locators_added += len(re.findall(r"\bBy\.\w+\s*\(|@FindBy\b", code))
+    return {
+        "cr_number": run.cr_number, "parent_cr": run.parent_cr, "brd": run.brd_name,
+        "transactions_identified": [i.txn for i in items],
+        "transactions_updated": [i.txn for i in updated],
+        "transactions_unchanged": [i.txn for i in items if i.status in ("unchanged", "passed")
+                                   and not (i.scenarios_added or i.scenarios_replaced or i.gen_files)],
+        "transactions_failed": [{"txn": i.txn, "reason": i.error,
+                                 "recovery_action": i.action_required,
+                                 "retried": i.retried} for i in failed],
+        "transactions_skipped": [i.txn for i in items if i.status == "skipped"],
+        "feature_files_modified": [i.hit["feature"] for i in updated
+                                   if i.hit and (i.scenarios_added or i.scenarios_replaced)],
+        "java_files_modified": sorted({rel for i in updated for rel in i.gen_files}),
+        "scenarios_added": {i.txn: i.scenarios_added for i in items if i.scenarios_added},
+        "scenarios_replaced": {i.txn: i.scenarios_replaced for i in items if i.scenarios_replaced},
+        "methods_added_estimate": methods_added,
+        "locators_added_estimate": locators_added,
+        "archives": {i.txn: i.archive_dir for i in items if i.archive_dir},
+        "execution": {i.txn: i.exec_summary for i in items if i.exec_summary},
+        "transactions_pending_execution": [i.txn for i in pending],
+        "overall_status": ("PENDING_EXECUTION" if pending
+            else "PASSED" if items and all(
+            i.status in ("passed", "skipped", "unchanged") for i in items)
+            else "PARTIAL" if passed else "FAILED"),
+    }
+
+
+def read_log(run_id: str, offset: int = 0) -> tuple[str, int]:
+    run = CR_RUNS.get(run_id)
+    if not run or not run.log_file or not run.log_file.exists():
+        return "", offset
+    data = run.log_file.read_bytes()
+    return data[offset:].decode("utf-8", errors="ignore"), len(data)
