@@ -1,383 +1,795 @@
 """
-Locator Intelligence Engine — Phase A: Human-Workflow Recorder.
+FastAPI orchestrator for the Java Cucumber framework.
 
-Not a video recorder: a BROWSER EVENT recorder (the Selenium-IDE/Playwright-
-codegen approach). We launch Edge with a small JavaScript listener injected;
-a human performs the workflow manually in that window; every click and every
-field the human types into captures the target element's full DOM identity
-(id / name / data-* / aria-label / placeholder / text / ancestor chain).
-From those snapshots, stable locators are derived deterministically using the
-spec's priority order, reviewed by the human, saved to the Locator Knowledge
-Repository (data/locator_repository.json), and injected into every future AI
-generation so "// TODO QA: verify locator" guesses become REAL, captured
-locators.
+Flow 1 (manager's primary flow):
+    POST /execute/txn/{txn_no}      -> looks up the feature in the index, runs it on Edge
 
-SECURITY (deliberate, non-negotiable for a banking app): the recorder NEVER
-captures what was typed — no values, no lengths. Only that a field received
-input, plus the field's DOM metadata. Passwords and account numbers never
-leave the browser.
+Flow 2 (alternate flow):
+    POST /execute/upload            -> user uploads a .feature file; we detect its module,
+                                       dry-run to verify glue code exists, then execute it
 
-v1 limitation, stated plainly: iframe capture covers same-origin frames one
-level deep, re-checked on every poll. If the NBC app nests frames deeper,
-extend _drain_all_contexts — the symptom would be clicks inside a frame not
-appearing in the captured list.
+Common:
+    GET  /jobs/{job_id}             -> status + pass/fail summary
+    GET  /jobs/{job_id}/logs        -> live console log (poll with ?offset=)
+    GET  /txns?q=0104               -> search the index (for an autocomplete box in Next.js)
+    POST /index/rebuild             -> rescan the framework after new features are added
+
+Run with:  uvicorn app.main:app --reload --port 8000
 """
-import json
 import re
-import threading
-import time
+
 from pathlib import Path
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-from . import config
-
-# ─────────────────────── injected recorder script ────────────────────────────
-RECORDER_JS = r"""
-if (!window.__liRec) {
-  window.__liRec = true;
-  window.__liRecEvents = [];
-  // Fields whose typed value must NEVER leave the browser as plaintext.
-  // Classified IN-BROWSER so a real secret is redacted at source, before it
-  // is ever placed into the event array, written to disk, or sent to the AI.
-  var __liSensitive = /pass|pwd|secret|token|otp|pin|cvv|cvc|ssn|sin|aadha|account|acct|acc[-_ ]?no|card|iban|routing|sortcode|dob|birth/i;
-  var __liSensField = function (el, attrs) {
-    if ((el.getAttribute('type') || '').toLowerCase() === 'password') return true;
-    if (el.autocomplete && /cc-|password|one-time-code/i.test(el.autocomplete)) return true;
-    var hay = [attrs['name'], attrs['id'], attrs['aria-label'],
-               attrs['placeholder'], attrs['data-testid']].join(' ');
-    return __liSensitive.test(hay);
-  };
-  var snap = function (el, kind) {
-    try {
-      var attrs = {};
-      for (var i = 0; i < el.attributes.length; i++) {
-        var a = el.attributes[i];
-        if (a.name !== 'value') attrs[a.name] = (a.value || '').slice(0, 120);
-      }
-      var chain = [], p = el.parentElement, d = 0;
-      while (p && d < 4) {
-        chain.push({tag: p.tagName.toLowerCase(), id: p.id || null,
-                    cls: (p.className && p.className.split ? p.className.split(/\s+/)[0] : null) || null});
-        p = p.parentElement; d++;
-      }
-      // Value capture: only for real inputs, only on 'input' (change) events.
-      // Sensitive fields are redacted HERE — we record that a value was
-      // entered and its length bucket for nothing but a placeholder; the
-      // characters themselves never enter __liRecEvents.
-      var value = null, sensitive = false, hadValue = false;
-      var tag = el.tagName.toLowerCase();
-      if (kind === 'input' && (tag === 'input' || tag === 'textarea' || tag === 'select')) {
-        var raw = '';
-        if (tag === 'select') {
-          try { raw = (el.options[el.selectedIndex] || {}).text || el.value || ''; }
-          catch (e2) { raw = el.value || ''; }
-        } else {
-          raw = el.value || '';
-        }
-        hadValue = raw.length > 0;
-        sensitive = __liSensField(el, attrs);
-        if (hadValue) value = sensitive ? '[REDACTED]' : String(raw).slice(0, 120);
-      }
-      window.__liRecEvents.push({
-        kind: kind,
-        tag: tag,
-        type: (el.getAttribute('type') || '').toLowerCase(),
-        attrs: attrs,
-        text: (el.innerText || el.textContent || '').trim().slice(0, 80),
-        ancestors: chain,
-        value: value,
-        sensitive: sensitive,
-        had_value: hadValue,
-        url: location.href.slice(0, 300),
-        title: (document.title || '').slice(0, 120),
-        ts: Date.now()
-      });
-    } catch (e) {}
-  };
-  document.addEventListener('click', function (e) { snap(e.target, 'click'); }, true);
-  document.addEventListener('change', function (e) { snap(e.target, 'input'); }, true);
-}
-"""
-DRAIN_JS = "var e = window.__liRecEvents || []; window.__liRecEvents = []; return e;"
+from . import config, executor, indexer, knowledge, framework_scanner, feature_matcher, feature_comparator, feature_normalizer, merge_engine, knowledge_graph, brd_processor, recorder, capture, runtime_capture, cr_pipeline
 
 
-# ─────────────────────── locator derivation (pure) ───────────────────────────
-_AUTOGEN_ID = re.compile(r"\d{4,}|^(ext-|gwt-|j_id|__)|--\d+$")
+class RunParams(BaseModel):
+    """Target environment + credentials for one execution.
+    All optional — omit any value to keep whatever the properties file already has."""
+    url: str | None = None
+    maker_id: str | None = None
+    maker_password: str | None = None
+    checker_id: str | None = None
+    checker_password: str | None = None
+
+app = FastAPI(title="Java Framework Orchestrator")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # your Next.js dev server
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-def derive_locators(ev: dict) -> list[dict]:
-    """Ordered stable-locator candidates for one captured element, following
-    the spec priority: data-testid > data-qa > id > name > aria-label >
-    stable CSS > relative XPath. Every candidate includes a ready Java line."""
-    attrs = ev.get("attrs", {})
-    tag = ev.get("tag", "*")
-    out = []
+@app.on_event("startup")
+def _startup():
+    if config.FRAMEWORK_ROOT.exists():
+        indexer.build_index()
+        try:
+            knowledge.build_knowledge()
+        except Exception:  # noqa: BLE001
+            pass
 
-    def add(loc_type, value, java_by, note=""):
-        out.append({"locator_type": loc_type, "locator_value": value,
-                    "java": java_by, "note": note})
 
-    for da in ("data-testid", "data-qa"):
-        if attrs.get(da):
-            add(da, attrs[da], f'By.cssSelector("[{da}=\'{attrs[da]}\']")')
-    if attrs.get("id"):
-        note = "id looks auto-generated - verify it is stable across sessions" \
-            if _AUTOGEN_ID.search(attrs["id"]) else ""
-        add("id", attrs["id"], f'By.id("{attrs["id"]}")', note)
-    if attrs.get("name"):
-        add("name", attrs["name"], f'By.name("{attrs["name"]}")')
-    if attrs.get("aria-label"):
-        add("aria-label", attrs["aria-label"],
-            f'By.cssSelector("{tag}[aria-label=\'{attrs["aria-label"]}\']")')
-    if attrs.get("placeholder"):
-        add("css-placeholder", attrs["placeholder"],
-            f'By.cssSelector("{tag}[placeholder=\'{attrs["placeholder"]}\']")')
-    text = (ev.get("text") or "").strip()
-    if text and len(text) <= 40 and tag in ("button", "a", "span", "td", "th", "label", "option", "div"):
-        safe = text.replace('"', "'")
-        add("xpath-text", text, f'By.xpath("//{tag}[normalize-space()=\\"{safe}\\"]")')
-    # last resort: relative xpath anchored on the nearest ancestor WITH an id
-    for anc in ev.get("ancestors", []):
-        if anc.get("id") and not _AUTOGEN_ID.search(anc["id"]):
-            suffix = f'[@type=\'{ev["type"]}\']' if ev.get("type") else ""
-            add("xpath-relative", f'#{anc["id"]} >> {tag}',
-                f'By.xpath("//*[@id=\\"{anc["id"]}\\"]//{tag}{suffix}")',
-                "anchored on nearest stable ancestor id")
-            break
-    if not out:
-        add("xpath-fragile", tag, f'By.xpath("//{tag}")',
-            "NO stable attributes found - this element needs a dev-added id/data-testid")
+# ─────────────────────────── index endpoints ────────────────────────────────
+@app.post("/index/rebuild")
+def rebuild_index():
+    idx = indexer.build_index()
+    return {"indexed_txns": len(idx)}
+
+
+@app.post("/knowledge/rebuild")
+def rebuild_knowledge(embed: bool = False):
+    """Rescan the WHOLE framework into the AI knowledge base. With ?embed=1,
+    also (re)build the RAG embeddings via Azure (needs an embedding deployment)."""
+    kb = knowledge.build_knowledge()
+    stats = dict(kb["stats"])
+    if embed:
+        stats.update(knowledge.build_embeddings())
+    stats["rag_embeddings"] = knowledge.embeddings_available()
+    return stats
+
+
+@app.get("/knowledge/stats")
+def knowledge_stats():
+    stats = dict(knowledge.get_knowledge()["stats"])
+    stats["rag_embeddings"] = knowledge.embeddings_available()
+    return stats
+
+
+# ═══════════════ Phase 1 — Framework Scanner (additive, new) ═══════════════
+# Separate from /knowledge/* (app/knowledge.py), which continues to power the
+# existing AI-generation RAG exactly as before. These endpoints expose the
+# richer, feature/scenario-level scan for future phases (matching, comparison,
+# normalization) and for direct browsing/search.
+@app.post("/framework/scan")
+def framework_scan():
+    kb = framework_scanner.scan_framework()
+    return kb["stats"]
+
+
+@app.get("/framework/stats")
+def framework_stats():
+    return framework_scanner.get_framework_knowledge()["stats"]
+
+
+@app.get("/framework/features/search")
+def framework_search(q: str, limit: int = 20):
+    return {"results": framework_scanner.search_features(q, limit)}
+
+
+# ═══════════════ Phase 6 — Intelligent Feature Matching (additive, new) ═════
+class MatchRequest(BaseModel):
+    text: str
+    filename: str | None = None
+    module_hint: str | None = None
+    txn_hint: str | None = None
+    top_k: int = 5
+
+
+@app.post("/framework/match")
+def framework_match(body: MatchRequest):
+    """Rank every framework feature against the given text — five signals
+    (txn/module/tags/scenario-lexical/semantic). Standalone + testable; not
+    yet wired into /execute/upload (that comes with Phase 7 Comparison)."""
+    return {"matches": feature_matcher.find_matches(
+        body.text, body.filename, body.module_hint, body.txn_hint, body.top_k)}
+
+
+@app.post("/framework/embeddings/rebuild")
+def framework_embeddings_rebuild():
+    """Embed every feature (name + scenario names) for the semantic_similarity
+    signal in /framework/match. Requires AZURE_OPENAI_EMBED_DEPLOYMENT."""
+    return feature_matcher.build_feature_embeddings()
+
+
+# ═══════════════ Phase 7 — Intelligent Feature Comparison (additive, new) ══
+class CompareRequest(BaseModel):
+    uploaded_text: str
+    existing_text: str | None = None   # if omitted, auto-matched via Phase 6
+    filename: str | None = None
+    module_hint: str | None = None
+    txn_hint: str | None = None
+
+
+@app.post("/framework/compare")
+def framework_compare(body: CompareRequest):
+    """Structured diff: unchanged / new / deleted / modified scenarios, with
+    step-level, Examples-level, and data-table-level detail for each modified
+    scenario. If existing_text is omitted, the best match is found
+    automatically (Phase 6). Not yet wired into /execute/upload."""
+    try:
+        if body.existing_text is not None:
+            return feature_comparator.compare_features(body.existing_text, body.uploaded_text)
+        return feature_comparator.compare_with_best_match(
+            body.uploaded_text, body.filename, body.module_hint, body.txn_hint)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+# ═══════════════ Phase 8 — Feature Normalization (additive, new) ════════════
+class NormalizeRequest(BaseModel):
+    uploaded_text: str
+
+
+@app.post("/framework/normalize")
+def framework_normalize(body: NormalizeRequest):
+    """Rewrite an uploaded feature to the framework's conventions: step wording
+    canonicalized to existing glue (so no Java is generated for steps the
+    framework can already run), tags recased/deduped, formatting standardized.
+    Deterministic; every rewrite is listed in `changes` for human review."""
+    try:
+        return feature_normalizer.normalize_feature(body.uploaded_text)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+# ═══════════════ Phase 8 — Feature Normalization (additive, new) ═══════════
+class NormalizeRequest(BaseModel):
+    uploaded_text: str
+    existing_text: str | None = None   # if omitted, auto-matched via Phase 6
+    filename: str | None = None
+    module_hint: str | None = None
+    txn_hint: str | None = None
+
+
+@app.post("/framework/normalize")
+def framework_normalize(body: NormalizeRequest):
+    """Rewrite the uploaded feature to match framework conventions (tag
+    casing, step wording, scenario naming, Examples headers) BEFORE any Java
+    generation. If existing_text is omitted, the best match is auto-found
+    (Phase 6). Not yet wired into /execute/upload."""
+    try:
+        if body.existing_text is not None:
+            return feature_normalizer.normalize_feature(body.uploaded_text, body.existing_text)
+        return feature_normalizer.normalize_with_best_match(
+            body.uploaded_text, body.filename, body.module_hint, body.txn_hint)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+# ═══════════════ Phase 9 — Intelligent Merge Engine (additive, new) ═════════
+class MergeRequest(BaseModel):
+    existing_text: str
+    normalized_text: str
+
+
+@app.post("/framework/merge")
+def framework_merge(body: MergeRequest):
+    """Merge a normalized upload into an existing feature's text: keep
+    unchanged, replace modified, append new, never delete, formatting/comments
+    of untouched content preserved. Pass Phase 8's normalized_text here."""
+    return merge_engine.merge(body.existing_text, body.normalized_text)
+
+
+class PipelineRequest(BaseModel):
+    uploaded_text: str
+    filename: str | None = None
+    module_hint: str | None = None
+    txn_hint: str | None = None
+
+
+@app.post("/framework/pipeline")
+def framework_pipeline(body: PipelineRequest):
+    """Convenience: Match (Phase 6) -> Normalize (Phase 8) -> Merge (Phase 9)
+    in one call, with full transparency into each step. Not yet wired into
+    /execute/upload."""
+    return merge_engine.merge_pipeline(body.uploaded_text, body.filename,
+                                       body.module_hint, body.txn_hint)
+
+
+@app.get("/framework/archive/status")
+def archive_status():
+    """Browse the permanent archive (data/archive/<Txn>/<timestamp>/...) —
+    every file version ever replaced by an approved AI commit, never deleted."""
+    if not config.ARCHIVE_DIR.exists():
+        return {"count": 0, "entries": []}
+    entries = []
+    for txn_dir in sorted(config.ARCHIVE_DIR.iterdir()):
+        if not txn_dir.is_dir():
+            continue
+        for ts_dir in sorted(txn_dir.iterdir(), reverse=True):
+            if not ts_dir.is_dir():
+                continue
+            files = sorted(f.name for f in ts_dir.iterdir() if f.is_file())
+            entries.append({"txn": txn_dir.name, "timestamp": ts_dir.name,
+                           "files": files, "file_count": len(files)})
+    return {"count": len(entries), "entries": entries}
+
+
+# ═══════════════ Phase 3 — Knowledge Graph (additive, new) ══════════════════
+@app.post("/framework/graph/build")
+def graph_build():
+    """Scan the whole framework and build the Feature->Scenario->Step->
+    StepDefinition->PageMethod->Locator->TestData relationship graph."""
+    g = knowledge_graph.build_graph()
+    return g["stats"]
+
+
+@app.get("/framework/graph/stats")
+def graph_stats():
+    return knowledge_graph.get_graph()["stats"]
+
+
+@app.get("/framework/graph/trace")
+def graph_trace(step: str, keyword: str | None = None):
+    """'What does this step actually do?' — resolves a step sentence all the
+    way down to the page methods, locators, and test-data keys it touches."""
+    result = knowledge_graph.trace_step(step, keyword)
+    if result is None:
+        raise HTTPException(404, "No step definition matches this step text.")
+    return result
+
+
+@app.get("/framework/graph/impact")
+def graph_impact(locator: str):
+    """'What breaks if I change this locator?' — reverse lookup across every
+    page method, step definition, and scenario that touches it."""
+    return knowledge_graph.impact_of_locator(locator)
+
+
+@app.post("/execute/brd")
+async def execute_brd(file: UploadFile = File(...)):
+    """Upload a BRD (.pdf/.docx/.txt): AI drafts a feature file in the
+    framework's own conventions, then the draft enters the SAME Framework
+    Intelligence pipeline as a normal feature upload (match -> normalize ->
+    merge -> dry-run -> generate -> human review -> approve -> execute)."""
+    data = await file.read()
+    try:
+        brd_text = brd_processor.extract_text(file.filename, data)
+        result = brd_processor.brd_to_feature(brd_text, file.filename)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:          # Azure config/network errors, already user-facing
+        raise HTTPException(502, str(e))
+
+    feature_text = result["feature_text"]
+    stem = Path(file.filename).stem
+    dest = config.UPLOADS_DIR / f"{stem}.feature"
+    dest.write_text(feature_text, encoding="utf-8")
+
+    hit = indexer.lookup(result["txn"]) if result["txn"] else None
+    job = executor.start_job(str(dest), ai_ctx={
+        "uploaded_text": feature_text, "filename": dest.name,
+        "hit": hit, "module": result["module"] or (hit or {}).get("module"),
+    })
+    out = job.public()
+    out["generated_feature"] = feature_text
+    out["brd_conversion"] = {"txn": result["txn"], "module": result["module"]}
     return out
 
 
-_ROLE_SUFFIX = {"button": "Button", "a": "Link", "select": "Dropdown",
-               "textarea": "Textbox", "table": "Table", "img": "Image"}
+# ═══════════ CR Pipeline — multi-transaction BRD change requests (additive) ══
+class CRApproval(BaseModel):
+    """approved_txns=None approves everything staged; a list approves those and
+    skips the rest. edits: {txn: {feature_text, files:{rel_path: java}}}."""
+    approved_txns: list[str] | None = None
+    edits: dict | None = None
 
 
-def suggest_name(ev: dict) -> str:
-    """A meaningful Java field name per the spec (customerNameTextbox, not field1)."""
-    attrs = ev.get("attrs", {})
-    base = (attrs.get("aria-label") or attrs.get("placeholder") or attrs.get("name")
-            or attrs.get("id") or ev.get("text") or ev.get("tag", "element"))
-    # split on non-letters AND on camelCase boundaries, so "holdReason" -> hold, Reason
-    words = re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z]*|[a-z]+", base)[:5] or ["element"]
-    # drop a leading UI-hungarian prefix (btnSetHold -> setHoldButton, not btnSetHoldButton)
-    if len(words) > 1 and words[0].lower() in ("btn", "txt", "lbl", "ddl", "chk", "img", "lnk", "tbl"):
-        words = words[1:]
-    words = words[:4]
-    camel = words[0].lower() + "".join(w.capitalize() for w in words[1:])
-    tag, typ = ev.get("tag", ""), ev.get("type", "")
-    if tag == "input":
-        suffix = {"checkbox": "Checkbox", "radio": "Radio", "submit": "Button",
-                 "button": "Button"}.get(typ, "Textbox")
-    else:
-        suffix = _ROLE_SUFFIX.get(tag, "Element")
-    return camel if camel.lower().endswith(suffix.lower()) else camel + suffix
+@app.post("/execute/cr")
+async def execute_cr(file: UploadFile = File(...)):
+    """Upload a BRD as a CHANGE REQUEST that may span MANY transactions.
+    The BRD is parsed ONCE; every transaction number is discovered; each becomes
+    an independent work item (search -> compare -> delta-only merge -> dry-run ->
+    generate -> quarantine-compile). One failed transaction never stops the
+    queue. All staged changes pause at ONE consolidated review; approval then
+    archives, commits, compiles, and executes each transaction sequentially,
+    ending in a consolidated CR report."""
+    data = await file.read()
+    try:
+        brd_text = brd_processor.extract_text(file.filename, data)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if len(brd_text.strip()) < 40:
+        raise HTTPException(400, "The BRD appears to be empty or unreadable after text extraction.")
+    run = cr_pipeline.start_cr(file.filename, brd_text)
+    return run.public()
 
 
-# ─────────────────────── locator repository ──────────────────────────────────
-def _repo_file() -> Path:
-    return config.DATA_DIR / "locator_repository.json"
+@app.get("/cr/{run_id}")
+def cr_status(run_id: str):
+    run = cr_pipeline.CR_RUNS.get(run_id)
+    if not run:
+        raise HTTPException(404, "unknown CR run")
+    return run.public()
 
 
-def load_repository() -> list[dict]:
-    f = _repo_file()
-    return json.loads(f.read_text()) if f.exists() else []
+@app.get("/cr/{run_id}/logs")
+def cr_logs(run_id: str, offset: int = 0):
+    text, new_offset = cr_pipeline.read_log(run_id, offset)
+    return {"log": text, "offset": new_offset}
 
 
-def save_entries(entries: list[dict]) -> int:
-    repo = load_repository()
-    existing = {(e.get("name"), e.get("java")) for e in repo}
-    added = 0
-    for e in entries:
-        if (e.get("name"), e.get("java")) not in existing:
-            e.setdefault("saved_at", time.strftime("%Y-%m-%d %H:%M:%S"))
-            repo.append(e)
-            added += 1
-    _repo_file().write_text(json.dumps(repo, indent=1))
-    return added
+@app.get("/cr/{run_id}/pending")
+def cr_pending(run_id: str):
+    """Consolidated review payload: every staged transaction's merged feature +
+    generated java, editable before approval."""
+    run = cr_pipeline.CR_RUNS.get(run_id)
+    if not run:
+        raise HTTPException(404, "unknown CR run")
+    staged = [{
+        "txn": i.txn, "module": (i.hit or {}).get("module"),
+        "feature_path": (i.hit or {}).get("feature"),
+        "feature_text": i.merged_feature, "files": i.gen_files,
+        "scenarios_added": i.scenarios_added, "scenarios_replaced": i.scenarios_replaced,
+        "undefined_steps": i.undefined_steps, "delta_notes": i.delta_notes,
+        "warnings": i.warnings,
+    } for i in run.items if i.status == "staged"]
+    action_items = [{"txn": i.txn, "status": i.status, "action": i.action_required}
+                    for i in run.items if i.action_required]
+    return {"cr_run_id": run.id, "status": run.status, "cr_number": run.cr_number,
+            "staged": staged, "action_items": action_items}
 
 
-def repository_for_prompt(cap: int = 40) -> str:
-    """Captured locators formatted for the AI generation prompt — real,
-    human-verified locators the model must prefer over TODO guesses."""
-    lines = []
-    for e in reversed(load_repository()):          # newest first
-        lines.append(f'{e.get("name")}: {e.get("java")}   '
-                     f'[screen: {e.get("screen", e.get("title", "?"))}]')
-        if len(lines) >= cap:
-            break
-    return "\n".join(lines)
+@app.post("/cr/{run_id}/approve")
+def cr_approve(run_id: str, body: CRApproval):
+    """Commits (archive -> write -> compile) the approved transactions ONLY.
+    Nothing executes here — committed transactions become 'ready'; run them
+    per-transaction or all together via /cr/{id}/execute."""
+    try:
+        run = cr_pipeline.approve_cr(run_id, body.approved_txns, body.edits)
+    except KeyError:
+        raise HTTPException(404, "unknown CR run")
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    return run.public()
 
 
-# ─────────────────────── live session management ─────────────────────────────
-_session: dict = {"driver": None, "events": [], "thread": None, "stop": False}
-_LOCK = threading.Lock()
+class CRExecute(BaseModel):
+    """txns=None executes every 'ready' transaction; a list executes only those
+    (a single-element list = run just that one transaction)."""
+    txns: list[str] | None = None
 
 
-def _new_driver(url: str):
-    from selenium import webdriver
-    from selenium.webdriver.edge.options import Options
-    from selenium.webdriver.edge.service import Service
-    opts = Options()
-    opts.add_argument("--start-maximized")
-    driver_path = getattr(config, "EDGE_DRIVER_PATH", "")
-    service = Service(executable_path=driver_path) if driver_path and Path(driver_path).exists() else Service()
-    driver = webdriver.Edge(service=service, options=opts)
-    if url:
-        driver.get(url)
-    return driver
+@app.post("/cr/{run_id}/execute")
+def cr_execute(run_id: str, body: CRExecute | None = None):
+    try:
+        run = cr_pipeline.execute_txns(run_id, body.txns if body else None)
+    except KeyError:
+        raise HTTPException(404, "unknown CR run")
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    return run.public()
 
 
-def _drain_all_contexts(driver) -> list[dict]:
-    """Inject-if-missing and drain events from the top document and every
-    same-origin first-level iframe."""
-    collected = []
+@app.post("/cr/{run_id}/stop")
+def cr_stop(run_id: str):
+    """Tree-kill the currently running transaction (java -> msedgedriver ->
+    Edge) and skip the rest of the batch; unexecuted transactions stay 'ready'."""
+    try:
+        run = cr_pipeline.stop_cr(run_id)
+    except KeyError:
+        raise HTTPException(404, "unknown CR run")
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    return run.public()
 
-    def drain_current():
+
+@app.post("/cr/{run_id}/discard")
+def cr_discard(run_id: str):
+    try:
+        run = cr_pipeline.discard_cr(run_id)
+    except KeyError:
+        raise HTTPException(404, "unknown CR run")
+    return run.public()
+
+
+@app.get("/cr/{run_id}/report")
+def cr_report(run_id: str):
+    run = cr_pipeline.CR_RUNS.get(run_id)
+    if not run:
+        raise HTTPException(404, "unknown CR run")
+    return run.report or cr_pipeline.build_report(run)
+
+
+# ═══════════ Locator Intelligence — human-workflow recorder (additive) ══════
+class RecorderStart(BaseModel):
+    url: str | None = None
+
+
+@app.post("/recorder/start")
+def recorder_start(body: RecorderStart):
+    """Launch Edge with the event recorder injected. A human then performs the
+    workflow MANUALLY in that window; every click/typed field captures the
+    element's DOM identity (never the typed values)."""
+    try:
+        return recorder.start(body.url or getattr(config, "RECORDER_DEFAULT_URL", ""))
+    except RuntimeError as e:
+        raise HTTPException(409 if "already running" in str(e) else 502, str(e))
+
+
+@app.get("/recorder/status")
+def recorder_status():
+    return recorder.status()
+
+
+@app.post("/recorder/stop")
+def recorder_stop():
+    """Close the recording browser and return every captured element with its
+    prioritized locator candidates + suggested Java field name, for review."""
+    return recorder.stop()
+
+
+class RecorderSave(BaseModel):
+    entries: list[dict]
+
+
+@app.post("/recorder/save")
+def recorder_save(body: RecorderSave):
+    """Persist reviewed locators to the Locator Knowledge Repository. They are
+    injected into every future AI generation, replacing TODO guesses."""
+    added = recorder.save_entries(body.entries)
+    return {"added": added, "total": len(recorder.load_repository())}
+
+
+# ═══════════ Standalone Record -> Generate (brand-new transactions) ═════════
+# For transactions the CR pipeline reports `not_found` (no existing feature/
+# page/steps): record the transaction once, then generate a full three-file
+# scaffold from that recording. Same human Approve + compile gate as every
+# other framework write (README §1) — these endpoints only STAGE.
+
+class ScaffoldStop(BaseModel):
+    txn: str
+
+
+@app.post("/scaffold/record/stop")
+def scaffold_record_stop(body: ScaffoldStop):
+    """Stop the current recording and SAVE it against a transaction number so
+    the scaffold generator can turn it into feature+page+steps. Non-sensitive
+    typed values are kept as Examples data; sensitive fields were already
+    redacted in the browser and resolve via the properties util at generation."""
+    result = recorder.stop()
+    saved = recorder.save_session(body.txn, result)
+    return {"txn": saved["txn"], "events": saved["events"],
+            "captured": result.get("captured", 0), "session": saved["path"]}
+
+
+@app.post("/scaffold/generate/{txn}")
+def scaffold_generate(txn: str):
+    """Generate (but do NOT write) the feature + page + steps for a recorded
+    transaction. Returns the three files for preview; commit goes through the
+    normal approve/compile gate."""
+    from . import scaffold_generator
+    try:
+        result = scaffold_generator.generate_scaffold(txn)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    return {"txn": result["model"]["txn"], "feature": result["feature"],
+            "files": result["files"],
+            "reader": result["reader"],
+            "params": result["model"]["params"],
+            "sensitive": result["model"]["sensitive"],
+            "gherkin": "Scenario Outline" if result["model"]["outline"] else "Scenario"}
+
+
+@app.get("/scaffold/session/{txn}")
+def scaffold_session(txn: str):
+    """Inspect the latest saved recording for a transaction before generating."""
+    session = recorder.latest_session(txn)
+    if not session:
+        raise HTTPException(404, f"No recorded session for {txn}.")
+    return {"txn": session.get("txn"), "recorded_at": session.get("recorded_at"),
+            "events": len(session.get("events", []))}
+
+
+@app.post("/jobs/{job_id}/heal")
+def job_heal(job_id: str):
+    """Self-healing: use the captured DOM of the failed screen to repair
+    locators, then route through review/approve (auto under CI policy)."""
+    try:
+        return executor.heal_job(job_id).public()
+    except KeyError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.get("/jobs/{job_id}/captures")
+def job_captures(job_id: str):
+    idx = runtime_capture.capture_dir_for(job_id) / "index.json"
+    if not idx.exists():
+        raise HTTPException(404, "No captures for this job.")
+    import json as _json
+    return {"checkpoints": _json.loads(idx.read_text())}
+
+
+# ═══════════ Capture Mode — runtime inspection ingestion (additive) ═════════
+class CaptureIn(BaseModel):
+    run_id: str | None = None
+    txn: str | None = None
+    checkpoint: str
+    html: str | None = None
+    screenshot_b64: str | None = None
+    metadata: dict | None = None
+
+
+@app.post("/capture/ingest")
+def capture_ingest(body: CaptureIn):
+    """Receive one runtime capture pushed by the Java framework when it reaches
+    a checkpoint screen. The framework navigates; this only stores what it
+    saw. Screenshot+HTML+metadata are persisted for AI reasoning."""
+    return capture.store_capture(body.run_id, body.txn, body.checkpoint,
+                                 body.html or "", body.screenshot_b64 or "", body.metadata)
+
+
+@app.get("/capture/list")
+def capture_list(run_id: str | None = None, txn: str | None = None):
+    return {"captures": capture.list_captures(run_id, txn)}
+
+
+@app.get("/txns")
+def search_txns(q: str = "", all: bool = False):
+    """Returns [{txn, module, file}] — the full list when all=1 so the UI can
+    offer a scrollable, searchable dropdown of every feature."""
+    idx = indexer.get_index()
+    q = q.lower()
+    items = []
+    from pathlib import Path as _P
+    for k, v in idx.items():
+        if not v.get("feature"):
+            continue  # java-only entries can't be executed — keep them out of the picker
+        name = v.get("txn") or k
+        if q and q not in name.lower() and q not in (v.get("feature") or "").lower():
+            continue
+        items.append({"txn": name, "module": v.get("module") or "",
+                      "file": _P(v["feature"]).name})
+    items.sort(key=lambda x: int(re.sub(r"\D", "", x["txn"]) or 0))
+    if not all:
+        items = items[:50]
+    return {"count": len(items), "txns": items}
+
+
+# ───────────────────────── flow 1: run by txn number ────────────────────────
+@app.post("/execute/txn/{txn_no}")
+def execute_txn(txn_no: str, capture: bool = False, params: RunParams | None = None):
+    """txn_no arrives as e.g. 'Txn36048' or 'txn69069' (prefix chosen in the UI).
+    We locate the feature via the index, VERIFY the matching @tag exists inside
+    the feature file, then run with cucumber.filter.tags=<that exact tag> —
+    same effect as replacing the number in TestRunner's tags, but with no
+    Java edit and no recompile."""
+    hit = indexer.lookup(txn_no)
+    if not hit:
+        raise HTTPException(404, f"Txn '{txn_no}' not found in index. Try POST /index/rebuild.")
+    if not hit.get("feature"):
+        raise HTTPException(409,
+            f"{hit['txn']} has step-definition/page Java files but NO .feature file was found "
+            f"for this number anywhere under {config.FEATURES_DIR.name}. This transaction is "
+            f"not automatable until its feature file exists (check the filename's Txn number).")
+
+    # find the matching tag inside the feature file. Frameworks tag in several
+    # styles, so we accept (in priority order):
+    #   1. @Txn012000                              (exact, any casing)
+    #   2. @Txn012000_LoansCreateLoanDetails       (starts with the txn id)
+    #   3. @12000                                  (bare number, zero-padding ignored)
+    from pathlib import Path as _P
+    text = _P(hit["feature"]).read_text(encoding="utf-8", errors="ignore")
+    tags_in_file = re.findall(r"@[\w]+", text)
+    digits = re.sub(r"\D", "", txn_no)
+
+    def _match_rank(t: str) -> int:
+        low = t.lower().lstrip("@")
+        if low == f"txn{digits}".lower():
+            return 1
+        if low.startswith(f"txn{digits}".lower()) and not low[len(f"txn{digits}"):][:1].isdigit():
+            return 2
+        if low.isdigit() and low.lstrip("0") == digits.lstrip("0"):
+            return 3
+        return 99
+
+    tag = min(tags_in_file, key=_match_rank, default=None)
+    if tag is not None and _match_rank(tag) == 99:
+        tag = None
+    if not tag:
+        raise HTTPException(409,
+            f"Feature found ({_P(hit['feature']).name}) but it has no @{txn_no} tag. "
+            f"Tags present in the file: {sorted(set(tags_in_file)) or 'none'}. "
+            f"Add the tag above the Scenario/Feature line, or run without tag matching.")
+
+    job = executor.start_job(hit["feature"],
+                             run_params=params.model_dump() if params else None,
+                             tag_filter=tag)
+    return {"txn": hit["txn"], "module": hit["module"], "tag": tag, **job.public()}
+
+
+# ───────────────────── flow 2: run an uploaded feature ──────────────────────
+@app.post("/execute/upload")
+async def execute_upload(
+    file: UploadFile = File(...),
+    dry_run: bool = False,
+    ai: bool = False,
+    capture: bool = False,
+    url: str | None = Form(None),
+    maker_id: str | None = Form(None),
+    maker_password: str | None = Form(None),
+    checker_id: str | None = Form(None),
+    checker_password: str | None = Form(None),
+):
+    if not file.filename.endswith(".feature"):
+        raise HTTPException(400, "Please upload a .feature file.")
+    text = (await file.read()).decode("utf-8", errors="ignore")
+    import re as _re
+    has_feature = _re.search(r"^\s*(?:@\S+\s*)*Feature:", text, _re.M)
+    has_scenario = _re.search(r"^\s*Scenario(?: Outline)?:", text, _re.M)
+    has_step = _re.search(r"^\s*(?:Given|When|Then|And|But)\s+\S", text, _re.M)
+    if not (has_feature and has_scenario and has_step):
+        missing = [n for ok, n in [(has_feature, "a 'Feature:' header"),
+                                    (has_scenario, "a 'Scenario:' line"),
+                                    (has_step, "Given/When/Then steps")] if not ok]
+        raise HTTPException(400,
+            f"'{file.filename}' is not valid Gherkin — it is missing {', '.join(missing)}. "
+            "Cucumber needs: Feature: <title>, then Scenario: <name>, then Given/When/Then steps. "
+            "If this is a solution/requirements document, a proper .feature must be written from it first.")
+
+    module = indexer.detect_module(text)
+    dest = config.UPLOADS_DIR / file.filename
+    dest.write_text(text, encoding="utf-8")
+
+    run_params = {
+        "url": url,
+        "maker_id": maker_id,
+        "maker_password": maker_password,
+        "checker_id": checker_id,
+        "checker_password": checker_password,
+    }
+    ai_ctx = None
+    if ai:
+        # identify the transaction from the filename first, then the content
+        m = indexer.TXN_RE.search(file.filename) or indexer.TXN_RE.search(text)
+        hit = indexer.lookup(m.group(1)) if m else None
+        ai_ctx = {"uploaded_text": text, "filename": file.filename,
+                  "hit": hit, "module": (hit or {}).get("module") or module}
+    job = executor.start_job(str(dest), dry_run=dry_run, run_params=run_params,
+                             ai_ctx=ai_ctx)
+    closest = indexer.closest_feature(text, module)
+    return {
+        "module_detected": module,
+        "closest_existing_feature": closest,
+        "hint": "If the run reports undefined_steps, the framework has no Java glue "
+                "for those lines — reuse the closest_existing_feature's wording, "
+                "or generate new step definitions (phase 2).",
+        **job.public(),
+    }
+
+
+# ─────────────────────────── job status / logs ──────────────────────────────
+@app.get("/jobs/{job_id}/pending")
+def job_pending(job_id: str):
+    """The proposed changes for the in-browser review editor."""
+    job = executor.JOBS.get(job_id)
+    if not job or job.status != "review" or not job.pending:
+        raise HTTPException(404, "No changes awaiting review for this job.")
+    p = job.pending
+    hit = p.get("hit") or {}
+
+    old_feature_text = ""
+    if hit.get("feature"):
         try:
-            driver.execute_script(RECORDER_JS)
-            collected.extend(driver.execute_script(DRAIN_JS) or [])
-        except Exception:  # noqa: BLE001 — page mid-navigation; next poll catches up
+            old_feature_text = Path(hit["feature"]).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
             pass
 
-    try:
-        driver.switch_to.default_content()
-    except Exception:  # noqa: BLE001
-        return collected
-    drain_current()
-    try:
-        from selenium.webdriver.common.by import By
-        frames = driver.find_elements(By.TAG_NAME, "iframe")
-        for i in range(len(frames)):
+    old_files: dict[str, str | None] = {}
+    for rel in p["files"]:
+        f = config.JAVA_SRC_ROOT / rel
+        if f.exists():
             try:
-                driver.switch_to.default_content()
-                driver.switch_to.frame(i)
-                drain_current()
-            except Exception:  # noqa: BLE001 — cross-origin or vanished frame
-                continue
-        driver.switch_to.default_content()
-    except Exception:  # noqa: BLE001
-        pass
-    return collected
+                old_files[rel] = f.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                old_files[rel] = None
+        else:
+            old_files[rel] = None  # brand-new file — every line is "added"
+
+    return {
+        "feature_text": p["feature_text"], "files": p["files"], "meta": p["meta"],
+        "old_feature_text": old_feature_text, "old_files": old_files,
+        "match": {
+            "txn": hit.get("txn"), "module": hit.get("module"),
+            "confidence": p["meta"].get("matched_via_fallback_score"),  # None = direct/exact match
+            "is_new_feature": not bool(hit.get("feature")),
+        },
+    }
 
 
-def _poll_loop():
-    while not _session["stop"]:
-        driver = _session["driver"]
-        if driver is None:
-            break
-        for ev in _drain_all_contexts(driver):
-            ev["derived"] = derive_locators(ev)
-            ev["suggested_name"] = suggest_name(ev)
-            _session["events"].append(ev)
-        time.sleep(0.8)
+class Approval(BaseModel):
+    feature_text: str | None = None
+    files: dict[str, str] | None = None
 
 
-def start(url: str = "") -> dict:
-    with _LOCK:
-        if _session["driver"] is not None:
-            raise RuntimeError("A recording session is already running - stop it first.")
-        try:
-            driver = _new_driver(url)
-        except Exception as e:  # noqa: BLE001
-            raise RuntimeError(
-                f"Could not launch Edge for recording ({e.__class__.__name__}: {e}). "
-                "Check EDGE_DRIVER_PATH in config.py points at msedgedriver.exe "
-                "and that its version matches the installed Edge browser.")
-        _session.update(driver=driver, events=[], stop=False)
-        t = threading.Thread(target=_poll_loop, daemon=True)
-        _session["thread"] = t
-        t.start()
-    return {"running": True, "url": url}
-
-
-def status() -> dict:
-    events = _session["events"]
-    return {"running": _session["driver"] is not None, "captured": len(events),
-            "recent": [{"kind": e["kind"], "tag": e["tag"],
-                        "name": e["suggested_name"],
-                        "top_locator": e["derived"][0]["java"] if e["derived"] else None}
-                       for e in events[-5:]]}
-
-
-def stop() -> dict:
-    with _LOCK:
-        driver = _session["driver"]
-        _session["stop"] = True
-        _session["driver"] = None
-        if driver is not None:
-            try:
-                driver.quit()
-            except Exception:  # noqa: BLE001
-                pass
-        events = _session["events"]
-        _session["events"] = []
-    return {"captured": len(events), "events": [
-        {"kind": e["kind"], "tag": e["tag"], "type": e.get("type", ""),
-         "text": e.get("text", ""), "title": e.get("title", ""), "url": e.get("url", ""),
-         "suggested_name": e["suggested_name"], "candidates": e["derived"],
-         # Value capture (safe-middle): non-sensitive fields carry their real
-         # typed value as an example; sensitive fields carry only '[REDACTED]'
-         # plus the sensitive flag, and resolve via the properties util at
-         # generation time. had_value distinguishes "typed nothing" from
-         # "typed a secret we redacted".
-         "value": e.get("value"), "sensitive": e.get("sensitive", False),
-         "had_value": e.get("had_value", False),
-         "param_name": _param_name_for(e)}
-        for e in events]}
-
-
-# ─────────────────────── parameter naming (pure) ─────────────────────────────
-def _param_name_for(ev: dict) -> str | None:
-    """A stable Gherkin/Examples parameter name for an input field, derived
-    from the same identity used for the Java field name but without the
-    role suffix (customerName, not customerNameTextbox). Returns None for
-    non-input events (clicks on buttons/links carry no parameter)."""
-    if ev.get("kind") != "input" or not ev.get("had_value"):
-        return None
-    attrs = ev.get("attrs", {})
-    base = (attrs.get("aria-label") or attrs.get("placeholder") or attrs.get("name")
-            or attrs.get("id") or ev.get("text") or "value")
-    words = re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z]*|[a-z]+", base)[:4] or ["value"]
-    if len(words) > 1 and words[0].lower() in ("btn", "txt", "lbl", "ddl", "chk", "img", "lnk", "tbl"):
-        words = words[1:]
-    return words[0].lower() + "".join(w.capitalize() for w in words[1:])
-
-
-# ─────────────────── scaffold-session persistence (per txn) ──────────────────
-def _sessions_root() -> Path:
-    d = config.DATA_DIR / "recorded_sessions"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def save_session(txn: str, stop_result: dict, meta: dict | None = None) -> dict:
-    """Persist a completed recording session for a transaction so the
-    standalone scaffold generator can turn it into feature+page+steps.
-    Sensitive values are already '[REDACTED]' by the in-browser capture,
-    so nothing secret is written here."""
-    digits = re.sub(r"\D", "", str(txn or ""))
-    txn_c = ("Txn" + digits.lstrip("0")) if digits else "unknown"
-    folder = _sessions_root() / txn_c
-    folder.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    payload = {"txn": txn_c, "recorded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-               "meta": dict(meta or {}), "events": stop_result.get("events", [])}
-    out = folder / f"{stamp}.json"
-    out.write_text(json.dumps(payload, indent=1))
-    return {"txn": txn_c, "path": str(out), "events": len(payload["events"])}
-
-
-def latest_session(txn: str) -> dict | None:
-    digits = re.sub(r"\D", "", str(txn or ""))
-    txn_c = ("Txn" + digits.lstrip("0")) if digits else "unknown"
-    folder = _sessions_root() / txn_c
-    if not folder.exists():
-        return None
-    files = sorted(folder.glob("*.json"), reverse=True)
-    if not files:
-        return None
+@app.post("/jobs/{job_id}/approve")
+def job_approve(job_id: str, body: Approval):
     try:
-        return json.loads(files[0].read_text())
-    except Exception:  # noqa: BLE001
-        return None
+        job = executor.approve_job(job_id, body.feature_text, body.files)
+    except KeyError as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(422, "Your edited java does not compile:\n" + str(e))
+    return job.public()
+
+
+@app.post("/jobs/{job_id}/discard")
+def job_discard(job_id: str):
+    if not executor.discard_job(job_id):
+        raise HTTPException(409, "Job is not awaiting review.")
+    return {"job_id": job_id, "status": "discarded"}
+
+
+@app.post("/jobs/{job_id}/stop")
+def stop_job(job_id: str):
+    ok = executor.stop_job(job_id)
+    if not ok:
+        raise HTTPException(409, "Job is not running (or unknown id).")
+    return {"job_id": job_id, "status": "stopping"}
+
+
+@app.get("/jobs/{job_id}")
+def job_status(job_id: str):
+    job = executor.JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Unknown job id.")
+    return job.public()
+
+
+@app.get("/jobs/{job_id}/logs")
+def job_logs(job_id: str, offset: int = 0):
+    chunk, new_offset = executor.read_log(job_id, offset)
+    job = executor.JOBS.get(job_id)
+    return {
+        "log": chunk,
+        "next_offset": new_offset,
+        "status": job.status if job else "unknown",
+    }
+
+
+# ───────────────────────── serve the frontend ───────────────────────────────
+# Must be mounted LAST so it doesn't shadow the API routes above.
+# Open http://localhost:8000 in a browser after starting uvicorn.
+from pathlib import Path as _Path
+from fastapi.staticfiles import StaticFiles
+
+_FRONTEND_DIR = _Path(__file__).resolve().parent.parent / "frontend"
+if _FRONTEND_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIR), html=True), name="frontend")
