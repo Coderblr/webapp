@@ -1,197 +1,325 @@
 """
-Step 14 — Self-Healing Execution Loop.
+Autonomous Locator Discovery — the piece that was missing between "we captured
+the DOM" and "we know which element a step means". Without this, the AI free-
+guesses locators from a step's wording alone (fragile: contains(text(),
+'Submit')). With it, the AI is told the SPECIFIC real element for that step,
+extracted from the actual captured page.
 
-HONEST ARCHITECTURAL NOTE, stated plainly rather than glossed over: "retry"
-here means relaunching the SAME feature execution as a fresh `java` process
-from the top, not resuming the exact paused Selenium session mid-script.
-Literal mid-script resume is not achievable — Python orchestrates a SEPARATE
-JVM process and has no way to pause/inspect/resume live Java thread state,
-the same physical constraint documented in capture.py. What IS achievable,
-and what this delivers, is the practical outcome the spec actually asks for:
-zero manual steps between a locator failure and a corrected, re-executed
-result.
+This is genuinely autonomous — no human recording session required for THIS
+step. The one thing that remains a one-time framework setup (not a per-run
+manual action) is the Java capture hook that writes the live page to disk when
+Python has no other way to see a separate browser process. That is a physical
+constraint of process isolation, not a design choice.
 
-Requires Capture Mode to have been active for the run (a failure-point DOM
-capture must exist) — this module has no way to inspect a live browser it
-never captured.
+Pipeline:
+  captured page.html
+    -> extract_candidates(): every input/button/select/a/textarea with its
+       REAL surrounding context (associated <label>, fieldset/legend, nearby
+       text, radio/checkbox value, table header)
+    -> score against the step's business wording (e.g. "select court order as
+       no" -> looks for a control near text "Court Order" whose value/label is
+       "No")
+    -> best match -> a stable locator via the SAME priority-ordered derivation
+       already proven in recorder.py (data-testid > id > name > aria-label > ...)
 
-One heal attempt = classify the failure -> trace it to the SPECIFIC page
-locator field via the knowledge graph (static analysis, already proven) ->
-get the failure-point captured DOM -> run locator discovery (DOM, then
-vision fallback) -> surgically patch ONLY that one field's declaration ->
-recompile. The executor (not this module) owns re-launching the job and
-enforcing the retry cap — this module never loops on its own, keeping it
-simple, testable, and impossible to run away unbounded.
+Never invents an element that isn't actually in the captured HTML — if nothing
+scores above threshold, returns None and the caller must fall back to the
+existing TODO-marker / locator-gate behaviour, never a blind guess.
 """
+import json
 import re
-from pathlib import Path
+from bs4 import BeautifulSoup
 
-from . import config
+from .recorder import derive_locators, suggest_name  # reuse the proven derivation logic
 
-LOCATOR_EXCEPTIONS = ("NoSuchElementException", "TimeoutException",
-                     "StaleElementReferenceException", "ElementNotInteractableException",
-                     "ElementClickInterceptedException", "InvalidSelectorException")
-
-_TXN_RE = re.compile(r"Txn0*(\d+)", re.IGNORECASE)
+_STOPWORDS = {"the", "a", "an", "is", "as", "on", "in", "of", "to", "for", "we", "i",
+             "select", "click", "enter", "check", "screen", "and", "with"}
+_INTERACTIVE_TAGS = ("input", "button", "select", "textarea", "a")
 
 
-def classify_failure(job_summary: dict) -> dict | None:
-    """The first failed step whose error looks like a locator problem, or
-    None if this failure is a different kind of problem entirely (self-heal
-    correctly does not apply to e.g. a business-logic assertion failure)."""
-    for sc in job_summary.get("scenarios", []):
-        if sc.get("status") != "failed":
+def _tokens(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-zA-Z]{3,}", (text or "").lower()) if w not in _STOPWORDS}
+
+
+def _value_tokens(text: str) -> set[str]:
+    """Lenient tokenizer for QUOTED literal values only (e.g. "no", "F") —
+    these are always intentional regardless of length, unlike incidental short
+    words in free step wording."""
+    return {w for w in re.findall(r"[a-zA-Z0-9]{1,}", (text or "").lower())}
+
+
+def _own_option_text(el) -> str:
+    """For a radio/checkbox specifically: the text immediately following IT
+    (its own option label, e.g. 'No'), not the group label. Walks forward
+    past the element itself, stopping at the next form control."""
+    node = el.next_sibling
+    hops = 0
+    while node is not None and hops < 4:
+        if hasattr(node, "name") and node.name in _INTERACTIVE_TAGS:
+            break
+        text = node.get_text(strip=True) if hasattr(node, "get_text") else str(node).strip()
+        if text:
+            return text
+        node = node.next_sibling
+        hops += 1
+    return ""
+
+
+def _group_label(soup: BeautifulSoup, el) -> str:
+    """The label for the whole control GROUP (e.g. 'Court Order' for a Yes/No
+    radio pair) — the nearest <label> that is NOT itself wrapping one specific
+    option, found by walking up to the nearest row/container ancestor first."""
+    for container in el.find_parents(["div", "tr", "fieldset", "li"]):
+        lbl = container.find("label", recursive=False) or \
+            (container.find("legend") if container.name == "fieldset" else None)
+        if lbl and lbl.get_text(strip=True):
+            return lbl.get_text(strip=True)
+        # a label that appears before this element within the same container,
+        # not wrapping a sibling input
+        for child in container.find_all(["label", "legend"]):
+            if child.get_text(strip=True) and child.find(_INTERACTIVE_TAGS) is None:
+                return child.get_text(strip=True)
+        if container.name in ("tr",):
+            break  # don't escalate past a table row
+    return ""
+
+
+def _label_for(soup: BeautifulSoup, el) -> str:
+    """Full real context for a form control: group label (e.g. 'Court Order')
+    combined with this SPECIFIC option's own text (e.g. 'No') when the element
+    is part of a radio/checkbox group — the two are kept separable so a step
+    like 'select court order as no' can match on both parts without confusing
+    it with a sibling option's text."""
+    el_id = el.get("id")
+    if el_id:
+        lbl = soup.find("label", attrs={"for": el_id})
+        if lbl and lbl.get_text(strip=True):
+            return lbl.get_text(strip=True)
+    parent_label = el.find_parent("label")
+    if parent_label:
+        return parent_label.get_text(strip=True)
+    if el.get("aria-label"):
+        return el["aria-label"]
+    if el.get("aria-labelledby"):
+        ref = soup.find(id=el["aria-labelledby"])
+        if ref:
+            return ref.get_text(strip=True)
+
+    if el.name == "input" and el.get("type") in ("radio", "checkbox"):
+        group = _group_label(soup, el)
+        own = _own_option_text(el)
+        return f"{group} {own}".strip()
+
+    fieldset = el.find_parent("fieldset")
+    if fieldset:
+        legend = fieldset.find("legend")
+        if legend:
+            return legend.get_text(strip=True)
+    td = el.find_parent("td")
+    if td:
+        idx = list(td.parent.find_all("td")).index(td) if td.parent else -1
+        table = td.find_parent("table")
+        if table and idx >= 0:
+            headers = table.find_all("th")
+            if idx < len(headers):
+                return headers[idx].get_text(strip=True)
+    # generic fallback: nearest preceding label-ish text within 2 hops
+    prev = el.find_previous(["label", "legend"])
+    if prev and prev.get_text(strip=True):
+        return prev.get_text(strip=True)
+    return ""
+
+
+def extract_candidates(html: str) -> list[dict]:
+    """Every interactive element actually present in the captured page, with
+    real context. Never fabricates an element."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    out = []
+    for el in soup.find_all(_INTERACTIVE_TAGS):
+        if el.get("type") == "hidden" or el.get("disabled") is not None:
             continue
-        for st in sc.get("steps", []):
-            if st.get("status") == "failed" and any(exc in (st.get("error") or "") for exc in LOCATOR_EXCEPTIONS):
-                return {"step_text": st["name"], "keyword": st.get("keyword", ""),
-                       "error": (st.get("error") or "")[:500]}
-    return None
+        attrs = {k: v for k, v in el.attrs.items()
+                if k in ("id", "name", "type", "aria-label", "placeholder",
+                        "data-testid", "data-qa", "value", "class")
+                and isinstance(v, str)}
+        label = _label_for(soup, el)
+        own_text = el.get_text(strip=True) if el.name in ("button", "a") else ""
+        out.append({
+            "tag": el.name, "type": attrs.get("type", ""), "attrs": attrs,
+            "text": own_text, "label": label,
+            "context": f"{label} {own_text} {attrs.get('placeholder', '')} "
+                      f"{attrs.get('value', '')} {attrs.get('aria-label', '')}".strip(),
+            "ancestors": [],  # derive_locators tolerates an empty ancestor chain
+        })
+    return out
 
 
-def _txn_for_job(job) -> str | None:
-    m = _TXN_RE.search(Path(job.feature_path).stem)
-    if m:
-        return m.group(1)
-    ctx = getattr(job, "ai_ctx", None) or {}
-    if ctx.get("txn"):
-        return ctx["txn"]
-    hit = (ctx.get("hit") or {}) if ctx else {}
-    return hit.get("txn")
-
-
-def _field_for_step(step_text: str, keyword: str) -> dict | None:
-    """Which real Page class + which locator FIELD this step's resolved chain
-    currently uses, via the knowledge graph's already-proven static tracing —
-    never guessed, only what the real compiled call chain actually shows."""
-    from . import knowledge_graph
-    trace = knowledge_graph.trace_step(step_text, keyword)
-    if not trace or not trace.get("calls_page_methods"):
+def best_match_for_step(step_text: str, html: str, min_score: float = 0.2) -> dict | None:
+    """The single best real element for a step's business meaning, or None if
+    nothing in the captured page is a confident match (never guesses)."""
+    candidates = extract_candidates(html)
+    if not candidates:
         return None
-    call = trace["calls_page_methods"][0]
-    if not call.get("locators_used"):
+    step_tokens = _tokens(step_text)
+    if not step_tokens:
         return None
-    return {"page_class": call["page_class"], "field_name": call["locators_used"][0]}
 
+    # value-aware boost: "select court order as no" should prefer a radio/option
+    # whose own value/label token-matches "no" specifically, not just "court order"
+    # Value-assignment detection: ONLY treat a quoted string as "the value this
+    # element must equal" when the step uses the specific "...as 'value'"
+    # pattern (the real convention in this framework's Gherkin) — a quoted
+    # transaction/screen number elsewhere in the step (e.g. 'on "20035" screen')
+    # is NOT a value slot and must never penalize unrelated candidates like a
+    # Submit button.
+    as_match = re.search(r'\bas\s+"([^"]+)"', step_text, re.I)
+    target_value_tokens = _value_tokens(as_match.group(1)) if as_match else set()
 
-def _find_page_file(page_class: str) -> Path | None:
-    base = getattr(config, "PAGES_DIR", None)
-    if not base or not Path(base).exists():
+    best, best_score = None, 0.0
+    for c in candidates:
+        ctx_tokens = _tokens(c["context"])
+        overlap = step_tokens & ctx_tokens
+        score = len(overlap) / max(1, len(step_tokens))
+        if target_value_tokens and c["tag"] == "input" and c.get("type") in ("radio", "checkbox"):
+            value_tokens = _value_tokens(c["attrs"].get("value", "") + " " + c["label"])
+            matched = target_value_tokens & value_tokens
+            if matched:
+                # exact literal-value match on a SHORT, precise token (e.g. "no")
+                # decisively disambiguates sibling radios (Yes vs No) where
+                # general context overlap alone is otherwise identical.
+                score += 0.6 * (len(matched) / len(target_value_tokens))
+            else:
+                # this radio is part of the SAME group but has the WRONG value
+                # for what the step asked for — penalize so a sibling doesn't
+                # win purely on shared group-label context overlap.
+                score -= 0.3
+        if score > best_score:
+            best_score, best = score, c
+    if not best or best_score < min_score:
         return None
-    for f in Path(base).rglob(f"{page_class}.java"):
-        return f
-    return None
+
+    locators = derive_locators(best)
+    return {
+        "score": round(best_score, 3), "tag": best["tag"], "context": best["context"][:80],
+        "suggested_name": suggest_name(best), "candidates": locators,
+        "top_locator": locators[0]["java"] if locators else None,
+    }
 
 
-def patch_locator_field(page_file: Path, field_name: str, new_java_locator: str, log) -> bool:
-    """Surgically replace ONE field's declaration value — every other line in
-    the file, every other field, every method, is untouched. Returns False
-    (no-op) if the field can't be found or the value is already identical."""
-    text = page_file.read_text(encoding="utf-8", errors="ignore")
-    pattern = re.compile(
-        r'(\b(?:private|protected|public)?\s*(?:static\s+)?(?:final\s+)?By\s+' +
-        re.escape(field_name) + r'\s*=\s*)[^;]+;')
-    m = pattern.search(text)
-    if not m:
-        log(f">>> Self-heal: could not find field '{field_name}' in {page_file.name} to patch.")
-        return False
-    if new_java_locator in m.group(0):
-        return False  # already this exact locator — nothing to change
-    new_text = pattern.sub(lambda mm: mm.group(1) + new_java_locator + ";", text, count=1)
-    page_file.write_text(new_text, encoding="utf-8")
-    log(f">>> Self-heal: patched {page_file.name}.{field_name} -> {new_java_locator}")
-    return True
+def discover_for_steps(step_texts: list[str], html: str, screenshot_b64: str | None = None,
+                       log=lambda m: None) -> dict[str, dict]:
+    """Best-effort discovery for a batch of steps against one captured page.
+    DOM-based matching (Level 3) runs first for every step; for any step it
+    can't confidently resolve, vision-assisted disambiguation (Level 4) is
+    attempted IF a screenshot is available and Azure is configured — vision
+    only ever picks among the SAME real DOM candidates, never invents one."""
+    out = {}
+    unresolved = []
+    for st in step_texts:
+        m = best_match_for_step(st, html)
+        if m:
+            out[st] = m
+        else:
+            unresolved.append(st)
+    if unresolved and screenshot_b64:
+        for st in unresolved:
+            vm = vision_match_for_step(st, html, screenshot_b64, log)
+            if vm:
+                out[st] = vm
+    return out
 
 
-def attempt_heal(job, log) -> dict:
-    """One heal attempt. Returns:
-      {"healed": bool, "reason": str, "patched_file": str|None, "field": str|None}
-    Never re-executes anything itself — the caller decides whether/how to
-    re-run after a successful patch+recompile."""
-    failure = classify_failure(job.summary or {})
-    if not failure:
-        return {"healed": False, "reason": "Failure is not locator-shaped "
-               "(no NoSuchElement/Timeout/StaleElement/NotInteractable exception found) "
-               "— self-heal does not apply to this kind of failure.", "patched_file": None, "field": None}
-
-    field = _field_for_step(failure["step_text"], failure["keyword"])
-    if not field:
-        return {"healed": False, "reason": f'Could not trace "{failure["step_text"][:70]}" to a '
-               "specific page locator field via the knowledge graph — no safe, targeted patch "
-               "is possible without risking an unrelated change.", "patched_file": None, "field": None}
-
-    txn = _txn_for_job(job)
+# ─────────────────────── Level 4: vision-assisted disambiguation ─────────────
+def _azure_vision_chat(system: str, user_text: str, image_b64: str) -> str:
+    import requests
+    from . import config
+    if "YOUR-RESOURCE" in config.AZURE_OPENAI_ENDPOINT or "PASTE" in config.AZURE_OPENAI_KEY:
+        raise RuntimeError("Azure OpenAI is not configured (app/config.py).")
+    deployment = getattr(config, "AZURE_OPENAI_VISION_DEPLOYMENT", "") or config.AZURE_OPENAI_DEPLOYMENT
+    url = (f"{config.AZURE_OPENAI_ENDPOINT.rstrip('/')}/openai/deployments/{deployment}"
+          f"/chat/completions?api-version={config.AZURE_OPENAI_API_VERSION}")
+    body = {
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+            ]},
+        ],
+        "temperature": 0, "max_tokens": 300,
+    }
     try:
-        from . import capture
-        latest = capture.latest_capture_for(txn) if txn else None
-    except Exception:  # noqa: BLE001
-        latest = None
-    if not latest or not latest.get("folder"):
-        return {"healed": False, "reason": "No runtime capture available for this transaction — "
-               "self-heal requires Capture Mode to have been active (and the Java capture hook "
-               "installed) so there is a real page to diagnose against.",
-               "patched_file": None, "field": None}
-
-    html_file = Path(latest["folder"]) / "page.html"
-    if not html_file.exists():
-        return {"healed": False, "reason": "Capture folder exists but has no page.html.",
-               "patched_file": None, "field": None}
-    html = html_file.read_text(encoding="utf-8", errors="ignore")
-
-    screenshot_b64 = None
-    shot_file = Path(latest["folder"]) / "screenshot.png"
-    if shot_file.exists():
-        import base64
-        screenshot_b64 = base64.b64encode(shot_file.read_bytes()).decode()
-
-    from . import locator_discovery
-    discoveries = locator_discovery.discover_for_steps(
-        [failure["step_text"]], html, screenshot_b64=screenshot_b64, log=log)
-    found = discoveries.get(failure["step_text"])
-    if not found:
-        return {"healed": False, "reason": f'Locator discovery (DOM + vision) found no confident '
-               f'candidate for "{failure["step_text"][:70]}" in the captured page — the element may '
-               "genuinely be missing or the screen may not have loaded as expected.",
-               "patched_file": None, "field": None}
-
-    page_file = _find_page_file(field["page_class"])
-    if not page_file:
-        return {"healed": False, "reason": f'Page class {field["page_class"]} not found on disk.',
-               "patched_file": None, "field": None}
-
-    patched = patch_locator_field(page_file, field["field_name"], found["top_locator"], log)
-    if not patched:
-        return {"healed": False, "reason": "Discovery found the SAME locator that's already there — "
-               "the problem is likely not the locator itself (timing, page state, or an application "
-               "change beyond a locator fix).", "patched_file": None, "field": None}
-
-    ok, err, _ = _recompile_page(page_file, log)
-    if not ok:
-        return {"healed": False, "reason": f"Patched locator but recompilation failed: {err[:300]}",
-               "patched_file": str(page_file), "field": field["field_name"]}
-
-    return {"healed": True, "reason": f'Patched {field["page_class"]}.{field["field_name"]} to '
-           f'{found["top_locator"]} (source: {found.get("source", "dom")}) and recompiled successfully.',
-           "patched_file": str(page_file), "field": field["field_name"]}
+        r = requests.post(url, headers={"api-key": config.AZURE_OPENAI_KEY,
+                                        "Content-Type": "application/json"}, json=body, timeout=60)
+    except requests.RequestException as e:
+        raise RuntimeError(f"Cannot reach Azure OpenAI ({e.__class__.__name__}: {e}).")
+    if r.status_code == 401:
+        raise RuntimeError("Azure OpenAI rejected the API key (401).")
+    if r.status_code == 404:
+        raise RuntimeError(f"Deployment '{deployment}' not found (404) — set "
+                           "AZURE_OPENAI_VISION_DEPLOYMENT to a multimodal (vision-capable) "
+                           "deployment name, e.g. gpt-4o.")
+    if r.status_code != 200:
+        # the common case for "this deployment doesn't support images"
+        raise RuntimeError(f"Azure OpenAI error {r.status_code} (the deployment may not support "
+                           f"image input — vision requires a multimodal model like gpt-4o): "
+                           f"{r.text[:300]}")
+    return r.json()["choices"][0]["message"]["content"]
 
 
-def _recompile_page(page_file: Path, log) -> tuple[bool, str, None]:
-    """Recompile just the framework (javac against the real classpath) after a
-    surgical patch — reuses the exact same compile mechanics as normal
-    execution, not a separate code path."""
-    import subprocess
-    javac = getattr(config, "JAVAC", None) or getattr(config, "JAVA", "javac").replace("java.exe", "javac.exe")
+_VISION_SYSTEM_PROMPT = """You disambiguate Selenium locators for a banking test automation
+framework. You are shown a screenshot of a live web page and a NUMBERED LIST of REAL candidate
+elements already extracted from that page's actual DOM — you are choosing among them, never
+inventing a new one. Respond with STRICT JSON only, no markdown, no explanation outside the JSON:
+{"candidate_index": <int, the number from the list, or null if none plausibly match>,
+ "confidence": <0.0 to 1.0>, "reasoning": "<one short sentence>"}"""
+
+
+def vision_match_for_step(step_text: str, html: str, screenshot_b64: str,
+                          log=lambda m: None, min_confidence: float = 0.55) -> dict | None:
+    """Level 4: when DOM-text matching (Level 3) isn't confident enough, show
+    the model the actual screenshot alongside the real candidate list and ask
+    it to pick which one the step means. Never returns a locator for an
+    element that isn't genuinely in the captured DOM."""
+    candidates = extract_candidates(html)
+    if not candidates:
+        return None
+    listing = "\n".join(f'{i}: <{c["tag"]}{" type=" + c["type"] if c["type"] else ""}> '
+                        f'context="{c["context"][:70]}"' for i, c in enumerate(candidates))
+    user_text = f'Step: "{step_text}"\n\nCandidates found in the actual page DOM:\n{listing}'
     try:
-        from . import executor as _exec
-        classpath = _exec._effective_classpath()
-    except Exception:  # noqa: BLE001
-        classpath = str(getattr(config, "TEST_CLASSES_DIR", ""))
-    cmd = [javac, "-cp", classpath, "-d", str(config.TEST_CLASSES_DIR), str(page_file)]
+        reply = _azure_vision_chat(_VISION_SYSTEM_PROMPT, user_text, screenshot_b64)
+    except RuntimeError as e:
+        log(f">>> Vision-assisted locator discovery unavailable ({e})")
+        return None
+
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", reply.strip())
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    except Exception as e:  # noqa: BLE001
-        return False, str(e), None
-    if r.returncode != 0:
-        return False, r.stderr or r.stdout, None
-    log(">>> Self-heal: recompiled successfully.")
-    return True, "", None
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        log(">>> Vision response was not valid JSON — skipping vision for this step.")
+        return None
+
+    idx = parsed.get("candidate_index")
+    conf = float(parsed.get("confidence", 0) or 0)
+    if idx is None or not isinstance(idx, int) or not (0 <= idx < len(candidates)) or conf < min_confidence:
+        return None
+
+    chosen = candidates[idx]
+    locators = derive_locators(chosen)
+    log(f'>>> Vision-assisted discovery: matched "{step_text[:60]}" to candidate #{idx} '
+       f'({parsed.get("reasoning", "")}) — confidence {conf}')
+    return {"score": round(conf, 3), "tag": chosen["tag"], "context": chosen["context"][:80],
+           "suggested_name": suggest_name(chosen), "candidates": locators,
+           "top_locator": locators[0]["java"] if locators else None, "source": "vision"}
+
+
+def format_for_prompt(discoveries: dict[str, dict]) -> str:
+    if not discoveries:
+        return ""
+    lines = ["## AUTO-DISCOVERED LOCATORS (extracted from the ACTUAL live captured page for "
+            "these exact steps — use these, do not guess a different locator):"]
+    for step, d in discoveries.items():
+        lines.append(f'  Step: "{step}"\n    -> {d["top_locator"]}   '
+                     f'(field name suggestion: {d["suggested_name"]}, confidence {d["score"]})')
+    return "\n".join(lines)
