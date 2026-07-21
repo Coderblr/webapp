@@ -1,110 +1,197 @@
 """
-Locator Intelligence — Level 6: Self-Learning tied to REAL execution outcomes.
+Step 14 — Self-Healing Execution Loop.
 
-Everything built before this learns from RECORDING (a human clicked through a
-screen) or from CAPTURE (the page was inspected). This is a higher trust
-tier: a locator that was actually exercised in a scenario that PASSED on the
-real application is proven correct in a way neither of those can claim.
+HONEST ARCHITECTURAL NOTE, stated plainly rather than glossed over: "retry"
+here means relaunching the SAME feature execution as a fresh `java` process
+from the top, not resuming the exact paused Selenium session mid-script.
+Literal mid-script resume is not achievable — Python orchestrates a SEPARATE
+JVM process and has no way to pause/inspect/resume live Java thread state,
+the same physical constraint documented in capture.py. What IS achievable,
+and what this delivers, is the practical outcome the spec actually asks for:
+zero manual steps between a locator failure and a corrected, re-executed
+result.
 
-No new Java instrumentation is needed for this — it reuses the knowledge
-graph's already-built, already-tested step -> step-def -> page-method ->
-locator tracing (static analysis of the real, freshly-compiled source) and
-correlates it with the per-step pass/fail status Cucumber's own JSON report
-already gives us (already parsed by executor._parse_report). A locator is
-"proven" if the step that exercises it passed; "suspect" if a step touching
-it failed with a locator-shaped exception.
+Requires Capture Mode to have been active for the run (a failure-point DOM
+capture must exist) — this module has no way to inspect a live browser it
+never captured.
+
+One heal attempt = classify the failure -> trace it to the SPECIFIC page
+locator field via the knowledge graph (static analysis, already proven) ->
+get the failure-point captured DOM -> run locator discovery (DOM, then
+vision fallback) -> surgically patch ONLY that one field's declaration ->
+recompile. The executor (not this module) owns re-launching the job and
+enforcing the retry cap — this module never loops on its own, keeping it
+simple, testable, and impossible to run away unbounded.
 """
-import json
-import time
+import re
+from pathlib import Path
 
 from . import config
 
+LOCATOR_EXCEPTIONS = ("NoSuchElementException", "TimeoutException",
+                     "StaleElementReferenceException", "ElementNotInteractableException",
+                     "ElementClickInterceptedException", "InvalidSelectorException")
 
-def _repo_file():
-    return config.DATA_DIR / "locator_learning.json"
-
-
-def load() -> dict:
-    f = _repo_file()
-    return json.loads(f.read_text()) if f.exists() else {}
+_TXN_RE = re.compile(r"Txn0*(\d+)", re.IGNORECASE)
 
 
-def _save(data: dict):
-    _repo_file().write_text(json.dumps(data, indent=1))
-
-
-def record_step_result(step_text: str, keyword: str | None, status: str) -> list[str]:
-    """Trace one executed step to its real locators (via the knowledge graph)
-    and update their success/failure counters based on this run's outcome.
-    Returns the locator names updated (empty if the step couldn't be traced —
-    e.g. it has no UI-touching implementation, nothing to learn)."""
-    try:
-        from . import knowledge_graph
-        trace = knowledge_graph.trace_step(step_text, keyword)
-    except Exception:  # noqa: BLE001 — learning is best-effort, never blocks a run
-        return []
-    if not trace:
-        return []
-
-    locators = set()
-    for call in trace.get("calls_page_methods", []):
-        locators.update(call.get("locators_used", []))
-    if not locators:
-        return []
-
-    data = load()
-    for loc in locators:
-        entry = data.setdefault(loc, {"success_count": 0, "failure_count": 0,
-                                      "page_classes": [], "last_status": None, "last_seen": None})
-        if status == "passed":
-            entry["success_count"] += 1
-        elif status == "failed":
-            entry["failure_count"] += 1
-        pc = trace["calls_page_methods"][0]["page_class"] if trace["calls_page_methods"] else None
-        if pc and pc not in entry["page_classes"]:
-            entry["page_classes"].append(pc)
-        entry["last_status"] = status
-        entry["last_seen"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    _save(data)
-    return sorted(locators)
-
-
-def learn_from_report(step_results: list[dict], log=lambda m: None) -> dict:
-    """step_results: [{"text": ..., "keyword": ..., "status": "passed"|"failed"|...}]
-    Called once after a job finishes executing. Returns a small summary for
-    the console/report."""
-    learned, updated_locators = 0, set()
-    for st in step_results:
-        if st.get("status") not in ("passed", "failed"):
+def classify_failure(job_summary: dict) -> dict | None:
+    """The first failed step whose error looks like a locator problem, or
+    None if this failure is a different kind of problem entirely (self-heal
+    correctly does not apply to e.g. a business-logic assertion failure)."""
+    for sc in job_summary.get("scenarios", []):
+        if sc.get("status") != "failed":
             continue
-        touched = record_step_result(st.get("text", ""), st.get("keyword"), st["status"])
-        if touched:
-            learned += 1
-            updated_locators.update(touched)
-    if updated_locators:
-        log(f">>> Self-learning: updated confidence for {len(updated_locators)} locator(s) "
-           f"from {learned} executed step(s) this run.")
-    return {"steps_learned_from": learned, "locators_updated": sorted(updated_locators)}
+        for st in sc.get("steps", []):
+            if st.get("status") == "failed" and any(exc in (st.get("error") or "") for exc in LOCATOR_EXCEPTIONS):
+                return {"step_text": st["name"], "keyword": st.get("keyword", ""),
+                       "error": (st.get("error") or "")[:500]}
+    return None
 
 
-def proven_locators_for_prompt(cap: int = 30) -> str:
-    """Locators PROVEN by real passing executions — the highest-trust source,
-    ranked above the recorder repository and framework catalogs, formatted for
-    injection into the AI generation prompt."""
-    data = load()
-    proven = [(name, e) for name, e in data.items()
-             if e["success_count"] > 0 and e["success_count"] >= e["failure_count"]]
-    proven.sort(key=lambda t: t[1]["success_count"], reverse=True)
-    lines = [f'{name}   [{e["success_count"]} real pass(es), {e["failure_count"]} fail(s), '
-            f'class: {e["page_classes"][0] if e["page_classes"] else "?"}]'
-            for name, e in proven[:cap]]
-    return "\n".join(lines)
+def _txn_for_job(job) -> str | None:
+    m = _TXN_RE.search(Path(job.feature_path).stem)
+    if m:
+        return m.group(1)
+    ctx = getattr(job, "ai_ctx", None) or {}
+    if ctx.get("txn"):
+        return ctx["txn"]
+    hit = (ctx.get("hit") or {}) if ctx else {}
+    return hit.get("txn")
 
 
-def suspect_locators(min_failures: int = 2) -> list[dict]:
-    """Locators that have failed more than they've succeeded in REAL runs —
-    candidates for re-discovery (feeds Step 14 self-healing's diagnosis)."""
-    data = load()
-    out = [{"locator": name, **e} for name, e in data.items()
-          if e["failure_count"] >= min_failures and e["failure_count"] >= e["success_count"]]
-    return sorted(out, key=lambda e: e["failure_count"], reverse=True)
+def _field_for_step(step_text: str, keyword: str) -> dict | None:
+    """Which real Page class + which locator FIELD this step's resolved chain
+    currently uses, via the knowledge graph's already-proven static tracing —
+    never guessed, only what the real compiled call chain actually shows."""
+    from . import knowledge_graph
+    trace = knowledge_graph.trace_step(step_text, keyword)
+    if not trace or not trace.get("calls_page_methods"):
+        return None
+    call = trace["calls_page_methods"][0]
+    if not call.get("locators_used"):
+        return None
+    return {"page_class": call["page_class"], "field_name": call["locators_used"][0]}
+
+
+def _find_page_file(page_class: str) -> Path | None:
+    base = getattr(config, "PAGES_DIR", None)
+    if not base or not Path(base).exists():
+        return None
+    for f in Path(base).rglob(f"{page_class}.java"):
+        return f
+    return None
+
+
+def patch_locator_field(page_file: Path, field_name: str, new_java_locator: str, log) -> bool:
+    """Surgically replace ONE field's declaration value — every other line in
+    the file, every other field, every method, is untouched. Returns False
+    (no-op) if the field can't be found or the value is already identical."""
+    text = page_file.read_text(encoding="utf-8", errors="ignore")
+    pattern = re.compile(
+        r'(\b(?:private|protected|public)?\s*(?:static\s+)?(?:final\s+)?By\s+' +
+        re.escape(field_name) + r'\s*=\s*)[^;]+;')
+    m = pattern.search(text)
+    if not m:
+        log(f">>> Self-heal: could not find field '{field_name}' in {page_file.name} to patch.")
+        return False
+    if new_java_locator in m.group(0):
+        return False  # already this exact locator — nothing to change
+    new_text = pattern.sub(lambda mm: mm.group(1) + new_java_locator + ";", text, count=1)
+    page_file.write_text(new_text, encoding="utf-8")
+    log(f">>> Self-heal: patched {page_file.name}.{field_name} -> {new_java_locator}")
+    return True
+
+
+def attempt_heal(job, log) -> dict:
+    """One heal attempt. Returns:
+      {"healed": bool, "reason": str, "patched_file": str|None, "field": str|None}
+    Never re-executes anything itself — the caller decides whether/how to
+    re-run after a successful patch+recompile."""
+    failure = classify_failure(job.summary or {})
+    if not failure:
+        return {"healed": False, "reason": "Failure is not locator-shaped "
+               "(no NoSuchElement/Timeout/StaleElement/NotInteractable exception found) "
+               "— self-heal does not apply to this kind of failure.", "patched_file": None, "field": None}
+
+    field = _field_for_step(failure["step_text"], failure["keyword"])
+    if not field:
+        return {"healed": False, "reason": f'Could not trace "{failure["step_text"][:70]}" to a '
+               "specific page locator field via the knowledge graph — no safe, targeted patch "
+               "is possible without risking an unrelated change.", "patched_file": None, "field": None}
+
+    txn = _txn_for_job(job)
+    try:
+        from . import capture
+        latest = capture.latest_capture_for(txn) if txn else None
+    except Exception:  # noqa: BLE001
+        latest = None
+    if not latest or not latest.get("folder"):
+        return {"healed": False, "reason": "No runtime capture available for this transaction — "
+               "self-heal requires Capture Mode to have been active (and the Java capture hook "
+               "installed) so there is a real page to diagnose against.",
+               "patched_file": None, "field": None}
+
+    html_file = Path(latest["folder"]) / "page.html"
+    if not html_file.exists():
+        return {"healed": False, "reason": "Capture folder exists but has no page.html.",
+               "patched_file": None, "field": None}
+    html = html_file.read_text(encoding="utf-8", errors="ignore")
+
+    screenshot_b64 = None
+    shot_file = Path(latest["folder"]) / "screenshot.png"
+    if shot_file.exists():
+        import base64
+        screenshot_b64 = base64.b64encode(shot_file.read_bytes()).decode()
+
+    from . import locator_discovery
+    discoveries = locator_discovery.discover_for_steps(
+        [failure["step_text"]], html, screenshot_b64=screenshot_b64, log=log)
+    found = discoveries.get(failure["step_text"])
+    if not found:
+        return {"healed": False, "reason": f'Locator discovery (DOM + vision) found no confident '
+               f'candidate for "{failure["step_text"][:70]}" in the captured page — the element may '
+               "genuinely be missing or the screen may not have loaded as expected.",
+               "patched_file": None, "field": None}
+
+    page_file = _find_page_file(field["page_class"])
+    if not page_file:
+        return {"healed": False, "reason": f'Page class {field["page_class"]} not found on disk.',
+               "patched_file": None, "field": None}
+
+    patched = patch_locator_field(page_file, field["field_name"], found["top_locator"], log)
+    if not patched:
+        return {"healed": False, "reason": "Discovery found the SAME locator that's already there — "
+               "the problem is likely not the locator itself (timing, page state, or an application "
+               "change beyond a locator fix).", "patched_file": None, "field": None}
+
+    ok, err, _ = _recompile_page(page_file, log)
+    if not ok:
+        return {"healed": False, "reason": f"Patched locator but recompilation failed: {err[:300]}",
+               "patched_file": str(page_file), "field": field["field_name"]}
+
+    return {"healed": True, "reason": f'Patched {field["page_class"]}.{field["field_name"]} to '
+           f'{found["top_locator"]} (source: {found.get("source", "dom")}) and recompiled successfully.',
+           "patched_file": str(page_file), "field": field["field_name"]}
+
+
+def _recompile_page(page_file: Path, log) -> tuple[bool, str, None]:
+    """Recompile just the framework (javac against the real classpath) after a
+    surgical patch — reuses the exact same compile mechanics as normal
+    execution, not a separate code path."""
+    import subprocess
+    javac = getattr(config, "JAVAC", None) or getattr(config, "JAVA", "javac").replace("java.exe", "javac.exe")
+    try:
+        from . import executor as _exec
+        classpath = _exec._effective_classpath()
+    except Exception:  # noqa: BLE001
+        classpath = str(getattr(config, "TEST_CLASSES_DIR", ""))
+    cmd = [javac, "-cp", classpath, "-d", str(config.TEST_CLASSES_DIR), str(page_file)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except Exception as e:  # noqa: BLE001
+        return False, str(e), None
+    if r.returncode != 0:
+        return False, r.stderr or r.stdout, None
+    log(">>> Self-heal: recompiled successfully.")
+    return True, "", None
