@@ -1,62 +1,43 @@
-"""Platform configuration.
-
-All secrets are read from environment variables (or an optional .env file).
-Nothing sensitive is ever returned unmasked to the frontend or written to logs.
 """
+Pre-recording flow (runs BEFORE transaction capture starts).
+
+Mirrors the bank's real entry sequence:
+
+    open target URL
+      -> login (userId + password)
+        -> if the "password expired / forced change" screen appears:
+             enter old password, new password, confirm, submit, dismiss success alert
+             -> re-login with the NEW password
+          -> land on the home screen
+    ... only THEN does transaction recording begin.
+
+Everything here is executed by the platform, not recorded as part of the
+transaction, so generated feature files describe the business transaction only
+and the login/password-change plumbing stays in shared common steps.
+
+Password rotation: banks force a NEW password each time, so the flow supports
+"password ping-pong" — after a successful change the new password is written
+back to settings as the current one (and the previous one becomes the next
+target), so repeated runs never lock the test user out.
+
+Credentials come from environment variables (preferred) or settings; they are
+masked everywhere they are displayed or logged.
+"""
+from __future__ import annotations
+
 import os
-import json
-from pathlib import Path
+import time
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = Path(os.getenv("PLATFORM_DATA_DIR", BASE_DIR / "data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-ARTIFACTS_DIR = DATA_DIR / "artifacts"          # screenshots, DOM snapshots, videos
-ARTIFACTS_DIR.mkdir(exist_ok=True)
-SETTINGS_FILE = DATA_DIR / "settings.json"       # non-secret, UI-editable settings
+from .. import config
 
-DB_URL = os.getenv("PLATFORM_DB_URL", f"sqlite:///{DATA_DIR / 'platform.db'}")
-
-# ---- Azure OpenAI (secrets: env only) ----------------------------------
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
-AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
-AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
-AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
-
-
-def mask_secret(value: str, show: int = 4) -> str:
-    """Mask a secret for display: 'sk-abc...wxyz' style."""
-    if not value:
-        return ""
-    if len(value) <= show * 2:
-        return "*" * len(value)
-    return f"{value[:show]}{'*' * 8}{value[-show:]}"
-
-
-DEFAULT_SETTINGS = {
-    "framework_path": "",                 # path to existing Java Selenium-Cucumber repo
-    "edgedriver_path": "msedgedriver",    # local EdgeDriver
-    "edge_binary_path": "",               # optional explicit Edge binary
-    "default_headless": False,            # Module 22: live visible Edge by default
-    "ai_confidence_threshold": 0.75,
-    "mask_fields": ["password", "pin", "otp", "accountnumber", "account_no",
-                    "customerid", "customer_id", "cvv", "ssn"],
-    "notification_email": "",
-    # --- Pure JDK runner (no Maven) ---
-    "java_home": "",                      # optional JAVA_HOME; blank = java/javac on PATH
-    "libs_path": "",                      # folder of jars; blank = <framework_path>/libs
-    "glue_package": "stepdefinitions",    # Cucumber glue package in the framework
-    # --- Pre-recording flow: login -> forced password change -> re-login ---
-    "prelogin_enabled": False,
-    "prelogin_test_url": "",              # URL used by "Test pre-login flow"
-    "prelogin_user_id": "",               # prefer env NBC_USER_ID
-    "prelogin_password": "",              # prefer env NBC_PASSWORD  (masked in UI)
-    "prelogin_new_password": "",          # prefer env NBC_NEW_PASSWORD (masked)
+# Default locators — overridable in Settings so no code change is needed
+# when the bank's login/password screens differ.
+DEFAULTS = {
     "login_user_locator": "name=loginId",
     "login_password_locator": "name=password",
     "login_submit_locator": "id=login_button",
@@ -65,58 +46,238 @@ DEFAULT_SETTINGS = {
     "pwd_confirm_locator": "id=UIPage_009750_confirmNewPassword",
     "pwd_submit_locator": "id=UIPage_009750_submit",
     "pwd_alert_ok_locator": "id=ok-button",
-    "home_ready_locator": "",
+    "home_ready_locator": "",          # optional: element proving login succeeded
     "spinner_locator": "css=.spinner, .loading, .blockUI",
 }
 
-# Settings that must never be returned to the UI in clear text
-SECRET_SETTINGS = ("prelogin_password", "prelogin_new_password")
+
+def _by(spec: str):
+    """Parse "id=foo" / "css=.bar" / "xpath=//x" / bare xpath into a Selenium By."""
+    if not spec:
+        return None
+    if "=" in spec:
+        kind, _, value = spec.partition("=")
+        kind = kind.strip().lower()
+        value = value.strip()
+        if kind == "id":
+            return (By.ID, value)
+        if kind == "name":
+            return (By.NAME, value)
+        if kind == "css":
+            return (By.CSS_SELECTOR, value)
+        if kind == "xpath":
+            return (By.XPATH, value)
+    return (By.XPATH, spec)
 
 
-# Locator values that shipped as wrong guesses in earlier builds; if a saved
-# settings.json still contains them, they are replaced with the corrected
-# default so users don't have to hunt down stale values by hand.
-STALE_DEFAULTS = {
-    "login_user_locator": ("id=UIPage_009750_userId",),
-    "login_password_locator": ("id=UIPage_009750_password",),
-    "login_submit_locator": ("id=UIPage_009750_login",),
-}
+def _settings() -> dict:
+    s = dict(DEFAULTS)
+    s.update({k: v for k, v in config.load_settings().items() if k in DEFAULTS})
+    return s
 
 
-def load_settings() -> dict:
-    settings = dict(DEFAULT_SETTINGS)
-    if SETTINGS_FILE.exists():
-        try:
-            settings.update(json.loads(SETTINGS_FILE.read_text()))
-        except json.JSONDecodeError:
-            pass
-    migrated = False
-    for key, stale_values in STALE_DEFAULTS.items():
-        if settings.get(key) in stale_values:
-            settings[key] = DEFAULT_SETTINGS[key]
-            migrated = True
-    if migrated and SETTINGS_FILE.exists():
-        try:
-            SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
-        except OSError:
-            pass
-    return settings
-
-
-def save_settings(patch: dict) -> dict:
-    settings = load_settings()
-    settings.update({k: v for k, v in patch.items() if k in DEFAULT_SETTINGS})
-    SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
-    return settings
-
-
-def public_ai_config() -> dict:
-    """Azure OpenAI config safe to show in the UI — key always masked."""
+def credentials() -> dict:
+    """Env vars win over settings. NEVER logged in clear text."""
+    st = config.load_settings()
     return {
-        "endpoint": AZURE_OPENAI_ENDPOINT,
-        "deployment": AZURE_OPENAI_DEPLOYMENT,
-        "api_version": AZURE_OPENAI_API_VERSION,
-        "api_key_masked": mask_secret(AZURE_OPENAI_API_KEY),
-        "configured": bool(AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY
-                           and AZURE_OPENAI_DEPLOYMENT),
+        "user_id": os.getenv("NBC_USER_ID") or st.get("prelogin_user_id", ""),
+        "password": os.getenv("NBC_PASSWORD") or st.get("prelogin_password", ""),
+        "new_password": os.getenv("NBC_NEW_PASSWORD") or st.get("prelogin_new_password", ""),
     }
+
+
+def _wait_spinner(driver, spec: str, timeout: int = 30) -> None:
+    target = _by(spec)
+    if not target:
+        return
+    try:
+        WebDriverWait(driver, timeout).until(
+            EC.invisibility_of_element_located(target))
+    except TimeoutException:
+        pass
+
+
+def _present(driver, spec: str, timeout: int = 5) -> bool:
+    target = _by(spec)
+    if not target:
+        return False
+    try:
+        WebDriverWait(driver, timeout).until(
+            EC.visibility_of_element_located(target))
+        return True
+    except TimeoutException:
+        return False
+
+
+def _type(driver, spec: str, value: str, timeout: int = 20) -> None:
+    target = _by(spec)
+    el = WebDriverWait(driver, timeout).until(
+        EC.visibility_of_element_located(target))
+    el.clear()
+    el.send_keys(value)
+
+
+def _click(driver, spec: str, timeout: int = 20) -> None:
+    target = _by(spec)
+    el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable(target))
+    el.click()
+
+
+
+def detect_login_fields(driver) -> dict:
+    """Inspect the current page and suggest locators for the login form.
+    Used by the "Detect login fields" button and as an automatic fallback."""
+    js = """
+    function sel(el){
+      if(!el) return null;
+      if(el.id) return 'id=' + el.id;
+      if(el.name) return 'name=' + el.name;
+      var p=[],n=el;
+      while(n && n.nodeType===1 && p.length<6){
+        var i=1,s=n.previousElementSibling;
+        while(s){ if(s.tagName===n.tagName) i++; s=s.previousElementSibling; }
+        p.unshift(n.tagName.toLowerCase()+'['+i+']'); n=n.parentElement;
+      }
+      return 'xpath=//'+p.join('/');
+    }
+    function visible(e){var r=e.getBoundingClientRect();
+      return r.width>0 && r.height>0 && getComputedStyle(e).visibility!=='hidden';}
+    var pwd=null, inputs=[].slice.call(document.querySelectorAll('input'));
+    var vis = inputs.filter(visible);
+    for(var i=0;i<vis.length;i++){ if(vis[i].type==='password'){ pwd=vis[i]; break; } }
+    var user=null;
+    if(pwd){ var idx=vis.indexOf(pwd);
+      for(var j=idx-1;j>=0;j--){ var t=vis[j].type;
+        if(t==='text'||t==='email'||t===''||t==='tel'){ user=vis[j]; break; } } }
+    if(!user){ for(var k=0;k<vis.length;k++){ var t2=vis[k].type;
+        if(t2==='text'||t2==='email'){ user=vis[k]; break; } } }
+    var btn=null, cands=[].slice.call(document.querySelectorAll(
+        "button,input[type=submit],input[type=button],a[role=button]")).filter(visible);
+    for(var b=0;b<cands.length;b++){
+      var txt=((cands[b].innerText||cands[b].value||'')+'').toLowerCase();
+      if(txt.indexOf('log')>=0||txt.indexOf('sign')>=0||txt.indexOf('submit')>=0){
+        btn=cands[b]; break; } }
+    if(!btn && cands.length) btn=cands[0];
+    return {
+      user: sel(user), password: sel(pwd), submit: sel(btn),
+      all_inputs: vis.slice(0,25).map(function(e){
+        return {tag:e.tagName.toLowerCase(), type:e.type||'', id:e.id||'',
+                name:e.name||'', placeholder:e.placeholder||'', locator:sel(e)}; }),
+      all_buttons: cands.slice(0,15).map(function(e){
+        return {text:((e.innerText||e.value||'')+'').trim().slice(0,40),
+                id:e.id||'', locator:sel(e)}; })
+    };
+    """
+    try:
+        return driver.execute_script("return (function(){" + js + "})();") or {}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _login(driver, cfg: dict, user_id: str, password: str, log) -> None:
+    _wait_spinner(driver, cfg["spinner_locator"])
+    _type(driver, cfg["login_user_locator"], user_id)
+    _type(driver, cfg["login_password_locator"], password)
+    log("Submitting login…")
+    _click(driver, cfg["login_submit_locator"])
+    _wait_spinner(driver, cfg["spinner_locator"])
+
+
+def run(driver, url: str, log=None) -> dict:
+    """Execute the full entry sequence. Returns a summary dict.
+    `log` is a callable used to stream status to the recording console."""
+    log = log or (lambda _m: None)
+    cfg = _settings()
+    creds = credentials()
+    result = {"logged_in": False, "password_changed": False, "relogin": False,
+              "steps": []}
+
+    if not creds["user_id"] or not creds["password"]:
+        log("Pre-login skipped: no credentials configured (Settings or env vars).")
+        result["skipped"] = "no credentials"
+        return result
+
+    def step(msg):
+        log(msg)
+        result["steps"].append(msg)
+
+    step(f"Opening {url}")
+    driver.get(url)
+
+    step(f"Logging in as {creds['user_id']}")
+    try:
+        _login(driver, cfg, creds["user_id"], creds["password"], log)
+    except TimeoutException:
+        found = detect_login_fields(driver)
+        result["detected"] = found
+        if found.get("user") and found.get("password"):
+            step("Configured login locators did not match. Auto-detected: "
+                 f"user={found['user']}, password={found['password']}, "
+                 f"submit={found.get('submit')} — retrying with these.")
+            cfg = dict(cfg, login_user_locator=found["user"],
+                       login_password_locator=found["password"],
+                       login_submit_locator=found.get("submit")
+                       or cfg["login_submit_locator"])
+            _login(driver, cfg, creds["user_id"], creds["password"], log)
+            result["autodetected_locators"] = {
+                "login_user_locator": cfg["login_user_locator"],
+                "login_password_locator": cfg["login_password_locator"],
+                "login_submit_locator": cfg["login_submit_locator"]}
+            step("Save these locators in Settings to make this permanent.")
+        else:
+            raise RuntimeError(
+                "Login user field not found using "
+                f"'{cfg['login_user_locator']}'. Fields visible on the page: "
+                + ", ".join(
+                    f"{i.get('locator')} (type={i.get('type')}, "
+                    f"placeholder={i.get('placeholder')})"
+                    for i in (found.get("all_inputs") or [])[:8])
+                or "no input fields detected — is this the login page?")
+    result["logged_in"] = True
+
+    # --- forced password change, only if the screen actually appears ---
+    if _present(driver, cfg["pwd_old_locator"], timeout=8):
+        new_pwd = creds["new_password"]
+        if not new_pwd:
+            step("Password change screen appeared but NBC_NEW_PASSWORD is not "
+                 "set — cannot continue automatically.")
+            result["error"] = "password change required but no new password configured"
+            return result
+
+        step("Password change screen detected — changing password")
+        _type(driver, cfg["pwd_old_locator"], creds["password"])
+        _type(driver, cfg["pwd_new_locator"], new_pwd)
+        _type(driver, cfg["pwd_confirm_locator"], new_pwd)
+        _wait_spinner(driver, cfg["spinner_locator"])
+        _click(driver, cfg["pwd_submit_locator"])
+        _wait_spinner(driver, cfg["spinner_locator"])
+
+        if _present(driver, cfg["pwd_alert_ok_locator"], timeout=15):
+            _click(driver, cfg["pwd_alert_ok_locator"])
+        result["password_changed"] = True
+
+        # Rotate stored credentials so the NEXT run logs in with the new
+        # password and changes it back — prevents lockout on repeat runs.
+        st = config.load_settings()
+        st["prelogin_password"] = new_pwd
+        st["prelogin_new_password"] = creds["password"]
+        config.save_settings(st)
+        step("Credentials rotated for the next run (ping-pong).")
+
+        step("Re-logging in with the new password")
+        _wait_spinner(driver, cfg["spinner_locator"])
+        if _present(driver, cfg["login_user_locator"], timeout=15):
+            _login(driver, cfg, creds["user_id"], new_pwd, log)
+        result["relogin"] = True
+    else:
+        step("No password change prompted — continuing.")
+
+    if cfg["home_ready_locator"]:
+        if _present(driver, cfg["home_ready_locator"], timeout=30):
+            step("Home screen ready.")
+        else:
+            step("Warning: home screen element not found; continuing anyway.")
+
+    time.sleep(1)
+    step("Pre-flow complete — recording of the transaction starts now.")
+    return result
