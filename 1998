@@ -1,344 +1,122 @@
-"""Module 17 — AI Automation Generator (+ Module 16 knowledge packaging).
+"""Platform configuration.
 
-Builds a Transaction Knowledge Package from everything the recorder captured
-and asks Azure OpenAI to generate: Feature File (positive AND negative
-scenarios derived from captured validation rules), Step Definitions, Page
-Object (reading locators from the central repository), Runner, and test data.
-Artifacts are stored as *proposals* for human review before being written into
-the existing Java framework by the Framework Update Engine.
+All secrets are read from environment variables (or an optional .env file).
+Nothing sensitive is ever returned unmasked to the frontend or written to logs.
 """
+import os
 import json
-import re
 from pathlib import Path
 
-from ..ai import azure_client
-from ..models import (Element, GeneratedArtifact, KnowledgePackage,
-                      LearningEvent, NetworkCall, RecordedAction, Recording,
-                      SessionLocal, TestDataField, ValidationMessage)
-from . import framework_update
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = Path(os.getenv("PLATFORM_DATA_DIR", BASE_DIR / "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+ARTIFACTS_DIR = DATA_DIR / "artifacts"          # screenshots, DOM snapshots, videos
+ARTIFACTS_DIR.mkdir(exist_ok=True)
+SETTINGS_FILE = DATA_DIR / "settings.json"       # non-secret, UI-editable settings
+
+DB_URL = os.getenv("PLATFORM_DB_URL", f"sqlite:///{DATA_DIR / 'platform.db'}")
+
+# ---- Azure OpenAI (secrets: env only) ----------------------------------
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
 
 
-def build_knowledge_package(db, transaction: str) -> dict:
-    """Module 16 — assemble the reusable knowledge package."""
-    actions = (db.query(RecordedAction).join(Recording)
-               .filter(Recording.transaction_number == transaction)
-               .order_by(RecordedAction.sequence).all())
-    fields = db.query(TestDataField).filter_by(transaction_number=transaction).all()
-    msgs = db.query(ValidationMessage).filter_by(transaction_number=transaction).all()
-    apis = db.query(NetworkCall).filter_by(transaction_number=transaction).all()
-    elements = db.query(Element).filter_by(transaction_number=transaction).all()
+def mask_secret(value: str, show: int = 4) -> str:
+    """Mask a secret for display: 'sk-abc...wxyz' style."""
+    if not value:
+        return ""
+    if len(value) <= show * 2:
+        return "*" * len(value)
+    return f"{value[:show]}{'*' * 8}{value[-show:]}"
 
-    workflow = []
-    last_screen = None
-    for a in actions:
-        if a.screen_name != last_screen:
-            workflow.append(a.screen_name)
-            last_screen = a.screen_name
 
-    pkg = {
-        "transaction_number": transaction,
-        "workflow": workflow,                            # Module 11
-        "actions": [{"seq": a.sequence, "type": a.action_type,
-                     "screen": a.screen_name, "description": a.description,
-                     "value": a.value_masked} for a in actions],
-        "fields": [{"name": f.field_name, "type": f.input_type,
-                    "mandatory": f.mandatory, "max_length": f.max_length,
-                    "pattern": f.pattern, "sample": f.value_masked,
-                    "sensitive": f.sensitive,
-                    "options": f.dropdown_options} for f in fields],
-        "messages": [{"kind": m.kind, "text": m.text, "code": m.error_code}
-                     for m in msgs],
-        "apis": [{"method": c.method, "url": c.url, "status": c.status_code,
-                  "time_ms": c.response_time_ms} for c in apis][:30],
-        "elements": [{"key": e.element_key, "screen": e.screen_name,
-                      "tag": e.tag_name,
-                      "primary_locator": next((l.value for l in e.locators
-                                               if l.is_primary), None)}
-                     for e in elements][:200],
+DEFAULT_SETTINGS = {
+    "framework_path": "",                 # path to existing Java Selenium-Cucumber repo
+    "edgedriver_path": "msedgedriver",    # local EdgeDriver
+    "edge_binary_path": "",               # optional explicit Edge binary
+    "default_headless": False,            # Module 22: live visible Edge by default
+    "ai_confidence_threshold": 0.75,
+    "mask_fields": ["password", "pin", "otp", "accountnumber", "account_no",
+                    "customerid", "customer_id", "cvv", "ssn"],
+    "notification_email": "",
+    # --- Pure JDK runner (no Maven) ---
+    "java_home": "",                      # optional JAVA_HOME; blank = java/javac on PATH
+    "libs_path": "",                      # folder of jars; blank = <framework_path>/libs
+    "glue_package": "stepdefinitions",    # Cucumber glue package in the framework
+    # --- Pre-recording flow: login -> forced password change -> re-login ---
+    "prelogin_enabled": False,
+    "prelogin_test_url": "",              # URL used by "Test pre-login flow"
+    "prelogin_user_id": "",               # prefer env NBC_USER_ID
+    "prelogin_password": "",              # prefer env NBC_PASSWORD  (masked in UI)
+    "prelogin_new_password": "",          # prefer env NBC_NEW_PASSWORD (masked)
+    "login_user_locator": "name=loginId",
+    "login_password_locator": "name=password",
+    "login_submit_locator": "id=login_button",
+    "pwd_old_locator": "id=UIPage_009750_oldPassword",
+    "pwd_new_locator": "id=UIPage_009750_newPassword",
+    "pwd_confirm_locator": "id=UIPage_009750_confirmNewPassword",
+    "pwd_submit_locator": "id=UIPage_009750_submit",
+    "pwd_alert_ok_locator": "id=ok-button",
+    "home_ready_locator": "",
+    "spinner_locator": "css=.spinner, .loading, .blockUI",
+}
+
+# Settings that must never be returned to the UI in clear text
+SECRET_SETTINGS = ("prelogin_password", "prelogin_new_password")
+
+
+# Locator values that shipped as wrong guesses in earlier builds; if a saved
+# settings.json still contains them, they are replaced with the corrected
+# default so users don't have to hunt down stale values by hand.
+STALE_DEFAULTS = {
+    "login_user_locator": ("id=UIPage_009750_userId",),
+    "login_password_locator": ("id=UIPage_009750_password",),
+    "login_submit_locator": ("id=UIPage_009750_login",),
+}
+
+
+def load_settings() -> dict:
+    settings = dict(DEFAULT_SETTINGS)
+    if SETTINGS_FILE.exists():
+        try:
+            settings.update(json.loads(SETTINGS_FILE.read_text()))
+        except json.JSONDecodeError:
+            pass
+    migrated = False
+    for key, stale_values in STALE_DEFAULTS.items():
+        if settings.get(key) in stale_values:
+            settings[key] = DEFAULT_SETTINGS[key]
+            migrated = True
+    if migrated and SETTINGS_FILE.exists():
+        try:
+            SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+        except OSError:
+            pass
+    return settings
+
+
+def save_settings(patch: dict) -> dict:
+    settings = load_settings()
+    settings.update({k: v for k, v in patch.items() if k in DEFAULT_SETTINGS})
+    SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+    return settings
+
+
+def public_ai_config() -> dict:
+    """Azure OpenAI config safe to show in the UI — key always masked."""
+    return {
+        "endpoint": AZURE_OPENAI_ENDPOINT,
+        "deployment": AZURE_OPENAI_DEPLOYMENT,
+        "api_version": AZURE_OPENAI_API_VERSION,
+        "api_key_masked": mask_secret(AZURE_OPENAI_API_KEY),
+        "configured": bool(AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY
+                           and AZURE_OPENAI_DEPLOYMENT),
     }
-    kp = db.query(KnowledgePackage).filter_by(transaction_number=transaction).first()
-    if kp:
-        kp.business_workflow = workflow
-        kp.version += 1
-    else:
-        db.add(KnowledgePackage(transaction_number=transaction,
-                                business_workflow=workflow, ai_confidence=0.8))
-    db.commit()
-    return pkg
-
-
-_GEN_SYSTEM = """You are a senior Java Selenium-Cucumber automation engineer for
-enterprise banking applications. You generate production-quality code that fits
-an EXISTING framework: reuse its base classes, utilities and coding style shown
-in the framework context; never duplicate existing helpers.
-Every Feature File MUST contain BOTH positive scenarios (happy path with the
-captured valid data and success messages) AND negative scenarios derived from
-the captured field metadata: blank mandatory fields, max-length boundary
-violations, invalid pattern/format, business-rule violations, and the exact
-captured validation/error messages as expected results.
-Page Objects must load locators from LocatorRepository.get(transaction, screen,
-elementKey) — the central repository is the single source of truth, with the
-literal locator kept only as an inline fallback comment.
-ONE framework for ALL transactions: page objects are one-per-SCREEN and shared
-across transactions. If a page object for a screen already exists (its current
-content is provided), UPDATE it — keep every existing method and add only the
-new elements/methods this transaction needs. Reuse existing generic steps
-(navigation, login, common assertions) instead of writing new ones.
-HARD RULES — code that violates these will not compile:
-1. Packages are fixed: page objects -> "package pages;", step definitions ->
-   "package stepdefinitions;", runners -> "package runners;". The ONLY utility
-   package is "core" (DriverFactory, ConfigReader, LocatorRepository). NEVER
-   import or create "utils", "helpers", or any other package.
-2. The public class name MUST exactly equal the file name in target_path
-   (Java requirement), including capitalization.
-3. Every page-object method called from a step definition MUST be defined in
-   the page object generated or provided in this same response. Before
-   finishing, verify each stepdef method call resolves.
-3b. Class names MUST start with an uppercase LETTER and be descriptive of the
-   SCREEN (e.g. DepositsShortEnquiryPage). Never start a class name with an
-   underscore or digit, and never embed raw transaction/screen ID numbers as a
-   prefix (_000400DepositsShortEnquiry is INVALID; DepositsShortEnquiryPage is
-   correct).
-3c. BALANCE ALL BRACKETS. Each statement must close every "(" it opens before
-   the ";". Re-read every LocatorRepository.by(...) / By.xpath(...) line and
-   count the parentheses before returning.
-4. Locator access pattern inside page objects:
-     import core.LocatorRepository;
-     By loc = LocatorRepository.by(TXN, SCREEN, KEY, By.id("fallbackId"));
-   where the last argument is the recorded literal locator as fallback.
-5. Do not reference any class you have not generated here or that is not in
-   core.* or standard Selenium/Cucumber APIs."""
-
-
-_CANON = {"feature": "src/test/resources/features/{name}.feature",
-          "stepdef": "src/test/java/stepdefinitions/{name}Steps.java",
-          "pageobject": "src/test/java/pages/{name}Page.java",
-          "runner": "src/test/java/runners/{name}Runner.java",
-          "testdata": "src/test/resources/testdata/{name}.json"}
-
-
-def _safe(name: str) -> str:
-    """Keep alphanumerics and PRESERVE capitalization (SBIBranchChannelPage
-    must not become Sbibranchchannelpage), uppercasing only the first char
-    so the filename always matches the public class name."""
-    s = "".join(c for c in name if c.isalnum())
-    s = s.lstrip("0123456789")          # class names cannot start with a digit
-    return (s[:1].upper() + s[1:]) if s else "Generated"
-
-
-_PUBLIC_CLASS = re.compile(r"public\s+(?:final\s+|abstract\s+)?class\s+([A-Za-z_$][\w$]*)")
-
-
-def _declared_class(content: str) -> str | None:
-    """The Java filename MUST equal the public class name declared inside the
-    file. Trust the code, never a normalized path."""
-    m = _PUBLIC_CLASS.search(content or "")
-    return m.group(1) if m else None
-
-
-
-def _balance_java(content: str) -> tuple[str, list[str]]:
-    """Auto-repair the most common LLM Java syntax slip: a statement line whose
-    round brackets are unbalanced (missing closing parens before the ';').
-    Only touches single-line statements ending in ');' or ';' and never removes
-    code — appends the missing ')' just before the semicolon."""
-    fixes, out = [], []
-    for i, line in enumerate(content.splitlines(), 1):
-        stripped = line.rstrip()
-        if stripped.endswith(";") and not stripped.lstrip().startswith(("//", "*", "/*")):
-            # count parens outside string literals / char literals
-            depth, in_str, in_chr, esc = 0, False, False, False
-            for ch in stripped:
-                if esc:
-                    esc = False
-                    continue
-                if ch == "\\":
-                    esc = True
-                    continue
-                if in_str:
-                    if ch == '"':
-                        in_str = False
-                    continue
-                if in_chr:
-                    if ch == "'":
-                        in_chr = False
-                    continue
-                if ch == '"':
-                    in_str = True
-                elif ch == "'":
-                    in_chr = True
-                elif ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-            if depth > 0:
-                indent_len = len(stripped) - len(stripped.lstrip())
-                line = stripped[:-1] + (")" * depth) + ";"
-                fixes.append(f"line {i}: added {depth} missing ')'")
-        out.append(line)
-    return "\n".join(out) + ("\n" if content.endswith("\n") else ""), fixes
-
-
-def _validate_java(content: str) -> list[str]:
-    """Report structural problems that would fail javac, so bad artifacts are
-    flagged in the review screen instead of silently breaking the build."""
-    problems = []
-    depth = {"(": 0, "{": 0}
-    in_str = in_chr = esc = False
-    in_line_comment = in_block_comment = False
-    prev = ""
-    for ch in content:
-        if in_line_comment:
-            if ch == "\n":
-                in_line_comment = False
-            prev = ch
-            continue
-        if in_block_comment:
-            if prev == "*" and ch == "/":
-                in_block_comment = False
-            prev = ch
-            continue
-        if esc:
-            esc = False
-            prev = ch
-            continue
-        if ch == "\\" and (in_str or in_chr):
-            esc = True
-            prev = ch
-            continue
-        if in_str:
-            if ch == '"':
-                in_str = False
-        elif in_chr:
-            if ch == "'":
-                in_chr = False
-        else:
-            if prev == "/" and ch == "/":
-                in_line_comment = True
-            elif prev == "/" and ch == "*":
-                in_block_comment = True
-            elif ch == '"':
-                in_str = True
-            elif ch == "'":
-                in_chr = True
-            elif ch in "({":
-                depth[ch] += 1
-            elif ch == ")":
-                depth["("] -= 1
-            elif ch == "}":
-                depth["{"] -= 1
-        prev = ch
-    if depth["("] != 0:
-        problems.append(f"unbalanced round brackets ({depth['(']:+d})")
-    if depth["{"] != 0:
-        problems.append(f"unbalanced braces ({depth['{']:+d})")
-    if "package " not in content:
-        problems.append("missing package declaration")
-    return problems
-
-
-def _canonical_path(art: dict, transaction: str) -> str:
-    """Force every artifact into one fixed layout so 1000s of recordings
-    accumulate in the SAME framework structure instead of scattering.
-    Page objects are named by SCREEN (shared across transactions);
-    features/stepdefs by transaction."""
-    atype = art.get("artifact_type", "feature")
-    raw = Path(art.get("target_path", "")).stem
-    # For Java artifacts the file name is dictated by the declared public class.
-    if atype in ("pageobject", "stepdef", "runner"):
-        declared = _declared_class(art.get("content", ""))
-        if declared:
-            folder = {"pageobject": "src/test/java/pages",
-                      "stepdef": "src/test/java/stepdefinitions",
-                      "runner": "src/test/java/runners"}[atype]
-            return f"{folder}/{declared}.java"
-    if atype == "pageobject":
-        name = _safe(raw.removesuffix("Page") or transaction)
-    else:
-        name = _safe(transaction if atype in ("feature", "stepdef") else raw)
-    template = _CANON.get(atype)
-    return template.format(name=name) if template else art.get("target_path", "")
-
-
-async def generate_for_transaction(transaction: str) -> list[int]:
-    """Generate all artifacts for one transaction; returns artifact ids."""
-    db = SessionLocal()
-    try:
-        pkg = build_knowledge_package(db, transaction)
-        fw = framework_update.framework_context(transaction)
-        # Feed the CURRENT content of page objects for every screen in this
-        # transaction so the AI updates shared files instead of recreating them.
-        screens = {a.get("screen") for a in pkg.get("actions", []) if a.get("screen")}
-        for s in screens:
-            rel = _CANON["pageobject"].format(name=_safe(s))
-            existing_po = framework_update.read_existing(rel)
-            if existing_po:
-                fw["matching_files"][rel] = existing_po[:8000]
-
-        result = await azure_client.chat_json(
-            _GEN_SYSTEM,
-            "Generate automation for this transaction knowledge package.\n"
-            f"KNOWLEDGE PACKAGE:\n{json.dumps(pkg)[:40000]}\n"
-            f"EXISTING FRAMEWORK CONTEXT:\n{json.dumps(fw)[:20000]}\n"
-            'Return JSON: {"artifacts": [{"artifact_type": '
-            '"feature|stepdef|pageobject|runner|testdata", '
-            '"target_path": "relative/path/in/framework", "content": "..."}], '
-            '"summary": "..."}',
-            max_tokens=8000)
-
-        ids, seen = [], set()
-        for art in result.get("artifacts", []):
-            # Auto-repair common LLM syntax slips, then validate.
-            if art.get("artifact_type") in ("pageobject", "stepdef", "runner"):
-                content, fixes = _balance_java(art.get("content", ""))
-                art["content"] = content
-                problems = _validate_java(content)
-                if fixes or problems:
-                    art["notes"] = ("auto-fixed: " + "; ".join(fixes) if fixes else "") + \
-                                   (" | REVIEW: " + "; ".join(problems) if problems else "")
-            path = _canonical_path(art, transaction)
-            if path in seen:            # one artifact per file per generation
-                continue
-            seen.add(path)
-            existing = framework_update.read_existing(path)
-            # Supersede older pending artifacts for the same file so re-recording
-            # a screen updates, never forks, the framework.
-            db.query(GeneratedArtifact).filter_by(
-                target_path=path, status="proposed").update({"status": "superseded"})
-            ga = GeneratedArtifact(transaction_number=transaction,
-                                   artifact_type=art["artifact_type"],
-                                   target_path=path,
-                                   content=art["content"],
-                                   existing_content=existing)
-            db.add(ga)
-            db.flush()
-            ids.append(ga.id)
-        db.add(LearningEvent(kind="recording", reference=transaction,
-                             detail={"generated": len(ids),
-                                     "summary": result.get("summary")}))
-        db.commit()
-        return ids
-    finally:
-        db.close()
-
-
-def approve_artifact(artifact_id: int, approve: bool, edited: str | None = None) -> dict:
-    """Human review gate — approved artifacts are written by the update engine."""
-    db = SessionLocal()
-    try:
-        art = db.query(GeneratedArtifact).get(artifact_id)
-        if not art:
-            return {"ok": False, "error": "not found"}
-        if edited is not None:
-            art.content = edited
-            db.add(LearningEvent(kind="human_correction", reference=art.target_path,
-                                 detail={"artifact_id": artifact_id}))
-        if approve:
-            framework_update.write_artifact(art.target_path, art.content)
-            art.status = "written"
-        else:
-            art.status = "rejected"
-        db.commit()
-        return {"ok": True, "status": art.status}
-    finally:
-        db.close()
