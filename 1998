@@ -1,207 +1,252 @@
-"""Module 17 — AI Automation Generator (+ Module 16 knowledge packaging).
+"""Module 22 — Execution Engine (+ Module 23 report data, Module 21 learning).
 
-Builds a Transaction Knowledge Package from everything the recorder captured
-and asks Azure OpenAI to generate: Feature File (positive AND negative
-scenarios derived from captured validation rules), Step Definitions, Page
-Object (reading locators from the central repository), Runner, and test data.
-Artifacts are stored as *proposals* for human review before being written into
-the existing Java framework by the Framework Update Engine.
+Compiles and runs the Java Selenium-Cucumber framework LIVE in a real, visible
+Microsoft Edge browser (headless only if explicitly toggled). Streams every log
+line / step / pass-fail to the frontend over WebSocket, captures failures,
+parses the cucumber JSON report, and asks Azure OpenAI for root cause analysis.
+The Edge/EdgeDriver versions are checked and must match; the execution session
+uses its own Edge profile so it never conflicts with the Recorder's session.
 """
+import asyncio
 import json
+import re
+import os
+import subprocess
 from pathlib import Path
 
+from .. import config
 from ..ai import azure_client
-from ..models import (Element, GeneratedArtifact, KnowledgePackage,
-                      LearningEvent, NetworkCall, RecordedAction, Recording,
-                      SessionLocal, TestDataField, ValidationMessage)
-from . import framework_update
+from ..models import Execution, LearningEvent, SessionLocal, now
+
+# execution_id → asyncio.Queue of live events (consumed by the WebSocket)
+_streams: dict[int, asyncio.Queue] = {}
+_procs: dict[int, subprocess.Popen] = {}
 
 
-def build_knowledge_package(db, transaction: str) -> dict:
-    """Module 16 — assemble the reusable knowledge package."""
-    actions = (db.query(RecordedAction).join(Recording)
-               .filter(Recording.transaction_number == transaction)
-               .order_by(RecordedAction.sequence).all())
-    fields = db.query(TestDataField).filter_by(transaction_number=transaction).all()
-    msgs = db.query(ValidationMessage).filter_by(transaction_number=transaction).all()
-    apis = db.query(NetworkCall).filter_by(transaction_number=transaction).all()
-    elements = db.query(Element).filter_by(transaction_number=transaction).all()
+def check_edge_versions() -> dict:
+    """Auto-detect Edge and EdgeDriver versions and verify they match."""
+    s = config.load_settings()
+    out = {"edge": None, "driver": None, "match": None}
+    try:
+        r = subprocess.run([s["edgedriver_path"], "--version"],
+                           capture_output=True, text=True, timeout=10)
+        m = re.search(r"(\d+)\.", r.stdout)
+        out["driver"] = r.stdout.strip().split("\n")[0]
+        drv_major = m.group(1) if m else None
+    except Exception as e:
+        out["driver"] = f"not found ({e})"
+        drv_major = None
+    for candidate in ([s["edge_binary_path"]] if s.get("edge_binary_path") else []) + \
+                     ["microsoft-edge", "msedge"]:
+        try:
+            r = subprocess.run([candidate, "--version"], capture_output=True,
+                               text=True, timeout=10)
+            out["edge"] = r.stdout.strip()
+            m = re.search(r"(\d+)\.", r.stdout)
+            out["match"] = bool(m and drv_major and m.group(1) == drv_major)
+            break
+        except Exception:
+            continue
+    return out
 
-    workflow = []
-    last_screen = None
-    for a in actions:
-        if a.screen_name != last_screen:
-            workflow.append(a.screen_name)
-            last_screen = a.screen_name
 
-    pkg = {
-        "transaction_number": transaction,
-        "workflow": workflow,                            # Module 11
-        "actions": [{"seq": a.sequence, "type": a.action_type,
-                     "screen": a.screen_name, "description": a.description,
-                     "value": a.value_masked} for a in actions],
-        "fields": [{"name": f.field_name, "type": f.input_type,
-                    "mandatory": f.mandatory, "max_length": f.max_length,
-                    "pattern": f.pattern, "sample": f.value_masked,
-                    "sensitive": f.sensitive,
-                    "options": f.dropdown_options} for f in fields],
-        "messages": [{"kind": m.kind, "text": m.text, "code": m.error_code}
-                     for m in msgs],
-        "apis": [{"method": c.method, "url": c.url, "status": c.status_code,
-                  "time_ms": c.response_time_ms} for c in apis][:30],
-        "elements": [{"key": e.element_key, "screen": e.screen_name,
-                      "tag": e.tag_name,
-                      "primary_locator": next((l.value for l in e.locators
-                                               if l.is_primary), None)}
-                     for e in elements][:200],
-    }
-    kp = db.query(KnowledgePackage).filter_by(transaction_number=transaction).first()
-    if kp:
-        kp.business_workflow = workflow
-        kp.version += 1
-    else:
-        db.add(KnowledgePackage(transaction_number=transaction,
-                                business_workflow=workflow, ai_confidence=0.8))
+async def _emit(execution_id: int, event: dict):
+    q = _streams.get(execution_id)
+    if q:
+        await q.put(event)
+
+
+def get_stream(execution_id: int) -> asyncio.Queue:
+    return _streams.setdefault(execution_id, asyncio.Queue())
+
+
+async def start_execution(transactions: list[str], environment: str = "SIT",
+                          headless: bool | None = None) -> int:
+    settings = config.load_settings()
+    if headless is None:
+        headless = settings["default_headless"]      # default: LIVE visible Edge
+    db = SessionLocal()
+    ex = Execution(transactions=transactions, environment=environment,
+                   headless=headless)
+    db.add(ex)
     db.commit()
-    return pkg
+    eid = ex.id
+    db.close()
+    get_stream(eid)
+    asyncio.create_task(_run(eid, transactions, environment, headless, settings))
+    return eid
 
 
-_GEN_SYSTEM = """You are a senior Java Selenium-Cucumber automation engineer for
-enterprise banking applications. You generate production-quality code that fits
-an EXISTING framework: reuse its base classes, utilities and coding style shown
-in the framework context; never duplicate existing helpers.
-Every Feature File MUST contain BOTH positive scenarios (happy path with the
-captured valid data and success messages) AND negative scenarios derived from
-the captured field metadata: blank mandatory fields, max-length boundary
-violations, invalid pattern/format, business-rule violations, and the exact
-captured validation/error messages as expected results.
-Page Objects must load locators from LocatorRepository.get(transaction, screen,
-elementKey) — the central repository is the single source of truth, with the
-literal locator kept only as an inline fallback comment.
-ONE framework for ALL transactions: page objects are one-per-SCREEN and shared
-across transactions. If a page object for a screen already exists (its current
-content is provided), UPDATE it — keep every existing method and add only the
-new elements/methods this transaction needs. Reuse existing generic steps
-(navigation, login, common assertions) instead of writing new ones.
-HARD RULES — code that violates these will not compile:
-1. Packages are fixed: page objects -> "package pages;", step definitions ->
-   "package stepdefinitions;", runners -> "package runners;". The ONLY utility
-   package is "core" (DriverFactory, ConfigReader, LocatorRepository). NEVER
-   import or create "utils", "helpers", or any other package.
-2. The public class name MUST exactly equal the file name in target_path
-   (Java requirement), including capitalization.
-3. Every page-object method called from a step definition MUST be defined in
-   the page object generated or provided in this same response. Before
-   finishing, verify each stepdef method call resolves.
-4. Locator access pattern inside page objects:
-     import core.LocatorRepository;
-     By loc = LocatorRepository.by(TXN, SCREEN, KEY, By.id("fallbackId"));
-   where the last argument is the recorded literal locator as fallback.
-5. Do not reference any class you have not generated here or that is not in
-   core.* or standard Selenium/Cucumber APIs."""
+async def _run(eid: int, transactions: list[str], environment: str,
+               headless: bool, settings: dict):
+    root = settings.get("framework_path")
+    log_dir = config.ARTIFACTS_DIR / f"exec_{eid}"
+    log_dir.mkdir(exist_ok=True)
+    log_path = log_dir / "execution.log"
+    tags = " or ".join(f"@{t}" for t in transactions) if transactions else ""
 
+    # ---- Pure JDK runner (no Maven): javac compile + Cucumber CLI ----
+    root_p = Path(root) if root else None
+    java_home = settings.get("java_home", "")
+    java = str(Path(java_home) / "bin" / "java") if java_home else "java"
+    javac = str(Path(java_home) / "bin" / "javac") if java_home else "javac"
 
-_CANON = {"feature": "src/test/resources/features/{name}.feature",
-          "stepdef": "src/test/java/stepdefinitions/{name}Steps.java",
-          "pageobject": "src/test/java/pages/{name}Page.java",
-          "runner": "src/test/java/runners/{name}Runner.java",
-          "testdata": "src/test/resources/testdata/{name}.json"}
+    libs = Path(settings.get("libs_path") or (root_p / "libs" if root_p else "libs"))
+    out_dir = (root_p / "out") if root_p else Path("out")
+    src_dirs = [root_p / d for d in ("src/main/java", "src/test/java")] if root_p else []
+    src_dirs = [d for d in src_dirs if d.exists()] or ([root_p / "src"] if root_p and (root_p / "src").exists() else [])
+    features = next((root_p / d for d in
+                     ("src/test/resources/features", "src/test/resources", "features")
+                     if root_p and (root_p / d).exists()), root_p)
+    resources = root_p / "src/test/resources" if root_p else None
 
+    def _jars(folder: Path) -> str:
+        """Explicit jar list excluding sources/javadoc jars — javac otherwise
+        compiles .java files found inside *-sources.jar (deprecation spam)."""
+        jars = [str(j) for j in sorted(folder.glob("*.jar"))
+                if not j.stem.endswith(("-sources", "-javadoc"))]
+        return os.pathsep.join(jars) if jars else str(folder / "*")
 
-def _safe(name: str) -> str:
-    """Keep alphanumerics and PRESERVE capitalization (SBIBranchChannelPage
-    must not become Sbibranchchannelpage), uppercasing only the first char
-    so the filename always matches the public class name."""
-    s = "".join(c for c in name if c.isalnum())
-    return (s[:1].upper() + s[1:]) if s else "Generated"
+    lib_cp = _jars(libs) if libs.exists() else str(libs / "*")
+    cp_parts = [str(out_dir), lib_cp]
+    if resources and resources.exists():
+        cp_parts.append(str(resources))
+    classpath = os.pathsep.join(cp_parts)
 
+    java_flags = [f"-Denvironment={environment}",
+                  "-Dbrowser=edge",
+                  f"-Dheadless={'true' if headless else 'false'}",
+                  f"-Dwebdriver.edge.driver={settings['edgedriver_path']}",
+                  f"-Dedge.profile.dir={config.DATA_DIR / 'edge_exec_profile'}"]
+    if settings.get("edge_binary_path"):
+        java_flags.append(f"-Dedge.binary={settings['edge_binary_path']}")
 
-def _canonical_path(art: dict, transaction: str) -> str:
-    """Force every artifact into one fixed layout so 1000s of recordings
-    accumulate in the SAME framework structure instead of scattering.
-    Page objects are named by SCREEN (shared across transactions);
-    features/stepdefs by transaction."""
-    atype = art.get("artifact_type", "feature")
-    raw = Path(art.get("target_path", "")).stem
-    if atype == "pageobject":
-        name = _safe(raw.removesuffix("Page") or transaction)
-    else:
-        name = _safe(transaction if atype in ("feature", "stepdef") else raw)
-    template = _CANON.get(atype)
-    return template.format(name=name) if template else art.get("target_path", "")
+    run_cmd = [java, "-cp", classpath, *java_flags,
+               "io.cucumber.core.cli.Main",
+               "--glue", settings.get("glue_package", "stepdefinitions"),
+               "--plugin", "pretty",
+               "--plugin", f"json:{log_dir}/cucumber.json",
+               *(["--tags", tags] if tags else []),
+               str(features)]
 
-
-async def generate_for_transaction(transaction: str) -> list[int]:
-    """Generate all artifacts for one transaction; returns artifact ids."""
+    await _emit(eid, {"type": "status", "message":
+                      f"Compiling with javac, then launching {'headless' if headless else 'LIVE visible'} Edge…",
+                      "cmd": " ".join(run_cmd)})
     db = SessionLocal()
     try:
-        pkg = build_knowledge_package(db, transaction)
-        fw = framework_update.framework_context(transaction)
-        # Feed the CURRENT content of page objects for every screen in this
-        # transaction so the AI updates shared files instead of recreating them.
-        screens = {a.get("screen") for a in pkg.get("actions", []) if a.get("screen")}
-        for s in screens:
-            rel = _CANON["pageobject"].format(name=_safe(s))
-            existing_po = framework_update.read_existing(rel)
-            if existing_po:
-                fw["matching_files"][rel] = existing_po[:8000]
+        if not root or not Path(root).exists():
+            raise RuntimeError("Framework path is not configured in Settings.")
+        if not libs.exists() or not any(libs.glob("*.jar")):
+            raise RuntimeError(f"No jars found in {libs}. Run get-libs script or set 'libs_path' in Settings.")
 
-        result = await azure_client.chat_json(
-            _GEN_SYSTEM,
-            "Generate automation for this transaction knowledge package.\n"
-            f"KNOWLEDGE PACKAGE:\n{json.dumps(pkg)[:40000]}\n"
-            f"EXISTING FRAMEWORK CONTEXT:\n{json.dumps(fw)[:20000]}\n"
-            'Return JSON: {"artifacts": [{"artifact_type": '
-            '"feature|stepdef|pageobject|runner|testdata", '
-            '"target_path": "relative/path/in/framework", "content": "..."}], '
-            '"summary": "..."}',
-            max_tokens=8000)
+        # Phase 1: compile all .java sources with javac
+        sources = [str(p) for d in src_dirs for p in d.rglob("*.java")]
+        if sources:
+            out_dir.mkdir(exist_ok=True)
+            src_list = log_dir / "sources.txt"
+            src_list.write_text("\n".join(sources))
+            comp = subprocess.run(
+                [javac, "-encoding", "UTF-8", "-implicit:none",
+                 "-cp", lib_cp, "-d", str(out_dir), f"@{src_list}"],
+                cwd=root, capture_output=True, text=True)
+            for line in (comp.stdout + comp.stderr).splitlines():
+                await _emit(eid, {"type": "log", "line": line})
+            if comp.returncode != 0:
+                raise RuntimeError("javac compilation failed — see log above.")
+            await _emit(eid, {"type": "status",
+                              "message": f"Compiled {len(sources)} Java files. Starting Cucumber…"})
 
-        ids, seen = [], set()
-        for art in result.get("artifacts", []):
-            path = _canonical_path(art, transaction)
-            if path in seen:            # one artifact per file per generation
-                continue
-            seen.add(path)
-            existing = framework_update.read_existing(path)
-            # Supersede older pending artifacts for the same file so re-recording
-            # a screen updates, never forks, the framework.
-            db.query(GeneratedArtifact).filter_by(
-                target_path=path, status="proposed").update({"status": "superseded"})
-            ga = GeneratedArtifact(transaction_number=transaction,
-                                   artifact_type=art["artifact_type"],
-                                   target_path=path,
-                                   content=art["content"],
-                                   existing_content=existing)
-            db.add(ga)
-            db.flush()
-            ids.append(ga.id)
-        db.add(LearningEvent(kind="recording", reference=transaction,
-                             detail={"generated": len(ids),
-                                     "summary": result.get("summary")}))
+        # Phase 2: run Cucumber CLI on the JDK, live-streamed
+        proc = subprocess.Popen(run_cmd, cwd=root, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+        _procs[eid] = proc
+        with open(log_path, "w") as lf:
+            loop = asyncio.get_event_loop()
+            while True:
+                line = await loop.run_in_executor(None, proc.stdout.readline)
+                if not line:
+                    break
+                lf.write(line)
+                ev = {"type": "log", "line": line.rstrip()}
+                if re.search(r"Scenario:|Given |When |Then ", line):
+                    ev["type"] = "step"
+                if re.search(r"PASSED|✔", line):
+                    ev["result"] = "passed"
+                elif re.search(r"FAILED|✘|Exception", line):
+                    ev["result"] = "failed"
+                    ev["type"] = "failure"
+                await _emit(eid, ev)
+        rc = proc.wait()
+        report = _parse_cucumber(log_dir / "cucumber.json")
+        rca = await _root_cause(report) if report.get("failed") else None
+        db.query(Execution).filter_by(id=eid).update({
+            "status": "passed" if rc == 0 else "failed",
+            "passed": report.get("passed", 0), "failed": report.get("failed", 0),
+            "skipped": report.get("skipped", 0), "finished_at": now(),
+            "log_path": str(log_path),
+            "report": {**report, "root_cause_analysis": rca}})
+        db.add(LearningEvent(kind="execution", reference=str(eid),
+                             detail={"rc": rc, "summary": report}))
         db.commit()
-        return ids
+        await _emit(eid, {"type": "done", "status": "passed" if rc == 0 else "failed",
+                          "report": report, "rca": rca})
+    except Exception as e:
+        db.query(Execution).filter_by(id=eid).update(
+            {"status": "failed", "finished_at": now()})
+        db.commit()
+        await _emit(eid, {"type": "error", "message": str(e)})
     finally:
         db.close()
+        _procs.pop(eid, None)
 
 
-def approve_artifact(artifact_id: int, approve: bool, edited: str | None = None) -> dict:
-    """Human review gate — approved artifacts are written by the update engine."""
-    db = SessionLocal()
+def stop_execution(eid: int) -> bool:
+    p = _procs.get(eid)
+    if p:
+        p.terminate()
+        return True
+    return False
+
+
+def _parse_cucumber(path: Path) -> dict:
+    if not path.exists():
+        return {"passed": 0, "failed": 0, "skipped": 0, "scenarios": []}
     try:
-        art = db.query(GeneratedArtifact).get(artifact_id)
-        if not art:
-            return {"ok": False, "error": "not found"}
-        if edited is not None:
-            art.content = edited
-            db.add(LearningEvent(kind="human_correction", reference=art.target_path,
-                                 detail={"artifact_id": artifact_id}))
-        if approve:
-            framework_update.write_artifact(art.target_path, art.content)
-            art.status = "written"
-        else:
-            art.status = "rejected"
-        db.commit()
-        return {"ok": True, "status": art.status}
-    finally:
-        db.close()
+        data = json.loads(path.read_text())
+    except Exception:
+        return {"passed": 0, "failed": 0, "skipped": 0, "scenarios": []}
+    passed = failed = skipped = 0
+    scenarios = []
+    for feature in data:
+        for el in feature.get("elements", []):
+            statuses = [s.get("result", {}).get("status") for s in el.get("steps", [])]
+            st = ("failed" if "failed" in statuses
+                  else "skipped" if "skipped" in statuses else "passed")
+            passed += st == "passed"
+            failed += st == "failed"
+            skipped += st == "skipped"
+            scenarios.append({"feature": feature.get("name"),
+                              "scenario": el.get("name"), "status": st,
+                              "error": next((s["result"].get("error_message", "")[:800]
+                                             for s in el.get("steps", [])
+                                             if s.get("result", {}).get("status") == "failed"), None)})
+    return {"passed": passed, "failed": failed, "skipped": skipped,
+            "scenarios": scenarios}
+
+
+async def _root_cause(report: dict) -> list[dict]:
+    """Module 23 — AI Root Cause Analysis for every failed scenario."""
+    failures = [s for s in report.get("scenarios", []) if s["status"] == "failed"][:10]
+    if not failures:
+        return []
+    result = await azure_client.chat_json(
+        "You are a senior automation failure analyst for banking test suites. "
+        "For each failure classify root cause (locator|data|environment|"
+        "application_defect|timing), explain it, state business impact, give a "
+        "confidence score 0-1 and a recommendation.",
+        json.dumps(failures) +
+        ' Return {"analysis": [{"scenario": "...", "root_cause": "...", '
+        '"explanation": "...", "business_impact": "...", "confidence": 0.9, '
+        '"recommendation": "..."}]}',
+        max_tokens=3000)
+    return result.get("analysis", [])
