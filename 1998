@@ -1,84 +1,207 @@
-package pages;
+"""Module 17 — AI Automation Generator (+ Module 16 knowledge packaging).
 
-import org.openqa.selenium.WebDriver;
-import org.openqa.selenium.WebElement;
+Builds a Transaction Knowledge Package from everything the recorder captured
+and asks Azure OpenAI to generate: Feature File (positive AND negative
+scenarios derived from captured validation rules), Step Definitions, Page
+Object (reading locators from the central repository), Runner, and test data.
+Artifacts are stored as *proposals* for human review before being written into
+the existing Java framework by the Framework Update Engine.
+"""
+import json
+from pathlib import Path
 
-public class SBIBranchChannelPage extends BasePage {
-
-    private static final String TXN    = "TXN-400";
-    private static final String SCREEN = "SBI Branch Channel";
-
-    public SBIBranchChannelPage(WebDriver driver) { super(driver); }
-
-    @Override protected String transaction() { return TXN; }
-    @Override protected String screen()      { return SCREEN; }
-
-    public WebElement username()  { return find("login-username"); }
-    public WebElement password()  { return find("password"); }
-    public WebElement appSearch() { return find("appSearch"); }
-
-    public void enterUsername(String v) { type("login-username", v); }
-    public void enterPassword(String v) { type("password", v); }
-    public void searchApp(String v)     { type("appSearch", v); }
-}
+from ..ai import azure_client
+from ..models import (Element, GeneratedArtifact, KnowledgePackage,
+                      LearningEvent, NetworkCall, RecordedAction, Recording,
+                      SessionLocal, TestDataField, ValidationMessage)
+from . import framework_update
 
 
+def build_knowledge_package(db, transaction: str) -> dict:
+    """Module 16 — assemble the reusable knowledge package."""
+    actions = (db.query(RecordedAction).join(Recording)
+               .filter(Recording.transaction_number == transaction)
+               .order_by(RecordedAction.sequence).all())
+    fields = db.query(TestDataField).filter_by(transaction_number=transaction).all()
+    msgs = db.query(ValidationMessage).filter_by(transaction_number=transaction).all()
+    apis = db.query(NetworkCall).filter_by(transaction_number=transaction).all()
+    elements = db.query(Element).filter_by(transaction_number=transaction).all()
 
+    workflow = []
+    last_screen = None
+    for a in actions:
+        if a.screen_name != last_screen:
+            workflow.append(a.screen_name)
+            last_screen = a.screen_name
 
-
-
-
-package pages;
-
-import org.openqa.selenium.WebDriver;
-import org.openqa.selenium.WebElement;
-
-public class DepositsShortEnquiryPage extends BasePage {
-
-    private static final String TXN    = "TXN-400";
-    private static final String SCREEN = "000400 : Deposits Short Enquiry";
-
-    public DepositsShortEnquiryPage(WebDriver driver) { super(driver); }
-
-    @Override protected String transaction() { return TXN; }
-    @Override protected String screen()      { return SCREEN; }
-
-    public WebElement accntNumber1() { return find("UIPage_000400_accntNumber1"); }
-
-    public void enterAccountNumber(String v) { type("UIPage_000400_accntNumber1", v); }
-}
-
-
-
-
-
-
-
-package pages;
-
-import org.openqa.selenium.WebDriver;
-import org.openqa.selenium.WebElement;
-
-public class UserPasswordExpiredForcedPasswordChangePage extends BasePage {
-
-    private static final String TXN    = "TXN-400";
-    private static final String SCREEN = "User Password Expired : Forced Password Change";
-
-    public UserPasswordExpiredForcedPasswordChangePage(WebDriver driver) { super(driver); }
-
-    @Override protected String transaction() { return TXN; }
-    @Override protected String screen()      { return SCREEN; }
-
-    public WebElement oldPassword()        { return find("UIPage_009750_oldPassword"); }
-    public WebElement newPassword()        { return find("UIPage_009750_newPassword"); }
-    public WebElement confirmNewPassword() { return find("UIPage_009750_confirmNewPassword"); }
-    public WebElement submit()             { return clickable("UIPage_009750_submit"); }
-    public WebElement okButton()           { return clickable("ok-button"); }
-
-    public void changePassword(String oldPwd, String newPwd) {
-        type("UIPage_009750_oldPassword", oldPwd);
-        type("UIPage_009750_newPassword", newPwd);
-        type("UIPage_009750_confirmNewPassword", newPwd);
-        click("UIPage_009750_submit");
+    pkg = {
+        "transaction_number": transaction,
+        "workflow": workflow,                            # Module 11
+        "actions": [{"seq": a.sequence, "type": a.action_type,
+                     "screen": a.screen_name, "description": a.description,
+                     "value": a.value_masked} for a in actions],
+        "fields": [{"name": f.field_name, "type": f.input_type,
+                    "mandatory": f.mandatory, "max_length": f.max_length,
+                    "pattern": f.pattern, "sample": f.value_masked,
+                    "sensitive": f.sensitive,
+                    "options": f.dropdown_options} for f in fields],
+        "messages": [{"kind": m.kind, "text": m.text, "code": m.error_code}
+                     for m in msgs],
+        "apis": [{"method": c.method, "url": c.url, "status": c.status_code,
+                  "time_ms": c.response_time_ms} for c in apis][:30],
+        "elements": [{"key": e.element_key, "screen": e.screen_name,
+                      "tag": e.tag_name,
+                      "primary_locator": next((l.value for l in e.locators
+                                               if l.is_primary), None)}
+                     for e in elements][:200],
     }
-}
+    kp = db.query(KnowledgePackage).filter_by(transaction_number=transaction).first()
+    if kp:
+        kp.business_workflow = workflow
+        kp.version += 1
+    else:
+        db.add(KnowledgePackage(transaction_number=transaction,
+                                business_workflow=workflow, ai_confidence=0.8))
+    db.commit()
+    return pkg
+
+
+_GEN_SYSTEM = """You are a senior Java Selenium-Cucumber automation engineer for
+enterprise banking applications. You generate production-quality code that fits
+an EXISTING framework: reuse its base classes, utilities and coding style shown
+in the framework context; never duplicate existing helpers.
+Every Feature File MUST contain BOTH positive scenarios (happy path with the
+captured valid data and success messages) AND negative scenarios derived from
+the captured field metadata: blank mandatory fields, max-length boundary
+violations, invalid pattern/format, business-rule violations, and the exact
+captured validation/error messages as expected results.
+Page Objects must load locators from LocatorRepository.get(transaction, screen,
+elementKey) — the central repository is the single source of truth, with the
+literal locator kept only as an inline fallback comment.
+ONE framework for ALL transactions: page objects are one-per-SCREEN and shared
+across transactions. If a page object for a screen already exists (its current
+content is provided), UPDATE it — keep every existing method and add only the
+new elements/methods this transaction needs. Reuse existing generic steps
+(navigation, login, common assertions) instead of writing new ones.
+HARD RULES — code that violates these will not compile:
+1. Packages are fixed: page objects -> "package pages;", step definitions ->
+   "package stepdefinitions;", runners -> "package runners;". The ONLY utility
+   package is "core" (DriverFactory, ConfigReader, LocatorRepository). NEVER
+   import or create "utils", "helpers", or any other package.
+2. The public class name MUST exactly equal the file name in target_path
+   (Java requirement), including capitalization.
+3. Every page-object method called from a step definition MUST be defined in
+   the page object generated or provided in this same response. Before
+   finishing, verify each stepdef method call resolves.
+4. Locator access pattern inside page objects:
+     import core.LocatorRepository;
+     By loc = LocatorRepository.by(TXN, SCREEN, KEY, By.id("fallbackId"));
+   where the last argument is the recorded literal locator as fallback.
+5. Do not reference any class you have not generated here or that is not in
+   core.* or standard Selenium/Cucumber APIs."""
+
+
+_CANON = {"feature": "src/test/resources/features/{name}.feature",
+          "stepdef": "src/test/java/stepdefinitions/{name}Steps.java",
+          "pageobject": "src/test/java/pages/{name}Page.java",
+          "runner": "src/test/java/runners/{name}Runner.java",
+          "testdata": "src/test/resources/testdata/{name}.json"}
+
+
+def _safe(name: str) -> str:
+    """Keep alphanumerics and PRESERVE capitalization (SBIBranchChannelPage
+    must not become Sbibranchchannelpage), uppercasing only the first char
+    so the filename always matches the public class name."""
+    s = "".join(c for c in name if c.isalnum())
+    return (s[:1].upper() + s[1:]) if s else "Generated"
+
+
+def _canonical_path(art: dict, transaction: str) -> str:
+    """Force every artifact into one fixed layout so 1000s of recordings
+    accumulate in the SAME framework structure instead of scattering.
+    Page objects are named by SCREEN (shared across transactions);
+    features/stepdefs by transaction."""
+    atype = art.get("artifact_type", "feature")
+    raw = Path(art.get("target_path", "")).stem
+    if atype == "pageobject":
+        name = _safe(raw.removesuffix("Page") or transaction)
+    else:
+        name = _safe(transaction if atype in ("feature", "stepdef") else raw)
+    template = _CANON.get(atype)
+    return template.format(name=name) if template else art.get("target_path", "")
+
+
+async def generate_for_transaction(transaction: str) -> list[int]:
+    """Generate all artifacts for one transaction; returns artifact ids."""
+    db = SessionLocal()
+    try:
+        pkg = build_knowledge_package(db, transaction)
+        fw = framework_update.framework_context(transaction)
+        # Feed the CURRENT content of page objects for every screen in this
+        # transaction so the AI updates shared files instead of recreating them.
+        screens = {a.get("screen") for a in pkg.get("actions", []) if a.get("screen")}
+        for s in screens:
+            rel = _CANON["pageobject"].format(name=_safe(s))
+            existing_po = framework_update.read_existing(rel)
+            if existing_po:
+                fw["matching_files"][rel] = existing_po[:8000]
+
+        result = await azure_client.chat_json(
+            _GEN_SYSTEM,
+            "Generate automation for this transaction knowledge package.\n"
+            f"KNOWLEDGE PACKAGE:\n{json.dumps(pkg)[:40000]}\n"
+            f"EXISTING FRAMEWORK CONTEXT:\n{json.dumps(fw)[:20000]}\n"
+            'Return JSON: {"artifacts": [{"artifact_type": '
+            '"feature|stepdef|pageobject|runner|testdata", '
+            '"target_path": "relative/path/in/framework", "content": "..."}], '
+            '"summary": "..."}',
+            max_tokens=8000)
+
+        ids, seen = [], set()
+        for art in result.get("artifacts", []):
+            path = _canonical_path(art, transaction)
+            if path in seen:            # one artifact per file per generation
+                continue
+            seen.add(path)
+            existing = framework_update.read_existing(path)
+            # Supersede older pending artifacts for the same file so re-recording
+            # a screen updates, never forks, the framework.
+            db.query(GeneratedArtifact).filter_by(
+                target_path=path, status="proposed").update({"status": "superseded"})
+            ga = GeneratedArtifact(transaction_number=transaction,
+                                   artifact_type=art["artifact_type"],
+                                   target_path=path,
+                                   content=art["content"],
+                                   existing_content=existing)
+            db.add(ga)
+            db.flush()
+            ids.append(ga.id)
+        db.add(LearningEvent(kind="recording", reference=transaction,
+                             detail={"generated": len(ids),
+                                     "summary": result.get("summary")}))
+        db.commit()
+        return ids
+    finally:
+        db.close()
+
+
+def approve_artifact(artifact_id: int, approve: bool, edited: str | None = None) -> dict:
+    """Human review gate — approved artifacts are written by the update engine."""
+    db = SessionLocal()
+    try:
+        art = db.query(GeneratedArtifact).get(artifact_id)
+        if not art:
+            return {"ok": False, "error": "not found"}
+        if edited is not None:
+            art.content = edited
+            db.add(LearningEvent(kind="human_correction", reference=art.target_path,
+                                 detail={"artifact_id": artifact_id}))
+        if approve:
+            framework_update.write_artifact(art.target_path, art.content)
+            art.status = "written"
+        else:
+            art.status = "rejected"
+        db.commit()
+        return {"ok": True, "status": art.status}
+    finally:
+        db.close()
