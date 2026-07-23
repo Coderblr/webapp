@@ -1,252 +1,277 @@
-"""Module 22 — Execution Engine (+ Module 23 report data, Module 21 learning).
-
-Compiles and runs the Java Selenium-Cucumber framework LIVE in a real, visible
-Microsoft Edge browser (headless only if explicitly toggled). Streams every log
-line / step / pass-fail to the frontend over WebSocket, captures failures,
-parses the cucumber JSON report, and asks Azure OpenAI for root cause analysis.
-The Edge/EdgeDriver versions are checked and must match; the execution session
-uses its own Edge profile so it never conflicts with the Recorder's session.
 """
-import asyncio
-import json
-import re
-import os
-import subprocess
+Framework scaffolder.
+
+If the configured framework path is empty (or missing the base plumbing), this
+creates a complete, runnable Selenium-Cucumber framework for plain JDK
+(javac + java, no Maven):
+
+    <framework>/
+      libs/                      <- jars (populate with scripts/get-libs)
+      src/main/java/
+        core/DriverFactory.java      Edge driver (live by default), -D flags
+        core/ConfigReader.java       environment config
+        core/LocatorRepository.java  central repo client + self-healing hook
+      src/test/java/
+        stepdefinitions/Hooks.java   before/after, screenshots on failure
+      src/test/resources/
+        features/                    generated .feature files land here
+        config/SIT.properties        per-environment URLs
+      run.bat / run.sh               manual one-command execution
+
+Generated artifacts (features, step defs, page objects) are then written into
+this structure by the generation engine after approval.
+"""
 from pathlib import Path
 
 from .. import config
-from ..ai import azure_client
-from ..models import Execution, LearningEvent, SessionLocal, now
 
-# execution_id → asyncio.Queue of live events (consumed by the WebSocket)
-_streams: dict[int, asyncio.Queue] = {}
-_procs: dict[int, subprocess.Popen] = {}
+GLUE = "stepdefinitions"
+
+FILES: dict[str, str] = {}
+
+FILES["src/main/java/core/DriverFactory.java"] = r"""package core;
+
+import org.openqa.selenium.WebDriver;
+import org.openqa.selenium.edge.EdgeDriver;
+import org.openqa.selenium.edge.EdgeOptions;
+import java.time.Duration;
+
+/** Creates the Edge driver. Live (visible) by default; controlled by -D flags
+ *  supplied by the AI Automation Platform execution engine. */
+public final class DriverFactory {
+    private static final ThreadLocal<WebDriver> DRIVER = new ThreadLocal<>();
+
+    public static WebDriver get() {
+        if (DRIVER.get() == null) {
+            String edgeDriver = System.getProperty("webdriver.edge.driver", "msedgedriver");
+            System.setProperty("webdriver.edge.driver", edgeDriver);
+            EdgeOptions options = new EdgeOptions();
+            String binary = System.getProperty("edge.binary", "");
+            if (!binary.isEmpty()) options.setBinary(binary);
+            String profile = System.getProperty("edge.profile.dir", "");
+            if (!profile.isEmpty()) options.addArguments("--user-data-dir=" + profile);
+            if (Boolean.getBoolean("headless")) options.addArguments("--headless=new");
+            options.addArguments("--start-maximized", "--remote-allow-origins=*");
+            WebDriver d = new EdgeDriver(options);
+            d.manage().timeouts().implicitlyWait(Duration.ofSeconds(10));
+            DRIVER.set(d);
+        }
+        return DRIVER.get();
+    }
+
+    public static void quit() {
+        if (DRIVER.get() != null) { DRIVER.get().quit(); DRIVER.remove(); }
+    }
+}
+"""
+
+FILES["src/main/java/core/ConfigReader.java"] = r"""package core;
+
+import java.io.FileInputStream;
+import java.util.Properties;
+
+/** Reads src/test/resources/config/<environment>.properties (default SIT). */
+public final class ConfigReader {
+    private static Properties props;
+
+    public static String get(String key) {
+        if (props == null) {
+            props = new Properties();
+            String env = System.getProperty("environment", "SIT");
+            try (FileInputStream in = new FileInputStream(
+                    "src/test/resources/config/" + env + ".properties")) {
+                props.load(in);
+            } catch (Exception e) {
+                throw new RuntimeException("Cannot load config for env " + env, e);
+            }
+        }
+        return props.getProperty(key, "");
+    }
+}
+"""
+
+FILES["src/main/java/core/LocatorRepository.java"] = r"""package core;
+
+import org.openqa.selenium.By;
+import org.openqa.selenium.NoSuchElementException;
+import org.openqa.selenium.WebDriver;
+import org.openqa.selenium.WebElement;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+
+/** Client for the AI Automation Platform's central locator repository.
+ *  find() resolves an element and, on failure, calls the self-healing API
+ *  so tests keep running when the UI changes. Falls back to the inline
+ *  locator if the platform is offline. */
+public final class LocatorRepository {
+    private static final String BASE =
+        System.getProperty("platform.url", "http://localhost:8000");
+
+    /** Primary API for page objects: resolve from the central repository,
+     *  fall back to the inline recorded locator if the platform is offline. */
+    public static By by(String txn, String screen, String key, By fallback) {
+        try {
+            String resp = httpGet(BASE + "/api/locator/resolve?key=" +
+                java.net.URLEncoder.encode(key, "UTF-8"));
+            String strategy = json(resp, "strategy"), value = json(resp, "value");
+            if (strategy != null && value != null) return toBy(strategy, value);
+        } catch (Exception ignore) { /* platform offline: use inline fallback */ }
+        return fallback;
+    }
+
+    private static String httpGet(String url) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(2000); c.setReadTimeout(5000);
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader r = new BufferedReader(
+                new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
+            String line; while ((line = r.readLine()) != null) sb.append(line);
+        }
+        return sb.toString();
+    }
+
+    /** Find with self-healing. key format: "TXN/Screen/elementName". */
+    public static WebElement find(WebDriver driver, String key, By fallback) {
+        try {
+            return driver.findElement(fallback);
+        } catch (NoSuchElementException first) {
+            try {
+                String dom = driver.getPageSource();
+                if (dom.length() > 200_000) dom = dom.substring(0, 200_000);
+                String body = "{\"key\":" + q(key)
+                    + ",\"failed_locator\":" + q(fallback.toString())
+                    + ",\"dom\":" + q(dom) + "}";
+                String resp = post(BASE + "/api/heal", body);
+                String type = json(resp, "type"), value = json(resp, "value");
+                if (type != null && value != null) {
+                    By healed = toBy(type, value);
+                    WebElement el = driver.findElement(healed);
+                    System.out.println("[SELF-HEALED] " + key + " -> " + healed);
+                    return el;
+                }
+            } catch (Exception ignore) { /* platform offline: fall through */ }
+            throw first;
+        }
+    }
+
+    private static By toBy(String type, String value) {
+        switch (type) {
+            case "id": return By.id(value);
+            case "name": return By.name(value);
+            case "css": return By.cssSelector(value);
+            default: return By.xpath(value);
+        }
+    }
+
+    private static String post(String url, String body) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setRequestMethod("POST");
+        c.setRequestProperty("Content-Type", "application/json");
+        c.setConnectTimeout(3000); c.setReadTimeout(15000); c.setDoOutput(true);
+        try (OutputStream os = c.getOutputStream()) {
+            os.write(body.getBytes(StandardCharsets.UTF_8));
+        }
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader r = new BufferedReader(
+                new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
+            String line; while ((line = r.readLine()) != null) sb.append(line);
+        }
+        return sb.toString();
+    }
+
+    private static String q(String s) {
+        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"")
+                       .replace("\n", "\\n").replace("\r", "") + "\"";
+    }
+
+    private static String json(String body, String field) {
+        int i = body.indexOf("\"" + field + "\"");
+        if (i < 0) return null;
+        int a = body.indexOf('"', body.indexOf(':', i) + 1);
+        int b = body.indexOf('"', a + 1);
+        return (a < 0 || b < 0) ? null : body.substring(a + 1, b);
+    }
+}
+"""
+
+FILES["src/test/java/stepdefinitions/Hooks.java"] = r"""package stepdefinitions;
+
+import core.DriverFactory;
+import io.cucumber.java.After;
+import io.cucumber.java.Before;
+import io.cucumber.java.Scenario;
+import org.openqa.selenium.OutputType;
+import org.openqa.selenium.TakesScreenshot;
+
+public class Hooks {
+    @Before
+    public void setUp() { DriverFactory.get(); }
+
+    @After
+    public void tearDown(Scenario scenario) {
+        if (scenario.isFailed()) {
+            byte[] shot = ((TakesScreenshot) DriverFactory.get())
+                .getScreenshotAs(OutputType.BYTES);
+            scenario.attach(shot, "image/png", scenario.getName());
+        }
+        DriverFactory.quit();
+    }
+}
+"""
+
+FILES["src/test/resources/config/SIT.properties"] = (
+    "# Base URLs and credentials-by-reference for the SIT environment\n"
+    "app.url=https://sit.yourbank.example.com\n")
+FILES["src/test/resources/config/UAT.properties"] = (
+    "app.url=https://uat.yourbank.example.com\n")
+
+FILES["run.bat"] = (
+    "@echo off\r\n"
+    "REM Compile + run with plain JDK. Usage: run.bat @TagName\r\n"
+    "if not exist out mkdir out\r\n"
+    "dir /s /b src\\*.java > sources.txt\r\n"
+    "javac -encoding UTF-8 -cp \"libs/*\" -d out @sources.txt || exit /b 1\r\n"
+    "java -cp \"out;libs/*;src/test/resources\" -Dbrowser=edge "
+    "io.cucumber.core.cli.Main --glue " + GLUE +
+    " --plugin pretty %* src/test/resources/features\r\n")
+
+FILES["run.sh"] = (
+    "#!/usr/bin/env bash\n"
+    "# Compile + run with plain JDK. Usage: ./run.sh --tags @TagName\n"
+    "set -e\nmkdir -p out\n"
+    "find src -name '*.java' > sources.txt\n"
+    "javac -encoding UTF-8 -cp 'libs/*' -d out @sources.txt\n"
+    "java -cp \"out:libs/*:src/test/resources\" -Dbrowser=edge \\\n"
+    "  io.cucumber.core.cli.Main --glue " + GLUE +
+    " --plugin pretty \"$@\" src/test/resources/features\n")
 
 
-def check_edge_versions() -> dict:
-    """Auto-detect Edge and EdgeDriver versions and verify they match."""
-    s = config.load_settings()
-    out = {"edge": None, "driver": None, "match": None}
-    try:
-        r = subprocess.run([s["edgedriver_path"], "--version"],
-                           capture_output=True, text=True, timeout=10)
-        m = re.search(r"(\d+)\.", r.stdout)
-        out["driver"] = r.stdout.strip().split("\n")[0]
-        drv_major = m.group(1) if m else None
-    except Exception as e:
-        out["driver"] = f"not found ({e})"
-        drv_major = None
-    for candidate in ([s["edge_binary_path"]] if s.get("edge_binary_path") else []) + \
-                     ["microsoft-edge", "msedge"]:
-        try:
-            r = subprocess.run([candidate, "--version"], capture_output=True,
-                               text=True, timeout=10)
-            out["edge"] = r.stdout.strip()
-            m = re.search(r"(\d+)\.", r.stdout)
-            out["match"] = bool(m and drv_major and m.group(1) == drv_major)
-            break
-        except Exception:
-            continue
-    return out
+def is_scaffolded(root: Path) -> bool:
+    return (root / "src/main/java/core/DriverFactory.java").exists()
 
 
-async def _emit(execution_id: int, event: dict):
-    q = _streams.get(execution_id)
-    if q:
-        await q.put(event)
-
-
-def get_stream(execution_id: int) -> asyncio.Queue:
-    return _streams.setdefault(execution_id, asyncio.Queue())
-
-
-async def start_execution(transactions: list[str], environment: str = "SIT",
-                          headless: bool | None = None) -> int:
+def scaffold(path: str | None = None, force: bool = False) -> dict:
+    """Create the base framework if it doesn't exist. Never overwrites
+    existing files unless force=True. Returns a summary of what was created."""
     settings = config.load_settings()
-    if headless is None:
-        headless = settings["default_headless"]      # default: LIVE visible Edge
-    db = SessionLocal()
-    ex = Execution(transactions=transactions, environment=environment,
-                   headless=headless)
-    db.add(ex)
-    db.commit()
-    eid = ex.id
-    db.close()
-    get_stream(eid)
-    asyncio.create_task(_run(eid, transactions, environment, headless, settings))
-    return eid
-
-
-async def _run(eid: int, transactions: list[str], environment: str,
-               headless: bool, settings: dict):
-    root = settings.get("framework_path")
-    log_dir = config.ARTIFACTS_DIR / f"exec_{eid}"
-    log_dir.mkdir(exist_ok=True)
-    log_path = log_dir / "execution.log"
-    tags = " or ".join(f"@{t}" for t in transactions) if transactions else ""
-
-    # ---- Pure JDK runner (no Maven): javac compile + Cucumber CLI ----
-    root_p = Path(root) if root else None
-    java_home = settings.get("java_home", "")
-    java = str(Path(java_home) / "bin" / "java") if java_home else "java"
-    javac = str(Path(java_home) / "bin" / "javac") if java_home else "javac"
-
-    libs = Path(settings.get("libs_path") or (root_p / "libs" if root_p else "libs"))
-    out_dir = (root_p / "out") if root_p else Path("out")
-    src_dirs = [root_p / d for d in ("src/main/java", "src/test/java")] if root_p else []
-    src_dirs = [d for d in src_dirs if d.exists()] or ([root_p / "src"] if root_p and (root_p / "src").exists() else [])
-    features = next((root_p / d for d in
-                     ("src/test/resources/features", "src/test/resources", "features")
-                     if root_p and (root_p / d).exists()), root_p)
-    resources = root_p / "src/test/resources" if root_p else None
-
-    def _jars(folder: Path) -> str:
-        """Explicit jar list excluding sources/javadoc jars — javac otherwise
-        compiles .java files found inside *-sources.jar (deprecation spam)."""
-        jars = [str(j) for j in sorted(folder.glob("*.jar"))
-                if not j.stem.endswith(("-sources", "-javadoc"))]
-        return os.pathsep.join(jars) if jars else str(folder / "*")
-
-    lib_cp = _jars(libs) if libs.exists() else str(libs / "*")
-    cp_parts = [str(out_dir), lib_cp]
-    if resources and resources.exists():
-        cp_parts.append(str(resources))
-    classpath = os.pathsep.join(cp_parts)
-
-    java_flags = [f"-Denvironment={environment}",
-                  "-Dbrowser=edge",
-                  f"-Dheadless={'true' if headless else 'false'}",
-                  f"-Dwebdriver.edge.driver={settings['edgedriver_path']}",
-                  f"-Dedge.profile.dir={config.DATA_DIR / 'edge_exec_profile'}"]
-    if settings.get("edge_binary_path"):
-        java_flags.append(f"-Dedge.binary={settings['edge_binary_path']}")
-
-    run_cmd = [java, "-cp", classpath, *java_flags,
-               "io.cucumber.core.cli.Main",
-               "--glue", settings.get("glue_package", "stepdefinitions"),
-               "--plugin", "pretty",
-               "--plugin", f"json:{log_dir}/cucumber.json",
-               *(["--tags", tags] if tags else []),
-               str(features)]
-
-    await _emit(eid, {"type": "status", "message":
-                      f"Compiling with javac, then launching {'headless' if headless else 'LIVE visible'} Edge…",
-                      "cmd": " ".join(run_cmd)})
-    db = SessionLocal()
-    try:
-        if not root or not Path(root).exists():
-            raise RuntimeError("Framework path is not configured in Settings.")
-        if not libs.exists() or not any(libs.glob("*.jar")):
-            raise RuntimeError(f"No jars found in {libs}. Run get-libs script or set 'libs_path' in Settings.")
-
-        # Phase 1: compile all .java sources with javac
-        sources = [str(p) for d in src_dirs for p in d.rglob("*.java")]
-        if sources:
-            out_dir.mkdir(exist_ok=True)
-            src_list = log_dir / "sources.txt"
-            src_list.write_text("\n".join(sources))
-            comp = subprocess.run(
-                [javac, "-encoding", "UTF-8", "-implicit:none",
-                 "-cp", lib_cp, "-d", str(out_dir), f"@{src_list}"],
-                cwd=root, capture_output=True, text=True)
-            for line in (comp.stdout + comp.stderr).splitlines():
-                await _emit(eid, {"type": "log", "line": line})
-            if comp.returncode != 0:
-                raise RuntimeError("javac compilation failed — see log above.")
-            await _emit(eid, {"type": "status",
-                              "message": f"Compiled {len(sources)} Java files. Starting Cucumber…"})
-
-        # Phase 2: run Cucumber CLI on the JDK, live-streamed
-        proc = subprocess.Popen(run_cmd, cwd=root, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1)
-        _procs[eid] = proc
-        with open(log_path, "w") as lf:
-            loop = asyncio.get_event_loop()
-            while True:
-                line = await loop.run_in_executor(None, proc.stdout.readline)
-                if not line:
-                    break
-                lf.write(line)
-                ev = {"type": "log", "line": line.rstrip()}
-                if re.search(r"Scenario:|Given |When |Then ", line):
-                    ev["type"] = "step"
-                if re.search(r"PASSED|✔", line):
-                    ev["result"] = "passed"
-                elif re.search(r"FAILED|✘|Exception", line):
-                    ev["result"] = "failed"
-                    ev["type"] = "failure"
-                await _emit(eid, ev)
-        rc = proc.wait()
-        report = _parse_cucumber(log_dir / "cucumber.json")
-        rca = await _root_cause(report) if report.get("failed") else None
-        db.query(Execution).filter_by(id=eid).update({
-            "status": "passed" if rc == 0 else "failed",
-            "passed": report.get("passed", 0), "failed": report.get("failed", 0),
-            "skipped": report.get("skipped", 0), "finished_at": now(),
-            "log_path": str(log_path),
-            "report": {**report, "root_cause_analysis": rca}})
-        db.add(LearningEvent(kind="execution", reference=str(eid),
-                             detail={"rc": rc, "summary": report}))
-        db.commit()
-        await _emit(eid, {"type": "done", "status": "passed" if rc == 0 else "failed",
-                          "report": report, "rca": rca})
-    except Exception as e:
-        db.query(Execution).filter_by(id=eid).update(
-            {"status": "failed", "finished_at": now()})
-        db.commit()
-        await _emit(eid, {"type": "error", "message": str(e)})
-    finally:
-        db.close()
-        _procs.pop(eid, None)
-
-
-def stop_execution(eid: int) -> bool:
-    p = _procs.get(eid)
-    if p:
-        p.terminate()
-        return True
-    return False
-
-
-def _parse_cucumber(path: Path) -> dict:
-    if not path.exists():
-        return {"passed": 0, "failed": 0, "skipped": 0, "scenarios": []}
-    try:
-        data = json.loads(path.read_text())
-    except Exception:
-        return {"passed": 0, "failed": 0, "skipped": 0, "scenarios": []}
-    passed = failed = skipped = 0
-    scenarios = []
-    for feature in data:
-        for el in feature.get("elements", []):
-            statuses = [s.get("result", {}).get("status") for s in el.get("steps", [])]
-            st = ("failed" if "failed" in statuses
-                  else "skipped" if "skipped" in statuses else "passed")
-            passed += st == "passed"
-            failed += st == "failed"
-            skipped += st == "skipped"
-            scenarios.append({"feature": feature.get("name"),
-                              "scenario": el.get("name"), "status": st,
-                              "error": next((s["result"].get("error_message", "")[:800]
-                                             for s in el.get("steps", [])
-                                             if s.get("result", {}).get("status") == "failed"), None)})
-    return {"passed": passed, "failed": failed, "skipped": skipped,
-            "scenarios": scenarios}
-
-
-async def _root_cause(report: dict) -> list[dict]:
-    """Module 23 — AI Root Cause Analysis for every failed scenario."""
-    failures = [s for s in report.get("scenarios", []) if s["status"] == "failed"][:10]
-    if not failures:
-        return []
-    result = await azure_client.chat_json(
-        "You are a senior automation failure analyst for banking test suites. "
-        "For each failure classify root cause (locator|data|environment|"
-        "application_defect|timing), explain it, state business impact, give a "
-        "confidence score 0-1 and a recommendation.",
-        json.dumps(failures) +
-        ' Return {"analysis": [{"scenario": "...", "root_cause": "...", '
-        '"explanation": "...", "business_impact": "...", "confidence": 0.9, '
-        '"recommendation": "..."}]}',
-        max_tokens=3000)
-    return result.get("analysis", [])
+    root = Path(path or settings.get("framework_path") or "")
+    if not str(root):
+        raise RuntimeError("Framework path is not configured in Settings.")
+    created, skipped = [], []
+    for rel, content in FILES.items():
+        target = root / rel
+        if target.exists() and not force:
+            skipped.append(rel)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        created.append(rel)
+    for d in ("libs", "src/test/resources/features", "out"):
+        (root / d).mkdir(parents=True, exist_ok=True)
+    return {"root": str(root), "created": created, "skipped": skipped,
+            "already_scaffolded": not created,
+            "next_step": "Populate libs/ with scripts/get-libs, then record & generate."}
