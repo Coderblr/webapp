@@ -98,6 +98,7 @@ def _wait_spinner(driver, spec: str, timeout: int = 30) -> None:
 
 
 def _present(driver, spec: str, timeout: int = 5) -> bool:
+    """Visible in the current context? (no frame switching)"""
     target = _by(spec)
     if not target:
         return False
@@ -107,6 +108,73 @@ def _present(driver, spec: str, timeout: int = 5) -> bool:
         return True
     except TimeoutException:
         return False
+
+
+def _present_any_frame(driver, spec: str, timeout: int = 20) -> bool:
+    """Look for the element in the top document AND inside every iframe,
+    polling until `timeout`. If found in a frame, the driver is LEFT switched
+    into that frame so the following _type/_click calls work there.
+    Banking apps frequently render the forced password-change screen in an
+    iframe, which is why a plain wait on the top document never sees it."""
+    target = _by(spec)
+    if not target:
+        return False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        driver.switch_to.default_content()
+        try:
+            els = driver.find_elements(*target)
+            if any(e.is_displayed() for e in els):
+                return True
+        except Exception:
+            pass
+        try:
+            frames = driver.find_elements("tag name", "iframe")
+        except Exception:
+            frames = []
+        for idx in range(len(frames)):
+            try:
+                driver.switch_to.default_content()
+                frames = driver.find_elements("tag name", "iframe")
+                driver.switch_to.frame(frames[idx])
+                els = driver.find_elements(*target)
+                if any(e.is_displayed() for e in els):
+                    return True          # stay inside this frame
+            except Exception:
+                continue
+        time.sleep(0.5)
+    driver.switch_to.default_content()
+    return False
+
+
+def describe_page(driver) -> dict:
+    """What is actually on screen right now — used when the password-change
+    screen is expected but not found, so the log says something useful."""
+    info = {"url": "", "title": "", "frames": 0, "inputs": [], "buttons": []}
+    try:
+        driver.switch_to.default_content()
+        info["url"] = driver.current_url
+        info["title"] = driver.title
+        info["frames"] = len(driver.find_elements("tag name", "iframe"))
+        info["inputs"] = driver.execute_script("""
+            return [].slice.call(document.querySelectorAll('input'))
+              .filter(function(e){var r=e.getBoundingClientRect();
+                                  return r.width>0&&r.height>0;})
+              .slice(0,20).map(function(e){
+                return (e.id? 'id='+e.id : e.name? 'name='+e.name : e.tagName)
+                       + ' (type=' + (e.type||'') + ')'; });
+        """) or []
+        info["buttons"] = driver.execute_script("""
+            return [].slice.call(document.querySelectorAll('button,input[type=submit]'))
+              .filter(function(e){var r=e.getBoundingClientRect();
+                                  return r.width>0&&r.height>0;})
+              .slice(0,12).map(function(e){
+                return ((e.innerText||e.value||'').trim().slice(0,30))
+                       + (e.id? ' [id='+e.id+']' : ''); });
+        """) or []
+    except Exception as e:
+        info["error"] = str(e)
+    return info
 
 
 def _type(driver, spec: str, value: str, timeout: int = 20) -> None:
@@ -236,7 +304,10 @@ def run(driver, url: str, log=None) -> dict:
     result["logged_in"] = True
 
     # --- forced password change, only if the screen actually appears ---
-    if _present(driver, cfg["pwd_old_locator"], timeout=8):
+    pwd_wait = int(config.load_settings().get("pwd_screen_wait_seconds", 20))
+    step(f"Checking for the forced password-change screen (up to {pwd_wait}s, "
+         "including iframes)…")
+    if _present_any_frame(driver, cfg["pwd_old_locator"], timeout=pwd_wait):
         new_pwd = creds["new_password"]
         if not new_pwd:
             step("Password change screen appeared but NBC_NEW_PASSWORD is not "
@@ -264,13 +335,21 @@ def run(driver, url: str, log=None) -> dict:
         config.save_settings(st)
         step("Credentials rotated for the next run (ping-pong).")
 
+        driver.switch_to.default_content()
         step("Re-logging in with the new password")
         _wait_spinner(driver, cfg["spinner_locator"])
         if _present(driver, cfg["login_user_locator"], timeout=15):
             _login(driver, cfg, creds["user_id"], new_pwd, log)
         result["relogin"] = True
     else:
-        step("No password change prompted — continuing.")
+        page = describe_page(driver)
+        result["page_after_login"] = page
+        step("Password-change screen NOT found using "
+             f"'{cfg['pwd_old_locator']}'. Page now: {page.get('title')} "
+             f"({page.get('url')}), {page.get('frames')} iframe(s). "
+             f"Visible inputs: {', '.join(page.get('inputs') or []) or 'none'}. "
+             "If the change screen IS on screen, copy the correct locator from "
+             "this list into Settings.")
 
     if cfg["home_ready_locator"]:
         if _present(driver, cfg["home_ready_locator"], timeout=30):
