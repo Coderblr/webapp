@@ -1,124 +1,876 @@
-"""Platform configuration.
+/* AI Automation Control Center — 100% plain JavaScript (no JSX/TS/React).
+   A tiny DOM builder h() renders everything; each page is a function that
+   returns a DOM element and manages its own refresh. */
+(function () {
+  "use strict";
+  var api = window.API;
+  var role = "Admin";  // auth removed — single-user local mode
+  var root = document.getElementById("root");
 
-All secrets are read from environment variables (or an optional .env file).
-Nothing sensitive is ever returned unmasked to the frontend or written to logs.
-"""
-import os
-import json
-from pathlib import Path
+  /* ---------- tiny DOM builder ---------- */
+  function h(tag, props) {
+    var el = document.createElement(tag);
+    props = props || {};
+    Object.keys(props).forEach(function (k) {
+      var v = props[k];
+      if (v == null) return;
+      if (k === "class") el.className = v;
+      else if (k === "style") Object.assign(el.style, v);
+      else if (k.indexOf("on") === 0) el.addEventListener(k.slice(2), v);
+      else if (k === "value") el.value = v;
+      else if (k === "checked" || k === "disabled" || k === "selected") el[k] = v;
+      else el.setAttribute(k, v);
+    });
+    for (var i = 2; i < arguments.length; i++) append(el, arguments[i]);
+    return el;
+  }
+  function append(el, c) {
+    if (c == null || c === false) return;
+    if (Array.isArray(c)) return c.forEach(function (x) { append(el, x); });
+    el.appendChild(c instanceof Node ? c : document.createTextNode(String(c)));
+  }
+  function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+  function badge(kind, text) { return h("span", { class: "badge " + kind }, text); }
+  function statusBadge(s) {
+    var ok = ["passed", "written", "success", "approved"].indexOf(s) >= 0;
+    var bad = ["failed", "rejected", "failure", "error"].indexOf(s) >= 0;
+    var warn = ["running", "recording"].indexOf(s) >= 0;
+    return badge(ok ? "ok" : bad ? "bad" : warn ? "warn" : "info", s);
+  }
+  function toast(msg) {
+    var t = h("div", { class: "toast" }, msg);
+    document.body.appendChild(t);
+    setTimeout(function () { t.remove(); }, 2600);
+  }
+  function table(headers, rows) {
+    return h("table", null,
+      h("thead", null, h("tr", null, headers.map(function (x) { return h("th", null, x); }))),
+      h("tbody", null, rows));
+  }
+  function muted(text) { return h("p", { class: "muted" }, text); }
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+  /* ================= 2. Dashboard ================= */
+  function Dashboard() {
+    var wrap = h("div", null, muted("Loading…"));
+    api.get("/api/dashboard").then(function (d) {
+      clear(wrap);
+      var cards = [["Transactions in knowledge base", d.total_transactions],
+        ["Recordings captured", d.recordings],
+        ["Self-healed locators", d.self_healed],
+        ["UI changes detected", d.ui_changes],
+        ["Changes awaiting review", d.pending_artifacts]]
+        .map(function (c) {
+          return h("div", { class: "card" },
+            h("div", { class: "num" }, c[1]), h("div", { class: "lbl" }, c[0]));
+        });
+      if (d.last_execution) {
+        cards.push(h("div", { class: "card" },
+          h("div", { class: "num" }, statusBadge(d.last_execution.status)),
+          h("div", { class: "lbl" }, "Last run · " + d.last_execution.passed +
+            " passed / " + d.last_execution.failed + " failed")));
+      }
+      append(wrap, [
+        h("div", { class: "topbar" }, h("h1", null, "Platform overview")),
+        h("div", { class: "cards" }, cards),
+        h("h2", null, "Recent activity"),
+        h("div", { class: "panel" },
+          h("table", null, h("tbody", null, d.recent_activity.map(function (a) {
+            return h("tr", null,
+              h("td", null, badge("info", a.kind)),
+              h("td", { class: "mono" }, a.ref),
+              h("td", { class: "muted" }, a.at));
+          })))),
+      ]);
+    });
+    return wrap;
+  }
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = Path(os.getenv("PLATFORM_DATA_DIR", BASE_DIR / "data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-ARTIFACTS_DIR = DATA_DIR / "artifacts"          # screenshots, DOM snapshots, videos
-ARTIFACTS_DIR.mkdir(exist_ok=True)
-SETTINGS_FILE = DATA_DIR / "settings.json"       # non-secret, UI-editable settings
-
-DB_URL = os.getenv("PLATFORM_DB_URL", f"sqlite:///{DATA_DIR / 'platform.db'}")
-
-# ---- Azure OpenAI (secrets: env only) ----------------------------------
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
-AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
-AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
-AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
-
-
-def mask_secret(value: str, show: int = 4) -> str:
-    """Mask a secret for display: 'sk-abc...wxyz' style."""
-    if not value:
-        return ""
-    if len(value) <= show * 2:
-        return "*" * len(value)
-    return f"{value[:show]}{'*' * 8}{value[-show:]}"
-
-
-DEFAULT_SETTINGS = {
-    "framework_path": "",                 # path to existing Java Selenium-Cucumber repo
-    "edgedriver_path": "msedgedriver",    # local EdgeDriver
-    "edge_binary_path": "",               # optional explicit Edge binary
-    "default_headless": False,            # Module 22: live visible Edge by default
-    "ai_confidence_threshold": 0.75,
-    "mask_fields": ["password", "pin", "otp", "accountnumber", "account_no",
-                    "customerid", "customer_id", "cvv", "ssn"],
-    "notification_email": "",
-    # --- Pure JDK runner (no Maven) ---
-    "java_home": "",                      # optional JAVA_HOME; blank = java/javac on PATH
-    "libs_path": "",                      # folder of jars; blank = <framework_path>/libs
-    "glue_package": "stepdefinitions",    # Cucumber glue package in the framework
-    # --- Pre-recording flow: login -> forced password change -> re-login ---
-    "prelogin_enabled": False,
-    "prelogin_test_url": "",              # URL used by "Test pre-login flow"
-    "prelogin_user_id": "",               # prefer env NBC_USER_ID
-    "prelogin_password": "",              # prefer env NBC_PASSWORD  (masked in UI)
-    "prelogin_new_password": "",          # prefer env NBC_NEW_PASSWORD (masked)
-    "login_user_locator": "name=loginId",
-    "login_password_locator": "name=password",
-    "login_submit_locator": "id=login_button",
-    "pwd_old_locator": "id=UIPage_009750_oldPassword",
-    "pwd_new_locator": "id=UIPage_009750_newPassword",
-    "pwd_confirm_locator": "id=UIPage_009750_confirmNewPassword",
-    "pwd_submit_locator": "id=UIPage_009750_submit",
-    "pwd_alert_ok_locator": "id=ok-button",
-    "home_ready_locator": "",
-    "spinner_locator": "css=.spinner, .loading, .blockUI",
-    "pwd_screen_wait_seconds": 20,        # how long to wait for the forced
-                                          # password-change screen after login
-}
-
-# Settings that must never be returned to the UI in clear text
-SECRET_SETTINGS = ("prelogin_password", "prelogin_new_password")
-
-
-# Locator values that shipped as wrong guesses in earlier builds; if a saved
-# settings.json still contains them, they are replaced with the corrected
-# default so users don't have to hunt down stale values by hand.
-STALE_DEFAULTS = {
-    "login_user_locator": ("id=UIPage_009750_userId",),
-    "login_password_locator": ("id=UIPage_009750_password",),
-    "login_submit_locator": ("id=UIPage_009750_login",),
-}
-
-
-def load_settings() -> dict:
-    settings = dict(DEFAULT_SETTINGS)
-    if SETTINGS_FILE.exists():
-        try:
-            settings.update(json.loads(SETTINGS_FILE.read_text()))
-        except json.JSONDecodeError:
-            pass
-    migrated = False
-    for key, stale_values in STALE_DEFAULTS.items():
-        if settings.get(key) in stale_values:
-            settings[key] = DEFAULT_SETTINGS[key]
-            migrated = True
-    if migrated and SETTINGS_FILE.exists():
-        try:
-            SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
-        except OSError:
-            pass
-    return settings
-
-
-def save_settings(patch: dict) -> dict:
-    settings = load_settings()
-    settings.update({k: v for k, v in patch.items() if k in DEFAULT_SETTINGS})
-    SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
-    return settings
-
-
-def public_ai_config() -> dict:
-    """Azure OpenAI config safe to show in the UI — key always masked."""
-    return {
-        "endpoint": AZURE_OPENAI_ENDPOINT,
-        "deployment": AZURE_OPENAI_DEPLOYMENT,
-        "api_version": AZURE_OPENAI_API_VERSION,
-        "api_key_masked": mask_secret(AZURE_OPENAI_API_KEY),
-        "configured": bool(AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY
-                           and AZURE_OPENAI_DEPLOYMENT),
+  /* ================= 3. BRD intelligence ================= */
+  function BRDPage() {
+    var wrap = h("div", null);
+    var list = h("div", null);
+    function load() {
+      api.get("/api/brds").then(function (brds) {
+        clear(list);
+        (brds || []).forEach(function (b) {
+          var an = b.analysis || {};
+          var counts = ["added", "modified", "deleted"].map(function (k) {
+            return h("div", { class: "card" },
+              h("div", { class: "num" }, ((an.changes || {})[k] || []).length),
+              h("div", { class: "lbl" }, k + " functionality"));
+          });
+          var impact = an.impact ? muted(
+            "To record: " + ((an.impact.transactions_to_record || []).join(", ") || "none") +
+            " · To update: " + ((an.impact.transactions_to_update || []).join(", ") || "none")) : null;
+          append(list, h("div", { class: "panel" },
+            h("b", null, b.filename), " ", badge("info", "v" + b.version),
+            h("span", { class: "muted" }, " · " + b.uploaded_at),
+            h("p", null, an.summary || ""),
+            h("div", { class: "cards" }, counts),
+            h("h2", null, "Extracted transactions"),
+            table(["Number", "Name", "Summary"], (b.transactions || []).map(function (t) {
+              return h("tr", null, h("td", { class: "mono" }, t.number),
+                h("td", null, t.name), h("td", null, t.summary));
+            })),
+            impact));
+        });
+      });
     }
+    function upload(file) {
+      busy.textContent = "Analyzing with Azure OpenAI…";
+      api.upload("/api/brds/upload", file)
+        .then(function () { toast("BRD analyzed"); load(); })
+        .catch(function (e) { toast(e.message); })
+        .then(function () { busy.textContent = ""; });
+    }
+    var busy = muted("");
+    var fileInput = h("input", {
+      type: "file", accept: ".pdf,.docx,.doc,.xlsx,.xls",
+      onchange: function (e) { if (e.target.files[0]) upload(e.target.files[0]); },
+    });
+    var drop = role === "Viewer" ? null : h("div", {
+      class: "panel",
+      ondragover: function (e) { e.preventDefault(); },
+      ondrop: function (e) {
+        e.preventDefault();
+        if (e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]);
+      },
+    },
+      h("p", null, "Drop a BRD here (PDF, Word, Excel) or choose a file. The platform " +
+        "extracts transactions, compares against the previous version, and maps the automation impact."),
+      fileInput, busy);
+    append(wrap, [h("div", { class: "topbar" }, h("h1", null, "BRD intelligence")), drop, list]);
+    load();
+    return wrap;
+  }
+
+  /* ================= 4. Recording console ================= */
+  function RecordingPage() {
+    var wrap = h("div", null);
+    var liveId = null, sock = null;
+    var txn = h("input", { type: "text", placeholder: "TXN-2041" });
+    var url = h("input", { type: "text", placeholder: "https://…" });
+    var liveLine = h("p", { style: { marginTop: "12px", display: "none" } });
+    var btn = h("button", { class: "primary", onclick: startStop }, "Start recording");
+    var hist = h("div", { class: "panel" });
+    var detail = h("div", null);
+
+    function startStop() {
+      if (!liveId) {
+        if (!txn.value || !url.value) return toast("Enter transaction number and URL");
+        api.post("/api/recordings/start",
+          { transaction_number: txn.value, target_url: url.value })
+          .then(function (r) {
+            liveId = r.recording_id;
+            btn.textContent = "Stop recording";
+            btn.className = "danger";
+            liveLine.style.display = "block";
+            sock = api.ws("/ws/recordings/" + liveId, function (live) {
+              clear(liveLine);
+              append(liveLine, [h("span", { class: "pulse" }),
+                "Recording in Microsoft Edge — actions " + (live.actions || 0) +
+                " · screens " + (live.screens || 0) +
+                " · elements " + (live.elements || 0) +
+                " · messages " + (live.messages || 0)]);
+            });
+            load();
+          }).catch(function (e) { toast(e.message); });
+      } else {
+        api.post("/api/recordings/" + liveId + "/stop").then(function () {
+          if (sock) sock.close();
+          liveId = null;
+          btn.textContent = "Start recording";
+          btn.className = "primary";
+          liveLine.style.display = "none";
+          load();
+        });
+      }
+    }
+    function load() {
+      api.get("/api/recordings").then(function (recs) {
+        clear(hist);
+        append(hist, table(["ID", "Transaction", "URL", "Status", "Actions", ""],
+          (recs || []).map(function (r) {
+            return h("tr", null,
+              h("td", null, r.id), h("td", { class: "mono" }, r.transaction),
+              h("td", { class: "mono" }, r.url), h("td", null, statusBadge(r.status)),
+              h("td", null, r.actions),
+              h("td", null, h("button", {
+                class: "ghost", onclick: function () {
+                  api.get("/api/recordings/" + r.id).then(function (d) {
+                    clear(detail);
+                    append(detail, h("div", { class: "panel" },
+                      h("h2", null, "Captured actions — " + d.transaction),
+                      table(["#", "Action", "Screen", "Description", "Value"],
+                        d.actions.map(function (a) {
+                          return h("tr", null, h("td", null, a.seq),
+                            h("td", null, badge("info", a.type)),
+                            h("td", null, a.screen), h("td", null, a.description),
+                            h("td", { class: "mono" }, a.value || ""));
+                        }))));
+                  });
+                },
+              }, "View")));
+          })));
+      });
+    }
+    var form = role === "Viewer" ? null : h("div", { class: "panel" },
+      h("div", { class: "row" },
+        h("div", null, h("label", null, "Transaction number"), txn),
+        h("div", null, h("label", null, "Target URL"), url),
+        btn),
+      liveLine);
+    append(wrap, [h("div", { class: "topbar" }, h("h1", null, "Recording console")),
+      form, h("h2", null, "Recording history"), hist, detail]);
+    load();
+    return wrap;
+  }
+
+  /* ================= 5. Knowledge base ================= */
+  function KnowledgePage() {
+    var wrap = h("div", null);
+    var listPanel = h("div", { class: "panel" });
+    var pkgPanel = h("div", null);
+    api.get("/api/knowledge").then(function (list) {
+      append(listPanel, table(["Transaction", "Workflow", "Version", ""],
+        (list || []).map(function (k) {
+          return h("tr", null,
+            h("td", { class: "mono" }, k.transaction),
+            h("td", null, (k.workflow || []).join(" → ")),
+            h("td", null, "v" + k.version),
+            h("td", null, h("button", {
+              class: "ghost", onclick: function () {
+                api.get("/api/knowledge/" + k.transaction).then(function (p) {
+                  clear(pkgPanel);
+                  append(pkgPanel, h("div", { class: "panel" },
+                    h("h2", null, "Transaction knowledge package · " + p.transaction_number),
+                    h("div", { class: "tree" }, h("ul", null,
+                      h("li", null, "Workflow: " + (p.workflow || []).join(" → ")),
+                      h("li", null, "Fields (" + p.fields.length + ")",
+                        h("ul", null, p.fields.slice(0, 20).map(function (f) {
+                          return h("li", { class: "mono" }, f.name + " · " + f.type +
+                            (f.mandatory ? " · mandatory" : "") +
+                            (f.max_length ? " · max " + f.max_length : ""));
+                        }))),
+                      h("li", null, "Messages (" + p.messages.length + ")",
+                        h("ul", null, p.messages.slice(0, 10).map(function (m) {
+                          return h("li", null, statusBadge(m.kind), " " + m.text);
+                        }))),
+                      h("li", null, "API calls (" + p.apis.length + ")",
+                        h("ul", null, p.apis.slice(0, 10).map(function (a) {
+                          return h("li", { class: "mono" },
+                            a.method + " " + a.url + " → " + a.status + " (" + a.time_ms + " ms)");
+                        }))),
+                      h("li", null, "Elements known on these screens: " + p.elements.length)))));
+                });
+              },
+            }, "Open package")));
+        })));
+    });
+    append(wrap, [h("div", { class: "topbar" }, h("h1", null, "Knowledge base")),
+      listPanel, pkgPanel]);
+    return wrap;
+  }
+
+  /* ================= 6. Locator repository ================= */
+  function LocatorPage() {
+    var wrap = h("div", null);
+    var q = h("input", {
+      type: "text", placeholder: "Search element key…",
+      onkeydown: function (e) { if (e.key === "Enter") search(); },
+    });
+    var results = h("div", null);
+    var healPanel = h("div", { class: "panel" });
+    function search() {
+      api.get("/api/locators?q=" + encodeURIComponent(q.value)).then(function (rows) {
+        clear(results);
+        rows.forEach(function (e) {
+          append(results, h("div", { class: "panel" },
+            h("b", { class: "mono" }, e.key),
+            h("span", { class: "muted" },
+              " · " + e.transaction + " · " + e.screen + " · <" + e.tag + ">"),
+            table(["Strategy", "Value", "Conf", "Uniq", "Rel", "v", "Source", ""],
+              e.locators.map(function (l) {
+                return h("tr",
+                  l.primary ? { style: { background: "var(--teal-soft)" } } : null,
+                  h("td", null, l.strategy + (l.primary ? " ★" : "")),
+                  h("td", { class: "mono" }, l.value,
+                    l.previous ? h("div", { class: "muted" }, "was: " + l.previous) : null),
+                  h("td", null, l.confidence), h("td", null, l.uniqueness),
+                  h("td", null, l.reliability), h("td", null, l.version),
+                  h("td", null, badge("info", l.source)),
+                  h("td", null, role === "Viewer" ? null : h("button", {
+                    class: "ghost", onclick: function () {
+                      var value = prompt("New locator value (recorded in the audit trail):");
+                      if (value) {
+                        api.post("/api/locators/" + l.id + "/override", { value: value })
+                          .then(search);
+                      }
+                    },
+                  }, "Override")));
+              }))));
+        });
+      });
+    }
+    api.get("/api/healing").then(function (healing) {
+      append(healPanel, table(
+        ["Failed locator", "Healed locator", "Strategy", "AI explanation", "When"],
+        (healing || []).map(function (x) {
+          return h("tr", null,
+            h("td", { class: "mono" }, x.failed),
+            h("td", { class: "mono" }, x.healed || statusBadge("failure")),
+            h("td", null, badge("info", x.strategy)),
+            h("td", null, x.explanation), h("td", { class: "muted" }, x.at));
+        })));
+    });
+    append(wrap, [h("div", { class: "topbar" }, h("h1", null, "Locator repository")),
+      h("div", { class: "panel" }, h("div", { class: "row" }, q,
+        h("button", { class: "primary", onclick: search }, "Search"))),
+      results, h("h2", null, "Self-healing log"), healPanel]);
+    search();
+    return wrap;
+  }
+
+  /* ================= 7. Generation & review ================= */
+  function GenerationPage() {
+    var wrap = h("div", null);
+    var txn = h("input", { type: "text" });
+    var genBtn = h("button", { class: "primary", onclick: generate }, "Generate automation");
+    var listPanel = h("div", { class: "panel" });
+    var diffPanel = h("div", null);
+    var arts = [];
+    function generate() {
+      if (!txn.value) return toast("Enter a transaction");
+      genBtn.disabled = true;
+      genBtn.textContent = "Generating…";
+      api.post("/api/generate/" + txn.value)
+        .then(load).catch(function (e) { toast(e.message); })
+        .then(function () { genBtn.disabled = false; genBtn.textContent = "Generate automation"; });
+    }
+    function review(id, approve) {
+      api.post("/api/artifacts/" + id + "/review", { approve: approve }).then(load);
+    }
+    function showDiff(a) {
+      clear(diffPanel);
+      append(diffPanel, h("div", { class: "panel" },
+        h("h2", null, a.path),
+        h("div", { class: "diff" },
+          h("div", null, h("label", null, "Existing framework file"),
+            h("pre", null, a.existing || "— new file —")),
+          h("div", null, h("label", null, "Proposed change"),
+            h("pre", null, a.content)))));
+    }
+    function load() {
+      api.get("/api/artifacts").then(function (data) {
+        arts = data || [];
+        clear(listPanel);
+        append(listPanel, table(["Transaction", "Type", "Target path", "Status", ""],
+          arts.map(function (a) {
+            var actions = [h("button", {
+              class: "ghost", onclick: function () { showDiff(a); },
+            }, "Diff"), " "];
+            if (role !== "Viewer" && a.status === "proposed") {
+              actions.push(h("button", {
+                class: "primary", onclick: function () { review(a.id, true); },
+              }, "Approve"), " ", h("button", {
+                class: "danger", onclick: function () { review(a.id, false); },
+              }, "Reject"));
+            }
+            return h("tr", null,
+              h("td", { class: "mono" }, a.transaction),
+              h("td", null, badge("info", a.type)),
+              h("td", { class: "mono" }, a.path),
+              h("td", null, statusBadge(a.status)),
+              h("td", { style: { whiteSpace: "nowrap" } }, actions));
+          })));
+      });
+    }
+    var form = role === "Viewer" ? null : h("div", { class: "panel" },
+      h("div", { class: "row" },
+        h("div", null, h("label", null, "Transaction to generate"), txn), genBtn),
+      muted("Feature files always include both positive and negative scenarios, " +
+        "derived from captured validation rules."));
+    append(wrap, [h("div", { class: "topbar" }, h("h1", null, "Generation review")),
+      form, listPanel, diffPanel]);
+    load();
+    return wrap;
+  }
+
+  /* ================= 8. Execution console ================= */
+  function ExecutionPage() {
+    var wrap = h("div", null);
+    var liveId = null, sock = null;
+    var txns = h("input", { type: "text", placeholder: "TXN-2041, TXN-2042" });
+    var mode = h("select", null,
+      h("option", { value: "0" }, "Live — visible Edge window"),
+      h("option", { value: "1" }, "Headless"));
+    var runBtn = h("button", { class: "primary", onclick: startStop }, "Run tests");
+    var livePanel = h("div", { class: "panel", style: { display: "none" } });
+    var liveTitle = h("h2", null);
+    var log = h("div", { class: "log" });
+    var hist = h("div", { class: "panel" });
+    livePanel.appendChild(liveTitle);
+    livePanel.appendChild(log);
+
+    function addLine(ev) {
+      var text = ev.line || ev.message ||
+        (ev.type === "done" ? "— Finished: " + ev.status + " (" +
+          ((ev.report || {}).passed || 0) + " passed, " +
+          ((ev.report || {}).failed || 0) + " failed)" : "");
+      if (!text) return;
+      var cls = ev.result === "failed" ? "fail" : ev.result === "passed" ? "pass" : "";
+      log.appendChild(h("div", cls ? { class: cls } : null, text));
+      while (log.childNodes.length > 500) log.removeChild(log.firstChild);
+      log.scrollTop = 1e9;
+    }
+    function startStop() {
+      if (!liveId) {
+        clear(log);
+        livePanel.style.display = "block";
+        clear(liveTitle);
+        append(liveTitle, [h("span", { class: "pulse" }), "Live execution"]);
+        api.post("/api/executions/start", {
+          transactions: txns.value.split(",").map(function (s) { return s.trim(); })
+            .filter(Boolean),
+          headless: mode.value === "1",
+        }).then(function (r) {
+          liveId = r.execution_id;
+          runBtn.textContent = "Stop";
+          runBtn.className = "danger";
+          sock = api.ws("/ws/executions/" + liveId, function (ev) {
+            addLine(ev);
+            if (ev.type === "done" || ev.type === "error") finish();
+          });
+          load();
+        }).catch(function (e) { toast(e.message); });
+      } else {
+        api.post("/api/executions/" + liveId + "/stop");
+      }
+    }
+    function finish() {
+      if (sock) sock.close();
+      liveId = null;
+      runBtn.textContent = "Run tests";
+      runBtn.className = "primary";
+      liveTitle.textContent = "Last run output";
+      load();
+    }
+    function load() {
+      api.get("/api/executions").then(function (execs) {
+        clear(hist);
+        append(hist, table(
+          ["ID", "Transactions", "Mode", "Status", "Passed", "Failed", "Started"],
+          (execs || []).map(function (e) {
+            return h("tr", null, h("td", null, e.id),
+              h("td", { class: "mono" }, (e.transactions || []).join(", ") || "full suite"),
+              h("td", null, e.headless ? "headless" : "live Edge"),
+              h("td", null, statusBadge(e.status)),
+              h("td", null, e.passed), h("td", null, e.failed),
+              h("td", { class: "muted" }, e.started_at));
+          })));
+      });
+    }
+    var form = role === "Viewer" ? null : h("div", { class: "panel" },
+      h("div", { class: "row" },
+        h("div", null,
+          h("label", null, "Transactions (comma-separated, empty = full suite)"), txns),
+        h("div", { style: { flex: "0", minWidth: "180px" } },
+          h("label", null, "Run mode"), mode),
+        runBtn));
+    append(wrap, [h("div", { class: "topbar" }, h("h1", null, "Execution console")),
+      form, livePanel, h("h2", null, "Execution history"), hist]);
+    load();
+    return wrap;
+  }
+
+  /* ================= 9. AI reports (SVG chart, no libraries) ================= */
+  function svgTrend(trend) {
+    var W = 800, H = 220, P = 30;
+    var ns = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    svg.setAttribute("width", "100%");
+    svg.setAttribute("height", H);
+    if (!trend || trend.length === 0) return svg;
+    var max = 1;
+    trend.forEach(function (t) { max = Math.max(max, t.passed || 0, t.failed || 0); });
+    function pts(key) {
+      return trend.map(function (t, i) {
+        var x = P + (W - 2 * P) * (trend.length === 1 ? 0.5 : i / (trend.length - 1));
+        var y = H - P - (H - 2 * P) * ((t[key] || 0) / max);
+        return x + "," + y;
+      }).join(" ");
+    }
+    [["passed", "var(--teal)"], ["failed", "var(--crimson)"]].forEach(function (s) {
+      var line = document.createElementNS(ns, "polyline");
+      line.setAttribute("points", pts(s[0]));
+      line.setAttribute("fill", "none");
+      line.setAttribute("stroke", s[1]);
+      line.setAttribute("stroke-width", "2");
+      svg.appendChild(line);
+    });
+    var axis = document.createElementNS(ns, "line");
+    axis.setAttribute("x1", P); axis.setAttribute("y1", H - P);
+    axis.setAttribute("x2", W - P); axis.setAttribute("y2", H - P);
+    axis.setAttribute("stroke", "var(--line)");
+    svg.appendChild(axis);
+    return svg;
+  }
+  function ReportsPage() {
+    var wrap = h("div", null, muted("Loading…"));
+    Promise.all([api.get("/api/reports/summary"), api.get("/api/executions")])
+      .then(function (res) {
+        var s = res[0], execs = res[1] || [];
+        clear(wrap);
+        var cards = [["Executions", s.executions], ["Passed", s.passed],
+          ["Failed", s.failed], ["Pass %", s.pass_pct + "%"],
+          ["Self-healed", s.self_healed],
+          ["Framework files updated", s.framework_changes],
+          ["UI changes", s.ui_changes]].map(function (c) {
+          return h("div", { class: "card" },
+            h("div", { class: "num" }, c[1]), h("div", { class: "lbl" }, c[0]));
+        });
+        var rca = null;
+        for (var i = 0; i < execs.length; i++) {
+          var r = (execs[i].report || {}).root_cause_analysis;
+          if (r && r.length) { rca = r; break; }
+        }
+        append(wrap, [
+          h("div", { class: "topbar" }, h("h1", null, "AI reporting dashboard")),
+          h("div", { class: "cards" }, cards),
+          h("h2", null, "Execution trend"),
+          h("div", { class: "panel" },
+            svgTrend(s.trend),
+            h("p", { class: "muted", style: { fontSize: "12px" } },
+              "teal = passed · crimson = failed")),
+          h("h2", null, "Root cause analysis (latest failed run)"),
+          h("div", { class: "panel" }, rca
+            ? table(["Scenario", "Root cause", "Explanation", "Business impact",
+                "Confidence", "Recommendation"],
+              rca.map(function (x) {
+                return h("tr", null, h("td", null, x.scenario),
+                  h("td", null, badge("bad", x.root_cause)),
+                  h("td", null, x.explanation), h("td", null, x.business_impact),
+                  h("td", null, x.confidence), h("td", null, x.recommendation));
+              }))
+            : muted("No failures analyzed yet.")),
+        ]);
+      });
+    return wrap;
+  }
+
+  /* ================= 10. UI version comparison ================= */
+  function UIChangesPage() {
+    var wrap = h("div", null);
+    var list = h("div", null);
+    var timeline = h("div", { class: "panel" });
+    function load() {
+      api.get("/api/ui/changes").then(function (changes) {
+        clear(list);
+        (changes || []).forEach(function (c) {
+          var counts = ["added", "removed", "renamed", "moved", "changed_attributes"]
+            .map(function (k) {
+              return h("div", { class: "card" },
+                h("div", { class: "num" }, ((c.diff || {})[k] || []).length),
+                h("div", { class: "lbl" }, k.replace(/_/g, " ")));
+            });
+          var affected = ((c.impacted || {}).affected_transactions || []);
+          var applyBtn = (role !== "Viewer" && c.status !== "updates_applied" &&
+            affected.length > 0) ? h("button", {
+              class: "primary", onclick: function () {
+                api.post("/api/ui/changes/" + c.id + "/apply").then(load);
+              },
+            }, "Apply targeted updates") : null;
+          append(list, h("div", { class: "panel" },
+            h("b", null, c.screen), " ",
+            badge("info", "v" + c.from + " → v" + c.to), " ",
+            statusBadge(c.status === "updates_applied" ? "success" : "running"),
+            h("span", { class: "muted" },
+              " · visual diff " + c.visual_score + "% · " + c.at),
+            c.summary ? h("p", null, c.summary) : null,
+            h("div", { class: "cards" }, counts),
+            muted("Impacted transactions: " + (affected.join(", ") || "none")),
+            applyBtn));
+        });
+      });
+      api.get("/api/ui/versions").then(function (versions) {
+        clear(timeline);
+        append(timeline, table(["Screen", "Version", "Source", "Captured"],
+          (versions || []).map(function (v) {
+            return h("tr", null, h("td", null, v.screen), h("td", null, "v" + v.version),
+              h("td", null, badge("info", v.source)),
+              h("td", { class: "muted" }, v.at));
+          })));
+      });
+    }
+    append(wrap, [h("div", { class: "topbar" }, h("h1", null, "UI version comparison")),
+      list, h("h2", null, "Screen version timeline"), timeline]);
+    load();
+    return wrap;
+  }
+
+  /* ================= 11. Settings ================= */
+  function SettingsPage() {
+    var wrap = h("div", null, muted("Loading…"));
+    api.get("/api/settings").then(function (data) {
+      clear(wrap);
+      var f = data.settings;
+      function field(label, key, placeholder) {
+        var inp = h("input", {
+          type: "text", value: f[key] || "", placeholder: placeholder || "",
+          oninput: function (e) { f[key] = e.target.value; },
+        });
+        return [h("label", null, label), inp];
+      }
+      var headSel = h("select", {
+        onchange: function (e) { f.default_headless = e.target.value === "1"; },
+      },
+        h("option", { value: "0", selected: !f.default_headless },
+          "Live — visible Edge window (recommended)"),
+        h("option", { value: "1", selected: !!f.default_headless }, "Headless"));
+      var conf = h("input", {
+        type: "number", step: "0.05", min: "0", max: "1",
+        value: f.ai_confidence_threshold,
+        oninput: function (e) { f.ai_confidence_threshold = parseFloat(e.target.value); },
+      });
+      var masks = h("input", {
+        type: "text", value: (f.mask_fields || []).join(", "),
+        oninput: function (e) {
+          f.mask_fields = e.target.value.split(",").map(function (s) { return s.trim(); });
+        },
+      });
+      var edgeInfo = h("p", { class: "mono" });
+      var ai = data.ai;
+      append(wrap, [
+        h("div", { class: "topbar" }, h("h1", null, "Settings")),
+        h("div", { class: "panel" },
+          h("h2", null, "Framework & browser"),
+          field("Java framework path — the framework is CREATED and stored here",
+            "framework_path", "C:\\automation\\bank-framework"),
+          field("EdgeDriver path (msedgedriver)", "edgedriver_path"),
+          field("Edge browser binary path (optional)", "edge_binary_path"),
+          field("JAVA_HOME (blank = java/javac on PATH) — pure JDK runner, no Maven",
+            "java_home"),
+          field("Jars folder (blank = <framework>/libs — populate with scripts/get-libs)",
+            "libs_path"),
+          field("Cucumber glue package", "glue_package"),
+          h("label", null, "Default run mode"), headSel,
+          h("div", { style: { marginTop: "12px" } },
+            h("button", {
+              class: "ghost", onclick: function () {
+                api.get("/api/edge/versions").then(function (e) {
+                  clear(edgeInfo);
+                  append(edgeInfo, ["Edge: " + (e.edge || "not detected") +
+                    " · Driver: " + (e.driver || "not detected") + " · ",
+                  e.match === true ? badge("ok", "versions match")
+                    : e.match === false ? badge("bad", "version mismatch")
+                      : badge("warn", "unknown")]);
+                });
+              },
+            }, "Check Edge / EdgeDriver versions"),
+            h("button", {
+              class: "ghost", style: { marginLeft: "8px" }, onclick: function () {
+                api.post("/api/framework/scaffold", {}).then(function (r) {
+                  alert(r.already_scaffolded
+                    ? "Framework already exists — nothing overwritten."
+                    : "Framework created at " + r.root + "\n\n" + r.created.length +
+                      " files: DriverFactory, Hooks, LocatorRepository, ConfigReader, " +
+                      "run scripts.\n\nNext: populate libs/ with scripts/get-libs.");
+                }).catch(function (e) { alert(e.message); });
+              },
+            }, "Create framework skeleton (JDK-only)"),
+            h("button", {
+              class: "ghost", style: { marginLeft: "8px" }, onclick: function (e) {
+                var b = e.target; b.disabled = true; b.textContent = "Repairing\u2026";
+                api.post("/api/framework/repair", {}).then(function (r) {
+                  var lines = [r.summary, ""];
+                  (r.renamed || []).forEach(function (x) {
+                    lines.push("renamed: " + x.from + " -> " + x.to); });
+                  (r.fixed || []).forEach(function (x) {
+                    lines.push(x.file + ": " + x.fixes.join(", ")); });
+                  (r.needs_attention || []).forEach(function (x) {
+                    lines.push("MANUAL: " + x.file + " - " + x.problems.join(", ")); });
+                  alert(lines.join("\n"));
+                }).catch(function (err) { alert(err.message); })
+                  .then(function () {
+                    b.disabled = false; b.textContent = "Repair generated code"; });
+              },
+            }, "Repair generated code"),
+            edgeInfo)),
+        h("div", { class: "panel" },
+          h("h2", null, "Azure OpenAI"),
+          h("p", { class: "mono" },
+            "Endpoint: " + (ai.endpoint || "not set"), h("br"),
+            "Deployment: " + (ai.deployment || "not set"), h("br"),
+            "API version: " + ai.api_version, h("br"),
+            "API key: " + (ai.api_key_masked || "not set") + " ",
+            ai.configured ? badge("ok", "configured") : badge("bad", "missing")),
+          muted("Credentials are read from environment variables on the server " +
+            "and are never shown unmasked or written to logs."),
+          h("label", null, "AI confidence threshold"), conf),
+        h("div", { class: "panel" },
+          h("h2", null, "Pre-recording flow (login \u2192 password change \u2192 re-login)"),
+          muted("Runs automatically before every recording so capture starts on the " +
+            "home screen. These actions are NOT recorded as part of the transaction."),
+          h("label", null, "Enable pre-recording login flow"),
+          h("select", {
+            onchange: function (e) { f.prelogin_enabled = e.target.value === "1"; },
+          },
+            h("option", { value: "0", selected: !f.prelogin_enabled }, "Disabled"),
+            h("option", { value: "1", selected: !!f.prelogin_enabled }, "Enabled")),
+          field("Test URL (used by 'Test pre-login flow')", "prelogin_test_url"),
+          field("User ID (or set env NBC_USER_ID)", "prelogin_user_id"),
+          field("Current password (or env NBC_PASSWORD) \u2014 stored masked",
+            "prelogin_password"),
+          field("New password for forced change (or env NBC_NEW_PASSWORD)",
+            "prelogin_new_password"),
+          muted("Credentials are masked in this screen and never written to logs. " +
+            "Environment variables take priority. After a successful change the " +
+            "platform swaps the two passwords so repeat runs never lock the user out."),
+          h("h2", null, "Login / password-change locators"),
+          field("Login \u2014 user field", "login_user_locator"),
+          field("Login \u2014 password field", "login_password_locator"),
+          field("Login \u2014 submit button", "login_submit_locator"),
+          field("Password change \u2014 old password", "pwd_old_locator"),
+          field("Password change \u2014 new password", "pwd_new_locator"),
+          field("Password change \u2014 confirm password", "pwd_confirm_locator"),
+          field("Password change \u2014 submit", "pwd_submit_locator"),
+          field("Success alert \u2014 OK button", "pwd_alert_ok_locator"),
+          field("Home screen ready element (optional)", "home_ready_locator"),
+          field("Spinner / loading overlay", "spinner_locator"),
+          h("label", null, "Seconds to wait for the password-change screen after login"),
+          h("input", {
+            type: "number", min: "5", max: "120",
+            value: f.pwd_screen_wait_seconds || 20,
+            oninput: function (e) {
+              f.pwd_screen_wait_seconds = parseInt(e.target.value, 10) || 20; },
+          }),
+          muted("Format: id=elementId, name=x, css=.sel, xpath=//x (bare value = xpath)"),
+          h("div", { style: { marginTop: "12px" } },
+            h("button", {
+              class: "ghost", onclick: function (e) {
+                var b = e.target; b.disabled = true; b.textContent = "Running\u2026";
+                api.post("/api/prelogin/test", {}).then(function (r) {
+                  var msg = "Pre-login test\n\n" + (r.log || []).join("\n") +
+                    "\n\nLogged in: " + r.logged_in +
+                    "\nPassword changed: " + r.password_changed +
+                    "\nRe-login: " + r.relogin;
+                  if (r.page_after_login) {
+                    var p = r.page_after_login;
+                    msg += "\n\n--- Page after login ---\n" + p.title +
+                      "\n" + p.url + "\niframes: " + p.frames +
+                      "\ninputs: " + (p.inputs || []).join(", ") +
+                      "\nbuttons: " + (p.buttons || []).join(", ");
+                  }
+                  alert(msg);
+                }).catch(function (err) { alert(err.message); })
+                  .then(function () { b.disabled = false; b.textContent = "Test pre-login flow"; });
+              },
+            }, "Test pre-login flow"),
+            h("button", {
+              class: "ghost", style: { marginLeft: "8px" }, onclick: function (e) {
+                var b = e.target; b.disabled = true; b.textContent = "Detecting\u2026";
+                api.post("/api/prelogin/detect", {}).then(function (r) {
+                  var lines = ["Detected login form:", "",
+                    "user field : " + (r.user || "not found"),
+                    "password   : " + (r.password || "not found"),
+                    "submit     : " + (r.submit || "not found"), "",
+                    "All visible inputs:"];
+                  (r.all_inputs || []).forEach(function (i) {
+                    lines.push("  " + i.locator + "  (type=" + i.type +
+                      (i.placeholder ? ", placeholder=" + i.placeholder : "") + ")");
+                  });
+                  lines.push("", "Buttons:");
+                  (r.all_buttons || []).forEach(function (i) {
+                    lines.push("  " + i.locator + "  \"" + i.text + "\"");
+                  });
+                  lines.push("", "Copy the right ones into the locator fields below, then Save.");
+                  alert(lines.join("\n"));
+                }).catch(function (err) { alert(err.message); })
+                  .then(function () {
+                    b.disabled = false; b.textContent = "Detect login fields"; });
+              },
+            }, "Detect login fields"))),
+        h("div", { class: "panel" },
+          h("h2", null, "Data masking"),
+          h("label", null, "Masked field keywords (comma-separated)"), masks),
+        role === "Viewer" ? null : h("button", {
+          class: "primary", onclick: function () {
+            api.post("/api/settings", f).then(function () { toast("Settings saved"); });
+          },
+        }, "Save settings"),
+      ]);
+    });
+    return wrap;
+  }
+
+  /* ================= App shell ================= */
+  var NAV = [
+    ["Operate", [
+      ["dashboard", "Home dashboard", Dashboard],
+      ["brd", "BRD intelligence", BRDPage],
+      ["recording", "Recording console", RecordingPage],
+      ["execution", "Execution console", ExecutionPage]]],
+    ["Knowledge", [
+      ["knowledge", "Knowledge base", KnowledgePage],
+      ["locators", "Locator repository", LocatorPage],
+      ["uichanges", "UI version compare", UIChangesPage]]],
+    ["Review", [
+      ["generation", "Generation review", GenerationPage],
+      ["reports", "AI reports", ReportsPage],
+      ["settings", "Settings", SettingsPage]]],
+  ];
+  var page = "dashboard";
+  var dark = false;
+
+  function renderApp() {
+    clear(root);
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+    var main = h("main", { class: "main" });
+    var navButtons = {};
+    function go(key, fn) {
+      page = key;
+      Object.keys(navButtons).forEach(function (k) {
+        navButtons[k].className = k === page ? "active" : "";
+      });
+      clear(main);
+      main.appendChild(fn());
+    }
+    var groups = NAV.map(function (g) {
+      var div = h("div", null, h("div", { class: "group" }, g[0]));
+      g[1].forEach(function (item) {
+        var btn = h("button", {
+          class: item[0] === page ? "active" : "",
+          onclick: function () { go(item[0], item[2]); },
+        }, item[1]);
+        navButtons[item[0]] = btn;
+        div.appendChild(btn);
+      });
+      return div;
+    });
+    var themeBtn = h("button", {
+      class: "ghost",
+      style: { width: "100%", marginBottom: "8px", color: "var(--navy-ink)" },
+      onclick: function () {
+        dark = !dark;
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+        themeBtn.textContent = dark ? "Light theme" : "Dark theme";
+      },
+    }, "Dark theme");
+    root.appendChild(h("div", { class: "layout" },
+      h("aside", { class: "sidebar" },
+        h("div", { class: "brand" }, "AI Automation",
+          h("small", null, "Control Center")),
+        h("nav", { class: "nav" }, groups),
+        h("div", { style: { padding: "0 20px" } },
+          themeBtn)),
+      main));
+    var current = null;
+    NAV.forEach(function (g) {
+      g[1].forEach(function (item) { if (item[0] === page) current = item; });
+    });
+    main.appendChild(current[2]());
+  }
+
+  renderApp();
+})();
