@@ -1,376 +1,383 @@
-"""Module 17 — AI Automation Generator (+ Module 16 knowledge packaging).
-
-Builds a Transaction Knowledge Package from everything the recorder captured
-and asks Azure OpenAI to generate: Feature File (positive AND negative
-scenarios derived from captured validation rules), Step Definitions, Page
-Object (reading locators from the central repository), Runner, and test data.
-Artifacts are stored as *proposals* for human review before being written into
-the existing Java framework by the Framework Update Engine.
 """
-import json
-import re
+Framework scaffolder.
+
+If the configured framework path is empty (or missing the base plumbing), this
+creates a complete, runnable Selenium-Cucumber framework for plain JDK
+(javac + java, no Maven):
+
+    <framework>/
+      libs/                      <- jars (populate with scripts/get-libs)
+      src/main/java/
+        core/DriverFactory.java      Edge driver (live by default), -D flags
+        core/ConfigReader.java       environment config
+        core/LocatorRepository.java  central repo client + self-healing hook
+      src/test/java/
+        stepdefinitions/Hooks.java   before/after, screenshots on failure
+      src/test/resources/
+        features/                    generated .feature files land here
+        config/SIT.properties        per-environment URLs
+      run.bat / run.sh               manual one-command execution
+
+Generated artifacts (features, step defs, page objects) are then written into
+this structure by the generation engine after approval.
+"""
 from pathlib import Path
 
 from .. import config
-from ..ai import azure_client
-from ..models import (Element, GeneratedArtifact, KnowledgePackage,
-                      LearningEvent, NetworkCall, RecordedAction, Recording,
-                      SessionLocal, TestDataField, ValidationMessage)
-from . import framework_update
 
+GLUE = "stepdefinitions"
 
-def build_knowledge_package(db, transaction: str) -> dict:
-    """Module 16 — assemble the reusable knowledge package."""
-    actions = (db.query(RecordedAction).join(Recording)
-               .filter(Recording.transaction_number == transaction)
-               .order_by(RecordedAction.sequence).all())
-    fields = db.query(TestDataField).filter_by(transaction_number=transaction).all()
-    msgs = db.query(ValidationMessage).filter_by(transaction_number=transaction).all()
-    apis = db.query(NetworkCall).filter_by(transaction_number=transaction).all()
-    elements = db.query(Element).filter_by(transaction_number=transaction).all()
+FILES: dict[str, str] = {}
 
-    workflow = []
-    last_screen = None
-    for a in actions:
-        if a.screen_name != last_screen:
-            workflow.append(a.screen_name)
-            last_screen = a.screen_name
+FILES["src/main/java/core/DriverFactory.java"] = r"""package core;
 
-    pkg = {
-        "transaction_number": transaction,
-        "workflow": workflow,                            # Module 11
-        "actions": [{"seq": a.sequence, "type": a.action_type,
-                     "screen": a.screen_name, "description": a.description,
-                     "value": a.value_masked} for a in actions],
-        "fields": [{"name": f.field_name, "type": f.input_type,
-                    "mandatory": f.mandatory, "max_length": f.max_length,
-                    "pattern": f.pattern, "sample": f.value_masked,
-                    "sensitive": f.sensitive,
-                    "options": f.dropdown_options} for f in fields],
-        "messages": [{"kind": m.kind, "text": m.text, "code": m.error_code}
-                     for m in msgs],
-        "apis": [{"method": c.method, "url": c.url, "status": c.status_code,
-                  "time_ms": c.response_time_ms} for c in apis][:30],
-        "elements": [{"key": e.element_key, "screen": e.screen_name,
-                      "tag": e.tag_name,
-                      "primary_locator": next((l.value for l in e.locators
-                                               if l.is_primary), None)}
-                     for e in elements][:200],
+import org.openqa.selenium.WebDriver;
+import org.openqa.selenium.edge.EdgeDriver;
+import org.openqa.selenium.edge.EdgeOptions;
+import java.time.Duration;
+
+/** Creates the Edge driver. Live (visible) by default; controlled by -D flags
+ *  supplied by the AI Automation Platform execution engine. */
+public final class DriverFactory {
+    private static final ThreadLocal<WebDriver> DRIVER = new ThreadLocal<>();
+
+    public static WebDriver get() {
+        if (DRIVER.get() == null) {
+            String edgeDriver = System.getProperty("webdriver.edge.driver", "msedgedriver");
+            System.setProperty("webdriver.edge.driver", edgeDriver);
+            EdgeOptions options = new EdgeOptions();
+            String binary = System.getProperty("edge.binary", "");
+            if (!binary.isEmpty()) options.setBinary(binary);
+            String profile = System.getProperty("edge.profile.dir", "");
+            if (!profile.isEmpty()) options.addArguments("--user-data-dir=" + profile);
+            if (Boolean.getBoolean("headless")) options.addArguments("--headless=new");
+            options.addArguments("--start-maximized", "--remote-allow-origins=*");
+            WebDriver d = new EdgeDriver(options);
+            d.manage().timeouts().implicitlyWait(Duration.ofSeconds(10));
+            DRIVER.set(d);
+        }
+        return DRIVER.get();
     }
-    kp = db.query(KnowledgePackage).filter_by(transaction_number=transaction).first()
-    if kp:
-        kp.business_workflow = workflow
-        kp.version += 1
-    else:
-        db.add(KnowledgePackage(transaction_number=transaction,
-                                business_workflow=workflow, ai_confidence=0.8))
-    db.commit()
-    return pkg
+
+    public static void quit() {
+        if (DRIVER.get() != null) { DRIVER.get().quit(); DRIVER.remove(); }
+    }
+}
+"""
+
+FILES["src/main/java/core/ConfigReader.java"] = r"""package core;
+
+import java.io.FileInputStream;
+import java.util.Properties;
+
+/** Reads src/test/resources/config/<environment>.properties (default SIT). */
+public final class ConfigReader {
+    private static Properties props;
+
+    public static String get(String key) {
+        if (props == null) {
+            props = new Properties();
+            String env = System.getProperty("environment", "SIT");
+            try (FileInputStream in = new FileInputStream(
+                    "src/test/resources/config/" + env + ".properties")) {
+                props.load(in);
+            } catch (Exception e) {
+                throw new RuntimeException("Cannot load config for env " + env, e);
+            }
+        }
+        return props.getProperty(key, "");
+    }
+}
+"""
+
+FILES["src/main/java/core/LocatorRepository.java"] = r"""package core;
+
+import org.openqa.selenium.By;
+import org.openqa.selenium.NoSuchElementException;
+import org.openqa.selenium.WebDriver;
+import org.openqa.selenium.WebElement;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+
+/** Client for the AI Automation Platform's central locator repository.
+ *  find() resolves an element and, on failure, calls the self-healing API
+ *  so tests keep running when the UI changes. Falls back to the inline
+ *  locator if the platform is offline. */
+public final class LocatorRepository {
+    private static final String BASE =
+        System.getProperty("platform.url", "http://localhost:8000");
+
+    /** Compatibility API used by generated BasePage:
+     *  returns the best locator VALUE (raw string) for txn/screen/key,
+     *  or null if the platform is offline / element unknown — callers must
+     *  handle null by using their inline fallback locator. */
+    public static String get(String txn, String screen, String key) {
+        try {
+            String resp = httpGet(BASE + "/api/locator/resolve?key=" +
+                java.net.URLEncoder.encode(txn + "/" + screen + "/" + key, "UTF-8"));
+            return json(resp, "value");
+        } catch (Exception e) { return null; }
+    }
+
+    /** Primary API for page objects: resolve from the central repository,
+     *  fall back to the inline recorded locator if the platform is offline. */
+    public static By by(String txn, String screen, String key, By fallback) {
+        try {
+            String resp = httpGet(BASE + "/api/locator/resolve?key=" +
+                java.net.URLEncoder.encode(key, "UTF-8"));
+            String strategy = json(resp, "strategy"), value = json(resp, "value");
+            if (strategy != null && value != null) return toBy(strategy, value);
+        } catch (Exception ignore) { /* platform offline: use inline fallback */ }
+        return fallback;
+    }
+
+    private static String httpGet(String url) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(2000); c.setReadTimeout(5000);
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader r = new BufferedReader(
+                new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
+            String line; while ((line = r.readLine()) != null) sb.append(line);
+        }
+        return sb.toString();
+    }
+
+    /** Find with self-healing. key format: "TXN/Screen/elementName". */
+    public static WebElement find(WebDriver driver, String key, By fallback) {
+        try {
+            return driver.findElement(fallback);
+        } catch (NoSuchElementException first) {
+            try {
+                String dom = driver.getPageSource();
+                if (dom.length() > 200_000) dom = dom.substring(0, 200_000);
+                String body = "{\"key\":" + q(key)
+                    + ",\"failed_locator\":" + q(fallback.toString())
+                    + ",\"dom\":" + q(dom) + "}";
+                String resp = post(BASE + "/api/heal", body);
+                String type = json(resp, "type"), value = json(resp, "value");
+                if (type != null && value != null) {
+                    By healed = toBy(type, value);
+                    WebElement el = driver.findElement(healed);
+                    System.out.println("[SELF-HEALED] " + key + " -> " + healed);
+                    return el;
+                }
+            } catch (Exception ignore) { /* platform offline: fall through */ }
+            throw first;
+        }
+    }
+
+    private static By toBy(String type, String value) {
+        switch (type) {
+            case "id": return By.id(value);
+            case "name": return By.name(value);
+            case "css": return By.cssSelector(value);
+            default: return By.xpath(value);
+        }
+    }
+
+    private static String post(String url, String body) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setRequestMethod("POST");
+        c.setRequestProperty("Content-Type", "application/json");
+        c.setConnectTimeout(3000); c.setReadTimeout(15000); c.setDoOutput(true);
+        try (OutputStream os = c.getOutputStream()) {
+            os.write(body.getBytes(StandardCharsets.UTF_8));
+        }
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader r = new BufferedReader(
+                new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
+            String line; while ((line = r.readLine()) != null) sb.append(line);
+        }
+        return sb.toString();
+    }
+
+    private static String q(String s) {
+        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"")
+                       .replace("\n", "\\n").replace("\r", "") + "\"";
+    }
+
+    private static String json(String body, String field) {
+        int i = body.indexOf("\"" + field + "\"");
+        if (i < 0) return null;
+        int a = body.indexOf('"', body.indexOf(':', i) + 1);
+        int b = body.indexOf('"', a + 1);
+        return (a < 0 || b < 0) ? null : body.substring(a + 1, b);
+    }
+}
+"""
+
+FILES["src/main/java/core/PasswordChangeGate.java"] = r"""package core;
+
+import org.openqa.selenium.WebDriver;
+import java.io.OutputStream;
+import java.lang.reflect.Method;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+
+/** Optional safety net, called after every step of every scenario (see
+ *  stepdefinitions.PasswordChangeHooks). If the platform's designated
+ *  password-change transaction (Settings -> "Password-change transaction
+ *  number", e.g. 9750) has been recorded, generated and approved, its
+ *  stepdefinitions.ChangePasswordSteps class exists and this calls it
+ *  whenever the forced password-change screen actually appears. If that
+ *  class doesn't exist yet, or the screen isn't showing, this is a silent
+ *  no-op -- it never fails a running scenario. */
+public final class PasswordChangeGate {
+    private static final String BASE =
+        System.getProperty("platform.url", "http://localhost:8000");
+
+    private PasswordChangeGate() {}
+
+    public static void checkAndHandle(WebDriver driver) {
+        try {
+            Class<?> steps = Class.forName("stepdefinitions.ChangePasswordSteps");
+            Method isRequired = steps.getMethod("isRequired", WebDriver.class);
+            if (!Boolean.TRUE.equals(isRequired.invoke(null, driver))) return;
+
+            String oldPwd = System.getProperty("app.password", "");
+            String newPwd = System.getProperty("app.newPassword", "");
+            if (oldPwd.isEmpty() || newPwd.isEmpty()) {
+                System.out.println("[PasswordChangeGate] Password-change screen "
+                    + "detected but app.password/app.newPassword were not supplied "
+                    + "-- skipping. Set them under Settings.");
+                return;
+            }
+            System.out.println("[PasswordChangeGate] Password-change screen detected "
+                + "-- running the recorded change-password transaction.");
+            Method perform = steps.getMethod("perform", WebDriver.class,
+                String.class, String.class);
+            perform.invoke(null, driver, oldPwd, newPwd);
+            System.out.println("[PasswordChangeGate] Password changed.");
+            rotateCredentials(oldPwd, newPwd);
+        } catch (ClassNotFoundException | NoSuchMethodException e) {
+            // Password-change transaction not recorded/generated yet -- nothing to do.
+        } catch (Exception e) {
+            System.out.println("[PasswordChangeGate] skipped: " + e);
+        }
+    }
+
+    /** Swap the stored current/new password in platform Settings so the NEXT
+     *  run logs in with the new password and changes it back -- mirrors the
+     *  recording-time pre-flow's rotation so repeat runs never lock the test
+     *  user out. Best-effort: failures here never affect the running scenario. */
+    private static void rotateCredentials(String oldPwd, String newPwd) {
+        try {
+            String body = "{\"prelogin_password\":" + q(newPwd)
+                + ",\"prelogin_new_password\":" + q(oldPwd) + "}";
+            HttpURLConnection c = (HttpURLConnection)
+                new URL(BASE + "/api/settings").openConnection();
+            c.setRequestMethod("POST");
+            c.setRequestProperty("Content-Type", "application/json");
+            c.setConnectTimeout(3000); c.setReadTimeout(5000); c.setDoOutput(true);
+            try (OutputStream os = c.getOutputStream()) {
+                os.write(body.getBytes(StandardCharsets.UTF_8));
+            }
+            c.getInputStream().close();
+        } catch (Exception ignore) { /* platform offline: rotate manually next time */ }
+    }
+
+    private static String q(String s) {
+        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+    }
+}
+"""
+
+FILES["src/test/java/stepdefinitions/PasswordChangeHooks.java"] = r"""package stepdefinitions;
+
+import core.DriverFactory;
+import core.PasswordChangeGate;
+import io.cucumber.java.AfterStep;
+
+/** Automatic safety net: after every step of every scenario, checks whether
+ *  the platform's designated password-change transaction's screen is showing
+ *  and, if so, runs it. See core.PasswordChangeGate. No-op otherwise. */
+public class PasswordChangeHooks {
+    @AfterStep
+    public void afterStep() {
+        PasswordChangeGate.checkAndHandle(DriverFactory.get());
+    }
+}
+"""
+
+FILES["src/test/java/stepdefinitions/Hooks.java"] = r"""package stepdefinitions;
+
+import core.DriverFactory;
+import io.cucumber.java.After;
+import io.cucumber.java.Before;
+import io.cucumber.java.Scenario;
+import org.openqa.selenium.OutputType;
+import org.openqa.selenium.TakesScreenshot;
+
+public class Hooks {
+    @Before
+    public void setUp() { DriverFactory.get(); }
+
+    @After
+    public void tearDown(Scenario scenario) {
+        if (scenario.isFailed()) {
+            byte[] shot = ((TakesScreenshot) DriverFactory.get())
+                .getScreenshotAs(OutputType.BYTES);
+            scenario.attach(shot, "image/png", scenario.getName());
+        }
+        DriverFactory.quit();
+    }
+}
+"""
+
+FILES["src/test/resources/config/SIT.properties"] = (
+    "# Base URLs and credentials-by-reference for the SIT environment\n"
+    "app.url=https://sit.yourbank.example.com\n")
+FILES["src/test/resources/config/UAT.properties"] = (
+    "app.url=https://uat.yourbank.example.com\n")
+
+FILES["run.bat"] = (
+    "@echo off\r\n"
+    "REM Compile + run with plain JDK. Usage: run.bat @TagName\r\n"
+    "if not exist out mkdir out\r\n"
+    "dir /s /b src\\*.java > sources.txt\r\n"
+    "javac -encoding UTF-8 -cp \"libs/*\" -d out @sources.txt || exit /b 1\r\n"
+    "java -cp \"out;libs/*;src/test/resources\" -Dbrowser=edge "
+    "io.cucumber.core.cli.Main --glue " + GLUE +
+    " --plugin pretty %* src/test/resources/features\r\n")
+
+FILES["run.sh"] = (
+    "#!/usr/bin/env bash\n"
+    "# Compile + run with plain JDK. Usage: ./run.sh --tags @TagName\n"
+    "set -e\nmkdir -p out\n"
+    "find src -name '*.java' > sources.txt\n"
+    "javac -encoding UTF-8 -cp 'libs/*' -d out @sources.txt\n"
+    "java -cp \"out:libs/*:src/test/resources\" -Dbrowser=edge \\\n"
+    "  io.cucumber.core.cli.Main --glue " + GLUE +
+    " --plugin pretty \"$@\" src/test/resources/features\n")
 
 
-_GEN_SYSTEM = """You are a senior Java Selenium-Cucumber automation engineer for
-enterprise banking applications. You generate production-quality code that fits
-an EXISTING framework: reuse its base classes, utilities and coding style shown
-in the framework context; never duplicate existing helpers.
-Every Feature File MUST contain BOTH positive scenarios (happy path with the
-captured valid data and success messages) AND negative scenarios derived from
-the captured field metadata: blank mandatory fields, max-length boundary
-violations, invalid pattern/format, business-rule violations, and the exact
-captured validation/error messages as expected results.
-Page Objects must load locators from LocatorRepository.get(transaction, screen,
-elementKey) — the central repository is the single source of truth, with the
-literal locator kept only as an inline fallback comment.
-ONE framework for ALL transactions: page objects are one-per-SCREEN and shared
-across transactions. If a page object for a screen already exists (its current
-content is provided), UPDATE it — keep every existing method and add only the
-new elements/methods this transaction needs. Reuse existing generic steps
-(navigation, login, common assertions) instead of writing new ones.
-HARD RULES — code that violates these will not compile:
-1. Packages are fixed: page objects -> "package pages;", step definitions ->
-   "package stepdefinitions;", runners -> "package runners;". The ONLY utility
-   package is "core" (DriverFactory, ConfigReader, LocatorRepository). NEVER
-   import or create "utils", "helpers", or any other package.
-2. The public class name MUST exactly equal the file name in target_path
-   (Java requirement), including capitalization.
-3. Every page-object method called from a step definition MUST be defined in
-   the page object generated or provided in this same response. Before
-   finishing, verify each stepdef method call resolves.
-3b. Class names MUST start with an uppercase LETTER and be descriptive of the
-   SCREEN (e.g. DepositsShortEnquiryPage). Never start a class name with an
-   underscore or digit, and never embed raw transaction/screen ID numbers as a
-   prefix (_000400DepositsShortEnquiry is INVALID; DepositsShortEnquiryPage is
-   correct).
-3c. BALANCE ALL BRACKETS. Each statement must close every "(" it opens before
-   the ";". Re-read every LocatorRepository.by(...) / By.xpath(...) line and
-   count the parentheses before returning.
-4. Locator access pattern inside page objects:
-     import core.LocatorRepository;
-     By loc = LocatorRepository.by(TXN, SCREEN, KEY, By.id("fallbackId"));
-   where the last argument is the recorded literal locator as fallback.
-5. Do not reference any class you have not generated here or that is not in
-   core.* or standard Selenium/Cucumber APIs."""
+def is_scaffolded(root: Path) -> bool:
+    return (root / "src/main/java/core/DriverFactory.java").exists()
 
 
-_PWD_CHANGE_INSTRUCTIONS = """
-THIS TRANSACTION IS THE PLATFORM'S DESIGNATED PASSWORD-CHANGE TRANSACTION
-(configured in Settings as "Password-change transaction number"). Every live
-execution of every OTHER transaction calls it automatically, right after
-login, ONLY if the forced password-change screen actually appears on screen.
-In addition to the normal feature file (still generate it — this transaction
-is also runnable on its own like any other), the step definitions class for
-this transaction MUST be named exactly "ChangePasswordSteps" (package
-stepdefinitions, file stepdefinitions/ChangePasswordSteps.java) and MUST
-expose these two extra public static methods, callable directly from plain
-Java code (not just matched from Gherkin step text), alongside its normal
-@Given/@When/@Then step methods:
-  public static boolean isRequired(org.openqa.selenium.WebDriver driver)
-      Returns true only if the password-change screen is visible RIGHT NOW.
-      Use driver.findElements(...) (no explicit WebDriverWait) so it returns
-      instantly, and wrap everything in try/catch returning false on any
-      exception — it must NEVER throw.
-  public static void perform(org.openqa.selenium.WebDriver driver,
-                              String oldPassword, String newPassword) throws Throwable
-      Runs the full recorded flow captured for this transaction (fill old/new/
-      confirm password fields, submit, dismiss any success alert, and anything
-      else this recording captured) reusing whatever page objects this
-      transaction needs (create/update them normally). Use oldPassword/
-      newPassword for the corresponding recorded fields instead of the
-      originally recorded literal values.
-These two methods are a fixed contract used by core.PasswordChangeGate — do
-not rename or change their signatures."""
-
-
-_CANON = {"feature": "src/test/resources/features/{name}.feature",
-          "stepdef": "src/test/java/stepdefinitions/{name}Steps.java",
-          "pageobject": "src/test/java/pages/{name}Page.java",
-          "runner": "src/test/java/runners/{name}Runner.java",
-          "testdata": "src/test/resources/testdata/{name}.json"}
-
-
-def _safe(name: str) -> str:
-    """Keep alphanumerics and PRESERVE capitalization (SBIBranchChannelPage
-    must not become Sbibranchchannelpage), uppercasing only the first char
-    so the filename always matches the public class name."""
-    s = "".join(c for c in name if c.isalnum())
-    s = s.lstrip("0123456789")          # class names cannot start with a digit
-    return (s[:1].upper() + s[1:]) if s else "Generated"
-
-
-_PUBLIC_CLASS = re.compile(r"public\s+(?:final\s+|abstract\s+)?class\s+([A-Za-z_$][\w$]*)")
-
-
-def _declared_class(content: str) -> str | None:
-    """The Java filename MUST equal the public class name declared inside the
-    file. Trust the code, never a normalized path."""
-    m = _PUBLIC_CLASS.search(content or "")
-    return m.group(1) if m else None
-
-
-
-def _balance_java(content: str) -> tuple[str, list[str]]:
-    """Auto-repair the most common LLM Java syntax slip: a statement line whose
-    round brackets are unbalanced (missing closing parens before the ';').
-    Only touches single-line statements ending in ');' or ';' and never removes
-    code — appends the missing ')' just before the semicolon."""
-    fixes, out = [], []
-    for i, line in enumerate(content.splitlines(), 1):
-        stripped = line.rstrip()
-        if stripped.endswith(";") and not stripped.lstrip().startswith(("//", "*", "/*")):
-            # count parens outside string literals / char literals
-            depth, in_str, in_chr, esc = 0, False, False, False
-            for ch in stripped:
-                if esc:
-                    esc = False
-                    continue
-                if ch == "\\":
-                    esc = True
-                    continue
-                if in_str:
-                    if ch == '"':
-                        in_str = False
-                    continue
-                if in_chr:
-                    if ch == "'":
-                        in_chr = False
-                    continue
-                if ch == '"':
-                    in_str = True
-                elif ch == "'":
-                    in_chr = True
-                elif ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-            if depth > 0:
-                indent_len = len(stripped) - len(stripped.lstrip())
-                line = stripped[:-1] + (")" * depth) + ";"
-                fixes.append(f"line {i}: added {depth} missing ')'")
-        out.append(line)
-    return "\n".join(out) + ("\n" if content.endswith("\n") else ""), fixes
-
-
-def _validate_java(content: str) -> list[str]:
-    """Report structural problems that would fail javac, so bad artifacts are
-    flagged in the review screen instead of silently breaking the build."""
-    problems = []
-    depth = {"(": 0, "{": 0}
-    in_str = in_chr = esc = False
-    in_line_comment = in_block_comment = False
-    prev = ""
-    for ch in content:
-        if in_line_comment:
-            if ch == "\n":
-                in_line_comment = False
-            prev = ch
+def scaffold(path: str | None = None, force: bool = False) -> dict:
+    """Create the base framework if it doesn't exist. Never overwrites
+    existing files unless force=True. Returns a summary of what was created."""
+    settings = config.load_settings()
+    root = Path(path or settings.get("framework_path") or "")
+    if not str(root):
+        raise RuntimeError("Framework path is not configured in Settings.")
+    created, skipped = [], []
+    for rel, content in FILES.items():
+        target = root / rel
+        if target.exists() and not force:
+            skipped.append(rel)
             continue
-        if in_block_comment:
-            if prev == "*" and ch == "/":
-                in_block_comment = False
-            prev = ch
-            continue
-        if esc:
-            esc = False
-            prev = ch
-            continue
-        if ch == "\\" and (in_str or in_chr):
-            esc = True
-            prev = ch
-            continue
-        if in_str:
-            if ch == '"':
-                in_str = False
-        elif in_chr:
-            if ch == "'":
-                in_chr = False
-        else:
-            if prev == "/" and ch == "/":
-                in_line_comment = True
-            elif prev == "/" and ch == "*":
-                in_block_comment = True
-            elif ch == '"':
-                in_str = True
-            elif ch == "'":
-                in_chr = True
-            elif ch in "({":
-                depth[ch] += 1
-            elif ch == ")":
-                depth["("] -= 1
-            elif ch == "}":
-                depth["{"] -= 1
-        prev = ch
-    if depth["("] != 0:
-        problems.append(f"unbalanced round brackets ({depth['(']:+d})")
-    if depth["{"] != 0:
-        problems.append(f"unbalanced braces ({depth['{']:+d})")
-    if "package " not in content:
-        problems.append("missing package declaration")
-    return problems
-
-
-def _canonical_path(art: dict, transaction: str) -> str:
-    """Force every artifact into one fixed layout so 1000s of recordings
-    accumulate in the SAME framework structure instead of scattering.
-    Page objects are named by SCREEN (shared across transactions);
-    features/stepdefs by transaction."""
-    atype = art.get("artifact_type", "feature")
-    raw = Path(art.get("target_path", "")).stem
-    # For Java artifacts the file name is dictated by the declared public class.
-    if atype in ("pageobject", "stepdef", "runner"):
-        declared = _declared_class(art.get("content", ""))
-        if declared:
-            folder = {"pageobject": "src/test/java/pages",
-                      "stepdef": "src/test/java/stepdefinitions",
-                      "runner": "src/test/java/runners"}[atype]
-            return f"{folder}/{declared}.java"
-    if atype == "pageobject":
-        name = _safe(raw.removesuffix("Page") or transaction)
-    else:
-        name = _safe(transaction if atype in ("feature", "stepdef") else raw)
-    template = _CANON.get(atype)
-    return template.format(name=name) if template else art.get("target_path", "")
-
-
-async def generate_for_transaction(transaction: str) -> list[int]:
-    """Generate all artifacts for one transaction; returns artifact ids."""
-    db = SessionLocal()
-    try:
-        pkg = build_knowledge_package(db, transaction)
-        fw = framework_update.framework_context(transaction)
-        # Feed the CURRENT content of page objects for every screen in this
-        # transaction so the AI updates shared files instead of recreating them.
-        screens = {a.get("screen") for a in pkg.get("actions", []) if a.get("screen")}
-        for s in screens:
-            rel = _CANON["pageobject"].format(name=_safe(s))
-            existing_po = framework_update.read_existing(rel)
-            if existing_po:
-                fw["matching_files"][rel] = existing_po[:8000]
-
-        is_pwd_txn = transaction == config.load_settings().get(
-            "password_change_transaction_number")
-        result = await azure_client.chat_json(
-            _GEN_SYSTEM + (_PWD_CHANGE_INSTRUCTIONS if is_pwd_txn else ""),
-            "Generate automation for this transaction knowledge package.\n"
-            f"KNOWLEDGE PACKAGE:\n{json.dumps(pkg)[:40000]}\n"
-            f"EXISTING FRAMEWORK CONTEXT:\n{json.dumps(fw)[:20000]}\n"
-            'Return JSON: {"artifacts": [{"artifact_type": '
-            '"feature|stepdef|pageobject|runner|testdata", '
-            '"target_path": "relative/path/in/framework", "content": "..."}], '
-            '"summary": "..."}',
-            max_tokens=8000)
-
-        ids, seen = [], set()
-        for art in result.get("artifacts", []):
-            # Auto-repair common LLM syntax slips, then validate.
-            if art.get("artifact_type") in ("pageobject", "stepdef", "runner"):
-                content, fixes = _balance_java(art.get("content", ""))
-                art["content"] = content
-                problems = _validate_java(content)
-                if fixes or problems:
-                    art["notes"] = ("auto-fixed: " + "; ".join(fixes) if fixes else "") + \
-                                   (" | REVIEW: " + "; ".join(problems) if problems else "")
-            path = _canonical_path(art, transaction)
-            if path in seen:            # one artifact per file per generation
-                continue
-            seen.add(path)
-            existing = framework_update.read_existing(path)
-            # Supersede older pending artifacts for the same file so re-recording
-            # a screen updates, never forks, the framework.
-            db.query(GeneratedArtifact).filter_by(
-                target_path=path, status="proposed").update({"status": "superseded"})
-            ga = GeneratedArtifact(transaction_number=transaction,
-                                   artifact_type=art["artifact_type"],
-                                   target_path=path,
-                                   content=art["content"],
-                                   existing_content=existing)
-            db.add(ga)
-            db.flush()
-            ids.append(ga.id)
-        db.add(LearningEvent(kind="recording", reference=transaction,
-                             detail={"generated": len(ids),
-                                     "summary": result.get("summary")}))
-        db.commit()
-        return ids
-    finally:
-        db.close()
-
-
-def approve_artifact(artifact_id: int, approve: bool, edited: str | None = None) -> dict:
-    """Human review gate — approved artifacts are written by the update engine."""
-    db = SessionLocal()
-    try:
-        art = db.query(GeneratedArtifact).get(artifact_id)
-        if not art:
-            return {"ok": False, "error": "not found"}
-        if edited is not None:
-            art.content = edited
-            db.add(LearningEvent(kind="human_correction", reference=art.target_path,
-                                 detail={"artifact_id": artifact_id}))
-        if approve:
-            framework_update.write_artifact(art.target_path, art.content)
-            art.status = "written"
-        else:
-            art.status = "rejected"
-        db.commit()
-        return {"ok": True, "status": art.status}
-    finally:
-        db.close()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        created.append(rel)
+    for d in ("libs", "src/test/resources/features", "out"):
+        (root / d).mkdir(parents=True, exist_ok=True)
+    return {"root": str(root), "created": created, "skipped": skipped,
+            "already_scaffolded": not created,
+            "next_step": "Populate libs/ with scripts/get-libs, then record & generate."}
