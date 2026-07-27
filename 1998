@@ -1,279 +1,521 @@
-"""Modules 1–14 — AI Knowledge Capture Engine.
+"""Platform backend — REST + WebSocket API consumed by the React Control Center.
 
-Launches a real Microsoft Edge via the local msedgedriver, injects the capture
-script into every document, polls the event buffer, and persists:
-actions, all locator strategies, full-page crawls, DOM before/after snapshots,
-screenshots, popup/validation messages, test data (masked), dropdown/table
-knowledge, network calls (via performance logs), and performance metrics.
+Auth: simple JWT with roles (Admin / Automation Engineer / Viewer).
+Every mutating request is written to the audit trail (LearningEvent).
 """
 import asyncio
-import hashlib
-import json
-import logging
-import re
-import threading
-import time
+import datetime as dt
+import shutil
+import uuid
 from pathlib import Path
 
-from selenium import webdriver
-from selenium.webdriver.edge.options import Options as EdgeOptions
-from selenium.webdriver.edge.service import Service as EdgeService
+import jwt
+from fastapi import (Depends, FastAPI, File, HTTPException, UploadFile,
+                     WebSocket, WebSocketDisconnect)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 
-from .. import config
-from ..models import (Element, Locator, NetworkCall, PageSnapshot, Recording,
-                      RecordedAction, SessionLocal, TestDataField,
-                      ValidationMessage, now)
-from . import locators as locator_engine
-from . import ui_versioning
+from . import config, models
+from .engines import (brd, execution, generator, recorder, scaffold,
+                      self_healing, ui_versioning)
+from .models import (BRD, Element, Execution, GeneratedArtifact, HealingEvent,
+                     KnowledgePackage, LearningEvent, Locator, PageSnapshot,
+                     Recording, RecordedAction, SessionLocal, UIChange,
+                     UIVersion, ValidationMessage)
 
-log = logging.getLogger("platform.recorder")
-CAPTURE_JS = (Path(__file__).parent / "capture_script.js").read_text()
+models.init_db()
+app = FastAPI(title="Enterprise AI Automation Platform")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
+                   allow_headers=["*"])
 
-_active: dict[int, "RecorderSession"] = {}
-
-
-def _artifact(recording_id: int, name: str, data: bytes | str) -> str:
-    d = config.ARTIFACTS_DIR / f"rec_{recording_id}"
-    d.mkdir(exist_ok=True)
-    p = d / name
-    if isinstance(data, str):
-        p.write_text(data, encoding="utf-8")
-    else:
-        p.write_bytes(data)
-    return str(p)
-
-
-def _mask_value(field_name: str, value: str, settings: dict) -> tuple[str, bool]:
-    key = re.sub(r"[^a-z0-9]", "", (field_name or "").lower())
-    for m in settings["mask_fields"]:
-        if re.sub(r"[^a-z0-9]", "", m) in key:
-            return "***MASKED***", True
-    return value, False
+# ---------------- auth ----------------
+SECRET = str(uuid.uuid4())  # per-process; replace with a stable secret in prod
+security = HTTPBearer(auto_error=False)
+# ---- Authentication removed: single-user local mode. Every request acts as
+# a full-access local admin. Re-introduce JWT/SSO here for multi-user setups.
+LOCAL_USER = {"sub": "local", "role": "Admin"}
 
 
-class RecorderSession:
-    """One live recording session in a dedicated Edge window."""
-
-    def __init__(self, recording_id: int, transaction: str, url: str):
-        self.recording_id = recording_id
-        self.transaction = transaction
-        self.url = url
-        self.stop_flag = threading.Event()
-        self.live_status = {"actions": 0, "screens": 0, "elements": 0, "messages": 0}
-        self._seen_screens: set[str] = set()
-        self._last_dom: str | None = None
-
-    # ---------- driver ----------
-    def _driver(self):
-        settings = config.load_settings()
-        opts = EdgeOptions()
-        opts.add_argument("--start-maximized")
-        # dedicated profile so it never conflicts with the Execution Engine session
-        opts.add_argument(f"--user-data-dir={config.DATA_DIR / 'edge_recorder_profile'}")
-        opts.set_capability("ms:loggingPrefs", {"performance": "ALL"})  # Module 12
-        if settings.get("edge_binary_path"):
-            opts.binary_location = settings["edge_binary_path"]
-        service = EdgeService(executable_path=settings["edgedriver_path"])
-        driver = webdriver.Edge(service=service, options=opts)
-        # inject capture script into every new document
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": CAPTURE_JS})
-        return driver
-
-    # ---------- main loop ----------
-    def run(self):
-        settings = config.load_settings()
-        db = SessionLocal()
-        driver = None
-        try:
-            driver = self._driver()
-            driver.get(self.url)
-
-            driver.execute_script(CAPTURE_JS)  # first page
-            self._capture_page(db, driver)     # Module 4 crawl on load
-            last_url = driver.current_url
-            while not self.stop_flag.is_set():
-                time.sleep(0.7)
-                try:
-                    if driver.current_url != last_url:      # navigation → crawl (M4, M11)
-                        last_url = driver.current_url
-                        driver.execute_script(CAPTURE_JS)
-                        self._capture_page(db, driver)
-                    events = driver.execute_script(
-                        "var e=(window.__aikce||{}).events||[];"
-                        "if(window.__aikce)window.__aikce.events=[];return e;")
-                    for ev in events or []:
-                        self._persist_event(db, driver, ev, settings)
-                except Exception as e:  # page transition race — reinject and continue
-                    if "no such window" in str(e).lower():
-                        break
-                    try:
-                        driver.execute_script(CAPTURE_JS)
-                    except Exception:
-                        pass
-            db.query(Recording).filter_by(id=self.recording_id).update(
-                {"status": "stopped", "stopped_at": now()})
-            db.commit()
-        finally:
-            if driver:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-            db.close()
-            _active.pop(self.recording_id, None)
-
-    # ---------- persistence ----------
-    def _capture_page(self, db, driver):
-        """Module 4/5/6/24: full-page crawl + DOM + screenshot + UI version."""
-        try:
-            page = driver.execute_script("return window.__aikce.crawlPage();")
-        except Exception:
-            return
-        screen = (page.get("title") or page["url"]).strip()[:120] or "unknown"
-        idx = len(self._seen_screens)
-        dom_path = _artifact(self.recording_id, f"dom_{idx}_{hashlib.md5(page['url'].encode()).hexdigest()[:8]}.html",
-                             page["dom"])
-        shot = driver.get_screenshot_as_png()
-        shot_path = _artifact(self.recording_id, f"screen_{idx}.png", shot)
-        snap = PageSnapshot(recording_id=self.recording_id,
-                            transaction_number=self.transaction,
-                            screen_name=screen, url=page["url"],
-                            dom_path=dom_path, html_path=dom_path,
-                            screenshot_path=shot_path,
-                            element_inventory={"count": len(page["inventory"]),
-                                               "perf": page.get("perf", {})})
-        db.add(snap)
-        # register every crawled element + all its locators (M3/M15)
-        for meta in page["inventory"]:
-            locator_engine.register_element(db, self.transaction, screen, meta)
-        db.commit()
-        self._seen_screens.add(screen)
-        self.live_status["screens"] = len(self._seen_screens)
-        self.live_status["elements"] += len(page["inventory"])
-        self._last_dom = page["dom"]
-        # Module 24: version this screen proactively
-        ui_versioning.register_ui_version(db, screen, "recording", page["dom"], shot_path)
-        # Module 12: drain performance log → network calls
-        self._capture_network(db, driver)
-
-    def _capture_network(self, db, driver):
-        try:
-            logs = driver.get_log("performance")
-        except Exception:
-            return
-        reqs: dict[str, dict] = {}
-        for entry in logs:
-            try:
-                msg = json.loads(entry["message"])["message"]
-            except Exception:
-                continue
-            p = msg.get("params", {})
-            if msg.get("method") == "Network.requestWillBeSent":
-                r = p.get("request", {})
-                if any(x in r.get("url", "") for x in ("api", "rest", "graphql", "service", "soap", "json")):
-                    reqs[p["requestId"]] = {"method": r.get("method"), "url": r.get("url"),
-                                            "start": p.get("timestamp", 0),
-                                            "headers": {k: ("***" if "auth" in k.lower() or "cookie" in k.lower() else v)
-                                                        for k, v in r.get("headers", {}).items()}}
-            elif msg.get("method") == "Network.responseReceived" and p.get("requestId") in reqs:
-                r = reqs.pop(p["requestId"])
-                resp = p.get("response", {})
-                url = r["url"].lower()
-                db.add(NetworkCall(
-                    recording_id=self.recording_id, transaction_number=self.transaction,
-                    api_type="graphql" if "graphql" in url else "soap" if "soap" in url or url.endswith(".asmx") else "rest",
-                    method=r["method"], url=r["url"], status_code=resp.get("status"),
-                    response_time_ms=round((p.get("timestamp", 0) - r["start"]) * 1000, 1),
-                    headers_masked=r["headers"]))
-        db.commit()
-
-    def _persist_event(self, db, driver, ev: dict, settings: dict):
-        t = ev.get("target") or {}
-        screen = (ev.get("title") or ev.get("url") or "")[:120]
-        element = locator_engine.register_element(db, self.transaction, screen, t) if t.get("tag") else None
-
-        if ev["type"] == "message":                       # Module 7
-            shot = _artifact(self.recording_id, f"msg_{ev['seq']}.png",
-                             driver.get_screenshot_as_png())
-            text = ev["extra"].get("text", "")
-            kind = ("failure" if re.search(r"fail|error|invalid|denied", text, re.I)
-                    else "success" if re.search(r"success|complete|saved", text, re.I)
-                    else "warning" if re.search(r"warn", text, re.I) else "info")
-            code = (re.search(r"\b[A-Z]{2,5}-?\d{2,6}\b", text) or [None])
-            db.add(ValidationMessage(recording_id=self.recording_id,
-                                     transaction_number=self.transaction, kind=kind,
-                                     text=text, error_code=code.group(0) if code else None,
-                                     screenshot_path=shot))
-            self.live_status["messages"] += 1
-            db.commit()
-            return
-
-        value_masked, sensitive = None, False
-        if ev["type"] == "change":                        # Module 8/9
-            raw = ev["extra"].get("value", "")
-            field = t.get("name") or t.get("id") or t.get("label") or t.get("placeholder") or "field"
-            value_masked, sensitive = (raw, True) if ev["extra"].get("sensitive") \
-                else _mask_value(field, raw, settings)
-            db.add(TestDataField(
-                transaction_number=self.transaction, screen_name=screen,
-                field_name=field, value_masked=value_masked, sensitive=sensitive,
-                input_type=t.get("input_type"), mandatory=bool(t.get("required")),
-                max_length=t.get("maxlength"), pattern=t.get("pattern"),
-                dropdown_options=t.get("options"),
-                validation_rules={"required": bool(t.get("required")),
-                                  "maxlength": t.get("maxlength"),
-                                  "pattern": t.get("pattern")}))
-
-        # Module 5/6: before/after DOM + screenshots
-        dom_after = None
-        try:
-            dom_after = driver.execute_script("return document.documentElement.outerHTML")
-        except Exception:
-            pass
-        shot_after = _artifact(self.recording_id, f"act_{ev['seq']}.png",
-                               driver.get_screenshot_as_png())
-        dom_before_path = _artifact(self.recording_id, f"dom_before_{ev['seq']}.html",
-                                    self._last_dom or "")
-        dom_after_path = _artifact(self.recording_id, f"dom_after_{ev['seq']}.html",
-                                   dom_after or "")
-        self._last_dom = dom_after
-
-        desc = f"{ev['type']} on <{t.get('tag')}> '{(t.get('label') or t.get('text') or t.get('placeholder') or '')[:60]}'"
-        db.add(RecordedAction(
-            recording_id=self.recording_id, sequence=ev["seq"],
-            action_type=ev["type"], page_name=screen, screen_name=screen,
-            url=ev.get("url"), description=desc,
-            expected_behaviour="Element responds and workflow continues",
-            element_id=element.id if element else None,
-            value_masked=value_masked,
-            dom_before_path=dom_before_path, dom_after_path=dom_after_path,
-            screenshot_after=shot_after, extra=ev.get("extra", {})))
-        db.commit()
-        self.live_status["actions"] += 1
+class LoginBody(BaseModel):
+    username: str = "local"
+    password: str = ""
 
 
-# ---------- public API ----------
-def start_recording(transaction: str, url: str) -> int:
-    db = SessionLocal()
-    rec = Recording(transaction_number=transaction, target_url=url)
-    db.add(rec)
+def current_user():
+    return LOCAL_USER
+
+
+def require_writer():
+    return LOCAL_USER
+
+
+def audit(db, user, action, detail=None):
+    db.add(LearningEvent(kind="audit", reference=f"{user['sub']}::{action}",
+                         detail=detail or {}))
     db.commit()
-    rid = rec.id
-    db.close()
-    session = RecorderSession(rid, transaction, url)
-    _active[rid] = session
-    threading.Thread(target=session.run, daemon=True).start()
-    return rid
 
 
-def stop_recording(recording_id: int) -> bool:
-    s = _active.get(recording_id)
-    if s:
-        s.stop_flag.set()
-        return True
-    return False
+@app.post("/api/login")
+def login(body: LoginBody | None = None):
+    """Auth disabled — always grants local admin access."""
+    return {"token": "local", "role": "Admin"}
 
 
-def live_status(recording_id: int) -> dict:
-    s = _active.get(recording_id)
-    return {"active": bool(s), **(s.live_status if s else {})}
+def db_dep():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# ---------------- dashboard ----------------
+@app.get("/api/dashboard")
+def dashboard(db=Depends(db_dep), user=Depends(current_user)):
+    last_exec = db.query(Execution).order_by(Execution.id.desc()).first()
+    return {
+        "total_transactions": db.query(KnowledgePackage).count(),
+        "recordings": db.query(Recording).count(),
+        "self_healed": db.query(HealingEvent).filter_by(success=True).count(),
+        "ui_changes": db.query(UIChange).count(),
+        "pending_artifacts": db.query(GeneratedArtifact)
+                               .filter_by(status="proposed").count(),
+        "last_execution": {"id": last_exec.id, "status": last_exec.status,
+                           "passed": last_exec.passed, "failed": last_exec.failed}
+        if last_exec else None,
+        "recent_activity": [{"kind": e.kind, "ref": e.reference,
+                             "at": str(e.created_at)}
+                            for e in db.query(LearningEvent)
+                            .order_by(LearningEvent.id.desc()).limit(15)],
+    }
+
+
+# ---------------- recorder (M1–14) ----------------
+class RecordBody(BaseModel):
+    transaction_number: str
+    target_url: str
+
+
+@app.post("/api/recordings/start")
+def start_rec(body: RecordBody, db=Depends(db_dep), user=Depends(require_writer)):
+    rid = recorder.start_recording(body.transaction_number, body.target_url)
+    audit(db, user, "start_recording", {"recording_id": rid})
+    return {"recording_id": rid}
+
+
+@app.post("/api/recordings/{rid}/stop")
+def stop_rec(rid: int, db=Depends(db_dep), user=Depends(require_writer)):
+    audit(db, user, "stop_recording", {"recording_id": rid})
+    return {"stopped": recorder.stop_recording(rid)}
+
+
+@app.get("/api/recordings")
+def list_recs(db=Depends(db_dep), user=Depends(current_user)):
+    return [{"id": r.id, "transaction": r.transaction_number, "url": r.target_url,
+             "status": r.status, "started_at": str(r.started_at),
+             "actions": len(r.actions)} for r in
+            db.query(Recording).order_by(Recording.id.desc()).all()]
+
+
+@app.get("/api/recordings/{rid}")
+def rec_detail(rid: int, db=Depends(db_dep), user=Depends(current_user)):
+    r = db.query(Recording).get(rid) or (_ for _ in ()).throw(HTTPException(404))
+    return {"id": r.id, "transaction": r.transaction_number, "status": r.status,
+            "live": recorder.live_status(rid),
+            "actions": [{"seq": a.sequence, "type": a.action_type,
+                         "screen": a.screen_name, "description": a.description,
+                         "value": a.value_masked,
+                         "screenshot": a.screenshot_after}
+                        for a in sorted(r.actions, key=lambda x: x.sequence or 0)],
+            "messages": [{"kind": m.kind, "text": m.text}
+                         for m in db.query(ValidationMessage)
+                         .filter_by(recording_id=rid)]}
+
+
+@app.websocket("/ws/recordings/{rid}")
+async def ws_recording(ws: WebSocket, rid: int):
+    await ws.accept()
+    try:
+        while True:
+            await ws.send_json(recorder.live_status(rid))
+            await asyncio.sleep(1)
+    except WebSocketDisconnect:
+        pass
+
+
+# ---------------- knowledge base (M16) ----------------
+@app.get("/api/knowledge")
+def knowledge(db=Depends(db_dep), user=Depends(current_user)):
+    return [{"transaction": k.transaction_number, "workflow": k.business_workflow,
+             "version": k.version, "confidence": k.ai_confidence}
+            for k in db.query(KnowledgePackage).all()]
+
+
+@app.get("/api/knowledge/{txn}")
+def knowledge_detail(txn: str, db=Depends(db_dep), user=Depends(current_user)):
+    return generator.build_knowledge_package(db, txn)
+
+
+# ---------------- locator repository (M15) ----------------
+@app.get("/api/locators")
+def locator_repo(q: str = "", db=Depends(db_dep), user=Depends(current_user)):
+    query = db.query(Element)
+    if q:
+        query = query.filter(Element.element_key.contains(q))
+    out = []
+    for e in query.limit(300):
+        out.append({"element_id": e.id, "key": e.element_key,
+                    "transaction": e.transaction_number, "screen": e.screen_name,
+                    "tag": e.tag_name,
+                    "locators": [{"id": l.id, "strategy": l.strategy,
+                                  "value": l.value, "primary": l.is_primary,
+                                  "confidence": l.confidence,
+                                  "uniqueness": l.uniqueness,
+                                  "reliability": l.reliability,
+                                  "version": l.version,
+                                  "previous": l.previous_value,
+                                  "source": l.source,
+                                  "updated": str(l.last_updated)}
+                                 for l in e.locators]})
+    return out
+
+
+class OverrideBody(BaseModel):
+    value: str
+
+
+@app.post("/api/locators/{lid}/override")
+def override_locator(lid: int, body: OverrideBody, db=Depends(db_dep),
+                     user=Depends(require_writer)):
+    from .engines import locators as le
+    loc = db.query(Locator).get(lid) or (_ for _ in ()).throw(HTTPException(404))
+    le.record_heal(db, loc, body.value, "manual")
+    audit(db, user, "locator_override", {"locator_id": lid})
+    db.commit()
+    return {"ok": True, "version": loc.version}
+
+
+@app.get("/api/healing")
+def healing_log(db=Depends(db_dep), user=Depends(current_user)):
+    return [{"id": h.id, "failed": h.failed_locator, "healed": h.healed_locator,
+             "strategy": h.strategy_used, "explanation": h.ai_explanation,
+             "success": h.success, "at": str(h.created_at)}
+            for h in db.query(HealingEvent).order_by(HealingEvent.id.desc())
+            .limit(200)]
+
+
+# ---------------- BRD (M18) ----------------
+@app.post("/api/brds/upload")
+async def upload_brd(file: UploadFile = File(...), db=Depends(db_dep),
+                     user=Depends(require_writer)):
+    d = config.DATA_DIR / "brds"
+    d.mkdir(exist_ok=True)
+    dest = d / f"{uuid.uuid4().hex[:8]}_{file.filename}"
+    with dest.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+    audit(db, user, "brd_upload", {"filename": file.filename})
+    brd_id = await brd.analyze_brd(str(dest), file.filename)
+    return {"brd_id": brd_id}
+
+
+@app.get("/api/brds")
+def list_brds(db=Depends(db_dep), user=Depends(current_user)):
+    return [{"id": b.id, "filename": b.filename, "version": b.version,
+             "uploaded_at": str(b.uploaded_at),
+             "transactions": b.extracted_transactions,
+             "analysis": b.ai_analysis} for b in
+            db.query(BRD).order_by(BRD.id.desc()).all()]
+
+
+# ---------------- generation (M17/M19) ----------------
+@app.post("/api/generate/{txn}")
+async def generate(txn: str, db=Depends(db_dep), user=Depends(require_writer)):
+    audit(db, user, "generate", {"transaction": txn})
+    ids = await generator.generate_for_transaction(txn)
+    return {"artifact_ids": ids}
+
+
+@app.get("/api/artifacts")
+def artifacts(db=Depends(db_dep), user=Depends(current_user)):
+    return [{"id": a.id, "transaction": a.transaction_number,
+             "type": a.artifact_type, "path": a.target_path, "status": a.status,
+             "content": a.content, "existing": a.existing_content}
+            for a in db.query(GeneratedArtifact)
+            .order_by(GeneratedArtifact.id.desc()).limit(100)]
+
+
+class ReviewBody(BaseModel):
+    approve: bool
+    edited_content: str | None = None
+
+
+@app.post("/api/artifacts/{aid}/review")
+def review(aid: int, body: ReviewBody, db=Depends(db_dep),
+           user=Depends(require_writer)):
+    audit(db, user, "artifact_review", {"artifact_id": aid,
+                                        "approve": body.approve})
+    if body.approve:
+        # Auto-create the runnable JDK-only framework skeleton on first
+        # approval (DriverFactory, Hooks, LocatorRepository, run scripts) so
+        # generated code always lands in a framework that can execute.
+        try:
+            scaffold.scaffold()
+        except RuntimeError:
+            pass  # framework path not set; approve_artifact will report it
+    return generator.approve_artifact(aid, body.approve, body.edited_content)
+
+
+@app.post("/api/framework/scaffold")
+def create_framework(db=Depends(db_dep), user=Depends(require_writer)):
+    """Create a complete runnable JDK-only Selenium-Cucumber framework at the
+    configured path (never overwrites existing files)."""
+    result = scaffold.scaffold()
+    audit(db, user, "framework_scaffold", result)
+    return result
+
+
+class HealBody(BaseModel):
+    key: str                      # "TXN/Screen/elementName" from the Java client
+    failed_locator: str
+    dom: str = ""
+
+
+@app.get("/api/locator/resolve")
+def resolve_locator(key: str):
+    """Flat best-locator lookup for the Java framework's LocatorRepository.by().
+    Returns the primary (or highest-confidence) locator for an element key."""
+    name = [p for p in key.split("/") if p][-1] if key else ""
+    db = models.SessionLocal()
+    try:
+        el = (db.query(Element).filter(Element.element_key.ilike(f"%{name}%"))
+                .order_by(Element.id.desc()).first())
+        if not el:
+            return {"found": False}
+        locs = sorted(el.locators, key=lambda l: (not l.is_primary, -l.confidence))
+        if not locs:
+            return {"found": False}
+        best = locs[0]
+        st = best.strategy if best.strategy in ("id", "name", "css") else "xpath"
+        return {"found": True, "strategy": st, "value": best.value}
+    finally:
+        db.close()
+
+
+@app.post("/api/heal")
+async def heal_from_framework(body: HealBody):
+    """Runtime self-healing hook called by core.LocatorRepository in the Java
+    framework when an element is not found: resolves the element by key and
+    runs the healing cascade against the DOM sent from the live browser."""
+    parts = [p for p in body.key.split("/") if p]
+    name = parts[-1] if parts else body.key
+    db = models.SessionLocal()
+    try:
+        el = (db.query(Element)
+                .filter(Element.element_key.ilike(f"%{name}%"))
+                .order_by(Element.id.desc()).first())
+        eid = el.id if el else None
+    finally:
+        db.close()
+    if eid is None:
+        return {"healed": False, "reason": "element not in repository"}
+    result = await self_healing.heal(
+        eid, body.failed_locator, body.dom,
+        validate=lambda _v: True)  # final check happens in the Java browser
+    if result.get("healed"):
+        return {"healed": True, "type": result.get("strategy_type", "xpath"),
+                "value": result.get("locator")}
+    return {"healed": False, "reason": result.get("reason", "no candidate")}
+
+
+# ---------------- execution (M22) ----------------
+class ExecBody(BaseModel):
+    transactions: list[str] = []
+    environment: str = "SIT"
+    headless: bool | None = None
+
+
+@app.post("/api/executions/start")
+async def start_exec(body: ExecBody, db=Depends(db_dep),
+                     user=Depends(require_writer)):
+    eid = await execution.start_execution(body.transactions, body.environment,
+                                          body.headless)
+    audit(db, user, "execution_start", {"execution_id": eid})
+    return {"execution_id": eid}
+
+
+@app.post("/api/executions/{eid}/stop")
+def stop_exec(eid: int, db=Depends(db_dep), user=Depends(require_writer)):
+    audit(db, user, "execution_stop", {"execution_id": eid})
+    return {"stopped": execution.stop_execution(eid)}
+
+
+@app.get("/api/executions")
+def list_execs(db=Depends(db_dep), user=Depends(current_user)):
+    return [{"id": e.id, "transactions": e.transactions, "status": e.status,
+             "passed": e.passed, "failed": e.failed, "skipped": e.skipped,
+             "headless": e.headless, "started_at": str(e.started_at),
+             "report": e.report} for e in
+            db.query(Execution).order_by(Execution.id.desc()).limit(50)]
+
+
+@app.get("/api/edge/versions")
+def edge_versions(user=Depends(current_user)):
+    return execution.check_edge_versions()
+
+
+@app.websocket("/ws/executions/{eid}")
+async def ws_execution(ws: WebSocket, eid: int):
+    await ws.accept()
+    q = execution.get_stream(eid)
+    try:
+        while True:
+            ev = await q.get()
+            await ws.send_json(ev)
+            if ev.get("type") in ("done", "error"):
+                break
+    except WebSocketDisconnect:
+        pass
+
+
+# ---------------- reporting (M23) ----------------
+@app.get("/api/reports/summary")
+def report_summary(db=Depends(db_dep), user=Depends(current_user)):
+    execs = db.query(Execution).order_by(Execution.id).all()
+    total_p = sum(e.passed for e in execs)
+    total_f = sum(e.failed for e in execs)
+    return {
+        "executions": len(execs),
+        "passed": total_p, "failed": total_f,
+        "skipped": sum(e.skipped for e in execs),
+        "pass_pct": round(100 * total_p / (total_p + total_f), 1)
+        if total_p + total_f else 0,
+        "trend": [{"id": e.id, "passed": e.passed, "failed": e.failed,
+                   "at": str(e.started_at)} for e in execs[-20:]],
+        "self_healed": db.query(HealingEvent).filter_by(success=True).count(),
+        "framework_changes": db.query(GeneratedArtifact)
+                               .filter_by(status="written").count(),
+        "ui_changes": db.query(UIChange).count(),
+    }
+
+
+# ---------------- UI versioning (M24) ----------------
+@app.get("/api/ui/versions")
+def ui_versions(db=Depends(db_dep), user=Depends(current_user)):
+    return [{"screen": v.screen_name, "version": v.version, "source": v.source,
+             "screenshot": v.screenshot_path, "at": str(v.captured_at)}
+            for v in db.query(UIVersion).order_by(UIVersion.screen_name,
+                                                  UIVersion.version)]
+
+
+@app.get("/api/ui/changes")
+def ui_changes(db=Depends(db_dep), user=Depends(current_user)):
+    return [{"id": c.id, "screen": c.screen_name, "from": c.from_version,
+             "to": c.to_version, "diff": c.dom_diff,
+             "visual_score": c.visual_diff_score,
+             "visual_diff": c.visual_diff_path, "impacted": c.impacted,
+             "summary": c.ai_summary, "status": c.status,
+             "at": str(c.detected_at)}
+            for c in db.query(UIChange).order_by(UIChange.id.desc()).limit(100)]
+
+
+@app.post("/api/ui/changes/{cid}/apply")
+async def apply_targeted(cid: int, db=Depends(db_dep),
+                         user=Depends(require_writer)):
+    c = db.query(UIChange).get(cid) or (_ for _ in ()).throw(HTTPException(404))
+    ids = []
+    for txn in (c.impacted or {}).get("affected_transactions", []):
+        ids += await generator.generate_for_transaction(txn)
+    c.status = "updates_applied"
+    audit(db, user, "apply_targeted_updates", {"change_id": cid})
+    db.commit()
+    return {"regenerated_artifacts": ids}
+
+
+# ---------------- settings (M25 §11) ----------------
+@app.get("/api/settings")
+def get_settings(user=Depends(current_user)):
+    s = dict(config.load_settings())
+    # Never return stored passwords in clear text.
+    for k in config.SECRET_SETTINGS:
+        s[k] = config.mask_secret(s.get(k, ""))
+    return {"settings": s, "ai": config.public_ai_config()}
+
+
+@app.post("/api/settings")
+def set_settings(patch: dict, db=Depends(db_dep), user=Depends(require_writer)):
+    # A masked value coming back from the UI means "unchanged" — don't save it.
+    for k in config.SECRET_SETTINGS:
+        if k in patch and (not patch[k] or "*" in str(patch[k])):
+            patch.pop(k)
+    audit(db, user, "settings_update", {"keys": list(patch.keys())})
+    saved = dict(config.save_settings(patch))
+    for k in config.SECRET_SETTINGS:
+        saved[k] = config.mask_secret(saved.get(k, ""))
+    return {"settings": saved}
+
+
+@app.post("/api/framework/repair")
+def repair_framework(db=Depends(db_dep), user=Depends(require_writer)):
+    """Scan every .java file already in the framework and fix the common
+    generated-code faults in place (with .bak backups):
+      - unbalanced round brackets in a statement (missing ')')
+      - file name not matching the declared public class -> renamed
+    Reports anything it could not fix automatically."""
+    from .engines.generator import _balance_java, _declared_class, _validate_java
+    st = config.load_settings()
+    root = Path(st.get("framework_path") or "")
+    if not root.exists():
+        raise HTTPException(400, "Framework path is not configured.")
+
+    fixed, renamed, remaining = [], [], []
+    for jf in sorted(root.rglob("*.java")):
+        if "core" in jf.parts and jf.parent.name == "core":
+            continue                      # scaffold plumbing: leave alone
+        try:
+            original = jf.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        content, fixes = _balance_java(original)
+        target = jf
+        declared = _declared_class(content)
+        if declared and declared != jf.stem:
+            target = jf.with_name(declared + ".java")
+        if fixes or target != jf:
+            jf.with_suffix(".java.bak").write_text(original, encoding="utf-8")
+        if fixes:
+            fixed.append({"file": str(jf.relative_to(root)), "fixes": fixes})
+        if target != jf:
+            target.write_text(content, encoding="utf-8")
+            jf.unlink()
+            renamed.append({"from": jf.name, "to": target.name})
+        elif fixes:
+            jf.write_text(content, encoding="utf-8")
+        problems = _validate_java(content)
+        if problems:
+            remaining.append({"file": target.name, "problems": problems})
+
+    audit(db, user, "framework_repair",
+          {"fixed": len(fixed), "renamed": len(renamed)})
+    return {"fixed": fixed, "renamed": renamed, "needs_attention": remaining,
+            "summary": f"{len(fixed)} file(s) bracket-fixed, "
+                       f"{len(renamed)} renamed to match their class, "
+                       f"{len(remaining)} still need manual review."}
+
+
+@app.get("/api/artifact-file")
+def artifact_file(path: str, user=Depends(current_user)):
+    p = Path(path).resolve()
+    if not str(p).startswith(str(config.ARTIFACTS_DIR.resolve())):
+        raise HTTPException(403)
+    return FileResponse(p)
+
+
+# ------------- serve the frontend (plain JS — no build, no Node.js) -------------
+# frontend/ contains index.html + js/*.js + styles.css; open http://localhost:8000
+from fastapi.staticfiles import StaticFiles  # noqa: E402
+
+_UI = Path(__file__).resolve().parents[2] / "frontend"
+if _UI.exists():
+    app.mount("/", StaticFiles(directory=str(_UI), html=True), name="ui")
