@@ -1,242 +1,302 @@
-# Enterprise AI Automation Engineering Platform
+# Architecture — spec section → code
 
-A **self-learning AI Automation Engineer** — not a script generator — for a Java
-Selenium-Cucumber banking automation framework (SBI environment).
-
-It learns the application by recording each unique transaction **once**, builds a
-permanent knowledge repository from every recording and every execution, generates
-and maintains Feature Files / Page Objects / Step Definitions / **pure-Java runners
-(no Maven, no Gradle)**, executes real transactions end-to-end including the forced
-password change and the CBS teller reset, and heals itself when the UI shifts.
-
-> **Rule:** Python orchestrates. Java executes. The AI never replaces the Java
-> framework — it reads it, indexes it, extends it and repairs it.
+Traceability map from the Master Build Specification to the implementation.
+Nothing here is a standalone script: every capability plugs into the Section 2
+architecture as an agent, a graph node or a knowledge-repository extension
+(Section 18).
 
 ---
 
-## 1. Quick start
+## Section 2 — System architecture
 
-### Prerequisites
+```
+frontend/*.html  (plain HTML/CSS/JS)
+        │
+        ▼
+backend/main.py + backend/api/*        FastAPI orchestration layer
+        │
+        ▼
+backend/graphs/*                       LangGraph workflows (checkpointed)
+backend/core/llm.py                    LangChain → Azure OpenAI (prompts/RAG only)
+        │
+        ▼
+backend/agents/*                       16 agents
+        │
+        ▼
+backend/knowledge/* + backend/core/vectorstore.py     SQLite (in-process cosine search)
+        │
+        ▼
+java-framework/                        pure-Java Selenium-Cucumber, local jars
+        │
+        ▼
+Edge + WebDriver + CDP  ·  backend/execution/socket_client.py (CBS)
+        │
+        ▼
+backend/reporting/*                    interactive HTML reports
+```
 
-| Need | Notes |
+**Python orchestrates. Java executes.** The only place Python touches a browser
+is the recorder (`backend/recorder/cdp_recorder.py`), which exists to *learn* the
+application. Execution itself is always handed to the Java framework.
+
+---
+
+## Section 3 — Technology stack
+
+| Layer | Where |
 |---|---|
-| Python 3.11+ | orchestration layer |
-| SQLite (bundled with Python — no install needed) | knowledge repository + RAG |
-| JDK (javac + java on PATH, or `JAVA_HOME` set) | compiles the framework |
-| Microsoft Edge + msedgedriver | recording and execution |
-| Selenium / Cucumber jars in `java-framework/lib/` | **exactly the jars from your office PC** |
+| FastAPI orchestration | `backend/main.py`, `backend/api/` |
+| LangGraph workflows | `backend/graphs/{recording,execution,brd}_graph.py` |
+| LangChain (prompts / RAG / tool-calling only) | `backend/core/llm.py`, `backend/knowledge/rag.py` |
+| Azure OpenAI (sole provider) | `backend/core/llm.py` — `get_chat_model`, `get_embeddings` |
+| Edge + WebDriver + CDP | `backend/recorder/cdp_recorder.py`, `java-framework/.../DriverFactory.java` |
+| Pure-Java build, no Maven/Gradle | `java-framework/build.{sh,bat}`, `backend/codegen/compiler.py` |
+| Plain HTML/CSS/JS frontend | `frontend/` — no framework, no build step |
+| SQLite (Python stdlib `sqlite3`) | `db/schema.sql`, `backend/core/db.py` |
+| In-process vector search (JSON-encoded embeddings, brute-force cosine) | `knowledge_embeddings` table, `backend/core/vectorstore.py` |
+| Encrypted secrets | `backend/core/security.py` (Fernet), `secrets` table |
+| HTML reports | `backend/reporting/` |
 
-### Install
-
-```bash
-pip install -r requirements.txt
-
-cp .env.example .env
-python scripts/generate_key.py          # paste output into SECRETS_MASTER_KEY
-# edit .env: SQLITE_PATH, AZURE_OPENAI_*, EDGE_DRIVER_PATH, CBS_SOCKET_*
-
-python scripts/init_db.py               # creates the SQLite file, schema + seeds transaction 9750
-
-python run.py                           # → http://127.0.0.1:8000
-```
-
-Copy your jars into `java-framework/lib/`, then:
-
-```bash
-cd java-framework && ./build.sh          # or build.bat on Windows
-```
+DB, browser and file operations are done directly in Python — never through a
+LangChain tool, exactly as the spec requires.
 
 ---
 
-## 2. First run — the order that matters
+## Section 4 — Philosophy
 
-1. **Profile Manager** — create `SBI_PREPROD`. Enter Teller ID, teller password,
-   the new password used by transaction 9750, checker credentials and the CBS
-   reset string. All of it is encrypted at rest and masked everywhere.
-2. **Record Transaction 9750 first.** It is the forced Change Password screen and
-   is auto-attached as a pre-step to every other transaction. Record it once; if
-   SBI ever changes that screen, re-record only 9750 and every transaction
-   benefits.
-3. **Record your business transaction** (e.g. 400, 1045). Perform it normally in
-   the Edge window the platform opens. Stop, then **Keep or Discard**.
-4. **Test Data Editor** — fill in the banking values. The platform never invents
-   CIF, PAN, account numbers, branch codes or IDs.
-5. **Execute** — pick transaction + environment + profile, run, watch live status.
-6. **Reports Dashboard** — drill into any run.
+`backend/knowledge/rag.py :: knows_transaction()` is the "do I already know
+this?" gate. It returns one of:
 
----
-
-## 3. What a recording captures
-
-A recording is a full digital twin, not a click log:
-
-- every page: full DOM, rendered HTML, URL, title, frames/iframes, shadow roots
-- **every interactable element on every page** — not only what you clicked, so a
-  future BRD can reference an element you never touched
-- a ranked multi-strategy locator repository per element
-  (`id → name → data-* → aria → css → relative XPath → placeholder → text →
-  class → absolute XPath`)
-- DOM snapshots before/after every action, plus a structural diff
-- screenshots before/after every action
-- the workflow path (`Login → Dashboard → CIF Creation → Review → Confirmation`)
-- input **metadata only** — never raw values (Section 7)
-- validation rules and every error / warning / success message
-- optional network activity (URLs, status codes, timings)
-
-Every re-recording creates a **new version**. Nothing is ever overwritten.
-
----
-
-## 4. When do I have to re-record?
-
-| Change | Re-record? |
+| level | action |
 |---|---|
-| Brand-new transaction | **Yes** |
-| Application fully redesigned | **Yes** |
-| AI confidence below threshold | **Yes** — the platform tells you, and why |
-| Locator / CSS / attribute / position change | No — self-healed |
-| Validation or message text change | No — self-healed |
-| Small workflow tweak | No — self-healed |
+| `complete` | **reuse** |
+| `partial` | **update** only what is needed |
+| `unknown` / `stale` / `low_confidence` | **record** |
+
+Every agent calls `retrieve()` (`backend/agents/base.py`) before any LLM call —
+retrieval-before-generation is enforced by the base class, not by convention.
 
 ---
 
-## 5. The execution pipeline
+## Section 5 — Recorder engine
 
-Every run follows the same fixed sequence:
-
-```
- 1  select Transaction + Environment + Data Profile
- 2  Edge launches (Selenium WebDriver + CDP)
- 3  target URL opens
- 4  login with Teller ID + password              ← user-supplied
- 5  forced Change Password window  →  TRANSACTION 9750, auto-attached
- 6  automatic re-login with the new password
- 7  search for the target transaction
- 8  execute the recorded workflow with resolved test data
- 9  logout
-10  TELLER RESET — CBS reset string over a socket   ← ALWAYS, even after failure
-11  detailed HTML report
-```
-
-Step 10 is a cleanup node in the LangGraph workflow *and* a `finally` block in the
-Java runner. The teller is never left locked or dirty.
-
----
-
-## 6. Test data rules
-
-Banking data — CIF, account numbers, PAN, IFSC, branch codes, maker/checker IDs,
-teller ID, passwords — is **always supplied by you**. The AI may generate only
-cosmetic, non-validated filler (remarks / narration), and only when asked.
-
-Resolution order at execution time:
-
-```
-1. existing framework data     java-framework/config/*.properties
-2. profile / saved values      Profile Manager + Test Data Editor
-3. runtime input               prompted on the Execute screen
-4. database query              configured SQL per field
-5. API data                    configured endpoint per field
-6. AI-generated                cosmetic fields only
-```
-
-Feature files reference variables, never literals:
-
-```gherkin
-When user enters "<CustomerName>" in "Customer Name"
-And user enters "<PAN>" in "PAN"
-```
-
-Changing a value tomorrow means editing
-`java-framework/test-data/<ENV>/transaction_<id>.json` — the feature file, page
-object, step definitions and runner stay untouched.
-
----
-
-## 7. Project layout
-
-```
-NBC_project/
-├── run.py                       start the platform
-├── requirements.txt  .env.example
-├── db/schema.sql                SQLite schema (Section 15)
-├── scripts/                     init_db · reindex · generate_key
-├── backend/
-│   ├── main.py                  FastAPI app, 61 endpoints + 2 WebSockets
-│   ├── core/                    config · logging(masking) · security · llm · db · vectorstore
-│   ├── recorder/                CDP recorder · injector.js · locator builder · snapshots
-│   ├── knowledge/               repository · RAG · versioning
-│   ├── framework_index/         Java parser · indexing engine (Section 8)
-│   ├── tdm/                     field metadata · templates · profiles · AI resolver
-│   ├── codegen/                 generator · javac bridge · Jinja2 templates
-│   ├── execution/               pipeline · CBS socket client · self-healing · store
-│   ├── agents/                  the 16 agents (Section 10)
-│   ├── graphs/                  recording · execution · BRD LangGraph workflows
-│   ├── reporting/               interactive HTML report builder
-│   └── api/                     routes · WebSocket hub · background jobs
-├── frontend/                    7 screens, plain HTML/CSS/JS (no framework)
-├── java-framework/              PURE JAVA — no Maven, no Gradle
-│   ├── build.sh / build.bat     javac -cp "lib/*" -d build
-│   ├── run.sh   / run.bat       java -cp "lib/*:build" ...PlatformRunner
-│   ├── lib/                     ← your office jars go here
-│   ├── config/                  *.properties (test-data source #1)
-│   ├── test-data/{PREPROD,UAT,PROD}/
-│   └── src/com/sbi/automation/
-│       ├── core/                DriverFactory (Edge+CDP) · BasePage · ConfigReader
-│       ├── utils/               LocatorRepository · ExecutionContext · TestDataReader · SocketResetClient
-│       ├── hooks/               Cucumber hooks (evidence capture)
-│       ├── pages/ steps/ runners/
-│       └── transactions/Transaction_9750/
-└── storage/                     recordings · screenshots · reports · knowledge · uploads
-```
-
----
-
-## 8. Bringing your own framework
-
-The `java-framework/` folder is a working starter that matches the spec's layout.
-To use the framework from your office PC instead:
-
-1. Point `FRAMEWORK_ROOT`, `FRAMEWORK_SRC`, `FRAMEWORK_LIB`, `FRAMEWORK_BUILD`
-   and `FRAMEWORK_TESTDATA` in `.env` at it.
-2. Run `python scripts/reindex.py` — the Framework Indexing Engine reads every
-   feature file, page object, step definition, runner, utility, hook and property
-   file, extracts classes, methods, Gherkin patterns, locators and the dependency
-   graph, and embeds it for RAG.
-3. From then on, every generation request queries that index first and **reuses
-   what exists instead of duplicating it**.
-
-Keep `BasePage.findWithFallback`, `LocatorRepository`, `ExecutionContext`,
-`TestDataReader` and `SocketResetClient` (or port their behaviour) — generated
-code and the self-healing engine depend on them.
-
----
-
-## 9. Safety properties
-
-- Credentials and the CBS reset string are user-supplied, Fernet-encrypted at
-  rest, masked in the UI, and scrubbed from every log line by a logging filter.
-- Raw input values are never stored in a recording — only field metadata.
-- Generated files preserve anything you hand-write between the
-  `// === CUSTOM CODE START/END ===` markers.
-- Recording captures are removed entirely on **Discard** — nothing reaches the
-  framework until you press Keep.
-- Every workflow is checkpointed; an interrupted run resumes from the last
-  successful checkpoint instead of restarting.
-
----
-
-## 10. Troubleshooting
-
-| Symptom | Fix |
+| Spec | Code |
 |---|---|
-| `Database not ready` on startup | run `python scripts/init_db.py` (creates the SQLite file + schema) |
-| AI generation/healing disabled | set `AZURE_OPENAI_API_KEY` and `AZURE_OPENAI_ENDPOINT` |
-| `javac not found` | set `JAVA_HOME` in `.env` |
-| `0 jars found` | copy your Selenium/Cucumber jars into `java-framework/lib/` |
-| Execution blocked on credentials | Profile Manager → fill teller id/password + CBS reset string |
-| `Transaction X is not in the knowledge repository` | record it once on the Record screen |
-| `flagged for re-recording` | the report explains why; re-record that transaction |
-| CBS reset `unreachable` | set `CBS_SOCKET_HOST` / `CBS_SOCKET_PORT`, check the probe on Execute |
+| 5.1 page-level capture | `injector.js :: crawlPage()`, `cdp_recorder._ingest_crawl` |
+| 5.2 whole-page element crawl | `injector.js :: CRAWL_SELECTOR` + `collectRoots()` (shadow DOM, iframes) |
+| 5.3 locator repository | `injector.js :: describe()` → `backend/recorder/locator_builder.py` |
+| 5.4 DOM snapshots before/after | `cdp_recorder._snapshot_dom`, `snapshot_store.dom_diff` |
+| 5.5 screenshots | `cdp_recorder._screenshot` |
+| 5.6 workflow path | `cdp_recorder._workflow` |
+| 5.7 input metadata, never raw values | `injector.js` change handler sends `value_length`/`sensitive` only |
+| 5.8 validation rules | `injector.js :: captureMessages()` → `validation_rules` table |
+| 5.9 network activity | `cdp_recorder._drain_network` (CDP performance log) |
+| 5.10 versioning | `backend/knowledge/versioning.py :: open_new_version` — never overwrites |
+| 5.11 Keep / Discard | `recording_graph` interrupt + `POST /api/recorder/decide` |
 
-See `docs/ARCHITECTURE.md` for how each spec section maps onto the code.
+The injector is re-installed via `Page.addScriptToEvaluateOnNewDocument` so it
+survives navigation, and is pushed into every iframe on each poll.
+
+---
+
+## Section 6 — Code generation
+
+`backend/codegen/generator.py :: generate_all()` produces, per transaction:
+
+- `Transaction_<id>/Transaction<id>.feature`
+- `pages/Transaction<id>Page.java`
+- `steps/Transaction<id>Steps.java`
+- `runners/Transaction<id>Runner.java` — **pure Java**
+- `test-data/<ENV>/transaction_<id>.json`
+
+Before writing anything it queries the Framework Index (Section 8) and skips any
+step definition that already exists, recording what it reused. Hand-written code
+between `// === CUSTOM CODE START/END ===` is extracted and re-injected on every
+regeneration, so the AI extends the framework and never clobbers your work.
+
+---
+
+## Section 7 — Test Data Management
+
+| Spec | Code |
+|---|---|
+| 7.1 banking data is user-supplied | `tdm/field_meta.py :: USER_ONLY`; `AI_ALLOWED = {"REMARKS"}` |
+| 7.2 field metadata | `field_meta.build()` → `test_data_fields` table |
+| 7.3 six-source priority order | `tdm/resolver.py :: resolve()` |
+| 7.4 per-transaction/per-environment templates | `tdm/templates.py` |
+| 7.5 variables, never literals | `codegen/templates/feature.j2` + `TestDataReader.resolve()` |
+| 7.6 data profiles | `tdm/profiles.py`, `test_data_profiles` table |
+| 7.7 AI Data Resolver | `resolver.resolve()` → `write_runtime_file()` |
+| 7.8 frontend editor | `frontend/testdata.html`, `templates.editor_view()` |
+
+Sensitive values never touch the JSON file — it carries `__ENCRYPTED__` and the
+real value lives Fernet-encrypted in `test_data_values`.
+
+---
+
+## Section 8 — Framework Indexing Engine
+
+`backend/framework_index/`
+
+- `java_parser.py` — javalang with a regex fallback, so indexing works even if
+  the wheel is unavailable. Extracts packages, classes, methods, annotations,
+  Gherkin patterns, `@FindBy` and `By.*` locators.
+- `indexer.py` — classifies every file (feature / page object / step definition /
+  runner / utility / hook / property / test data), persists to
+  `framework_artifacts`, `framework_methods`, `framework_relations`, and embeds
+  each artefact for RAG.
+
+Query helpers used by the Framework Search Agent: `find_artifacts`,
+`find_step_definition`, `find_method`, `find_utilities`, `dependency_graph`.
+
+---
+
+## Section 9 — Knowledge retrieval
+
+`backend/knowledge/rag.py :: build_context()` assembles, before every LLM call:
+existing framework artefacts, the known transaction record, the locator
+repository, recent execution history and past AI decisions (so the platform does
+not repeat a known failure). If the SQLite database is unreachable it degrades
+gracefully rather than hanging.
+
+---
+
+## Section 10 — Agents
+
+`backend/agents/__init__.py :: REGISTRY` — 16 singletons:
+
+| Agent | Module |
+|---|---|
+| Recorder | `recorder_agent.py` |
+| BRD | `brd_agent.py` |
+| Knowledge | `knowledge_agent.py` |
+| Framework Search | `framework_search_agent.py` |
+| Locator | `locator_agent.py` |
+| Test Data | `test_data_agent.py` |
+| Feature Generation / Page Object / Step Definition / Test Runner / CodeGen | `codegen_agents.py` |
+| Compilation | `compilation_agent.py` |
+| Execution | `execution_agent.py` |
+| Self-Healing | `self_heal_agent.py` |
+| Report | `report_agent.py` |
+| Continuous Learning | `learning_agent.py` |
+
+Each inherits `BaseAgent`: `retrieve → ask → record`. Every decision lands in
+`ai_decisions` with its rationale, confidence and eventual outcome.
+
+### Workflows
+
+| Graph | Nodes | Interrupts |
+|---|---|---|
+| `recording_graph` | start_recording → stop_recording → **keep_or_discard** → persist → reuse_scan → generate → compile | before `stop_recording` and `keep_or_discard` |
+| `execution_graph` | preflight → execute → self_heal? → **teller_reset** → report → learn | none (runs to completion) |
+| `brd_graph` | upload → analyse → **approval** → reuse_scan → apply_changes → compile → execute | before `approval` |
+
+All three compile with a SQLite checkpointer (memory fallback), so an
+interrupted workflow resumes from its last successful checkpoint —
+`POST /api/execution/thread/{id}/resume`.
+
+---
+
+## Section 11 — Execution engine
+
+`backend/execution/pipeline.py` implements the fixed 11-step flow.
+
+- **9750 auto-attachment** — `_resolve_prestep()` looks up the transaction typed
+  `system_prerequisite` and passes `--prestep=9750` to `PlatformRunner`, which
+  chains the 9750 feature ahead of the target feature **in the same browser
+  session**, so login → forced password change → re-login → search → execute →
+  logout is one continuous flow. The user never selects 9750.
+- **Credentials** — `tdm/profiles.py :: credentials()` decrypts at the last
+  moment and passes them to the JVM as environment variables; `missing_credentials()`
+  blocks the run rather than guessing.
+- **Teller reset** — `execution/socket_client.py`. It is wired twice, on purpose:
+  as the `teller_reset` cleanup node in `execution_graph` (authoritative) and as
+  `SocketResetClient.resetTellerQuietly()` in the runner's `finally` block (for
+  runs launched manually outside the platform). `{TELLER_ID}` in the reset string
+  is substituted at send time.
+- **Evidence** — Java writes `steps.jsonl` into the report directory; the pipeline
+  mirrors it into `execution_steps` so the dashboard shows real browser steps.
+
+---
+
+## Section 12 — Self-healing
+
+`backend/execution/self_healing.py :: heal()`
+
+1. Promote the next-best locator from the ranked repository (free, no LLM).
+2. Otherwise ask the Locator Agent for a replacement, grounded in the live DOM
+   and the known locator list. Never invents an attribute absent from the DOM.
+3. Apply if confidence ≥ `SELF_HEAL_CONFIDENCE_THRESHOLD` — persist the new
+   locator, demote the failed one, and patch the generated page object in place.
+4. Between the two thresholds → human approval (Section 17).
+5. Below `RERECORD_CONFIDENCE_THRESHOLD` → flag for re-recording with the reason
+   written into the report.
+
+Every attempt is logged to `self_heal_log` with before/after locators — that log
+drives the diff view in the report.
+
+---
+
+## Section 13 — Reporting
+
+`backend/reporting/report_builder.py` + `templates/report.html.j2`. Self-contained
+HTML (screenshots base64-inlined) with transaction/environment/profile, expandable
+step-by-step results, the 9750 sub-step, the teller-reset result and CBS response,
+self-healing before/after diffs, timing metrics, and links back to the knowledge
+version used.
+
+---
+
+## Section 14 — Frontend
+
+Plain HTML/CSS/JS, no framework, no build step. `frontend/js/api.js` holds the
+shared client, the sidebar renderer and the WebSocket helper; each screen is one
+self-contained page.
+
+`record.html` · `library.html` · `testdata.html` · `profiles.html` · `brd.html` ·
+`execute.html` · `reports.html` (+ `index.html` overview).
+
+Live feeds: `ws://…/api/recorder/live` and `ws://…/api/execution/live`.
+
+---
+
+## Section 15 — Storage
+
+`db/schema.sql` — 18 tables: `transactions`, `pages`, `elements`, `locators`,
+`recorded_actions`, `validation_rules`, `test_data_fields`, `test_data_profiles`,
+`test_data_values`, `secrets`, `executions`, `execution_steps`, `self_heal_log`,
+`brd_uploads`, `framework_artifacts`, `framework_methods`, `framework_relations`,
+`ai_decisions`, `approvals`, `recording_sessions`, `knowledge_embeddings`.
+
+The vector column dimension follows `EMBEDDING_DIM` and is rewritten at schema
+apply time if you switch embedding models.
+
+---
+
+## Section 16 — Folder structure
+
+Produced exactly as specified — see the layout table in `README.md` §7. Knowledge
+packages live at `storage/knowledge/transaction_<id>/v<version>/` containing
+`manifest.json`, `locators.json`, `workflow.json` and the capture directory.
+
+---
+
+## Section 17 — Human-in-the-loop
+
+| Gate | Mechanism |
+|---|---|
+| Keep / Discard after recording | `recording_graph` interrupt + `POST /api/recorder/decide` |
+| Approve BRD-driven changes | `brd_graph` interrupt + `POST /api/brd/thread/{id}/approve` (auto for low risk when `AUTO_APPROVE_LOW_RISK=true`) |
+| Approve a low-confidence self-heal | `self_healing.heal()` returns `needs_approval`; surfaced on the Execute screen and in `approvals` |
+
+---
+
+## Section 18 — Extending the platform
+
+To add a capability, add an **agent** (subclass `BaseAgent`, register it in
+`backend/agents/__init__.py`) and wire it as a **node** in an existing graph, or
+extend the **knowledge repository**. Do not add a standalone script.
+
+The test: does the addition make the platform more autonomous over time? The
+Continuous Learning Agent is the reference implementation of that principle — it
+turns every outcome, good or bad, into knowledge that reduces future manual work.
