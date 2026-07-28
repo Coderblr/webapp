@@ -1,175 +1,62 @@
-"""Central configuration.  Everything the platform needs comes from here.
+"""Checkpointing so every workflow is resumable (Section 10).
 
-Rule (Section 2):  Python orchestrates, Java executes.  This module knows
-where the Java framework lives but never rewrites it wholesale.
+If an execution stops halfway, it resumes from the last successful
+checkpoint rather than restarting from scratch.  A file-backed SQLite
+checkpoint store is used when available (durable across restarts);
+otherwise an in-memory saver keeps the process working for that session.
 """
 from __future__ import annotations
 
-from functools import lru_cache
-from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from ..core.config import settings
+from ..core.logging_conf import get_logger
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+log = get_logger(__name__)
 
-
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=str(PROJECT_ROOT / ".env"),
-        env_file_encoding="utf-8",
-        extra="ignore",
-        case_sensitive=False,
-    )
-
-    # ── app ──────────────────────────────────────────────────────────────
-    app_name: str = "Enterprise AI Automation Engineering Platform"
-    app_host: str = "127.0.0.1"
-    app_port: int = 8000
-    log_level: str = "INFO"
-
-    # ── database (SQLite) ───────────────────────────────────────────────
-    sqlite_path: str = "./storage/ai_automation.db"
-
-    # ── postgres (legacy, unused now the platform runs on SQLite) ────────
-    pg_host: str = "localhost"
-    pg_port: int = 5432
-    pg_db: str = "ai_automation"
-    pg_user: str = "postgres"
-    pg_password: str = "changeme"
-    pg_schema: str = "public"
-    pg_connect_timeout: int = 5
-
-    # ── azure openai (sole LLM provider) ────────────────────────────────
-    azure_openai_api_key: str = ""
-    azure_openai_endpoint: str = ""
-    azure_openai_api_version: str = "2024-10-21"
-    azure_openai_chat_deployment: str = "gpt-4o"
-    azure_openai_embedding_deployment: str = "text-embedding-3-large"
-    embedding_dim: int = 3072
-    llm_temperature: float = 0.0
-    llm_max_tokens: int = 4096
-
-    # ── secrets ──────────────────────────────────────────────────────────
-    secrets_master_key: str = ""
-
-    # ── java framework ───────────────────────────────────────────────────
-    framework_root: str = "./java-framework"
-    framework_src: str = "./java-framework/src"
-    framework_lib: str = "./java-framework/lib"
-    framework_build: str = "./java-framework/build"
-    framework_testdata: str = "./java-framework/test-data"
-    java_home: Optional[str] = None
-    javac_bin: str = "javac"
-    java_bin: str = "java"
-
-    # ── storage ──────────────────────────────────────────────────────────
-    storage_root: str = "./storage"
-    knowledge_root: str = "./storage/knowledge"
-
-    # ── recorder / browser ───────────────────────────────────────────────
-    edge_driver_path: Optional[str] = None
-    edge_binary_path: Optional[str] = None
-    recorder_cdp_port: int = 9222
-    recorder_capture_network: bool = True
-    recorder_fullpage_crawl: bool = True
-    browser_implicit_wait: int = 10
-
-    # ── CBS socket (teller reset) ────────────────────────────────────────
-    cbs_socket_host: str = ""
-    cbs_socket_port: int = 0
-    cbs_socket_timeout: int = 30
-    cbs_socket_encoding: str = "utf-8"
-
-    # ── confidence thresholds ────────────────────────────────────────────
-    self_heal_confidence_threshold: float = 0.75
-    rerecord_confidence_threshold: float = 0.55
-    auto_approve_low_risk: bool = False
-
-    # ── system transaction ids ───────────────────────────────────────────
-    password_change_transaction: str = Field(
-        default="9750",
-        description="Transaction auto-attached as pre-step to every execution.",
-    )
-
-    # ── derived ──────────────────────────────────────────────────────────
-    @property
-    def sqlite_db_path(self) -> Path:
-        return self.path(self.sqlite_path)
-
-    def path(self, value: str) -> Path:
-        p = Path(value)
-        return p if p.is_absolute() else (PROJECT_ROOT / p).resolve()
-
-    @property
-    def framework_root_path(self) -> Path:
-        return self.path(self.framework_root)
-
-    @property
-    def framework_src_path(self) -> Path:
-        return self.path(self.framework_src)
-
-    @property
-    def framework_lib_path(self) -> Path:
-        return self.path(self.framework_lib)
-
-    @property
-    def framework_build_path(self) -> Path:
-        return self.path(self.framework_build)
-
-    @property
-    def framework_testdata_path(self) -> Path:
-        return self.path(self.framework_testdata)
-
-    @property
-    def storage_path(self) -> Path:
-        return self.path(self.storage_root)
-
-    @property
-    def knowledge_path(self) -> Path:
-        return self.path(self.knowledge_root)
-
-    @property
-    def screenshots_path(self) -> Path:
-        return self.storage_path / "screenshots"
-
-    @property
-    def recordings_path(self) -> Path:
-        return self.storage_path / "recordings"
-
-    @property
-    def reports_path(self) -> Path:
-        return self.storage_path / "reports"
-
-    @property
-    def uploads_path(self) -> Path:
-        return self.storage_path / "uploads"
-
-    @property
-    def llm_configured(self) -> bool:
-        return bool(self.azure_openai_api_key and self.azure_openai_endpoint)
-
-    def ensure_dirs(self) -> None:
-        for p in (
-            self.storage_path,
-            self.knowledge_path,
-            self.screenshots_path,
-            self.recordings_path,
-            self.reports_path,
-            self.uploads_path,
-            self.framework_build_path,
-            self.framework_testdata_path,
-        ):
-            p.mkdir(parents=True, exist_ok=True)
-        self.sqlite_db_path.parent.mkdir(parents=True, exist_ok=True)
+_saver: Optional[Any] = None
 
 
-@lru_cache(maxsize=1)
-def get_settings() -> Settings:
-    s = Settings()
-    s.ensure_dirs()
-    return s
+def get_checkpointer() -> Any:
+    global _saver
+    if _saver is not None:
+        return _saver
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+        checkpoint_path = str(settings.sqlite_db_path.with_name("checkpoints.db"))
+        _saver = SqliteSaver.from_conn_string(checkpoint_path)
+        # from_conn_string may return a context manager depending on version
+        if hasattr(_saver, "__enter__"):
+            _saver = _saver.__enter__()
+        _saver.setup()
+        log.info("LangGraph checkpointer: SQLite (%s)", checkpoint_path)
+        return _saver
+    except Exception as exc:  # noqa: BLE001
+        log.warning("SQLite checkpointer unavailable (%s) — using memory saver", exc)
+    from langgraph.checkpoint.memory import MemorySaver
+    _saver = MemorySaver()
+    return _saver
 
 
-settings = get_settings()
+def config_for(thread_id: str, **extra: Any) -> dict[str, Any]:
+    return {"configurable": {"thread_id": thread_id, **extra}}
+
+
+def get_state(graph: Any, thread_id: str) -> dict[str, Any]:
+    try:
+        snapshot = graph.get_state(config_for(thread_id))
+        return {
+            "values": snapshot.values,
+            "next": list(snapshot.next or ()),
+            "created_at": getattr(snapshot, "created_at", None),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+
+def resume(graph: Any, thread_id: str, update: dict[str, Any] | None = None) -> Any:
+    """Resume an interrupted workflow, optionally applying a human decision."""
+    config = config_for(thread_id)
+    if update:
+        graph.update_state(config, update)
+    return graph.invoke(None, config)
