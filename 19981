@@ -1,223 +1,96 @@
-"""Execution workflow (Section 11) as a resumable state machine.
+package com.sbi.automation.runners;
 
-    preflight → compile → [9750 auto-attached] → execute → self-heal?
-              → teller_reset (ALWAYS) → report → learn
+import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
 
-`teller_reset` is wired as the cleanup node: every terminal path routes
-through it, so the teller ID is never left locked, even when the transaction
-itself blew up.
-"""
-from __future__ import annotations
+import com.sbi.automation.core.DriverFactory;
+import com.sbi.automation.utils.ExecutionContext;
+import com.sbi.automation.utils.SocketResetClient;
 
-from typing import Any
+/**
+ * The runner the Execution Agent launches.  PURE JAVA — no Maven, no Gradle.
+ *
+ * It chains the mandatory password-change transaction (9750) IN THE SAME
+ * BROWSER SESSION before the requested transaction, which is exactly the real
+ * SBI flow of Section 11.1:
+ *
+ *   launch → URL → login → forced password change (9750) → re-login
+ *          → search transaction → execute → logout
+ *
+ * Usage:
+ *   java -cp "lib/*;build" com.sbi.automation.runners.PlatformRunner \
+ *        --transaction=400 --env=PREPROD --profile=SBI_PREPROD \
+ *        --prestep=9750 --execution=exec_400_...
+ */
+public class PlatformRunner {
 
-from langgraph.graph import END, StateGraph
+    private static final String TXN_ROOT = "src/com/sbi/automation/transactions";
+    private static final String GLUE = "com.sbi.automation.steps";
+    private static final String HOOKS = "com.sbi.automation.hooks";
 
-from ..agents import (
-    execution_agent, learning_agent, report_agent, self_healing_agent,
-)
-from ..core.config import settings
-from ..core.logging_conf import get_logger
-from ..execution import socket_client, store
-from ..tdm import profiles as tdm_profiles
-from .checkpointer import config_for, get_checkpointer
-from .state import ExecutionState, entry
+    public static void main(String[] args) {
+        ExecutionContext.initFromArgs(args);
+        String transaction = ExecutionContext.transaction();
+        String prestep = ExecutionContext.prestep();
 
-log = get_logger(__name__)
+        int exitCode = 1;
+        try {
+            List<String> cucumberArgs = new ArrayList<>();
 
+            /* 1. mandatory password change, attached automatically */
+            if (prestep != null && !prestep.isEmpty()) {
+                File presteFeature = featureFor(prestep);
+                if (presteFeature.exists()) {
+                    cucumberArgs.add(presteFeature.getAbsolutePath());
+                    ExecutionContext.recordStep("password_change",
+                            "Transaction " + prestep + " attached as pre-step",
+                            "passed", 0, "", null);
+                } else {
+                    ExecutionContext.recordStep("password_change",
+                            "Transaction " + prestep + " feature not found",
+                            "skipped", 0, "",
+                            presteFeature.getAbsolutePath());
+                }
+            }
 
-def node_preflight(state: ExecutionState) -> dict[str, Any]:
-    result = execution_agent(
-        action="preflight",
-        transaction_id=state["transaction_id"],
-        environment=state.get("environment", "PREPROD"),
-        profile=state["profile"],
-    )
-    payload = dict(result)
-    errors = []
-    if not payload.get("transaction_known"):
-        errors.append(
-            f"Transaction {state['transaction_id']} has not been recorded yet."
-        )
-    if payload.get("missing_credentials"):
-        errors.append(
-            "Missing user-supplied credentials: "
-            + ", ".join(payload["missing_credentials"])
-        )
-    return {
-        "preflight": payload,
-        "prestep_transaction": (
-            settings.password_change_transaction
-            if payload.get("password_change_attached")
-            and not state.get("skip_password_change") else None
-        ),
-        "status": "preflight_failed" if errors else "preflight_ok",
-        "errors": errors,
-        "log": entry("preflight", "failed" if errors else "ok",
-                     "; ".join(errors) or
-                     "Credentials present, 9750 pre-step attached"),
+            /* 2. the requested transaction */
+            File feature = featureFor(transaction);
+            if (!feature.exists()) {
+                throw new IllegalStateException(
+                        "Feature file not found: " + feature.getAbsolutePath()
+                        + " — record transaction " + transaction + " first.");
+            }
+            cucumberArgs.add(feature.getAbsolutePath());
+
+            cucumberArgs.add("--glue");
+            cucumberArgs.add(GLUE);
+            cucumberArgs.add("--glue");
+            cucumberArgs.add(HOOKS);
+            cucumberArgs.add("--plugin");
+            cucumberArgs.add("pretty");
+            cucumberArgs.add("--plugin");
+            cucumberArgs.add("json:" + ExecutionContext.reportPath("cucumber.json"));
+            cucumberArgs.add("--plugin");
+            cucumberArgs.add("html:" + ExecutionContext.reportPath("cucumber.html"));
+            cucumberArgs.add("--monochrome");
+
+            exitCode = io.cucumber.core.cli.Main.run(
+                    cucumberArgs.toArray(new String[0]),
+                    Thread.currentThread().getContextClassLoader());
+        } catch (Throwable t) {
+            ExecutionContext.recordFatal(t);
+        } finally {
+            /* 3. always tear down and always attempt the teller reset */
+            DriverFactory.quitQuietly();
+            SocketResetClient.resetTellerQuietly();
+            ExecutionContext.flush();
+        }
+        System.exit(exitCode);
     }
 
-
-def node_execute(state: ExecutionState) -> dict[str, Any]:
-    """Runs the whole browser pipeline: launch → login → 9750 → relogin →
-    search → transaction → logout (steps 2-9 of Section 11.1)."""
-    result = execution_agent(
-        action="execute",
-        transaction_id=state["transaction_id"],
-        environment=state.get("environment", "PREPROD"),
-        profile_name=state["profile"],
-        thread_id=state.get("thread_id", ""),
-        target_url=state.get("target_url"),
-        runtime_values=state.get("runtime_values", {}),
-        skip_password_change=state.get("skip_password_change", False),
-        # the graph owns the reset node, so the pipeline must not fire it twice
-        skip_teller_reset=True,
-        headless=state.get("headless", False),
-    )
-    return {
-        "run_result": dict(result),
-        "execution_uid": result.get("execution_uid", ""),
-        "execution_pk": result.get("execution_pk", 0),
-        "status": result.get("status", "failed"),
-        "errors": result.get("errors", []),
-        "log": entry("execute", "ok" if result.ok else "failed",
-                     f"Transaction {state['transaction_id']} → "
-                     f"{result.get('status')}"),
+    private static File featureFor(String transactionId) {
+        return new File(TXN_ROOT + File.separator + "Transaction_" + transactionId,
+                "Transaction" + transactionId + ".feature");
     }
-
-
-def node_self_heal(state: ExecutionState) -> dict[str, Any]:
-    if not state.get("execution_pk"):
-        return {"log": entry("self_heal", "skipped", "no execution to analyse")}
-    result = self_healing_agent(
-        action="heal_execution",
-        execution_pk=state["execution_pk"],
-        transaction_id=state["transaction_id"],
-    )
-    healed = result.get("healed", [])
-    rerecord = result.get("requires_rerecording", [])
-    return {
-        "heal_result": dict(result),
-        "log": entry(
-            "self_heal", "ok" if healed else "none",
-            f"{len(healed)} locator(s) healed"
-            + (f"; {len(rerecord)} need re-recording" if rerecord else ""),
-        ),
-    }
-
-
-def node_teller_reset(state: ExecutionState) -> dict[str, Any]:
-    """GUARANTEED final step (Section 11.4) — runs on every path."""
-    if state.get("skip_teller_reset"):
-        payload = {"status": "skipped", "ok": False,
-                   "detail": "explicit user override — audit logged"}
-    else:
-        credentials = tdm_profiles.credentials(
-            state["profile"], state.get("environment")
-        )
-        result = socket_client.reset_teller(
-            credentials.get("cbs_reset_string", ""),
-            teller_id=credentials.get("teller_id"),
-        )
-        payload = result.as_dict()
-    if state.get("execution_pk"):
-        store.set_teller_reset(
-            int(state["execution_pk"]), payload["status"],
-            payload.get("response", ""),
-        )
-        store.add_step(
-            int(state["execution_pk"]), 900, "teller_reset",
-            "CBS teller reset (socket client)",
-            "passed" if payload.get("ok") else
-            ("skipped" if payload["status"] == "skipped" else "failed"),
-            duration_ms=payload.get("duration_ms"),
-            error=None if payload.get("ok") else payload.get("detail"),
-            detail=payload,
-        )
-    return {
-        "teller_reset": payload,
-        "log": entry("teller_reset",
-                     "ok" if payload.get("ok") else payload["status"],
-                     payload.get("detail") or payload.get("response", "")[:200]),
-    }
-
-
-def node_report(state: ExecutionState) -> dict[str, Any]:
-    if not state.get("execution_uid"):
-        return {"log": entry("report", "skipped", "no execution recorded")}
-    result = report_agent(action="build", execution_uid=state["execution_uid"])
-    return {"report_path": result.get("report_path", ""),
-            "log": entry("report", "ok" if result.ok else "failed",
-                         result.get("report_path", ""))}
-
-
-def node_learn(state: ExecutionState) -> dict[str, Any]:
-    if not state.get("execution_uid"):
-        return {"log": entry("learn", "skipped", "")}
-    result = learning_agent(action="learn", execution_uid=state["execution_uid"])
-    return {"learning": dict(result),
-            "log": entry("learn", "ok",
-                         f"confidence now {result.get('confidence')}")}
-
-
-# ── routing ─────────────────────────────────────────────────────────────
-def route_after_preflight(state: ExecutionState) -> str:
-    return "teller_reset" if state.get("status") == "preflight_failed" else "execute"
-
-
-def route_after_execute(state: ExecutionState) -> str:
-    return "self_heal" if state.get("status") != "passed" else "teller_reset"
-
-
-def build_graph(compiled: bool = True) -> Any:
-    graph = StateGraph(ExecutionState)
-    # NOTE: node ids are deliberately NOT "preflight" / "teller_reset" —
-    # those are ExecutionState field names (state.py), and LangGraph forbids
-    # a node id colliding with a state key ("'X' is already being used as a
-    # state key"). The state fields still carry the same names/payloads;
-    # only the graph's internal node identifiers differ.
-    graph.add_node("preflight_check", node_preflight)
-    graph.add_node("execute", node_execute)
-    graph.add_node("self_heal", node_self_heal)
-    graph.add_node("teller_reset_step", node_teller_reset)
-    graph.add_node("report", node_report)
-    graph.add_node("learn", node_learn)
-
-    graph.set_entry_point("preflight_check")
-    graph.add_conditional_edges(
-        "preflight_check", route_after_preflight,
-        {"execute": "execute", "teller_reset": "teller_reset_step"},
-    )
-    graph.add_conditional_edges(
-        "execute", route_after_execute,
-        {"self_heal": "self_heal", "teller_reset": "teller_reset_step"},
-    )
-    graph.add_edge("self_heal", "teller_reset_step")
-    graph.add_edge("teller_reset_step", "report")
-    graph.add_edge("report", "learn")
-    graph.add_edge("learn", END)
-
-    if not compiled:
-        return graph
-    return graph.compile(checkpointer=get_checkpointer())
-
-
-_graph: Any = None
-
-
-def get_graph() -> Any:
-    global _graph
-    if _graph is None:
-        _graph = build_graph()
-    return _graph
-
-
-def run(thread_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    payload = {**payload, "thread_id": thread_id}
-    return get_graph().invoke(payload, config_for(thread_id))
-
-
-def resume(thread_id: str) -> dict[str, Any]:
-    """Continue a run that stopped midway, from the last checkpoint."""
-    return get_graph().invoke(None, config_for(thread_id))
+}
