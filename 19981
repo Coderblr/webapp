@@ -1,62 +1,365 @@
-"""Checkpointing so every workflow is resumable (Section 10).
+"""Framework Indexing Engine (Section 8).
 
-If an execution stops halfway, it resumes from the last successful
-checkpoint rather than restarting from scratch.  A file-backed SQLite
-checkpoint store is used when available (durable across restarts);
-otherwise an in-memory saver keeps the process working for that session.
+Builds a complete, queryable index of the existing pure-Java Selenium-
+Cucumber framework so the AI ALWAYS prefers reuse over duplication.
+The index covers: feature files, page objects, step definitions, runners,
+utilities, hooks, property files, test-data files, every class/method/
+package, locators, tags, class relationships and the call graph.
 """
 from __future__ import annotations
 
+import re
+from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Optional
 
+from ..core import db, vectorstore
 from ..core.config import settings
 from ..core.logging_conf import get_logger
+from . import java_parser as jp
 
 log = get_logger(__name__)
 
-_saver: Optional[Any] = None
+ARTIFACT_FEATURE = "feature"
+ARTIFACT_PAGE = "page_object"
+ARTIFACT_STEPS = "step_definition"
+ARTIFACT_RUNNER = "runner"
+ARTIFACT_UTILITY = "utility"
+ARTIFACT_HOOK = "hook"
+ARTIFACT_PROPERTY = "property"
+ARTIFACT_TESTDATA = "test_data"
+
+_RE_CALL = re.compile(r"\b([A-Z]\w+)\s*\.\s*\w+\s*\(")
+_RE_NEW = re.compile(r"\bnew\s+([A-Z]\w+)\s*\(")
 
 
-def get_checkpointer() -> Any:
-    global _saver
-    if _saver is not None:
-        return _saver
-    try:
-        from langgraph.checkpoint.sqlite import SqliteSaver
-        checkpoint_path = str(settings.sqlite_db_path.with_name("checkpoints.db"))
-        _saver = SqliteSaver.from_conn_string(checkpoint_path)
-        # from_conn_string may return a context manager depending on version
-        if hasattr(_saver, "__enter__"):
-            _saver = _saver.__enter__()
-        _saver.setup()
-        log.info("LangGraph checkpointer: SQLite (%s)", checkpoint_path)
-        return _saver
-    except Exception as exc:  # noqa: BLE001
-        log.warning("SQLite checkpointer unavailable (%s) — using memory saver", exc)
-    from langgraph.checkpoint.memory import MemorySaver
-    _saver = MemorySaver()
-    return _saver
+def classify(path: Path, text: str = "") -> str:
+    name = path.name.lower()
+    parent = path.parent.name.lower()
+    if name.endswith(".feature"):
+        return ARTIFACT_FEATURE
+    if name.endswith(".properties"):
+        return ARTIFACT_PROPERTY
+    if name.endswith(".json") and "test-data" in str(path).lower():
+        return ARTIFACT_TESTDATA
+    if name.endswith(".java"):
+        if "runner" in name or "runner" in parent:
+            return ARTIFACT_RUNNER
+        if "hook" in name or "hook" in parent:
+            return ARTIFACT_HOOK
+        if "steps" in name or "stepdef" in name or parent == "steps":
+            return ARTIFACT_STEPS
+        if "page" in name or parent == "pages":
+            return ARTIFACT_PAGE
+        if "@CucumberOptions" in text:
+            return ARTIFACT_RUNNER
+        if re.search(r"@(Given|When|Then)\b", text):
+            return ARTIFACT_STEPS
+        return ARTIFACT_UTILITY
+    return ARTIFACT_UTILITY
 
 
-def config_for(thread_id: str, **extra: Any) -> dict[str, Any]:
-    return {"configurable": {"thread_id": thread_id, **extra}}
+def _transaction_id_from(path: Path) -> Optional[str]:
+    match = re.search(r"[Tt]ransaction[_-]?(\d+)", str(path))
+    if match:
+        return match.group(1)
+    match = re.search(r"(\d{3,5})", path.stem)
+    return match.group(1) if match else None
 
 
-def get_state(graph: Any, thread_id: str) -> dict[str, Any]:
-    try:
-        snapshot = graph.get_state(config_for(thread_id))
-        return {
-            "values": snapshot.values,
-            "next": list(snapshot.next or ()),
-            "created_at": getattr(snapshot, "created_at", None),
+class FrameworkIndexer:
+    """Scan → parse → persist → embed."""
+
+    def __init__(self, root: Path | None = None) -> None:
+        self.root = root or settings.framework_root_path
+        self.src = settings.framework_src_path
+        self.testdata = settings.framework_testdata_path
+
+    # ── discovery ───────────────────────────────────────────────────────
+    def discover(self) -> list[Path]:
+        patterns = ("*.java", "*.feature", "*.properties", "*.json")
+        files: list[Path] = []
+        for pattern in patterns:
+            files.extend(
+                p for p in self.root.rglob(pattern)
+                if "build" not in p.parts and "lib" not in p.parts
+            )
+        return sorted(set(files))
+
+    # ── full rebuild ────────────────────────────────────────────────────
+    def rebuild(self, embed: bool = True) -> dict[str, Any]:
+        files = self.discover()
+        db.execute("TRUNCATE framework_methods, framework_relations RESTART IDENTITY")
+        db.execute("TRUNCATE framework_artifacts RESTART IDENTITY CASCADE")
+        summary = {
+            "files": len(files), "classes": 0, "methods": 0,
+            "features": 0, "locators": 0, "relations": 0, "embedded": 0,
         }
-    except Exception as exc:  # noqa: BLE001
-        return {"error": str(exc)}
+        docs: list[dict[str, Any]] = []
+
+        for path in files:
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            artifact_type = classify(path, text)
+            txn_id = _transaction_id_from(path)
+
+            if artifact_type == ARTIFACT_FEATURE:
+                parsed = jp.parse_feature_file(path)
+                artifact_pk = self._save_artifact(
+                    artifact_type, path.stem, None, path, parsed["content_hash"],
+                    txn_id, parsed["tags"],
+                    summary=f"Feature: {parsed['feature']} "
+                            f"({len(parsed['scenarios'])} scenario(s))",
+                    meta=parsed,
+                )
+                summary["features"] += 1
+                docs.append({
+                    "namespace": "framework", "ref_type": ARTIFACT_FEATURE,
+                    "ref_id": str(artifact_pk), "transaction_id": txn_id,
+                    "content": f"Feature file {path.name}\n{parsed['feature']}\n"
+                               + "\n".join(parsed["steps"][:60]),
+                    "meta": {"file": str(path), "tags": parsed["tags"]},
+                })
+                continue
+
+            if artifact_type in (ARTIFACT_PROPERTY, ARTIFACT_TESTDATA):
+                self._save_artifact(
+                    artifact_type, path.name, None, path,
+                    jp.content_hash(text), txn_id, [],
+                    summary=f"{artifact_type} file with "
+                            f"{len(text.splitlines())} line(s)",
+                    meta={"keys": list(jp.parse_properties_file(path).keys())
+                          if artifact_type == ARTIFACT_PROPERTY else {}},
+                )
+                continue
+
+            # Java source
+            classes = jp.parse_file(path)
+            for cls in classes:
+                artifact_pk = self._save_artifact(
+                    artifact_type, cls.name, cls.package, path, cls.content_hash,
+                    txn_id, [], summary=self._class_summary(cls),
+                    meta={"extends": cls.extends, "implements": cls.implements,
+                          "imports": cls.imports[:80],
+                          "locators": cls.locators[:200]},
+                )
+                summary["classes"] += 1
+                summary["locators"] += len(cls.locators)
+                for method in cls.methods:
+                    db.execute(
+                        """
+                        INSERT INTO framework_methods
+                          (artifact_pk, class_name, method_name, signature,
+                           return_type, annotations, gherkin_pattern,
+                           line_start, line_end, body_summary)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        (artifact_pk, cls.name, method.name, method.signature,
+                         method.return_type, method.annotations,
+                         method.gherkin_pattern, method.line_start,
+                         method.line_end, method.body_summary),
+                    )
+                    summary["methods"] += 1
+                summary["relations"] += self._save_relations(cls, text)
+                docs.append({
+                    "namespace": "framework", "ref_type": artifact_type,
+                    "ref_id": str(artifact_pk), "transaction_id": txn_id,
+                    "content": self._class_document(cls),
+                    "meta": {"file": str(path), "class": cls.fqn},
+                })
+
+        if embed and docs and settings.llm_configured:
+            try:
+                summary["embedded"] = vectorstore.upsert_many(docs)
+            except Exception as exc:  # embedding is best-effort
+                log.warning("Embedding skipped: %s", exc)
+
+        log.info("Framework index rebuilt: %s", summary)
+        return summary
+
+    # ── persistence helpers ─────────────────────────────────────────────
+    def _save_artifact(
+        self, artifact_type: str, name: str, package: Optional[str],
+        path: Path, digest: str, txn_id: Optional[str], tags: list[str],
+        summary: str = "", meta: dict[str, Any] | None = None,
+    ) -> int:
+        row = db.insert_returning(
+            """
+            INSERT INTO framework_artifacts
+              (artifact_type, name, package, file_path, content_hash,
+               transaction_id, tags, summary, meta)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+            ON CONFLICT (file_path) DO UPDATE SET
+              artifact_type=EXCLUDED.artifact_type, name=EXCLUDED.name,
+              package=EXCLUDED.package, content_hash=EXCLUDED.content_hash,
+              transaction_id=EXCLUDED.transaction_id, tags=EXCLUDED.tags,
+              summary=EXCLUDED.summary, meta=EXCLUDED.meta, indexed_at=now()
+            RETURNING id
+            """,
+            (artifact_type, name, package, str(path), digest, txn_id,
+             tags, summary, db.jsonb(meta or {})),
+        )
+        return int((row or {}).get("id", 0))
+
+    def _save_relations(self, cls: jp.JavaClass, source: str) -> int:
+        rows: list[tuple[str, str, str, str]] = []
+        if cls.extends:
+            rows.append((cls.fqn, cls.extends, "extends", ""))
+        for iface in cls.implements:
+            rows.append((cls.fqn, iface, "implements", ""))
+        for imported in cls.imports:
+            if imported.startswith(("java.", "javax.")):
+                continue
+            rows.append((cls.fqn, imported, "imports", ""))
+        called = set(_RE_CALL.findall(source)) | set(_RE_NEW.findall(source))
+        for target in called:
+            if target != cls.name:
+                rows.append((cls.fqn, target, "calls", ""))
+        db.executemany(
+            "INSERT INTO framework_relations (from_class,to_class,relation,detail)"
+            " VALUES (%s,%s,%s,%s)",
+            rows,
+        )
+        return len(rows)
+
+    @staticmethod
+    def _class_summary(cls: jp.JavaClass) -> str:
+        return (
+            f"{cls.kind} {cls.fqn} — {len(cls.methods)} method(s), "
+            f"{len(cls.locators)} locator(s)"
+            + (f", extends {cls.extends}" if cls.extends else "")
+        )
+
+    @staticmethod
+    def _class_document(cls: jp.JavaClass) -> str:
+        lines = [f"Java {cls.kind}: {cls.fqn}", f"File: {cls.file_path}"]
+        if cls.extends:
+            lines.append(f"Extends: {cls.extends}")
+        if cls.implements:
+            lines.append("Implements: " + ", ".join(cls.implements))
+        if cls.methods:
+            lines.append("Methods:")
+            lines += [
+                f"  - {m.signature}"
+                + (f"  [@{m.annotations[0]}(\"{m.gherkin_pattern}\")]"
+                   if m.gherkin_pattern else "")
+                for m in cls.methods[:120]
+            ]
+        if cls.locators:
+            lines.append("Locators:")
+            lines += [
+                f"  - {loc['element'] or '?'}: {loc['strategy']}={loc['value']}"
+                for loc in cls.locators[:80]
+            ]
+        return "\n".join(lines)
 
 
-def resume(graph: Any, thread_id: str, update: dict[str, Any] | None = None) -> Any:
-    """Resume an interrupted workflow, optionally applying a human decision."""
-    config = config_for(thread_id)
-    if update:
-        graph.update_state(config, update)
-    return graph.invoke(None, config)
+# ── query API used by the Framework Search Agent ────────────────────────
+def find_artifacts(
+    artifact_type: str | None = None,
+    transaction_id: str | None = None,
+    name_like: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    if not db.available():
+        return []
+    clauses, params = ["TRUE"], []
+    if artifact_type:
+        clauses.append("artifact_type = %s")
+        params.append(artifact_type)
+    if transaction_id:
+        clauses.append("transaction_id = %s")
+        params.append(transaction_id)
+    if name_like:
+        clauses.append("name ILIKE %s")
+        params.append(f"%{name_like}%")
+    return db.query(
+        f"SELECT * FROM framework_artifacts WHERE {' AND '.join(clauses)}"
+        f" ORDER BY name LIMIT %s",
+        (*params, limit),
+    )
+
+
+_GHERKIN_PLACEHOLDER_RE = re.compile(r"\(\.\*\)|\{[a-z]+\}|\^|\$")
+
+
+def find_step_definition(gherkin_text: str) -> list[dict[str, Any]]:
+    """Does a step definition matching this Gherkin line already exist?
+
+    Loose match: strip capture-group / placeholder / anchor syntax out of
+    each known step's Gherkin pattern and see if the candidate text
+    contains what's left, or matches exactly. Done in Python (rather than
+    Postgres regexp_replace + ILIKE) since SQLite has neither.
+    """
+    if not db.available():
+        return []
+    rows = db.query(
+        """
+        SELECT m.*, a.file_path, a.name AS artifact_name
+        FROM framework_methods m
+        JOIN framework_artifacts a ON a.id = m.artifact_pk
+        WHERE m.gherkin_pattern IS NOT NULL
+        """,
+    )
+    needle = gherkin_text.lower()
+    matches = []
+    for row in rows:
+        pattern = row.get("gherkin_pattern") or ""
+        stripped = _GHERKIN_PLACEHOLDER_RE.sub("", pattern).strip().lower()
+        if pattern == gherkin_text or (stripped and stripped in needle):
+            matches.append(row)
+            if len(matches) >= 20:
+                break
+    return matches
+
+
+def find_method(name_like: str) -> list[dict[str, Any]]:
+    if not db.available():
+        return []
+    return db.query(
+        """
+        SELECT m.*, a.file_path, a.artifact_type
+        FROM framework_methods m
+        JOIN framework_artifacts a ON a.id = m.artifact_pk
+        WHERE m.method_name ILIKE %s
+        ORDER BY m.class_name, m.method_name LIMIT 50
+        """,
+        (f"%{name_like}%",),
+    )
+
+
+def find_utilities() -> list[dict[str, Any]]:
+    return find_artifacts(artifact_type=ARTIFACT_UTILITY, limit=500)
+
+
+def dependency_graph(class_fqn: str) -> dict[str, Any]:
+    outgoing = db.query(
+        "SELECT to_class, relation FROM framework_relations WHERE from_class=%s",
+        (class_fqn,),
+    )
+    incoming = db.query(
+        "SELECT from_class, relation FROM framework_relations WHERE to_class=%s",
+        (class_fqn,),
+    )
+    return {"class": class_fqn, "depends_on": outgoing, "used_by": incoming}
+
+
+def index_stats() -> dict[str, Any]:
+    by_type = db.query(
+        "SELECT artifact_type, COUNT(*) AS n FROM framework_artifacts"
+        " GROUP BY artifact_type ORDER BY artifact_type"
+    )
+    methods = db.query_one("SELECT COUNT(*) AS n FROM framework_methods")
+    relations = db.query_one("SELECT COUNT(*) AS n FROM framework_relations")
+    return {
+        "artifacts_by_type": {r["artifact_type"]: r["n"] for r in by_type},
+        "methods": (methods or {}).get("n", 0),
+        "relations": (relations or {}).get("n", 0),
+        "framework_root": str(settings.framework_root_path),
+    }
+
+
+def as_dict(cls: jp.JavaClass) -> dict[str, Any]:
+    return asdict(cls)
