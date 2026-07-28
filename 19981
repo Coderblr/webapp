@@ -1,383 +1,175 @@
--- ═══════════════════════════════════════════════════════════════════════
---  Enterprise AI Automation Engineering Platform — Knowledge Repository
---  SQLite (ported from PostgreSQL + pgvector)
---  Section 15 of the Master Build Specification
--- ═══════════════════════════════════════════════════════════════════════
+"""Central configuration.  Everything the platform needs comes from here.
+
+Rule (Section 2):  Python orchestrates, Java executes.  This module knows
+where the Java framework lives but never rewrites it wholesale.
+"""
+from __future__ import annotations
+
+from functools import lru_cache
+from pathlib import Path
+from typing import Optional
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
--- ── 1. TRANSACTIONS ────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS transactions (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    transaction_id  TEXT        NOT NULL,          -- e.g. '1045', '9750'
-    name            TEXT        NOT NULL,
-    description     TEXT,
-    version         TEXT        NOT NULL DEFAULT '1.0',
-    build           TEXT,
-    type            TEXT        NOT NULL DEFAULT 'business',
-        -- 'business' | 'system_prerequisite' | 'system_cleanup'
-    status          TEXT        NOT NULL DEFAULT 'draft',
-        -- draft | pending_review | active | superseded | needs_rerecording
-    confidence      NUMERIC(4,3) DEFAULT 1.000,
-    knowledge_json  TEXT       NOT NULL DEFAULT '{}',
-    workflow_path   TEXT       NOT NULL DEFAULT '[]',
-    knowledge_dir   TEXT,                          -- storage/knowledge/<txn>/<ver>
-    generated_files TEXT       NOT NULL DEFAULT '{}',
-    tags            TEXT        NOT NULL DEFAULT '[]',
-    recorded_at     TEXT,
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (transaction_id, version)
-);
-CREATE INDEX IF NOT EXISTS idx_txn_txnid  ON transactions (transaction_id);
-CREATE INDEX IF NOT EXISTS idx_txn_status ON transactions (status);
-CREATE INDEX IF NOT EXISTS idx_txn_type   ON transactions (type);
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=str(PROJECT_ROOT / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
 
--- ── 2. PAGES captured during a recording ───────────────────────────────
-CREATE TABLE IF NOT EXISTS pages (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    transaction_pk  BIGINT      NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
-    page_key        TEXT        NOT NULL,          -- stable slug for the screen
-    title           TEXT,
-    url             TEXT,
-    sequence        INT         NOT NULL DEFAULT 0,
-    dom_ref         TEXT,                          -- file ref to full DOM snapshot
-    screenshot_ref  TEXT,
-    frames          TEXT       NOT NULL DEFAULT '[]',
-    shadow_roots    TEXT       NOT NULL DEFAULT '[]',
-    meta            TEXT       NOT NULL DEFAULT '{}',
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_pages_txn ON pages (transaction_pk);
+    # ── app ──────────────────────────────────────────────────────────────
+    app_name: str = "Enterprise AI Automation Engineering Platform"
+    app_host: str = "127.0.0.1"
+    app_port: int = 8000
+    log_level: str = "INFO"
 
--- ── 3. ELEMENTS (whole-page crawl, not only clicked elements) ──────────
-CREATE TABLE IF NOT EXISTS elements (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    transaction_pk  BIGINT      NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
-    page_pk         BIGINT      REFERENCES pages(id) ON DELETE CASCADE,
-    element_key     TEXT        NOT NULL,
-    tag             TEXT,
-    element_type    TEXT,        -- button | textbox | dropdown | checkbox | ...
-    label           TEXT,
-    visible         BOOLEAN     DEFAULT TRUE,
-    enabled         BOOLEAN     DEFAULT TRUE,
-    interacted      BOOLEAN     DEFAULT FALSE,     -- touched in this recording?
-    element_meta    TEXT       NOT NULL DEFAULT '{}',
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_elements_txn  ON elements (transaction_pk);
-CREATE INDEX IF NOT EXISTS idx_elements_page ON elements (page_pk);
-CREATE INDEX IF NOT EXISTS idx_elements_key  ON elements (element_key);
+    # ── database (SQLite) ───────────────────────────────────────────────
+    sqlite_path: str = "./storage/ai_automation.db"
 
--- ── 4. LOCATORS (multi-strategy fallback repository) ───────────────────
-CREATE TABLE IF NOT EXISTS locators (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    element_pk          BIGINT      NOT NULL REFERENCES elements(id) ON DELETE CASCADE,
-    transaction_pk      BIGINT      NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
-    strategy            TEXT        NOT NULL,      -- id|name|css|xpath|relative_xpath|text|aria|data
-    value               TEXT        NOT NULL,
-    priority            INT         NOT NULL DEFAULT 100,
-    reliability_score   NUMERIC(4,3) NOT NULL DEFAULT 0.500,
-    success_count       INT         NOT NULL DEFAULT 0,
-    failure_count       INT         NOT NULL DEFAULT 0,
-    last_used_at        TEXT,
-    active              BOOLEAN     NOT NULL DEFAULT TRUE,
-    created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_loc_element ON locators (element_pk, priority);
-CREATE INDEX IF NOT EXISTS idx_loc_txn     ON locators (transaction_pk);
+    # ── postgres (legacy, unused now the platform runs on SQLite) ────────
+    pg_host: str = "localhost"
+    pg_port: int = 5432
+    pg_db: str = "ai_automation"
+    pg_user: str = "postgres"
+    pg_password: str = "changeme"
+    pg_schema: str = "public"
+    pg_connect_timeout: int = 5
 
--- ── 5. RECORDED ACTIONS / workflow steps ───────────────────────────────
-CREATE TABLE IF NOT EXISTS recorded_actions (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    transaction_pk  BIGINT      NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
-    sequence        INT         NOT NULL,
-    action          TEXT        NOT NULL,          -- click|type|select|check|navigate|wait|assert
-    element_key     TEXT,
-    field_name      TEXT,
-    value_ref       TEXT,                          -- variable name, NEVER a raw value
-    page_key        TEXT,
-    dom_before_ref  TEXT,
-    dom_after_ref   TEXT,
-    screenshot_before TEXT,
-    screenshot_after  TEXT,
-    network_ref     TEXT,
-    meta            TEXT       NOT NULL DEFAULT '{}',
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_actions_txn ON recorded_actions (transaction_pk, sequence);
+    # ── azure openai (sole LLM provider) ────────────────────────────────
+    azure_openai_api_key: str = ""
+    azure_openai_endpoint: str = ""
+    azure_openai_api_version: str = "2024-10-21"
+    azure_openai_chat_deployment: str = "gpt-4o"
+    azure_openai_embedding_deployment: str = "text-embedding-3-large"
+    embedding_dim: int = 3072
+    llm_temperature: float = 0.0
+    llm_max_tokens: int = 4096
 
--- ── 6. VALIDATION RULES ────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS validation_rules (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    transaction_pk  BIGINT      NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
-    field_name      TEXT,
-    rule_type       TEXT,                          -- mandatory|format|business|message
-    expression      TEXT,
-    message_text    TEXT,
-    severity        TEXT        DEFAULT 'error',   -- error|warning|success|info
-    meta            TEXT       NOT NULL DEFAULT '{}',
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_valrules_txn ON validation_rules (transaction_pk);
+    # ── secrets ──────────────────────────────────────────────────────────
+    secrets_master_key: str = ""
 
--- ── 7. TEST DATA — field metadata (Section 7.2) ────────────────────────
-CREATE TABLE IF NOT EXISTS test_data_fields (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    transaction_pk  BIGINT      NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
-    field           TEXT        NOT NULL,
-    datatype        TEXT,                          -- PAN | CIF | AMOUNT | TEXT | DATE ...
-    required        BOOLEAN     NOT NULL DEFAULT FALSE,
-    pattern         TEXT,
-    business_meaning TEXT,
-    sensitive       BOOLEAN     NOT NULL DEFAULT FALSE,
-    editable        BOOLEAN     NOT NULL DEFAULT TRUE,
-    source          TEXT        NOT NULL DEFAULT 'user',
-        -- framework | profile | runtime | database | api | ai
-    source_config   TEXT       NOT NULL DEFAULT '{}',
-    element_key     TEXT,
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (transaction_pk, field)
-);
+    # ── java framework ───────────────────────────────────────────────────
+    framework_root: str = "./java-framework"
+    framework_src: str = "./java-framework/src"
+    framework_lib: str = "./java-framework/lib"
+    framework_build: str = "./java-framework/build"
+    framework_testdata: str = "./java-framework/test-data"
+    java_home: Optional[str] = None
+    javac_bin: str = "javac"
+    java_bin: str = "java"
 
--- ── 8. DATA PROFILES (Section 7.6) ─────────────────────────────────────
-CREATE TABLE IF NOT EXISTS test_data_profiles (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    name            TEXT        NOT NULL UNIQUE,   -- e.g. SBI_PREPROD
-    environment     TEXT        NOT NULL,          -- PREPROD | UAT | PROD
-    description     TEXT,
-    values_json     TEXT       NOT NULL DEFAULT '{}',  -- non-sensitive
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
+    # ── storage ──────────────────────────────────────────────────────────
+    storage_root: str = "./storage"
+    knowledge_root: str = "./storage/knowledge"
 
-CREATE TABLE IF NOT EXISTS test_data_values (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    profile_pk      BIGINT      REFERENCES test_data_profiles(id) ON DELETE CASCADE,
-    transaction_id  TEXT,
-    environment     TEXT        NOT NULL,
-    field           TEXT        NOT NULL,
-    value_plain     TEXT,                          -- non-sensitive only
-    value_encrypted TEXT,                          -- sensitive values, Fernet
-    sensitive       BOOLEAN     NOT NULL DEFAULT FALSE,
-    source          TEXT        NOT NULL DEFAULT 'user',
-    updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (profile_pk, transaction_id, environment, field)
-);
-CREATE INDEX IF NOT EXISTS idx_tdv_lookup
-    ON test_data_values (transaction_id, environment);
+    # ── recorder / browser ───────────────────────────────────────────────
+    edge_driver_path: Optional[str] = None
+    edge_binary_path: Optional[str] = None
+    recorder_cdp_port: int = 9222
+    recorder_capture_network: bool = True
+    recorder_fullpage_crawl: bool = True
+    browser_implicit_wait: int = 10
 
--- ── 9. SECRETS (Section 11.3) — never plaintext ────────────────────────
-CREATE TABLE IF NOT EXISTS secrets (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    scope           TEXT        NOT NULL,          -- global | profile | environment
-    scope_ref       TEXT,                          -- profile name / environment
-    key             TEXT        NOT NULL,          -- teller_id|teller_password|checker_id|
-                                                   -- checker_password|cbs_reset_string
-    value_encrypted TEXT        NOT NULL,
-    hint            TEXT,                          -- masked preview for the UI
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (scope, scope_ref, key)
-);
+    # ── CBS socket (teller reset) ────────────────────────────────────────
+    cbs_socket_host: str = ""
+    cbs_socket_port: int = 0
+    cbs_socket_timeout: int = 30
+    cbs_socket_encoding: str = "utf-8"
 
--- ── 10. EXECUTIONS ─────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS executions (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    execution_uid   TEXT        NOT NULL UNIQUE,
-    transaction_id  TEXT        NOT NULL,
-    transaction_pk  BIGINT      REFERENCES transactions(id) ON DELETE SET NULL,
-    environment     TEXT        NOT NULL,
-    profile_pk      BIGINT      REFERENCES test_data_profiles(id) ON DELETE SET NULL,
-    status          TEXT        NOT NULL DEFAULT 'queued',
-        -- queued|running|passed|failed|aborted|partial
-    thread_id       TEXT,                          -- LangGraph checkpoint thread
-    report_id       TEXT,
-    report_path     TEXT,
-    password_change_status TEXT,                   -- 9750 sub-step result
-    teller_reset_status    TEXT,
-    teller_reset_response  TEXT,
-    error_summary   TEXT,
-    metrics         TEXT       NOT NULL DEFAULT '{}',
-    started_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    finished_at     TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_exec_txn    ON executions (transaction_id);
-CREATE INDEX IF NOT EXISTS idx_exec_status ON executions (status);
-CREATE INDEX IF NOT EXISTS idx_exec_start  ON executions (started_at DESC);
+    # ── confidence thresholds ────────────────────────────────────────────
+    self_heal_confidence_threshold: float = 0.75
+    rerecord_confidence_threshold: float = 0.55
+    auto_approve_low_risk: bool = False
 
--- ── 11. EXECUTION STEPS ────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS execution_steps (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    execution_pk    BIGINT      NOT NULL REFERENCES executions(id) ON DELETE CASCADE,
-    sequence        INT         NOT NULL,
-    phase           TEXT        NOT NULL DEFAULT 'transaction',
-        -- launch|login|password_change|relogin|search|transaction|logout|teller_reset|report
-    step_name       TEXT        NOT NULL,
-    status          TEXT        NOT NULL,          -- passed|failed|skipped|healed
-    duration_ms     INT,
-    screenshot_ref  TEXT,
-    error_msg       TEXT,
-    detail          TEXT       NOT NULL DEFAULT '{}',
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_steps_exec ON execution_steps (execution_pk, sequence);
+    # ── system transaction ids ───────────────────────────────────────────
+    password_change_transaction: str = Field(
+        default="9750",
+        description="Transaction auto-attached as pre-step to every execution.",
+    )
 
--- ── 12. SELF-HEALING LOG (Section 12) ──────────────────────────────────
-CREATE TABLE IF NOT EXISTS self_heal_log (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    transaction_pk  BIGINT      REFERENCES transactions(id) ON DELETE CASCADE,
-    execution_pk    BIGINT      REFERENCES executions(id) ON DELETE SET NULL,
-    element_key     TEXT,
-    old_locator     TEXT,
-    new_locator     TEXT,
-    strategy        TEXT,
-    reason          TEXT,
-    confidence      NUMERIC(4,3),
-    applied         BOOLEAN     NOT NULL DEFAULT FALSE,
-    approved_by     TEXT,
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_heal_txn ON self_heal_log (transaction_pk);
+    # ── derived ──────────────────────────────────────────────────────────
+    @property
+    def sqlite_db_path(self) -> Path:
+        return self.path(self.sqlite_path)
 
--- ── 13. BRD UPLOADS (Section 11.5) ─────────────────────────────────────
-CREATE TABLE IF NOT EXISTS brd_uploads (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    filename            TEXT        NOT NULL,
-    file_ref            TEXT        NOT NULL,
-    content_hash        TEXT,
-    parsed_text         TEXT,
-    parsed_impact_json  TEXT       NOT NULL DEFAULT '{}',
-    status              TEXT        NOT NULL DEFAULT 'uploaded',
-        -- uploaded|analysed|approved|rejected|applied
-    approved_by         TEXT,
-    created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
+    def path(self, value: str) -> Path:
+        p = Path(value)
+        return p if p.is_absolute() else (PROJECT_ROOT / p).resolve()
 
--- ── 14. FRAMEWORK INDEX (Section 8) ────────────────────────────────────
-CREATE TABLE IF NOT EXISTS framework_artifacts (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    artifact_type   TEXT        NOT NULL,
-        -- feature|page_object|step_definition|runner|utility|hook|property|test_data
-    name            TEXT        NOT NULL,
-    package         TEXT,
-    file_path       TEXT        NOT NULL,
-    content_hash    TEXT,
-    transaction_id  TEXT,
-    tags            TEXT        NOT NULL DEFAULT '[]',
-    summary         TEXT,
-    meta            TEXT       NOT NULL DEFAULT '{}',
-    indexed_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (file_path)
-);
-CREATE INDEX IF NOT EXISTS idx_fw_type ON framework_artifacts (artifact_type);
-CREATE INDEX IF NOT EXISTS idx_fw_txn  ON framework_artifacts (transaction_id);
+    @property
+    def framework_root_path(self) -> Path:
+        return self.path(self.framework_root)
 
-CREATE TABLE IF NOT EXISTS framework_methods (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    artifact_pk     BIGINT      NOT NULL REFERENCES framework_artifacts(id) ON DELETE CASCADE,
-    class_name      TEXT        NOT NULL,
-    method_name     TEXT        NOT NULL,
-    signature       TEXT,
-    return_type     TEXT,
-    annotations     TEXT        NOT NULL DEFAULT '[]',
-    gherkin_pattern TEXT,                          -- for step definitions
-    line_start      INT,
-    line_end        INT,
-    body_summary    TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_fwm_artifact ON framework_methods (artifact_pk);
-CREATE INDEX IF NOT EXISTS idx_fwm_gherkin  ON framework_methods (gherkin_pattern);
+    @property
+    def framework_src_path(self) -> Path:
+        return self.path(self.framework_src)
 
-CREATE TABLE IF NOT EXISTS framework_relations (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    from_class      TEXT        NOT NULL,
-    to_class        TEXT        NOT NULL,
-    relation        TEXT        NOT NULL,          -- imports|extends|implements|calls|uses
-    detail          TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_fwr_from ON framework_relations (from_class);
+    @property
+    def framework_lib_path(self) -> Path:
+        return self.path(self.framework_lib)
 
--- ── 15. AI DECISIONS (continuous learning) ─────────────────────────────
-CREATE TABLE IF NOT EXISTS ai_decisions (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent           TEXT        NOT NULL,
-    context_type    TEXT,                          -- recording|codegen|execution|heal|brd
-    transaction_id  TEXT,
-    prompt_summary  TEXT,
-    decision        TEXT,
-    rationale       TEXT,
-    confidence      NUMERIC(4,3),
-    outcome         TEXT,                          -- success|failure|unknown
-    meta            TEXT       NOT NULL DEFAULT '{}',
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_ai_txn   ON ai_decisions (transaction_id);
-CREATE INDEX IF NOT EXISTS idx_ai_agent ON ai_decisions (agent);
+    @property
+    def framework_build_path(self) -> Path:
+        return self.path(self.framework_build)
 
--- ── 16. HUMAN APPROVALS (Section 17) ───────────────────────────────────
-CREATE TABLE IF NOT EXISTS approvals (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    thread_id       TEXT        NOT NULL,
-    approval_type   TEXT        NOT NULL,   -- recording_keep|codegen|self_heal
-    subject_ref     TEXT,
-    payload         TEXT       NOT NULL DEFAULT '{}',
-    decision        TEXT,                   -- pending|approved|rejected|discarded
-    decided_by      TEXT,
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    decided_at      TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_appr_thread ON approvals (thread_id);
+    @property
+    def framework_testdata_path(self) -> Path:
+        return self.path(self.framework_testdata)
 
--- ── 17. VECTOR STORE (RAG, Section 9) ──────────────────────────────────
--- NOTE: dimension must match AZURE_OPENAI_EMBEDDING_DEPLOYMENT.
---       text-embedding-3-large = 3072, text-embedding-3-small = 1536.
-CREATE TABLE IF NOT EXISTS knowledge_embeddings (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    namespace       TEXT        NOT NULL,
-        -- element|dom|workflow|brd|framework|decision|report
-    ref_type        TEXT,
-    ref_id          TEXT,
-    transaction_id  TEXT,
-    content         TEXT        NOT NULL,
-    meta            TEXT       NOT NULL DEFAULT '{}',
-    embedding       TEXT,
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_emb_ns  ON knowledge_embeddings (namespace);
-CREATE INDEX IF NOT EXISTS idx_emb_txn ON knowledge_embeddings (transaction_id);
--- CREATE INDEX idx_emb_vec ON knowledge_embeddings
+    @property
+    def storage_path(self) -> Path:
+        return self.path(self.storage_root)
 
--- ── 18. RECORDING SESSIONS ─────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS recording_sessions (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_uid     TEXT        NOT NULL UNIQUE,
-    transaction_id  TEXT        NOT NULL,
-    transaction_name TEXT,
-    environment     TEXT,
-    status          TEXT        NOT NULL DEFAULT 'recording',
-        -- recording|stopped|kept|discarded|converted
-    start_url       TEXT,
-    capture_dir     TEXT,
-    stats           TEXT       NOT NULL DEFAULT '{}',
-    started_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    stopped_at      TEXT
-);
+    @property
+    def knowledge_path(self) -> Path:
+        return self.path(self.knowledge_root)
 
--- ── trigger: keep updated_at fresh (native SQLite triggers) ────────────
-DROP TRIGGER IF EXISTS trg_txn_touch;
-CREATE TRIGGER trg_txn_touch AFTER UPDATE ON transactions
-BEGIN
-    UPDATE transactions SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-END;
+    @property
+    def screenshots_path(self) -> Path:
+        return self.storage_path / "screenshots"
 
-DROP TRIGGER IF EXISTS trg_profile_touch;
-CREATE TRIGGER trg_profile_touch AFTER UPDATE ON test_data_profiles
-BEGIN
-    UPDATE test_data_profiles SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-END;
+    @property
+    def recordings_path(self) -> Path:
+        return self.storage_path / "recordings"
 
-DROP TRIGGER IF EXISTS trg_secrets_touch;
-CREATE TRIGGER trg_secrets_touch AFTER UPDATE ON secrets
-BEGIN
-    UPDATE secrets SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-END;
+    @property
+    def reports_path(self) -> Path:
+        return self.storage_path / "reports"
+
+    @property
+    def uploads_path(self) -> Path:
+        return self.storage_path / "uploads"
+
+    @property
+    def llm_configured(self) -> bool:
+        return bool(self.azure_openai_api_key and self.azure_openai_endpoint)
+
+    def ensure_dirs(self) -> None:
+        for p in (
+            self.storage_path,
+            self.knowledge_path,
+            self.screenshots_path,
+            self.recordings_path,
+            self.reports_path,
+            self.uploads_path,
+            self.framework_build_path,
+            self.framework_testdata_path,
+        ):
+            p.mkdir(parents=True, exist_ok=True)
+        self.sqlite_db_path.parent.mkdir(parents=True, exist_ok=True)
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    s = Settings()
+    s.ensure_dirs()
+    return s
+
+
+settings = get_settings()
