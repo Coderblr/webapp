@@ -1,415 +1,96 @@
-"""Automatic Code Generation (Section 6).
+package com.sbi.automation.runners;
 
-Turns an accepted recording into real artefacts inside the EXISTING pure-Java
-framework:
+import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
 
-    Transaction_<id>/Transaction<id>.feature
-                     Transaction<id>Steps.java
-                     Transaction<id>Page.java
-                     Transaction<id>Runner.java
-    test-data/<ENV>/transaction_<id>.json
+import com.sbi.automation.core.DriverFactory;
+import com.sbi.automation.utils.ExecutionContext;
+import com.sbi.automation.utils.SocketResetClient;
 
-Rules:
-  • The Framework Indexing Engine is queried FIRST — reuse beats duplication.
-  • Existing files are updated, never blindly replaced; hand-written code
-    between the CUSTOM markers is preserved.
-  • The AI never regenerates the framework itself, only extends it.
-"""
-from __future__ import annotations
+/**
+ * The runner the Execution Agent launches.  PURE JAVA — no Maven, no Gradle.
+ *
+ * It chains the mandatory password-change transaction (9750) IN THE SAME
+ * BROWSER SESSION before the requested transaction, which is exactly the real
+ * SBI flow of Section 11.1:
+ *
+ *   launch → URL → login → forced password change (9750) → re-login
+ *          → search transaction → execute → logout
+ *
+ * Usage:
+ *   java -cp "lib/*;build" com.sbi.automation.runners.PlatformRunner \
+ *        --transaction=400 --env=PREPROD --profile=SBI_PREPROD \
+ *        --prestep=9750 --execution=exec_400_...
+ */
+public class PlatformRunner {
 
-import re
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Optional
+    private static final String TXN_ROOT = "src/com/sbi/automation/transactions";
+    private static final String GLUE = "com.sbi.automation.steps";
+    private static final String HOOKS = "com.sbi.automation.hooks";
 
-from jinja2 import Environment, FileSystemLoader, StrictUndefined
+    public static void main(String[] args) {
+        ExecutionContext.initFromArgs(args);
+        String transaction = ExecutionContext.transaction();
+        String prestep = ExecutionContext.prestep();
 
-from ..core.config import settings
-from ..core.logging_conf import get_logger
-from ..framework_index import indexer
-from ..recorder import locator_builder
-from ..tdm import templates as tdm_templates
-from . import naming
+        int exitCode = 1;
+        try {
+            List<String> cucumberArgs = new ArrayList<>();
 
-log = get_logger(__name__)
+            /* 1. mandatory password change, attached automatically */
+            if (prestep != null && !prestep.isEmpty()) {
+                File presteFeature = featureFor(prestep);
+                if (presteFeature.exists()) {
+                    cucumberArgs.add(presteFeature.getAbsolutePath());
+                    ExecutionContext.recordStep("password_change",
+                            "Transaction " + prestep + " attached as pre-step",
+                            "passed", 0, "", null);
+                } else {
+                    ExecutionContext.recordStep("password_change",
+                            "Transaction " + prestep + " feature not found",
+                            "skipped", 0, "",
+                            presteFeature.getAbsolutePath());
+                }
+            }
 
-TEMPLATE_DIR = Path(__file__).parent / "templates"
-_env = Environment(
-    loader=FileSystemLoader(str(TEMPLATE_DIR)),
-    undefined=StrictUndefined,
-    trim_blocks=False,
-    lstrip_blocks=False,
-    keep_trailing_newline=True,
-)
+            /* 2. the requested transaction */
+            File feature = featureFor(transaction);
+            if (!feature.exists()) {
+                throw new IllegalStateException(
+                        "Feature file not found: " + feature.getAbsolutePath()
+                        + " — record transaction " + transaction + " first.");
+            }
+            cucumberArgs.add(feature.getAbsolutePath());
 
-CUSTOM_START = "// === CUSTOM CODE START"
-CUSTOM_END = "// === CUSTOM CODE END ==="
+            cucumberArgs.add("--glue");
+            cucumberArgs.add(GLUE);
+            cucumberArgs.add("--glue");
+            cucumberArgs.add(HOOKS);
+            cucumberArgs.add("--plugin");
+            cucumberArgs.add("pretty");
+            cucumberArgs.add("--plugin");
+            cucumberArgs.add("json:" + ExecutionContext.reportPath("cucumber.json"));
+            cucumberArgs.add("--plugin");
+            cucumberArgs.add("html:" + ExecutionContext.reportPath("cucumber.html"));
+            cucumberArgs.add("--monochrome");
 
-def _java_string(value: str) -> str:
-    """Escape a value for embedding inside a Java string literal.
-
-    Gherkin patterns contain double quotes around field labels; unescaped they
-    terminate the annotation string and produce uncompilable step definitions.
-    """
-    return (value or "").replace("\\", "\\\\").replace('"', '\\"')
-
-
-ACTION_VERBS = {
-    "click": "clicks",
-    "type": "enters",
-    "select": "selects",
-    "check": "checks",
-    "uncheck": "unchecks",
-    "upload": "uploads",
-    "submit": "submits",
-    "navigate": "navigates to",
-}
-
-
-class GenerationResult(dict):
-    """{artifact_type: file_path} plus a reuse report."""
-
-
-# ── preserved custom blocks ─────────────────────────────────────────────
-def _extract_custom(path: Path) -> str:
-    if not path.exists():
-        return ""
-    text = path.read_text(encoding="utf-8", errors="ignore")
-    start = text.find(CUSTOM_START)
-    end = text.find(CUSTOM_END)
-    if start == -1 or end == -1 or end < start:
-        return ""
-    block = text[text.find("\n", start) + 1 : end]
-    return block.rstrip()
-
-
-def _reinject_custom(rendered: str, custom: str) -> str:
-    if not custom.strip():
-        return rendered
-    start = rendered.find(CUSTOM_START)
-    end = rendered.find(CUSTOM_END)
-    if start == -1 or end == -1:
-        return rendered
-    head = rendered[: rendered.find("\n", start) + 1]
-    tail = rendered[end:]
-    return head + custom + "\n    " + tail
-
-
-def _write(path: Path, content: str) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    custom = _extract_custom(path)
-    path.write_text(_reinject_custom(content, custom), encoding="utf-8")
-    log.info("Generated %s", path)
-    return str(path)
-
-
-# ── model building ──────────────────────────────────────────────────────
-def _element_models(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    models, used = [], set()
-    for element in elements:
-        key = element["element_key"]
-        const = naming.constant(key.split("::")[-1])
-        while const in used:
-            const += "_X"
-        used.add(const)
-        locators = element.get("locators", [])
-        if isinstance(locators, list) and locators and isinstance(locators[0], dict):
-            java_locators = [
-                {"java": locator_builder.to_java_by(loc)} for loc in locators[:5]
-            ]
-        else:
-            java_locators = [{"java": 'By.xpath("//*")'}]
-        models.append({
-            "element_key": key,
-            "constant": const,
-            "getter": naming.getter(key),
-            "element_type": element.get("element_type"),
-            "label": element.get("label"),
-            "locators": java_locators,
-        })
-    return models
-
-
-def _action_models(
-    actions: list[dict[str, Any]], element_models: list[dict[str, Any]]
-) -> list[Optional[dict[str, Any]]]:
-    """One entry per action, SAME LENGTH AND ORDER as `actions`.
-
-    `_step_models()` below indexes into this list with the *same* index it
-    uses for `actions` (`action_models[index]`), so this must never drop or
-    reorder entries — an action with no matching element becomes `None`
-    here rather than being skipped, otherwise every action after the first
-    skip would line up with the wrong page-object method and the generated
-    step definition would call a method that doesn't exist on the page
-    object ("cannot find symbol").
-    """
-    by_key = {e["element_key"]: e for e in element_models}
-    models: list[Optional[dict[str, Any]]] = []
-    used = set()
-    for action in actions:
-        key = action.get("element_key") or ""
-        element = by_key.get(key)
-        if not element:
-            models.append(None)
-            continue
-        verb = action.get("action", "click")
-        method = naming.method_for_action(verb, key)
-        while method in used:
-            method += "X"
-        used.add(method)
-        if verb == "type":
-            params = "String value"
-            body = f'type({element["constant"]}, value);'
-        elif verb == "select":
-            params = "String value"
-            body = f'selectByVisibleText({element["constant"]}, value);'
-        elif verb in ("check", "uncheck"):
-            params = ""
-            body = f'setCheckbox({element["constant"]}, {str(verb == "check").lower()});'
-        elif verb == "upload":
-            params = "String filePath"
-            body = f'uploadFile({element["constant"]}, filePath);'
-        else:
-            params = ""
-            body = f'click({element["constant"]});'
-        models.append({
-            "method": method,
-            "params": params,
-            "body": body,
-            "comment": f"{verb} on {element.get('label') or key}",
-        })
-    return models
-
-
-def _step_models(
-    actions: list[dict[str, Any]],
-    element_models: list[dict[str, Any]],
-    action_models: list[Optional[dict[str, Any]]],
-    transaction_id: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
-    """Return (gherkin steps, java step methods, reuse notes)."""
-    by_key = {e["element_key"]: e for e in element_models}
-    gherkin: list[dict[str, str]] = []
-    java_steps: list[dict[str, Any]] = []
-    reuse_notes: list[str] = []
-    used_methods: set[str] = set()
-
-    for index, action in enumerate(actions):
-        key = action.get("element_key") or ""
-        element = by_key.get(key)
-        if not element:
-            continue
-        verb = action.get("action", "click")
-        label = element.get("label") or key.split("::")[-1]
-        action_model = action_models[index] if index < len(action_models) else None
-        page_method = action_model["method"] if action_model else None
-        if page_method is None:
-            continue
-
-        if verb in ("type", "select", "upload"):
-            variable = action.get("value_ref") or naming.variable(
-                action.get("field_name") or label
-            )
-            text = f'user {ACTION_VERBS.get(verb, verb)} "<{variable}>" in "{label}"'
-            pattern = f'user {ACTION_VERBS.get(verb, verb)} {{string}} in "{label}"'
-            params = "String value"
-            body = (
-                f'page.{page_method}(data.resolve(value));'
-            )
-        else:
-            text = f'user {ACTION_VERBS.get(verb, verb)} "{label}"'
-            pattern = f'user {ACTION_VERBS.get(verb, verb)} "{label}"'
-            params = ""
-            body = f"page.{page_method}();"
-
-        keyword = "When" if index == 0 else "And"
-        gherkin.append({"keyword": keyword, "text": text})
-
-        # ── reuse check against the Framework Index (Section 8) ─────────
-        try:
-            existing = indexer.find_step_definition(pattern)
-        except Exception:
-            existing = []
-        if existing:
-            reuse_notes.append(
-                f"Reused existing step definition "
-                f"{existing[0]['class_name']}.{existing[0]['method_name']} "
-                f"for: {pattern}"
-            )
-            continue
-
-        method = naming.camel(f"{verb}_{label}_{index}")
-        while method in used_methods:
-            method += "X"
-        used_methods.add(method)
-        java_steps.append({
-            "annotation": "When" if index == 0 else "And",
-            "pattern": _java_string(pattern),
-            "method": method,
-            "params": params,
-            "body": body,
-        })
-
-    return gherkin, java_steps, reuse_notes
-
-
-def _validation_models(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    models, used = [], set()
-    for rule in rules:
-        text = rule.get("message_text") or rule.get("expression") or ""
-        if not text:
-            continue
-        method = naming.camel("is_" + (rule.get("severity") or "info") + "_" + text[:30])
-        while method in used:
-            method += "X"
-        used.add(method)
-        models.append({"method": method, "message_text": _java_string(text)})
-    return models
-
-
-# ── public API ──────────────────────────────────────────────────────────
-def generate_all(
-    transaction_id: str,
-    transaction_name: str,
-    version: str,
-    elements: list[dict[str, Any]],
-    actions: list[dict[str, Any]],
-    validations: list[dict[str, Any]] | None = None,
-    environment: str = "PREPROD",
-    field_metadata: list[dict[str, Any]] | None = None,
-    description: str | None = None,
-) -> GenerationResult:
-    """Generate feature + page object + steps + runner + test data."""
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    element_models = _element_models(elements)
-    action_models = _action_models(actions, element_models)
-    gherkin, java_steps, reuse_notes = _step_models(
-        actions, element_models, action_models, transaction_id
-    )
-    validation_models = _validation_models(validations or [])
-
-    page_class = naming.transaction_class(transaction_id, "Page")
-    steps_class = naming.transaction_class(transaction_id, "Steps")
-    runner_class = naming.transaction_class(transaction_id, "Runner")
-    feature_name = f"Transaction {transaction_id} — {transaction_name}"
-
-    txn_dir = settings.framework_src_path / "com" / "sbi" / "automation" / \
-        "transactions" / f"Transaction_{transaction_id}"
-
-    result = GenerationResult()
-
-    # ── feature ─────────────────────────────────────────────────────────
-    feature_text = _env.get_template("feature.j2").render(
-        transaction_id=transaction_id,
-        feature_name=feature_name,
-        scenario_name=f"Execute {transaction_name}",
-        description=description,
-        version=version,
-        tags=[],
-        steps=gherkin,
-    )
-    result["feature"] = _write(
-        txn_dir / naming.feature_file_name(transaction_id), feature_text
-    )
-
-    # ── page object ─────────────────────────────────────────────────────
-    page_text = _env.get_template("page.j2").render(
-        package="com.sbi.automation.pages",
-        class_name=page_class,
-        transaction_id=transaction_id,
-        transaction_name=transaction_name,
-        version=version,
-        generated_at=now,
-        elements=element_models,
-        actions=[m for m in action_models if m is not None],
-        validations=validation_models,
-    )
-    result["page_object"] = _write(
-        settings.framework_src_path / "com" / "sbi" / "automation" / "pages"
-        / f"{page_class}.java",
-        page_text,
-    )
-
-    # ── step definitions ────────────────────────────────────────────────
-    steps_text = _env.get_template("steps.j2").render(
-        package="com.sbi.automation.steps",
-        class_name=steps_class,
-        page_class=page_class,
-        transaction_id=transaction_id,
-        transaction_name=transaction_name,
-        version=version,
-        generated_at=now,
-        steps=java_steps,
-    )
-    result["step_definition"] = _write(
-        settings.framework_src_path / "com" / "sbi" / "automation" / "steps"
-        / f"{steps_class}.java",
-        steps_text,
-    )
-
-    # ── runner (pure Java) ──────────────────────────────────────────────
-    runner_text = _env.get_template("runner.j2").render(
-        package="com.sbi.automation.runners",
-        package_path="com/sbi/automation/transactions/Transaction_" + transaction_id,
-        class_name=runner_class,
-        transaction_id=transaction_id,
-        transaction_name=transaction_name,
-        version=version,
-        generated_at=now,
-        feature_file=naming.feature_file_name(transaction_id),
-        glue_package="com.sbi.automation.steps",
-    )
-    result["runner"] = _write(
-        settings.framework_src_path / "com" / "sbi" / "automation" / "runners"
-        / f"{runner_class}.java",
-        runner_text,
-    )
-
-    # ── test data template ──────────────────────────────────────────────
-    if field_metadata:
-        for env_name in (environment, "UAT", "PROD"):
-            path = tdm_templates.scaffold_from_fields(
-                transaction_id, env_name, field_metadata
-            )
-            if env_name == environment:
-                result["test_data"] = path
-
-    result["reuse_notes"] = reuse_notes
-    result["metadata"] = {
-        "transaction_id": transaction_id,
-        "version": version,
-        "generated_at": now,
-        "elements": len(element_models),
-        "page_actions": len(action_models),
-        "gherkin_steps": len(gherkin),
-        "new_step_definitions": len(java_steps),
-        "reused_step_definitions": len(reuse_notes),
+            exitCode = io.cucumber.core.cli.Main.run(
+                    cucumberArgs.toArray(new String[0]),
+                    Thread.currentThread().getContextClassLoader());
+        } catch (Throwable t) {
+            ExecutionContext.recordFatal(t);
+        } finally {
+            /* 3. always tear down and always attempt the teller reset */
+            DriverFactory.quitQuietly();
+            SocketResetClient.resetTellerQuietly();
+            ExecutionContext.flush();
+        }
+        System.exit(exitCode);
     }
-    log.info("Code generation complete for %s: %s", transaction_id, result["metadata"])
-    return result
 
-
-def repair_file(path: str, new_content: str) -> str:
-    """Used by the Self-Healing / BRD flow to patch a single file."""
-    return _write(Path(path), new_content)
-
-
-def patch_locator(page_object_path: str, element_constant: str,
-                  new_java_by: str) -> bool:
-    """Swap one locator inside a generated page object (self-healing)."""
-    path = Path(page_object_path)
-    if not path.exists():
-        return False
-    text = path.read_text(encoding="utf-8")
-    pattern = re.compile(
-        r"(LocatorRepository\.register\(\s*" + re.escape(element_constant)
-        + r"\s*,\s*new By\[\]\s*\{)",
-    )
-    match = pattern.search(text)
-    if not match:
-        return False
-    insert_at = match.end()
-    patched = text[:insert_at] + f"\n            {new_java_by}," + text[insert_at:]
-    path.write_text(patched, encoding="utf-8")
-    log.info("Self-heal: promoted %s for %s", new_java_by, element_constant)
-    return True
+    private static File featureFor(String transactionId) {
+        return new File(TXN_ROOT + File.separator + "Transaction_" + transactionId,
+                "Transaction" + transactionId + ".feature");
+    }
+}
