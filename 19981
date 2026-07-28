@@ -1,159 +1,383 @@
-"""SQLite-backed vector store for the RAG layer (Section 9).
-
-Postgres/pgvector did cosine search in the database with an ANN index.
-SQLite has no vector type, so embeddings are stored as JSON-encoded float
-lists in a TEXT column and similarity is computed in Python. This is
-brute-force (O(n) per search within the filtered namespace/transaction),
-which is fine at the scale a single-machine knowledge repository holds.
-
-Everything embeddable lands here: element descriptions, DOM fragments,
-workflow paths, BRD text, framework artefacts and past AI decisions.
-"""
-from __future__ import annotations
-
-import math
-from typing import Any, Optional
-
-from . import db
-from .config import settings
-from .llm import embed_batch, embed_text
-from .logging_conf import get_logger
-
-log = get_logger(__name__)
-
-NAMESPACES = (
-    "element", "dom", "workflow", "brd", "framework", "decision", "report"
-)
+-- ═══════════════════════════════════════════════════════════════════════
+--  Enterprise AI Automation Engineering Platform — Knowledge Repository
+--  SQLite (ported from PostgreSQL + pgvector)
+--  Section 15 of the Master Build Specification
+-- ═══════════════════════════════════════════════════════════════════════
 
 
-def _encode_vec(values: list[float]) -> str:
-    return db.jsonb(values)
+-- ── 1. TRANSACTIONS ────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS transactions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    transaction_id  TEXT        NOT NULL,          -- e.g. '1045', '9750'
+    name            TEXT        NOT NULL,
+    description     TEXT,
+    version         TEXT        NOT NULL DEFAULT '1.0',
+    build           TEXT,
+    type            TEXT        NOT NULL DEFAULT 'business',
+        -- 'business' | 'system_prerequisite' | 'system_cleanup'
+    status          TEXT        NOT NULL DEFAULT 'draft',
+        -- draft | pending_review | active | superseded | needs_rerecording
+    confidence      NUMERIC(4,3) DEFAULT 1.000,
+    knowledge_json  TEXT       NOT NULL DEFAULT '{}',
+    workflow_path   TEXT       NOT NULL DEFAULT '[]',
+    knowledge_dir   TEXT,                          -- storage/knowledge/<txn>/<ver>
+    generated_files TEXT       NOT NULL DEFAULT '{}',
+    tags            TEXT        NOT NULL DEFAULT '[]',
+    recorded_at     TEXT,
+    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (transaction_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_txn_txnid  ON transactions (transaction_id);
+CREATE INDEX IF NOT EXISTS idx_txn_status ON transactions (status);
+CREATE INDEX IF NOT EXISTS idx_txn_type   ON transactions (type);
 
+-- ── 2. PAGES captured during a recording ───────────────────────────────
+CREATE TABLE IF NOT EXISTS pages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    transaction_pk  BIGINT      NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+    page_key        TEXT        NOT NULL,          -- stable slug for the screen
+    title           TEXT,
+    url             TEXT,
+    sequence        INT         NOT NULL DEFAULT 0,
+    dom_ref         TEXT,                          -- file ref to full DOM snapshot
+    screenshot_ref  TEXT,
+    frames          TEXT       NOT NULL DEFAULT '[]',
+    shadow_roots    TEXT       NOT NULL DEFAULT '[]',
+    meta            TEXT       NOT NULL DEFAULT '{}',
+    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_pages_txn ON pages (transaction_pk);
 
-def _decode_vec(raw: Any) -> list[float]:
-    if raw is None:
-        return []
-    if isinstance(raw, list):
-        return [float(x) for x in raw]
-    import json
-    return [float(x) for x in json.loads(raw)]
+-- ── 3. ELEMENTS (whole-page crawl, not only clicked elements) ──────────
+CREATE TABLE IF NOT EXISTS elements (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    transaction_pk  BIGINT      NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+    page_pk         BIGINT      REFERENCES pages(id) ON DELETE CASCADE,
+    element_key     TEXT        NOT NULL,
+    tag             TEXT,
+    element_type    TEXT,        -- button | textbox | dropdown | checkbox | ...
+    label           TEXT,
+    visible         BOOLEAN     DEFAULT TRUE,
+    enabled         BOOLEAN     DEFAULT TRUE,
+    interacted      BOOLEAN     DEFAULT FALSE,     -- touched in this recording?
+    element_meta    TEXT       NOT NULL DEFAULT '{}',
+    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_elements_txn  ON elements (transaction_pk);
+CREATE INDEX IF NOT EXISTS idx_elements_page ON elements (page_pk);
+CREATE INDEX IF NOT EXISTS idx_elements_key  ON elements (element_key);
 
+-- ── 4. LOCATORS (multi-strategy fallback repository) ───────────────────
+CREATE TABLE IF NOT EXISTS locators (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    element_pk          BIGINT      NOT NULL REFERENCES elements(id) ON DELETE CASCADE,
+    transaction_pk      BIGINT      NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+    strategy            TEXT        NOT NULL,      -- id|name|css|xpath|relative_xpath|text|aria|data
+    value               TEXT        NOT NULL,
+    priority            INT         NOT NULL DEFAULT 100,
+    reliability_score   NUMERIC(4,3) NOT NULL DEFAULT 0.500,
+    success_count       INT         NOT NULL DEFAULT 0,
+    failure_count       INT         NOT NULL DEFAULT 0,
+    last_used_at        TEXT,
+    active              BOOLEAN     NOT NULL DEFAULT TRUE,
+    created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_loc_element ON locators (element_pk, priority);
+CREATE INDEX IF NOT EXISTS idx_loc_txn     ON locators (transaction_pk);
 
-def _cosine(a: list[float], b: list[float]) -> float:
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(y * y for y in b))
-    if na == 0.0 or nb == 0.0:
-        return 0.0
-    return dot / (na * nb)
+-- ── 5. RECORDED ACTIONS / workflow steps ───────────────────────────────
+CREATE TABLE IF NOT EXISTS recorded_actions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    transaction_pk  BIGINT      NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+    sequence        INT         NOT NULL,
+    action          TEXT        NOT NULL,          -- click|type|select|check|navigate|wait|assert
+    element_key     TEXT,
+    field_name      TEXT,
+    value_ref       TEXT,                          -- variable name, NEVER a raw value
+    page_key        TEXT,
+    dom_before_ref  TEXT,
+    dom_after_ref   TEXT,
+    screenshot_before TEXT,
+    screenshot_after  TEXT,
+    network_ref     TEXT,
+    meta            TEXT       NOT NULL DEFAULT '{}',
+    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_actions_txn ON recorded_actions (transaction_pk, sequence);
 
+-- ── 6. VALIDATION RULES ────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS validation_rules (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    transaction_pk  BIGINT      NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+    field_name      TEXT,
+    rule_type       TEXT,                          -- mandatory|format|business|message
+    expression      TEXT,
+    message_text    TEXT,
+    severity        TEXT        DEFAULT 'error',   -- error|warning|success|info
+    meta            TEXT       NOT NULL DEFAULT '{}',
+    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_valrules_txn ON validation_rules (transaction_pk);
 
-def upsert(
-    namespace: str,
-    content: str,
-    ref_type: str | None = None,
-    ref_id: str | None = None,
-    transaction_id: str | None = None,
-    meta: dict[str, Any] | None = None,
-    embedding: list[float] | None = None,
-) -> Optional[int]:
-    """Store one document + embedding.  Returns row id."""
-    if not content or not content.strip():
-        return None
-    vec = embedding if embedding is not None else embed_text(content)
-    row = db.insert_returning(
-        """
-        INSERT INTO knowledge_embeddings
-            (namespace, ref_type, ref_id, transaction_id, content, meta, embedding)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        RETURNING id
-        """,
-        (
-            namespace, ref_type, ref_id, transaction_id, content,
-            db.jsonb(meta or {}), _encode_vec(vec),
-        ),
-    )
-    return (row or {}).get("id")
+-- ── 7. TEST DATA — field metadata (Section 7.2) ────────────────────────
+CREATE TABLE IF NOT EXISTS test_data_fields (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    transaction_pk  BIGINT      NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+    field           TEXT        NOT NULL,
+    datatype        TEXT,                          -- PAN | CIF | AMOUNT | TEXT | DATE ...
+    required        BOOLEAN     NOT NULL DEFAULT FALSE,
+    pattern         TEXT,
+    business_meaning TEXT,
+    sensitive       BOOLEAN     NOT NULL DEFAULT FALSE,
+    editable        BOOLEAN     NOT NULL DEFAULT TRUE,
+    source          TEXT        NOT NULL DEFAULT 'user',
+        -- framework | profile | runtime | database | api | ai
+    source_config   TEXT       NOT NULL DEFAULT '{}',
+    element_key     TEXT,
+    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (transaction_pk, field)
+);
 
+-- ── 8. DATA PROFILES (Section 7.6) ─────────────────────────────────────
+CREATE TABLE IF NOT EXISTS test_data_profiles (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT        NOT NULL UNIQUE,   -- e.g. SBI_PREPROD
+    environment     TEXT        NOT NULL,          -- PREPROD | UAT | PROD
+    description     TEXT,
+    values_json     TEXT       NOT NULL DEFAULT '{}',  -- non-sensitive
+    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 
-def upsert_many(docs: list[dict[str, Any]]) -> int:
-    """Batch-embed and store.  Each doc: namespace, content, [ref_type,
-    ref_id, transaction_id, meta]."""
-    docs = [d for d in docs if (d.get("content") or "").strip()]
-    if not docs:
-        return 0
-    vectors = embed_batch([d["content"] for d in docs])
-    rows = [
-        (
-            d["namespace"], d.get("ref_type"), d.get("ref_id"),
-            d.get("transaction_id"), d["content"], db.jsonb(d.get("meta") or {}),
-            _encode_vec(v),
-        )
-        for d, v in zip(docs, vectors)
-    ]
-    db.executemany(
-        """
-        INSERT INTO knowledge_embeddings
-            (namespace, ref_type, ref_id, transaction_id, content, meta, embedding)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """,
-        rows,
-    )
-    return len(rows)
+CREATE TABLE IF NOT EXISTS test_data_values (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_pk      BIGINT      REFERENCES test_data_profiles(id) ON DELETE CASCADE,
+    transaction_id  TEXT,
+    environment     TEXT        NOT NULL,
+    field           TEXT        NOT NULL,
+    value_plain     TEXT,                          -- non-sensitive only
+    value_encrypted TEXT,                          -- sensitive values, Fernet
+    sensitive       BOOLEAN     NOT NULL DEFAULT FALSE,
+    source          TEXT        NOT NULL DEFAULT 'user',
+    updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (profile_pk, transaction_id, environment, field)
+);
+CREATE INDEX IF NOT EXISTS idx_tdv_lookup
+    ON test_data_values (transaction_id, environment);
 
+-- ── 9. SECRETS (Section 11.3) — never plaintext ────────────────────────
+CREATE TABLE IF NOT EXISTS secrets (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope           TEXT        NOT NULL,          -- global | profile | environment
+    scope_ref       TEXT,                          -- profile name / environment
+    key             TEXT        NOT NULL,          -- teller_id|teller_password|checker_id|
+                                                   -- checker_password|cbs_reset_string
+    value_encrypted TEXT        NOT NULL,
+    hint            TEXT,                          -- masked preview for the UI
+    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (scope, scope_ref, key)
+);
 
-def search(
-    query_text: str,
-    namespace: str | None = None,
-    transaction_id: str | None = None,
-    top_k: int = 8,
-    min_similarity: float = 0.0,
-) -> list[dict[str, Any]]:
-    """Cosine-similarity retrieval, computed in Python."""
-    query_vec = embed_text(query_text)
-    clauses, params = ["TRUE"], []
-    if namespace:
-        clauses.append("namespace = %s")
-        params.append(namespace)
-    if transaction_id:
-        clauses.append("transaction_id = %s")
-        params.append(transaction_id)
-    sql = f"""
-        SELECT id, namespace, ref_type, ref_id, transaction_id, content, meta, embedding
-        FROM knowledge_embeddings
-        WHERE {' AND '.join(clauses)}
-    """
-    candidates = db.query(sql, params)
-    scored: list[dict[str, Any]] = []
-    for row in candidates:
-        vec = _decode_vec(row.pop("embedding", None))
-        sim = _cosine(query_vec, vec)
-        if sim >= min_similarity:
-            row["similarity"] = sim
-            scored.append(row)
-    scored.sort(key=lambda r: r["similarity"], reverse=True)
-    return scored[:top_k]
+-- ── 10. EXECUTIONS ─────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS executions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    execution_uid   TEXT        NOT NULL UNIQUE,
+    transaction_id  TEXT        NOT NULL,
+    transaction_pk  BIGINT      REFERENCES transactions(id) ON DELETE SET NULL,
+    environment     TEXT        NOT NULL,
+    profile_pk      BIGINT      REFERENCES test_data_profiles(id) ON DELETE SET NULL,
+    status          TEXT        NOT NULL DEFAULT 'queued',
+        -- queued|running|passed|failed|aborted|partial
+    thread_id       TEXT,                          -- LangGraph checkpoint thread
+    report_id       TEXT,
+    report_path     TEXT,
+    password_change_status TEXT,                   -- 9750 sub-step result
+    teller_reset_status    TEXT,
+    teller_reset_response  TEXT,
+    error_summary   TEXT,
+    metrics         TEXT       NOT NULL DEFAULT '{}',
+    started_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    finished_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_exec_txn    ON executions (transaction_id);
+CREATE INDEX IF NOT EXISTS idx_exec_status ON executions (status);
+CREATE INDEX IF NOT EXISTS idx_exec_start  ON executions (started_at DESC);
 
+-- ── 11. EXECUTION STEPS ────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS execution_steps (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    execution_pk    BIGINT      NOT NULL REFERENCES executions(id) ON DELETE CASCADE,
+    sequence        INT         NOT NULL,
+    phase           TEXT        NOT NULL DEFAULT 'transaction',
+        -- launch|login|password_change|relogin|search|transaction|logout|teller_reset|report
+    step_name       TEXT        NOT NULL,
+    status          TEXT        NOT NULL,          -- passed|failed|skipped|healed
+    duration_ms     INT,
+    screenshot_ref  TEXT,
+    error_msg       TEXT,
+    detail          TEXT       NOT NULL DEFAULT '{}',
+    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_steps_exec ON execution_steps (execution_pk, sequence);
 
-def delete_for_transaction(transaction_id: str, namespace: str | None = None) -> int:
-    if namespace:
-        return db.execute(
-            "DELETE FROM knowledge_embeddings WHERE transaction_id=%s AND namespace=%s",
-            (transaction_id, namespace),
-        )
-    return db.execute(
-        "DELETE FROM knowledge_embeddings WHERE transaction_id=%s", (transaction_id,)
-    )
+-- ── 12. SELF-HEALING LOG (Section 12) ──────────────────────────────────
+CREATE TABLE IF NOT EXISTS self_heal_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    transaction_pk  BIGINT      REFERENCES transactions(id) ON DELETE CASCADE,
+    execution_pk    BIGINT      REFERENCES executions(id) ON DELETE SET NULL,
+    element_key     TEXT,
+    old_locator     TEXT,
+    new_locator     TEXT,
+    strategy        TEXT,
+    reason          TEXT,
+    confidence      NUMERIC(4,3),
+    applied         BOOLEAN     NOT NULL DEFAULT FALSE,
+    approved_by     TEXT,
+    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_heal_txn ON self_heal_log (transaction_pk);
 
+-- ── 13. BRD UPLOADS (Section 11.5) ─────────────────────────────────────
+CREATE TABLE IF NOT EXISTS brd_uploads (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename            TEXT        NOT NULL,
+    file_ref            TEXT        NOT NULL,
+    content_hash        TEXT,
+    parsed_text         TEXT,
+    parsed_impact_json  TEXT       NOT NULL DEFAULT '{}',
+    status              TEXT        NOT NULL DEFAULT 'uploaded',
+        -- uploaded|analysed|approved|rejected|applied
+    approved_by         TEXT,
+    created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 
-def stats() -> dict[str, Any]:
-    rows = db.query(
-        "SELECT namespace, COUNT(*) AS n FROM knowledge_embeddings GROUP BY namespace"
-    )
-    return {
-        "dimension": settings.embedding_dim,
-        "by_namespace": {r["namespace"]: r["n"] for r in rows},
-        "total": sum(r["n"] for r in rows),
-    }
+-- ── 14. FRAMEWORK INDEX (Section 8) ────────────────────────────────────
+CREATE TABLE IF NOT EXISTS framework_artifacts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    artifact_type   TEXT        NOT NULL,
+        -- feature|page_object|step_definition|runner|utility|hook|property|test_data
+    name            TEXT        NOT NULL,
+    package         TEXT,
+    file_path       TEXT        NOT NULL,
+    content_hash    TEXT,
+    transaction_id  TEXT,
+    tags            TEXT        NOT NULL DEFAULT '[]',
+    summary         TEXT,
+    meta            TEXT       NOT NULL DEFAULT '{}',
+    indexed_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (file_path)
+);
+CREATE INDEX IF NOT EXISTS idx_fw_type ON framework_artifacts (artifact_type);
+CREATE INDEX IF NOT EXISTS idx_fw_txn  ON framework_artifacts (transaction_id);
+
+CREATE TABLE IF NOT EXISTS framework_methods (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    artifact_pk     BIGINT      NOT NULL REFERENCES framework_artifacts(id) ON DELETE CASCADE,
+    class_name      TEXT        NOT NULL,
+    method_name     TEXT        NOT NULL,
+    signature       TEXT,
+    return_type     TEXT,
+    annotations     TEXT        NOT NULL DEFAULT '[]',
+    gherkin_pattern TEXT,                          -- for step definitions
+    line_start      INT,
+    line_end        INT,
+    body_summary    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_fwm_artifact ON framework_methods (artifact_pk);
+CREATE INDEX IF NOT EXISTS idx_fwm_gherkin  ON framework_methods (gherkin_pattern);
+
+CREATE TABLE IF NOT EXISTS framework_relations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_class      TEXT        NOT NULL,
+    to_class        TEXT        NOT NULL,
+    relation        TEXT        NOT NULL,          -- imports|extends|implements|calls|uses
+    detail          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_fwr_from ON framework_relations (from_class);
+
+-- ── 15. AI DECISIONS (continuous learning) ─────────────────────────────
+CREATE TABLE IF NOT EXISTS ai_decisions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent           TEXT        NOT NULL,
+    context_type    TEXT,                          -- recording|codegen|execution|heal|brd
+    transaction_id  TEXT,
+    prompt_summary  TEXT,
+    decision        TEXT,
+    rationale       TEXT,
+    confidence      NUMERIC(4,3),
+    outcome         TEXT,                          -- success|failure|unknown
+    meta            TEXT       NOT NULL DEFAULT '{}',
+    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_ai_txn   ON ai_decisions (transaction_id);
+CREATE INDEX IF NOT EXISTS idx_ai_agent ON ai_decisions (agent);
+
+-- ── 16. HUMAN APPROVALS (Section 17) ───────────────────────────────────
+CREATE TABLE IF NOT EXISTS approvals (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id       TEXT        NOT NULL,
+    approval_type   TEXT        NOT NULL,   -- recording_keep|codegen|self_heal
+    subject_ref     TEXT,
+    payload         TEXT       NOT NULL DEFAULT '{}',
+    decision        TEXT,                   -- pending|approved|rejected|discarded
+    decided_by      TEXT,
+    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    decided_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_appr_thread ON approvals (thread_id);
+
+-- ── 17. VECTOR STORE (RAG, Section 9) ──────────────────────────────────
+-- NOTE: dimension must match AZURE_OPENAI_EMBEDDING_DEPLOYMENT.
+--       text-embedding-3-large = 3072, text-embedding-3-small = 1536.
+CREATE TABLE IF NOT EXISTS knowledge_embeddings (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    namespace       TEXT        NOT NULL,
+        -- element|dom|workflow|brd|framework|decision|report
+    ref_type        TEXT,
+    ref_id          TEXT,
+    transaction_id  TEXT,
+    content         TEXT        NOT NULL,
+    meta            TEXT       NOT NULL DEFAULT '{}',
+    embedding       TEXT,
+    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_emb_ns  ON knowledge_embeddings (namespace);
+CREATE INDEX IF NOT EXISTS idx_emb_txn ON knowledge_embeddings (transaction_id);
+-- CREATE INDEX idx_emb_vec ON knowledge_embeddings
+
+-- ── 18. RECORDING SESSIONS ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS recording_sessions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_uid     TEXT        NOT NULL UNIQUE,
+    transaction_id  TEXT        NOT NULL,
+    transaction_name TEXT,
+    environment     TEXT,
+    status          TEXT        NOT NULL DEFAULT 'recording',
+        -- recording|stopped|kept|discarded|converted
+    start_url       TEXT,
+    capture_dir     TEXT,
+    stats           TEXT       NOT NULL DEFAULT '{}',
+    started_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    stopped_at      TEXT
+);
+
+-- ── trigger: keep updated_at fresh (native SQLite triggers) ────────────
+DROP TRIGGER IF EXISTS trg_txn_touch;
+CREATE TRIGGER trg_txn_touch AFTER UPDATE ON transactions
+BEGIN
+    UPDATE transactions SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+END;
+
+DROP TRIGGER IF EXISTS trg_profile_touch;
+CREATE TRIGGER trg_profile_touch AFTER UPDATE ON test_data_profiles
+BEGIN
+    UPDATE test_data_profiles SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+END;
+
+DROP TRIGGER IF EXISTS trg_secrets_touch;
+CREATE TRIGGER trg_secrets_touch AFTER UPDATE ON secrets
+BEGIN
+    UPDATE secrets SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+END;
