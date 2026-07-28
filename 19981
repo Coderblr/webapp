@@ -1,96 +1,182 @@
-package com.sbi.automation.runners;
+"""Locator Repository builder (Section 5.3).
 
-import java.io.File;
-import java.util.ArrayList;
-import java.util.List;
+Turns the raw locator bundle captured in the browser into a ranked,
+multi-strategy fallback list.  Ranking is what makes self-healing cheap:
+if the top strategy dies, the next one usually still resolves.
+"""
+from __future__ import annotations
 
-import com.sbi.automation.core.DriverFactory;
-import com.sbi.automation.utils.ExecutionContext;
-import com.sbi.automation.utils.SocketResetClient;
+import re
+from typing import Any
 
-/**
- * The runner the Execution Agent launches.  PURE JAVA — no Maven, no Gradle.
- *
- * It chains the mandatory password-change transaction (9750) IN THE SAME
- * BROWSER SESSION before the requested transaction, which is exactly the real
- * SBI flow of Section 11.1:
- *
- *   launch → URL → login → forced password change (9750) → re-login
- *          → search transaction → execute → logout
- *
- * Usage:
- *   java -cp "lib/*;build" com.sbi.automation.runners.PlatformRunner \
- *        --transaction=400 --env=PREPROD --profile=SBI_PREPROD \
- *        --prestep=9750 --execution=exec_400_...
- */
-public class PlatformRunner {
-
-    private static final String TXN_ROOT = "src/com/sbi/automation/transactions";
-    private static final String GLUE = "com.sbi.automation.steps";
-    private static final String HOOKS = "com.sbi.automation.hooks";
-
-    public static void main(String[] args) {
-        ExecutionContext.initFromArgs(args);
-        String transaction = ExecutionContext.transaction();
-        String prestep = ExecutionContext.prestep();
-
-        int exitCode = 1;
-        try {
-            List<String> cucumberArgs = new ArrayList<>();
-
-            /* 1. mandatory password change, attached automatically */
-            if (prestep != null && !prestep.isEmpty()) {
-                File presteFeature = featureFor(prestep);
-                if (presteFeature.exists()) {
-                    cucumberArgs.add(presteFeature.getAbsolutePath());
-                    ExecutionContext.recordStep("password_change",
-                            "Transaction " + prestep + " attached as pre-step",
-                            "passed", 0, "", null);
-                } else {
-                    ExecutionContext.recordStep("password_change",
-                            "Transaction " + prestep + " feature not found",
-                            "skipped", 0, "",
-                            presteFeature.getAbsolutePath());
-                }
-            }
-
-            /* 2. the requested transaction */
-            File feature = featureFor(transaction);
-            if (!feature.exists()) {
-                throw new IllegalStateException(
-                        "Feature file not found: " + feature.getAbsolutePath()
-                        + " — record transaction " + transaction + " first.");
-            }
-            cucumberArgs.add(feature.getAbsolutePath());
-
-            cucumberArgs.add("--glue");
-            cucumberArgs.add(GLUE);
-            cucumberArgs.add("--glue");
-            cucumberArgs.add(HOOKS);
-            cucumberArgs.add("--plugin");
-            cucumberArgs.add("pretty");
-            cucumberArgs.add("--plugin");
-            cucumberArgs.add("json:" + ExecutionContext.reportPath("cucumber.json"));
-            cucumberArgs.add("--plugin");
-            cucumberArgs.add("html:" + ExecutionContext.reportPath("cucumber.html"));
-            cucumberArgs.add("--monochrome");
-
-            exitCode = io.cucumber.core.cli.Main.run(
-                    cucumberArgs.toArray(new String[0]),
-                    Thread.currentThread().getContextClassLoader());
-        } catch (Throwable t) {
-            ExecutionContext.recordFatal(t);
-        } finally {
-            /* 3. always tear down and always attempt the teller reset */
-            DriverFactory.quitQuietly();
-            SocketResetClient.resetTellerQuietly();
-            ExecutionContext.flush();
-        }
-        System.exit(exitCode);
-    }
-
-    private static File featureFor(String transactionId) {
-        return new File(TXN_ROOT + File.separator + "Transaction_" + transactionId,
-                "Transaction" + transactionId + ".feature");
-    }
+# lower priority number = tried first
+BASE_PRIORITY = {
+    "id": 10,
+    "name": 20,
+    "data": 25,
+    "aria": 30,
+    "css": 40,
+    "relative_xpath": 50,
+    "placeholder": 55,
+    "link_text": 60,
+    "text": 70,
+    "class": 80,
+    "xpath": 90,          # absolute XPath = last resort, most brittle
 }
+
+BASE_RELIABILITY = {
+    "id": 0.95, "name": 0.90, "data": 0.88, "aria": 0.82, "css": 0.75,
+    "relative_xpath": 0.70, "placeholder": 0.65, "link_text": 0.60,
+    "text": 0.55, "class": 0.40, "xpath": 0.30,
+}
+
+_DYNAMIC_ID = re.compile(
+    r"(\d{4,}|[0-9a-f]{8}-[0-9a-f]{4}|__\d+|_\d{3,}|ctl\d+|:r[0-9a-z]+:)", re.I
+)
+_NOISE_CLASS = re.compile(r"^(ng-|is-|active|selected|hover|focus|open|show)", re.I)
+
+
+def looks_dynamic(value: str) -> bool:
+    return bool(value and _DYNAMIC_ID.search(value))
+
+
+def _penalise(strategy: str, value: str) -> tuple[int, float]:
+    priority = BASE_PRIORITY.get(strategy, 100)
+    reliability = BASE_RELIABILITY.get(strategy, 0.5)
+    if looks_dynamic(value):
+        priority += 25
+        reliability *= 0.55
+    if strategy == "css" and value.count(">") > 5:
+        priority += 10
+        reliability *= 0.8
+    if strategy == "xpath" and value.count("/") > 8:
+        priority += 10
+        reliability *= 0.7
+    if len(value) > 300:
+        priority += 15
+        reliability *= 0.7
+    return priority, round(min(reliability, 0.999), 3)
+
+
+def build(raw: dict[str, Any], element_type: str = "") -> list[dict[str, Any]]:
+    """raw = the `locators` object produced by injector.js."""
+    out: list[dict[str, Any]] = []
+
+    def add(strategy: str, value: Any) -> None:
+        if value is None:
+            return
+        value = str(value).strip()
+        if not value:
+            return
+        if strategy == "class":
+            classes = [c for c in value.split() if not _NOISE_CLASS.match(c)]
+            if not classes:
+                return
+            value = ".".join(classes[:3])
+        priority, reliability = _penalise(strategy, value)
+        out.append({
+            "strategy": strategy,
+            "value": value,
+            "priority": priority,
+            "reliability": reliability,
+            "dynamic": looks_dynamic(value),
+        })
+
+    add("id", raw.get("id"))
+    add("name", raw.get("name"))
+    for key, value in (raw.get("data") or {}).items():
+        add("data", f"[{key}='{value}']")
+    add("aria", raw.get("aria"))
+    add("css", raw.get("css"))
+    for xpath in (raw.get("relative_xpath") or [])[:6]:
+        add("relative_xpath", xpath)
+    add("placeholder", raw.get("placeholder"))
+    if element_type == "link":
+        add("link_text", raw.get("text"))
+    else:
+        add("text", raw.get("text"))
+    add("class", raw.get("class"))
+    add("xpath", raw.get("xpath"))
+
+    # de-duplicate, keep the best-ranked instance of each value
+    best: dict[tuple[str, str], dict[str, Any]] = {}
+    for locator in out:
+        key = (locator["strategy"], locator["value"])
+        if key not in best or locator["priority"] < best[key]["priority"]:
+            best[key] = locator
+    return sorted(best.values(), key=lambda x: (x["priority"], -x["reliability"]))
+
+
+def _java_escape(value: str) -> str:
+    """Escape a value for safe embedding inside a Java string literal.
+
+    Order matters: backslashes MUST be escaped first, otherwise the
+    backslash inserted for a later replacement (e.g. before a quote) would
+    itself get re-escaped. A recorded locator value can legitimately
+    contain backslashes (Windows-style paths, regex-flavoured CSS
+    attribute selectors), quotes, or even embedded newlines (multi-line
+    element text) — any of those, left raw, breaks out of the Java string
+    literal and cascades into dozens of downstream "illegal character" /
+    "unclosed string literal" compile errors from a single bad character.
+    """
+    return (
+        (value or "")
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+
+
+def to_java_by(locator: dict[str, Any]) -> str:
+    """Render a locator as Selenium Java `By.*` code."""
+    strategy, value = locator["strategy"], _java_escape(locator["value"])
+    mapping = {
+        "id": f'By.id("{value}")',
+        "name": f'By.name("{value}")',
+        "css": f'By.cssSelector("{value}")',
+        "data": f'By.cssSelector("{value}")',
+        "aria": f'By.cssSelector("[aria-label=\'{value}\']")',
+        "class": f'By.cssSelector(".{value}")',
+        "xpath": f'By.xpath("{value}")',
+        "relative_xpath": f'By.xpath("{value}")',
+        "placeholder": f'By.cssSelector("[placeholder=\'{value}\']")',
+        "link_text": f'By.linkText("{value}")',
+        "text": f'By.xpath("//*[normalize-space(text())=\'{value}\']")',
+    }
+    return mapping.get(strategy, f'By.xpath("{value}")')
+
+
+def to_java_findby(locator: dict[str, Any]) -> str:
+    """Render as a @FindBy annotation."""
+    strategy, value = locator["strategy"], _java_escape(locator["value"])
+    mapping = {
+        "id": f'@FindBy(id = "{value}")',
+        "name": f'@FindBy(name = "{value}")',
+        "css": f'@FindBy(css = "{value}")',
+        "data": f'@FindBy(css = "{value}")',
+        "class": f'@FindBy(css = ".{value}")',
+        "link_text": f'@FindBy(linkText = "{value}")',
+    }
+    return mapping.get(strategy, f'@FindBy(xpath = "{value}")')
+
+
+def primary(locators: list[dict[str, Any]]) -> dict[str, Any]:
+    return locators[0] if locators else {"strategy": "xpath", "value": "//*", "priority": 999}
+
+
+def fallbacks(locators: list[dict[str, Any]], limit: int = 4) -> list[dict[str, Any]]:
+    return locators[1 : 1 + limit]
+
+
+def score_change(old: dict[str, Any], new: dict[str, Any]) -> float:
+    """How confident are we that `new` replaces `old`?  Used by self-healing."""
+    if old.get("strategy") == new.get("strategy") and old.get("value") == new.get("value"):
+        return 1.0
+    score = new.get("reliability", 0.5)
+    if old.get("strategy") == new.get("strategy"):
+        score += 0.10
+    if not new.get("dynamic", False):
+        score += 0.05
+    return round(min(score, 0.99), 3)
