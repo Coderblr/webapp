@@ -1,146 +1,451 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Reports Dashboard</title>
-<link rel="stylesheet" href="css/style.css">
-</head>
-<body>
-<script src="js/api.js"></script>
-<script>
-const content = renderShell('reports.html', 'Reports Dashboard',
-  'Every execution, every self-heal, every lesson learned');
+"""Automatic Code Generation (Section 6).
 
-content.innerHTML = `
-  <div class="grid g4" id="stats"></div>
+Turns an accepted recording into real artefacts inside the EXISTING pure-Java
+framework:
 
-  <div class="card">
-    <h3>Executions</h3>
-    <div class="row" style="margin-bottom:12px">
-      <div class="field" style="margin:0"><label>Transaction filter</label>
-        <input id="filter" placeholder="e.g. 400" oninput="load()"></div>
-    </div>
-    <table><thead><tr><th>Execution</th><th>Transaction</th><th>Env</th><th>Status</th>
-      <th>9750</th><th>Teller reset</th><th>Duration</th><th>Started</th><th></th></tr></thead>
-      <tbody id="rows"><tr><td colspan="9" class="muted">loading…</td></tr></tbody></table>
-  </div>
+    Transaction_<id>/Transaction<id>.feature
+                     Transaction<id>Steps.java
+                     Transaction<id>Page.java
+                     Transaction<id>Runner.java
+    test-data/<ENV>/transaction_<id>.json
 
-  <div id="drill"></div>
+Rules:
+  • The Framework Indexing Engine is queried FIRST — reuse beats duplication.
+  • Existing files are updated, never blindly replaced; hand-written code
+    between the CUSTOM markers is preserved.
+  • The AI never regenerates the framework itself, only extends it.
+"""
+from __future__ import annotations
 
-  <div class="grid g2">
-    <div class="card">
-      <h3>Per-transaction reliability</h3>
-      <table><thead><tr><th>Transaction</th><th>Runs</th><th>Passed</th><th>Last run</th></tr></thead>
-        <tbody id="byTxn"><tr><td colspan="4" class="muted">loading…</td></tr></tbody></table>
-    </div>
-    <div class="card">
-      <h3>Continuous learning</h3>
-      <div id="insights" class="muted">loading…</div>
-    </div>
-  </div>`;
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
 
-async function load() {
-  try {
-    const stats = await API.get('/api/reports/dashboard');
-    const t = stats.totals || {};
-    $('#stats').innerHTML = [
-      ['Total Tests', t.total || 0], ['Passed', t.passed || 0], ['Failed', t.failed || 0],
-      ['Success Rate', (t.success_rate ?? 0) + '%'],
-      ['Self-heals applied', stats.self_heals_applied || 0],
-    ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
-    $('#byTxn').innerHTML = (stats.by_transaction || []).map(r => `
-      <tr><td class="mono">${r.transaction_id}</td><td>${r.runs}</td>
-        <td>${r.passed}</td><td class="muted">${fmtTime(r.last_run)}</td></tr>`).join('')
-      || '<tr><td colspan="4" class="empty">No data.</td></tr>';
-  } catch (e) {}
+from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
-  const filter = $('#filter').value.trim();
-  try {
-    const runs = await API.get('/api/execution?limit=100'
-      + (filter ? '&transaction_id=' + encodeURIComponent(filter) : ''));
-    $('#rows').innerHTML = runs.length ? runs.map(r => `
-      <tr><td class="mono">${r.execution_uid}</td><td>${r.transaction_id}</td>
-        <td class="muted">${r.environment}</td><td>${badge(r.status)}</td>
-        <td>${badge(r.password_change_status || 'skipped')}</td>
-        <td>${badge(r.teller_reset_status || 'skipped')}</td>
-        <td class="muted">${fmtMs((r.metrics || {}).total_ms)}</td>
-        <td class="muted">${fmtTime(r.started_at)}</td>
-        <td class="right"><button class="ghost sm" onclick="drill('${r.execution_uid}')">drill down</button>
-          <a class="btn sm" href="/api/reports/${r.execution_uid}" target="_blank">report</a></td></tr>`).join('')
-      : '<tr><td colspan="9" class="empty">No executions match.</td></tr>';
-  } catch (e) { toast(e.message, 'err'); }
+from ..core.config import settings
+from ..core.logging_conf import get_logger
+from ..framework_index import indexer
+from ..recorder import locator_builder
+from ..tdm import templates as tdm_templates
+from . import naming
 
-  try {
-    const ins = (await API.get('/api/reports/insights')).insights || {};
-    $('#insights').innerHTML = `
-      <div><strong>Transactions needing re-recording</strong><br>
-        ${(ins.needs_rerecording || []).map(t =>
-          `<span class="pill">${t.transaction_id} — confidence ${t.confidence}</span>`).join('')
-          || '<span class="muted">none — self-healing is keeping up</span>'}</div>
-      <div style="margin-top:12px"><strong>Most-healed elements</strong><br>
-        ${(ins.most_healed_elements || []).slice(0, 8).map(h =>
-          `<span class="pill">${h.element_key} ×${h.heals}</span>`).join('') || '<span class="muted">none</span>'}</div>
-      <div style="margin-top:12px"><strong>Failure-prone steps</strong>
-        <table style="margin-top:6px"><tbody>${(ins.flaky_steps || []).slice(0, 8).map(s =>
-          `<tr><td>${s.step_name}</td><td class="right muted">${s.failures}/${s.runs}</td></tr>`).join('')
-          || '<tr><td class="muted">none</td></tr>'}</tbody></table></div>`;
-  } catch (e) {}
+log = get_logger(__name__)
+
+TEMPLATE_DIR = Path(__file__).parent / "templates"
+_env = Environment(
+    loader=FileSystemLoader(str(TEMPLATE_DIR)),
+    undefined=StrictUndefined,
+    trim_blocks=False,
+    lstrip_blocks=False,
+    keep_trailing_newline=True,
+)
+
+CUSTOM_START = "// === CUSTOM CODE START"
+CUSTOM_END = "// === CUSTOM CODE END ==="
+
+def _java_string(value: str) -> str:
+    """Escape a value for embedding inside a Java string literal.
+
+    Gherkin patterns contain double quotes around field labels; unescaped they
+    terminate the annotation string and produce uncompilable step definitions.
+    Recorded element/validation text can also contain literal backslashes or
+    embedded newlines, either of which would just as surely break the string
+    literal open — escape those too.
+    """
+    return (
+        (value or "")
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+
+
+ACTION_VERBS = {
+    "click": "clicks",
+    "type": "enters",
+    "select": "selects",
+    "check": "checks",
+    "uncheck": "unchecks",
+    "upload": "uploads",
+    "submit": "submits",
+    "navigate": "navigates to",
 }
 
-async function drill(uid) {
-  try {
-    const e = await API.get('/api/execution/' + uid);
-    const totals = {
-      passed: e.steps.filter(s => s.status === 'passed').length,
-      failed: e.steps.filter(s => s.status === 'failed').length,
-      healed: e.steps.filter(s => s.status === 'healed').length,
-      skipped: e.steps.filter(s => s.status === 'skipped').length,
-    };
-    $('#drill').innerHTML = `
-      <div class="card">
-        <h3>${e.execution_uid} ${badge(e.status)}
-          <span class="muted">transaction ${e.transaction_id} · ${e.environment}</span></h3>
-        <div class="grid g4" style="margin-bottom:14px">
-          ${Object.entries(totals).map(([k, v]) =>
-            `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('')}
-        </div>
-        <table><thead><tr><th>#</th><th>Phase</th><th>Step</th><th>Status</th>
-          <th>Duration</th><th>Error</th></tr></thead>
-          <tbody>${e.steps.map(s => `<tr><td class="muted">${s.sequence}</td>
-            <td class="muted">${s.phase}</td><td>${s.step_name}</td>
-            <td>${badge(s.status)}</td><td class="muted">${fmtMs(s.duration_ms)}</td>
-            <td class="muted">${(s.error_msg || '').slice(0, 160)}</td></tr>`).join('')}</tbody></table>
 
-        ${(e.self_heal || []).length ? `<h3 style="margin-top:18px">Self-healing actions</h3>
-          ${e.self_heal.map(h => `
-            <div style="margin-bottom:12px">
-              <div><strong>${h.element_key}</strong> ${badge(h.applied ? 'healed' : 'skipped')}
-                <span class="muted">confidence ${h.confidence}</span></div>
-              <div class="split" style="margin-top:6px">
-                <div class="old"><span class="muted">before</span><br>${h.old_locator}</div>
-                <div class="new"><span class="muted">after</span><br>${h.new_locator}</div>
-              </div>
-              <div class="muted" style="margin-top:4px">${h.reason || ''}</div>
-            </div>`).join('')}` : ''}
+class GenerationResult(dict):
+    """{artifact_type: file_path} plus a reuse report."""
 
-        <div class="actions">
-          <a class="btn sm" href="/api/reports/${e.execution_uid}" target="_blank">Open full HTML report</a>
-          <button class="ghost sm" onclick="learn('${e.execution_uid}')">Feed back into knowledge</button>
-        </div>
-      </div>`;
-    $('#drill').scrollIntoView({ behavior: 'smooth' });
-  } catch (err) { toast(err.message, 'err'); }
-}
 
-async function learn(uid) {
-  try {
-    const r = await API.post(`/api/execution/${uid}/learn`);
-    toast(`Knowledge updated — confidence now ${r.confidence}`, 'ok');
-    load();
-  } catch (e) { toast(e.message, 'err'); }
-}
-load();
-</script>
-</body>
-</html>
+# ── preserved custom blocks ─────────────────────────────────────────────
+def _extract_custom(path: Path) -> str:
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    start = text.find(CUSTOM_START)
+    end = text.find(CUSTOM_END)
+    if start == -1 or end == -1 or end < start:
+        return ""
+    block = text[text.find("\n", start) + 1 : end]
+    return block.rstrip()
+
+
+def _reinject_custom(rendered: str, custom: str) -> str:
+    if not custom.strip():
+        return rendered
+    start = rendered.find(CUSTOM_START)
+    end = rendered.find(CUSTOM_END)
+    if start == -1 or end == -1:
+        return rendered
+    head = rendered[: rendered.find("\n", start) + 1]
+    tail = rendered[end:]
+    return head + custom + "\n    " + tail
+
+
+def _write(path: Path, content: str) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    custom = _extract_custom(path)
+    path.write_text(_reinject_custom(content, custom), encoding="utf-8")
+    log.info("Generated %s", path)
+    return str(path)
+
+
+# ── model building ──────────────────────────────────────────────────────
+def _element_models(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    models, used = [], set()
+    for element in elements:
+        key = element["element_key"]
+        const = naming.constant(key.split("::")[-1])
+        while const in used:
+            const += "_X"
+        used.add(const)
+        locators = element.get("locators", [])
+        if isinstance(locators, list) and locators and isinstance(locators[0], dict):
+            java_locators = [
+                {"java": locator_builder.to_java_by(loc)} for loc in locators[:5]
+            ]
+        else:
+            java_locators = [{"java": 'By.xpath("//*")'}]
+        models.append({
+            "element_key": key,
+            "constant": const,
+            "getter": naming.getter(key),
+            "element_type": element.get("element_type"),
+            "label": element.get("label"),
+            "page_key": element.get("page_key"),
+            "locators": java_locators,
+        })
+    return models
+
+
+def _action_models(
+    actions: list[dict[str, Any]], element_models: list[dict[str, Any]]
+) -> list[Optional[dict[str, Any]]]:
+    """One entry per action, SAME LENGTH AND ORDER as `actions`.
+
+    `_step_models()` below indexes into this list with the *same* index it
+    uses for `actions` (`action_models[index]`), so this must never drop or
+    reorder entries — an action with no matching element becomes `None`
+    here rather than being skipped, otherwise every action after the first
+    skip would line up with the wrong page-object method and the generated
+    step definition would call a method that doesn't exist on the page
+    object ("cannot find symbol").
+    """
+    by_key = {e["element_key"]: e for e in element_models}
+    models: list[Optional[dict[str, Any]]] = []
+    used = set()
+    for action in actions:
+        key = action.get("element_key") or ""
+        element = by_key.get(key)
+        if not element:
+            models.append(None)
+            continue
+        verb = action.get("action", "click")
+        method = naming.method_for_action(verb, key)
+        while method in used:
+            method += "X"
+        used.add(method)
+        if verb == "type":
+            params = "String value"
+            body = f'type({element["constant"]}, value);'
+        elif verb == "select":
+            params = "String value"
+            body = f'selectByVisibleText({element["constant"]}, value);'
+        elif verb in ("check", "uncheck"):
+            params = ""
+            body = f'setCheckbox({element["constant"]}, {str(verb == "check").lower()});'
+        elif verb == "upload":
+            params = "String filePath"
+            body = f'uploadFile({element["constant"]}, filePath);'
+        else:
+            params = ""
+            body = f'click({element["constant"]});'
+        models.append({
+            "method": method,
+            "params": params,
+            "body": body,
+            "comment": f"{verb} on {element.get('label') or key}",
+        })
+    return models
+
+
+def _step_models(
+    actions: list[dict[str, Any]],
+    element_models: list[dict[str, Any]],
+    action_models: list[Optional[dict[str, Any]]],
+    transaction_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """Return (gherkin steps, java step methods, reuse notes)."""
+    by_key = {e["element_key"]: e for e in element_models}
+    gherkin: list[dict[str, str]] = []
+    java_steps: list[dict[str, Any]] = []
+    reuse_notes: list[str] = []
+    used_methods: set[str] = set()
+    used_patterns: set[str] = set()
+
+    for index, action in enumerate(actions):
+        key = action.get("element_key") or ""
+        element = by_key.get(key)
+        if not element:
+            continue
+        verb = action.get("action", "click")
+        label = element.get("label") or key.split("::")[-1]
+        page_key = element.get("page_key") or ""
+        action_model = action_models[index] if index < len(action_models) else None
+        page_method = action_model["method"] if action_model else None
+        if page_method is None:
+            continue
+
+        # Two elements can legitimately share the same label on different
+        # screens (e.g. "Submit", "Remarks", "Account Number" repeated
+        # across pages in a banking UI). Since the Gherkin PATTERN is built
+        # from the label alone, that produces two step definitions with the
+        # identical @When/@And text — Cucumber rejects this as ambiguous
+        # glue at runtime (CompositeCucumberException / CachingGlue error),
+        # not a compile-time problem, so it only surfaces during execution.
+        # Disambiguate with page context, and an index as a last-resort
+        # tiebreaker for a genuine same-label-same-page duplicate.
+        display_label = label
+
+        def _pattern_for(lbl: str) -> str:
+            if verb in ("type", "select", "upload"):
+                return f'user {ACTION_VERBS.get(verb, verb)} {{string}} in "{lbl}"'
+            return f'user {ACTION_VERBS.get(verb, verb)} "{lbl}"'
+
+        pattern = _pattern_for(display_label)
+        if pattern in used_patterns and page_key:
+            display_label = f"{label} ({page_key})"
+            pattern = _pattern_for(display_label)
+        if pattern in used_patterns:
+            display_label = f"{label} ({page_key or 'step'} #{index})"
+            pattern = _pattern_for(display_label)
+        used_patterns.add(pattern)
+
+        if verb in ("type", "select", "upload"):
+            variable = action.get("value_ref") or naming.variable(
+                action.get("field_name") or label
+            )
+            text = f'user {ACTION_VERBS.get(verb, verb)} "<{variable}>" in "{display_label}"'
+            params = "String value"
+            body = (
+                f'page.{page_method}(data.resolve(value));'
+            )
+        else:
+            text = f'user {ACTION_VERBS.get(verb, verb)} "{display_label}"'
+            params = ""
+            body = f"page.{page_method}();"
+
+        keyword = "When" if index == 0 else "And"
+        gherkin.append({"keyword": keyword, "text": text})
+
+        # ── reuse check against the Framework Index (Section 8) ─────────
+        try:
+            existing = indexer.find_step_definition(pattern)
+        except Exception:
+            existing = []
+        if existing:
+            reuse_notes.append(
+                f"Reused existing step definition "
+                f"{existing[0]['class_name']}.{existing[0]['method_name']} "
+                f"for: {pattern}"
+            )
+            continue
+
+        method = naming.camel(f"{verb}_{label}_{index}")
+        while method in used_methods:
+            method += "X"
+        used_methods.add(method)
+        java_steps.append({
+            "annotation": "When" if index == 0 else "And",
+            "pattern": _java_string(pattern),
+            "method": method,
+            "params": params,
+            "body": body,
+        })
+
+    return gherkin, java_steps, reuse_notes
+
+
+def _validation_models(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    models, used = [], set()
+    for rule in rules:
+        text = rule.get("message_text") or rule.get("expression") or ""
+        if not text:
+            continue
+        method = naming.camel("is_" + (rule.get("severity") or "info") + "_" + text[:30])
+        while method in used:
+            method += "X"
+        used.add(method)
+        models.append({"method": method, "message_text": _java_string(text)})
+    return models
+
+
+# ── public API ──────────────────────────────────────────────────────────
+def generate_all(
+    transaction_id: str,
+    transaction_name: str,
+    version: str,
+    elements: list[dict[str, Any]],
+    actions: list[dict[str, Any]],
+    validations: list[dict[str, Any]] | None = None,
+    environment: str = "PREPROD",
+    field_metadata: list[dict[str, Any]] | None = None,
+    description: str | None = None,
+) -> GenerationResult:
+    """Generate feature + page object + steps + runner + test data."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    element_models = _element_models(elements)
+    action_models = _action_models(actions, element_models)
+    gherkin, java_steps, reuse_notes = _step_models(
+        actions, element_models, action_models, transaction_id
+    )
+    validation_models = _validation_models(validations or [])
+
+    page_class = naming.transaction_class(transaction_id, "Page")
+    steps_class = naming.transaction_class(transaction_id, "Steps")
+    runner_class = naming.transaction_class(transaction_id, "Runner")
+    feature_name = f"Transaction {transaction_id} — {transaction_name}"
+
+    txn_dir = settings.framework_src_path / "com" / "sbi" / "automation" / \
+        "transactions" / f"Transaction_{transaction_id}"
+
+    result = GenerationResult()
+
+    # ── feature ─────────────────────────────────────────────────────────
+    feature_text = _env.get_template("feature.j2").render(
+        transaction_id=transaction_id,
+        feature_name=feature_name,
+        scenario_name=f"Execute {transaction_name}",
+        description=description,
+        version=version,
+        tags=[],
+        steps=gherkin,
+    )
+    result["feature"] = _write(
+        txn_dir / naming.feature_file_name(transaction_id), feature_text
+    )
+
+    # ── page object ─────────────────────────────────────────────────────
+    page_text = _env.get_template("page.j2").render(
+        package="com.sbi.automation.pages",
+        class_name=page_class,
+        transaction_id=transaction_id,
+        transaction_name=transaction_name,
+        version=version,
+        generated_at=now,
+        elements=element_models,
+        actions=[m for m in action_models if m is not None],
+        validations=validation_models,
+    )
+    result["page_object"] = _write(
+        settings.framework_src_path / "com" / "sbi" / "automation" / "pages"
+        / f"{page_class}.java",
+        page_text,
+    )
+
+    # ── step definitions ────────────────────────────────────────────────
+    steps_text = _env.get_template("steps.j2").render(
+        package="com.sbi.automation.steps",
+        class_name=steps_class,
+        page_class=page_class,
+        transaction_id=transaction_id,
+        transaction_name=transaction_name,
+        version=version,
+        generated_at=now,
+        steps=java_steps,
+    )
+    result["step_definition"] = _write(
+        settings.framework_src_path / "com" / "sbi" / "automation" / "steps"
+        / f"{steps_class}.java",
+        steps_text,
+    )
+
+    # ── runner (pure Java) ──────────────────────────────────────────────
+    runner_text = _env.get_template("runner.j2").render(
+        package="com.sbi.automation.runners",
+        package_path="com/sbi/automation/transactions/Transaction_" + transaction_id,
+        class_name=runner_class,
+        transaction_id=transaction_id,
+        transaction_name=transaction_name,
+        version=version,
+        generated_at=now,
+        feature_file=naming.feature_file_name(transaction_id),
+        glue_package="com.sbi.automation.steps",
+    )
+    result["runner"] = _write(
+        settings.framework_src_path / "com" / "sbi" / "automation" / "runners"
+        / f"{runner_class}.java",
+        runner_text,
+    )
+
+    # ── test data template ──────────────────────────────────────────────
+    if field_metadata:
+        for env_name in (environment, "UAT", "PROD"):
+            path = tdm_templates.scaffold_from_fields(
+                transaction_id, env_name, field_metadata
+            )
+            if env_name == environment:
+                result["test_data"] = path
+
+    result["reuse_notes"] = reuse_notes
+    result["metadata"] = {
+        "transaction_id": transaction_id,
+        "version": version,
+        "generated_at": now,
+        "elements": len(element_models),
+        "page_actions": len(action_models),
+        "gherkin_steps": len(gherkin),
+        "new_step_definitions": len(java_steps),
+        "reused_step_definitions": len(reuse_notes),
+    }
+    log.info("Code generation complete for %s: %s", transaction_id, result["metadata"])
+    return result
+
+
+def repair_file(path: str, new_content: str) -> str:
+    """Used by the Self-Healing / BRD flow to patch a single file."""
+    return _write(Path(path), new_content)
+
+
+def patch_locator(page_object_path: str, element_constant: str,
+                  new_java_by: str) -> bool:
+    """Swap one locator inside a generated page object (self-healing)."""
+    path = Path(page_object_path)
+    if not path.exists():
+        return False
+    text = path.read_text(encoding="utf-8")
+    pattern = re.compile(
+        r"(LocatorRepository\.register\(\s*" + re.escape(element_constant)
+        + r"\s*,\s*new By\[\]\s*\{)",
+    )
+    match = pattern.search(text)
+    if not match:
+        return False
+    insert_at = match.end()
+    patched = text[:insert_at] + f"\n            {new_java_by}," + text[insert_at:]
+    path.write_text(patched, encoding="utf-8")
+    log.info("Self-heal: promoted %s for %s", new_java_by, element_constant)
+    return True
