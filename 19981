@@ -1,321 +1,233 @@
-"""Compilation Agent bridge — javac against local jars.  NO Maven, NO Gradle.
+"""Transaction Data Templates (Section 7.4).
 
-Mirrors exactly what the office PC does:
-
-    javac -cp "lib/*" -d build $(find src -name "*.java")
-    java  -cp "lib/*:build" com.sbi.automation.runners.Transaction400Runner
-
-Compiler errors are parsed and fed back to the code-generation agents so the
-AI can repair its own output.
+test-data/<ENV>/transaction_<id>.json — one file per transaction per
+environment.  Feature files reference variables; only these files change
+when a value changes (Section 7.5).
 """
 from __future__ import annotations
 
-import os
-import platform
-import re
-import subprocess
-from dataclasses import dataclass, field
+import json
 from pathlib import Path
 from typing import Any, Optional
 
+from ..core import db
 from ..core.config import settings
 from ..core.logging_conf import get_logger
+from ..core.security import get_secret_box, mask_value
+from ..knowledge import repository as repo
 
 log = get_logger(__name__)
 
-_ERROR_RE = re.compile(
-    r"^(?P<file>.+\.java):(?P<line>\d+):\s*(?P<severity>error|warning):\s*(?P<message>.+)$"
-)
+ENVIRONMENTS = ("PREPROD", "UAT", "PROD")
 
 
-def classpath_separator() -> str:
-    return ";" if platform.system().lower().startswith("win") else ":"
+def template_path(transaction_id: str, environment: str) -> Path:
+    directory = settings.framework_testdata_path / environment.upper()
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"transaction_{transaction_id}.json"
 
 
-def build_classpath(extra: list[str] | None = None) -> str:
-    sep = classpath_separator()
-    lib = settings.framework_lib_path
-    parts = [str(lib / "*"), str(settings.framework_build_path)]
-    parts.extend(extra or [])
-    return sep.join(parts)
+def read(transaction_id: str, environment: str) -> dict[str, Any]:
+    path = template_path(transaction_id, environment)
+    if not path.exists():
+        return {"transaction": transaction_id, "environment": environment.upper(),
+                "data": {}}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        log.error("Corrupt test-data file %s: %s", path, exc)
+        return {"transaction": transaction_id, "environment": environment.upper(),
+                "data": {}}
 
 
-@dataclass
-class CompileError:
-    file: str
-    line: int
-    severity: str
-    message: str
+def write(transaction_id: str, environment: str, data: dict[str, Any]) -> str:
+    """Persist the template.  Sensitive values are NOT written in plaintext —
+    the file carries a placeholder and the real value lives encrypted in
+    Postgres (`test_data_values`)."""
+    path = template_path(transaction_id, environment)
+    payload = {
+        "transaction": transaction_id,
+        "environment": environment.upper(),
+        "data": data,
+    }
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    log.info("Test-data template written: %s", path)
+    return str(path)
 
-    @property
-    def class_name(self) -> str:
-        return Path(self.file).stem
 
-
-@dataclass
-class CompileResult:
-    ok: bool
-    returncode: int
-    errors: list[CompileError] = field(default_factory=list)
-    warnings: list[CompileError] = field(default_factory=list)
-    stdout: str = ""
-    stderr: str = ""
-    command: str = ""
-    files_compiled: int = 0
-
-    def summary(self) -> str:
-        if self.ok:
-            return f"Compiled {self.files_compiled} source file(s) successfully."
-        head = "\n".join(
-            f"  {e.file}:{e.line} — {e.message}" for e in self.errors[:15]
-        )
-        return f"{len(self.errors)} compile error(s):\n{head}"
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "ok": self.ok,
-            "returncode": self.returncode,
-            "files_compiled": self.files_compiled,
-            "errors": [e.__dict__ for e in self.errors],
-            "warnings": [w.__dict__ for w in self.warnings],
-            "summary": self.summary(),
-            "command": self.command,
+def scaffold_from_fields(
+    transaction_id: str, environment: str, fields: list[dict[str, Any]]
+) -> str:
+    """Create the template right after a recording is kept."""
+    existing = read(transaction_id, environment).get("data", {})
+    data: dict[str, Any] = {}
+    for meta in fields:
+        name = meta["field"]
+        previous = existing.get(name, {})
+        data[name] = {
+            "value": previous.get("value", ""),
+            "sensitive": bool(meta.get("sensitive")),
+            "datatype": meta.get("datatype"),
+            "required": bool(meta.get("required")),
+            "pattern": meta.get("pattern"),
+            "source": meta.get("source", "user"),
         }
+    return write(transaction_id, environment, data)
 
 
-def _javac() -> str:
-    if settings.java_home:
-        candidate = Path(settings.java_home) / "bin" / settings.javac_bin
-        if candidate.exists() or candidate.with_suffix(".exe").exists():
-            return str(candidate)
-    return settings.javac_bin
-
-
-def _java() -> str:
-    if settings.java_home:
-        candidate = Path(settings.java_home) / "bin" / settings.java_bin
-        if candidate.exists() or candidate.with_suffix(".exe").exists():
-            return str(candidate)
-    return settings.java_bin
-
-
-def java_available() -> dict[str, Any]:
-    info: dict[str, Any] = {"javac": _javac(), "java": _java()}
-    for key in ("javac", "java"):
-        try:
-            proc = subprocess.run(
-                [info[key], "-version"], capture_output=True, text=True, timeout=20
-            )
-            info[f"{key}_version"] = (proc.stderr or proc.stdout).strip().splitlines()[0]
-            info[f"{key}_ok"] = True
-        except Exception as exc:
-            info[f"{key}_ok"] = False
-            info[f"{key}_error"] = str(exc)
-    jars = list(settings.framework_lib_path.glob("*.jar"))
-    info["jars_found"] = len(jars)
-    info["lib_dir"] = str(settings.framework_lib_path)
-    return info
-
-
-def collect_sources(root: Path | None = None) -> list[Path]:
-    src = root or settings.framework_src_path
-    return sorted(src.rglob("*.java"))
-
-
-def _parse(output: str) -> tuple[list[CompileError], list[CompileError]]:
-    errors, warnings = [], []
-    for line in (output or "").splitlines():
-        match = _ERROR_RE.match(line.strip())
-        if not match:
-            continue
-        entry = CompileError(
-            file=match.group("file"),
-            line=int(match.group("line")),
-            severity=match.group("severity"),
-            message=match.group("message").strip(),
-        )
-        (errors if entry.severity == "error" else warnings).append(entry)
-    return errors, warnings
-
-
-def compile_framework(
-    sources: list[Path] | None = None, timeout: int = 600
-) -> CompileResult:
-    """Compile the whole framework (or a subset) into ./build."""
-    files = sources if sources is not None else collect_sources()
-    if not files:
-        return CompileResult(ok=False, returncode=-1,
-                             stderr="No .java sources found under "
-                                    f"{settings.framework_src_path}")
-    build_dir = settings.framework_build_path
-    build_dir.mkdir(parents=True, exist_ok=True)
-
-    argfile = build_dir / "sources.txt"
-    argfile.write_text(
-        "\n".join(str(f) for f in files), encoding="utf-8"
-    )
-
-    command = [
-        _javac(),
-        "-nowarn",
-        "-encoding", "UTF-8",
-        "-cp", build_classpath(),
-        "-d", str(build_dir),
-        f"@{argfile}",
-    ]
-    log.info("Compiling %d source file(s) with local jars", len(files))
-    try:
-        proc = subprocess.run(
-            command, capture_output=True, text=True, timeout=timeout,
-            cwd=str(settings.framework_root_path),
-        )
-    except FileNotFoundError as exc:
-        return CompileResult(ok=False, returncode=-1, stderr=str(exc),
-                             command=" ".join(command))
-    except subprocess.TimeoutExpired:
-        return CompileResult(ok=False, returncode=-2,
-                             stderr=f"javac timed out after {timeout}s",
-                             command=" ".join(command))
-
-    errors, warnings = _parse(proc.stderr + "\n" + proc.stdout)
-    return CompileResult(
-        ok=proc.returncode == 0,
-        returncode=proc.returncode,
-        errors=errors,
-        warnings=warnings,
-        stdout=proc.stdout,
-        stderr=proc.stderr,
-        command=" ".join(command),
-        files_compiled=len(files),
-    )
-
-
-def _build_fingerprint(files: list[Path]) -> str:
-    """Cheap change-detection over a set of source files (path+mtime+size)."""
-    import hashlib
-    h = hashlib.sha256()
-    for f in files:
-        try:
-            stat = f.stat()
-            h.update(f"{f}:{stat.st_mtime_ns}:{stat.st_size}".encode())
-        except OSError:
-            h.update(f"{f}:MISSING".encode())
-    return h.hexdigest()
-
-
-def _fingerprint_path() -> Path:
-    return settings.framework_build_path / ".compile_fingerprint"
-
-
-def _is_build_up_to_date(files: list[Path]) -> bool:
-    fp_file = _fingerprint_path()
-    if not fp_file.exists():
-        return False
-    build_dir = settings.framework_build_path
-    if not build_dir.exists() or not any(build_dir.rglob("*.class")):
-        return False  # build/ was cleaned but the fingerprint survived
-    try:
-        stored = fp_file.read_text(encoding="utf-8").strip()
-    except OSError:
-        return False
-    return bool(stored) and stored == _build_fingerprint(files)
-
-
-def _write_build_fingerprint(files: list[Path]) -> None:
-    try:
-        _fingerprint_path().write_text(_build_fingerprint(files), encoding="utf-8")
-    except OSError:
-        pass
-
-
-def compile_transaction(transaction_id: str) -> CompileResult:
-    """Compile only what a transaction needs — faster feedback loop.
-
-    A recorded transaction shouldn't need Java rebuilt on every single
-    execution — only when its generated code (or the shared core/utils/
-    hooks) actually changed since the last successful compile. Skips
-    javac entirely when the fingerprint of all wanted source files matches
-    the last successful build.
-    """
-    src = settings.framework_src_path
-    wanted: list[Path] = []
-    wanted.extend((src / "com" / "sbi" / "automation" / "core").rglob("*.java"))
-    wanted.extend((src / "com" / "sbi" / "automation" / "utils").rglob("*.java"))
-    wanted.extend((src / "com" / "sbi" / "automation" / "hooks").rglob("*.java"))
-    for folder in ("pages", "steps", "runners"):
-        wanted.extend(
-            p for p in (src / "com" / "sbi" / "automation" / folder).rglob("*.java")
-        )
-    files = sorted(set(wanted))
-
-    if _is_build_up_to_date(files):
-        log.info("Framework build is up to date (%d files unchanged) — "
-                  "skipping recompile", len(files))
-        return CompileResult(ok=True, returncode=0, files_compiled=len(files),
-                             stdout="(skipped — build up to date)")
-
-    result = compile_framework(files)
-    if result.ok:
-        _write_build_fingerprint(files)
-    return result
-
-
-def run_runner(
-    runner_fqn: str,
-    args: list[str] | None = None,
-    timeout: int = 3600,
-    env: dict[str, str] | None = None,
+# ── DB-backed values (sensitive ones encrypted) ─────────────────────────
+def save_values(
+    transaction_id: str,
+    environment: str,
+    values: list[dict[str, Any]],
+    profile_pk: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Launch a pure-Java runner.  This is how Java executes (Section 2)."""
-    command = [
-        _java(),
-        "-cp", build_classpath(),
-        runner_fqn,
-        *(args or []),
-    ]
-    process_env = {**os.environ, **(env or {})}
-    log.info("Launching runner %s", runner_fqn)
-    try:
-        proc = subprocess.run(
-            command, capture_output=True, text=True, timeout=timeout,
-            cwd=str(settings.framework_root_path), env=process_env,
+    box = get_secret_box()
+    file_data = read(transaction_id, environment).get("data", {})
+    saved = 0
+    for item in values:
+        field = item["field"]
+        raw = item.get("value", "")
+        sensitive = bool(item.get("sensitive"))
+        db.execute(
+            """
+            INSERT INTO test_data_values
+              (profile_pk, transaction_id, environment, field, value_plain,
+               value_encrypted, sensitive, source)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (profile_pk, transaction_id, environment, field)
+            DO UPDATE SET value_plain=EXCLUDED.value_plain,
+                          value_encrypted=EXCLUDED.value_encrypted,
+                          sensitive=EXCLUDED.sensitive,
+                          source=EXCLUDED.source,
+                          updated_at=now()
+            """,
+            (profile_pk, transaction_id, environment.upper(), field,
+             None if sensitive else raw,
+             box.encrypt(raw) if sensitive else None,
+             sensitive, item.get("source", "user")),
         )
+        entry = file_data.get(field, {})
+        entry.update({
+            "value": "__ENCRYPTED__" if sensitive else raw,
+            "sensitive": sensitive,
+            "source": item.get("source", "user"),
+        })
+        file_data[field] = entry
+        saved += 1
+    path = write(transaction_id, environment, file_data)
+    return {"saved": saved, "file": path}
+
+
+def resolve_values(
+    transaction_id: str, environment: str, profile_pk: Optional[int] = None
+) -> dict[str, str]:
+    """Return decrypted, ready-to-inject values."""
+    box = get_secret_box()
+    rows = db.query(
+        """
+        SELECT field, value_plain, value_encrypted, sensitive
+        FROM test_data_values
+        WHERE transaction_id=%s AND environment=%s
+          AND (profile_pk = %s OR profile_pk IS NULL)
+        ORDER BY (profile_pk IS NULL)
+        """,
+        (transaction_id, environment.upper(), profile_pk),
+    )
+    out: dict[str, str] = {}
+    for row in rows:
+        if row["field"] in out:
+            continue
+        out[row["field"]] = (
+            box.decrypt(row["value_encrypted"]) if row["sensitive"]
+            else (row["value_plain"] or "")
+        )
+    # fall back to plaintext entries in the JSON file
+    for field, entry in read(transaction_id, environment).get("data", {}).items():
+        if field not in out and entry.get("value") not in (None, "", "__ENCRYPTED__"):
+            out[field] = str(entry["value"])
+    return out
+
+
+def editor_view(
+    transaction_id: str, environment: str, profile_pk: Optional[int] = None
+) -> dict[str, Any]:
+    """What the frontend Test Data Editor renders (Section 7.8).
+
+    Scoped to the CURRENT version of the transaction only (same "active,
+    else most recently recorded" resolution used everywhere else via
+    repository.get_transaction()) — joining on transaction_id alone would
+    pull in one row per historical version (v1.0, v2.0, v3.0, ...) for any
+    field whose name/pattern hasn't changed across versions, which is
+    exactly why the editor was showing 2-3 identical-looking rows for what
+    is really a single field.
+    """
+    txn = repo.get_transaction(transaction_id)
+    if not txn:
         return {
-            "ok": proc.returncode == 0,
-            "returncode": proc.returncode,
-            "stdout": proc.stdout[-40000:],
-            "stderr": proc.stderr[-40000:],
-            "command": " ".join(command),
+            "transaction_id": transaction_id, "environment": environment.upper(),
+            "file": str(template_path(transaction_id, environment)), "fields": [],
         }
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "returncode": -2,
-                "stderr": f"Runner timed out after {timeout}s",
-                "command": " ".join(command)}
-    except FileNotFoundError as exc:
-        return {"ok": False, "returncode": -1, "stderr": str(exc),
-                "command": " ".join(command)}
+    metas = db.query(
+        "SELECT * FROM test_data_fields WHERE transaction_pk=%s ORDER BY id",
+        (txn["id"],),
+    )
+    values = resolve_values(transaction_id, environment, profile_pk)
+    fields = []
+    for meta in metas:
+        raw = values.get(meta["field"], "")
+        fields.append({
+            "field": meta["field"],
+            "datatype": meta["datatype"],
+            "required": meta["required"],
+            "pattern": meta["pattern"],
+            "business_meaning": meta["business_meaning"],
+            "sensitive": meta["sensitive"],
+            "editable": meta["editable"],
+            "source": meta["source"],
+            "options": (meta.get("source_config") or {}).get("options"),
+            "value": mask_value(raw) if meta["sensitive"] else raw,
+            "has_value": bool(raw),
+        })
+    return {
+        "transaction_id": transaction_id,
+        "environment": environment.upper(),
+        "file": str(template_path(transaction_id, environment)),
+        "fields": fields,
+    }
 
 
-def errors_for_prompt(result: CompileResult, max_errors: int = 12) -> str:
-    """Format compiler errors for the code-generation agent to repair."""
-    if result.ok:
-        return ""
-    lines = []
-    for error in result.errors[:max_errors]:
-        source = Path(error.file)
-        context = ""
-        if source.exists():
-            try:
-                all_lines = source.read_text(encoding="utf-8",
-                                             errors="ignore").splitlines()
-                start = max(0, error.line - 4)
-                context = "\n".join(
-                    f"{n + 1:>5}| {all_lines[n]}"
-                    for n in range(start, min(len(all_lines), error.line + 2))
-                )
-            except OSError:
-                context = ""
-        lines.append(
-            f"FILE: {error.file}\nLINE {error.line}: {error.message}\n{context}"
+def save_field_metadata(transaction_pk: int, fields: list[dict[str, Any]]) -> int:
+    for meta in fields:
+        db.execute(
+            """
+            INSERT INTO test_data_fields
+              (transaction_pk, field, datatype, required, pattern,
+               business_meaning, sensitive, editable, source, source_config,
+               element_key)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+            ON CONFLICT (transaction_pk, field) DO UPDATE SET
+              datatype=EXCLUDED.datatype, required=EXCLUDED.required,
+              pattern=EXCLUDED.pattern,
+              business_meaning=EXCLUDED.business_meaning,
+              sensitive=EXCLUDED.sensitive, editable=EXCLUDED.editable,
+              source=EXCLUDED.source, source_config=EXCLUDED.source_config,
+              element_key=EXCLUDED.element_key
+            """,
+            (transaction_pk, meta["field"], meta.get("datatype"),
+             meta.get("required", False), meta.get("pattern"),
+             meta.get("business_meaning"), meta.get("sensitive", False),
+             meta.get("editable", True), meta.get("source", "user"),
+             db.jsonb(meta.get("source_config", {})), meta.get("element_key")),
         )
-    return "\n\n".join(lines)
+    return len(fields)
+
+
+def get_field_metadata(transaction_id: str) -> list[dict[str, Any]]:
+    txn = repo.get_transaction(transaction_id)
+    if not txn:
+        return []
+    return db.query(
+        "SELECT * FROM test_data_fields WHERE transaction_pk=%s ORDER BY id",
+        (txn["id"],),
+    )
