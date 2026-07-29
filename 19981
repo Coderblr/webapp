@@ -1,247 +1,503 @@
-"""Pydantic contracts shared by the API layer and the agents."""
+"""Knowledge Repository — the permanent, growing memory of the platform.
+
+Everything the platform ever learns lands here: recordings, elements,
+locators, workflows, validation rules, execution outcomes and AI decisions.
+Nothing is ever overwritten — new knowledge becomes a new version
+(Section 5.10).
+"""
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Literal, Optional
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from ..core import db, vectorstore
+from ..core.config import settings
+from ..core.logging_conf import get_logger
 
-Environment = Literal["PREPROD", "UAT", "PROD"]
-TransactionType = Literal["business", "system_prerequisite", "system_cleanup"]
-DataSource = Literal["framework", "profile", "runtime", "database", "api", "ai", "user"]
-
-
-# ── recorder ────────────────────────────────────────────────────────────
-class RecordingStartRequest(BaseModel):
-    transaction_id: str = Field(..., examples=["1045"])
-    transaction_name: str = Field(..., examples=["CIF Creation"])
-    environment: Environment = "PREPROD"
-    start_url: str
-    transaction_type: TransactionType = "business"
-    description: Optional[str] = None
-    fullpage_crawl: bool = True
-    capture_network: bool = True
+log = get_logger(__name__)
 
 
-class RecordingSession(BaseModel):
-    session_uid: str
-    transaction_id: str
-    transaction_name: Optional[str] = None
-    environment: Optional[str] = None
-    status: str
-    start_url: Optional[str] = None
-    capture_dir: Optional[str] = None
-    stats: dict[str, Any] = {}
-    started_at: Optional[datetime] = None
-    stopped_at: Optional[datetime] = None
+# ── transactions ────────────────────────────────────────────────────────
+def create_transaction(
+    transaction_id: str,
+    name: str,
+    version: str = "1.0",
+    transaction_type: str = "business",
+    description: str | None = None,
+    status: str = "draft",
+    knowledge_json: dict[str, Any] | None = None,
+    workflow_path: list[Any] | None = None,
+    knowledge_dir: str | None = None,
+    tags: list[str] | None = None,
+) -> dict[str, Any]:
+    row = db.insert_returning(
+        """
+        INSERT INTO transactions
+          (transaction_id, name, description, version, type, status,
+           knowledge_json, workflow_path, knowledge_dir, tags, recorded_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s)
+        ON CONFLICT (transaction_id, version) DO UPDATE SET
+          name=EXCLUDED.name, description=EXCLUDED.description,
+          status=EXCLUDED.status, knowledge_json=EXCLUDED.knowledge_json,
+          workflow_path=EXCLUDED.workflow_path,
+          knowledge_dir=EXCLUDED.knowledge_dir, tags=EXCLUDED.tags
+        RETURNING *
+        """,
+        (transaction_id, name, description, version, transaction_type, status,
+         db.jsonb(knowledge_json or {}), db.jsonb(workflow_path or []),
+         knowledge_dir, tags or [], datetime.now(timezone.utc)),
+    )
+    log.info("Transaction %s v%s stored (%s)", transaction_id, version, status)
+    return row or {}
 
 
-class RecordedActionOut(BaseModel):
-    sequence: int
-    action: str
-    element_key: Optional[str] = None
-    field_name: Optional[str] = None
-    value_ref: Optional[str] = None
-    page_key: Optional[str] = None
-    screenshot_after: Optional[str] = None
+def next_version(transaction_id: str) -> str:
+    row = db.query_one(
+        "SELECT version FROM transactions WHERE transaction_id=%s"
+        " ORDER BY created_at DESC LIMIT 1",
+        (transaction_id,),
+    )
+    if not row:
+        return "1.0"
+    try:
+        major, _, minor = str(row["version"]).partition(".")
+        return f"{int(major) + 1}.0"
+    except Exception:
+        return "1.0"
 
 
-class KeepDiscardRequest(BaseModel):
-    session_uid: str
-    decision: Literal["keep", "discard"]
-    reason: Optional[str] = None
-    generate_code: bool = True
+def get_transaction(
+    transaction_id: str, version: str | None = None
+) -> Optional[dict[str, Any]]:
+    if not db.available():
+        return None
+    if version:
+        return db.query_one(
+            "SELECT * FROM transactions WHERE transaction_id=%s AND version=%s",
+            (transaction_id, version),
+        )
+    return db.query_one(
+        """
+        SELECT * FROM transactions
+        WHERE transaction_id=%s
+        ORDER BY (status='active') DESC, created_at DESC
+        LIMIT 1
+        """,
+        (transaction_id,),
+    )
 
 
-# ── transactions / knowledge ────────────────────────────────────────────
-class TransactionOut(BaseModel):
-    id: int
-    transaction_id: str
-    name: str
-    description: Optional[str] = None
-    version: str
-    type: str
-    status: str
-    confidence: float = 1.0
-    tags: list[str] = []
-    workflow_path: list[Any] = []
-    generated_files: dict[str, Any] = {}
-    recorded_at: Optional[datetime] = None
-    created_at: Optional[datetime] = None
+def list_transactions(
+    status: str | None = None, transaction_type: str | None = None
+) -> list[dict[str, Any]]:
+    clauses, params = ["TRUE"], []
+    if status:
+        clauses.append("status=%s")
+        params.append(status)
+    if transaction_type:
+        clauses.append("type=%s")
+        params.append(transaction_type)
+    return db.query(
+        f"SELECT * FROM transactions WHERE {' AND '.join(clauses)}"
+        " ORDER BY transaction_id, created_at DESC",
+        params,
+    )
 
 
-class ElementOut(BaseModel):
-    element_key: str
-    tag: Optional[str] = None
-    element_type: Optional[str] = None
-    label: Optional[str] = None
-    visible: bool = True
-    enabled: bool = True
-    interacted: bool = False
-    locators: list[dict[str, Any]] = []
+def list_versions(transaction_id: str) -> list[dict[str, Any]]:
+    return db.query(
+        "SELECT id, version, build, status, confidence, recorded_at, created_at"
+        " FROM transactions WHERE transaction_id=%s ORDER BY created_at DESC",
+        (transaction_id,),
+    )
 
 
-# ── test data ───────────────────────────────────────────────────────────
-class TestDataFieldMeta(BaseModel):
-    field: str
-    datatype: Optional[str] = None
-    required: bool = False
-    pattern: Optional[str] = None
-    business_meaning: Optional[str] = None
-    sensitive: bool = False
-    editable: bool = True
-    source: DataSource = "user"
-    source_config: dict[str, Any] = {}
-    element_key: Optional[str] = None
+def set_status(transaction_pk: int, status: str) -> None:
+    db.execute("UPDATE transactions SET status=%s WHERE id=%s", (status, transaction_pk))
 
 
-class TestDataValueIn(BaseModel):
-    field: str
-    value: str
-    sensitive: bool = False
-    source: DataSource = "user"
+def activate_version(transaction_id: str, version: str) -> None:
+    """Exactly one active version per transaction."""
+    db.execute(
+        "UPDATE transactions SET status='superseded'"
+        " WHERE transaction_id=%s AND status='active'",
+        (transaction_id,),
+    )
+    db.execute(
+        "UPDATE transactions SET status='active'"
+        " WHERE transaction_id=%s AND version=%s",
+        (transaction_id, version),
+    )
 
 
-class TestDataSaveRequest(BaseModel):
-    transaction_id: str
-    environment: Environment
-    profile: Optional[str] = None
-    values: list[TestDataValueIn]
+def set_generated_files(transaction_pk: int, files: dict[str, Any]) -> None:
+    db.execute(
+        "UPDATE transactions SET generated_files=%s::jsonb WHERE id=%s",
+        (db.jsonb(files), transaction_pk),
+    )
 
 
-class TestDataTemplateOut(BaseModel):
-    transaction: str
-    environment: str
-    data: dict[str, dict[str, Any]]
-    file_path: Optional[str] = None
+def system_prerequisites() -> list[dict[str, Any]]:
+    """Transactions auto-attached to every execution (e.g. 9750)."""
+    return db.query(
+        "SELECT * FROM transactions WHERE type='system_prerequisite'"
+        " AND status='active' ORDER BY transaction_id"
+    )
 
 
-class ManualLocatorRequest(BaseModel):
-    strategy: str            # id | name | css | xpath | data | aria | text ...
-    value: str
-    priority: int = 1        # 1 = tried first, ahead of the recorder's own locators
+# ── pages / elements / locators ─────────────────────────────────────────
+def save_page(transaction_pk: int, page: dict[str, Any]) -> int:
+    row = db.insert_returning(
+        """
+        INSERT INTO pages (transaction_pk, page_key, title, url, sequence,
+                           dom_ref, screenshot_ref, frames, shadow_roots, meta)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb)
+        RETURNING id
+        """,
+        (transaction_pk, page.get("page_key"), page.get("title"), page.get("url"),
+         page.get("sequence", 0), page.get("dom_ref"), page.get("screenshot_ref"),
+         db.jsonb(page.get("frames", [])), db.jsonb(page.get("shadow_roots", [])),
+         db.jsonb(page.get("meta", {}))),
+    )
+    return int((row or {}).get("id", 0))
 
 
-class ProfileIn(BaseModel):
-    name: str
-    environment: Environment
-    description: Optional[str] = None
-    values: dict[str, str] = {}
-    secrets: dict[str, str] = {}   # teller_id, teller_password, checker_id, ...
+def add_manual_locator(
+    transaction_id: str,
+    element_key: str,
+    strategy: str,
+    value: str,
+    priority: int = 1,
+    reliability: float = 0.99,
+    tag: str = "input",
+    element_type: str = "textbox",
+    label: str | None = None,
+    page_key: str | None = None,
+    action: str | None = None,
+) -> dict[str, Any]:
+    """Manually attach a locator to an element — creating it if the
+    recorder never captured it at all.
+
+    Two real cases this covers:
+    1. The element exists (recorder found it, but its own locators are
+       unreliable) — the manual locator is inserted at top priority,
+       existing fallbacks kept.
+    2. The element does NOT exist (the recorder's crawl never triggered
+       whatever revealed it — a toggle/icon, a hidden panel, etc.) — the
+       element AND a matching recorded_actions entry are created from
+       scratch, using the given locator, so codegen actually generates a
+       step for it (codegen only turns recorded ACTIONS into steps, not
+       raw elements — an element with no action is invisible to codegen).
+    """
+    txn = get_transaction(transaction_id)
+    if not txn:
+        raise ValueError(f"transaction {transaction_id} not found")
+
+    element = get_element_by_key(txn["id"], element_key)
+    created = False
+    if not element:
+        page_key = page_key or (element_key.split("::")[0] if "::" in element_key else "page")
+        element_pk = save_element(txn["id"], None, {
+            "element_key": element_key, "tag": tag, "element_type": element_type,
+            "label": label or element_key.split("::")[-1], "interacted": True,
+            "locators": [],
+        })
+        element = get_element_by_key(txn["id"], element_key)
+        created = True
+
+        existing_actions = get_actions(txn["id"])
+        if not any(a.get("element_key") == element_key for a in existing_actions):
+            save_actions(txn["id"], [{
+                "sequence": len(existing_actions),
+                "action": action or ("type" if element_type == "textbox" else "click"),
+                "element_key": element_key,
+                "field_name": label or element_key.split("::")[-1],
+                "value_ref": naming_variable(label or element_key.split("::")[-1]),
+                "page_key": page_key,
+            }])
+
+    db.execute(
+        """
+        INSERT INTO locators (element_pk, transaction_pk, strategy, value,
+                              priority, reliability_score)
+        VALUES (%s,%s,%s,%s,%s,%s)
+        """,
+        (element["id"], txn["id"], strategy, value, priority, reliability),
+    )
+    return {
+        "element_key": element_key, "strategy": strategy, "value": value,
+        "priority": priority, "element_created": created,
+    }
 
 
-class ProfileOut(BaseModel):
-    id: int
-    name: str
-    environment: str
-    description: Optional[str] = None
-    values: dict[str, Any] = {}
-    secret_keys: list[str] = []    # names only, never values
+def naming_variable(text: str) -> str:
+    """<VariableName> style, matching backend/codegen/generator.py's
+    convention — used when a manual locator has to synthesize a fresh
+    recorded_actions row from scratch."""
+    cleaned = "".join(
+        part.capitalize()
+        for part in "".join(ch if ch.isalnum() else " " for ch in (text or "field")).split()
+    )
+    return cleaned or "Field"
 
 
-# ── execution ───────────────────────────────────────────────────────────
-class ExecutionRequest(BaseModel):
-    transaction_id: str
-    environment: Environment = "PREPROD"
-    profile: str
-    target_url: Optional[str] = None
-    runtime_values: dict[str, str] = {}
-    skip_password_change: bool = False    # audit-logged override
-    skip_teller_reset: bool = False       # audit-logged override
-    headless: bool = False
+def save_element(transaction_pk: int, page_pk: int | None, element: dict[str, Any]) -> int:
+    row = db.insert_returning(
+        """
+        INSERT INTO elements (transaction_pk, page_pk, element_key, tag,
+                              element_type, label, visible, enabled,
+                              interacted, element_meta)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+        RETURNING id
+        """,
+        (transaction_pk, page_pk, element.get("element_key"), element.get("tag"),
+         element.get("element_type"), element.get("label"),
+         element.get("visible", True), element.get("enabled", True),
+         element.get("interacted", False), db.jsonb(element.get("meta", {}))),
+    )
+    element_pk = int((row or {}).get("id", 0))
+    save_locators(transaction_pk, element_pk, element.get("locators", []))
+    return element_pk
 
 
-class ExecutionStepOut(BaseModel):
-    sequence: int
-    phase: str
-    step_name: str
-    status: str
-    duration_ms: Optional[int] = None
-    screenshot_ref: Optional[str] = None
-    error_msg: Optional[str] = None
-    detail: dict[str, Any] = {}
+def save_locators(
+    transaction_pk: int, element_pk: int, locators: list[dict[str, Any]]
+) -> None:
+    db.executemany(
+        """
+        INSERT INTO locators (element_pk, transaction_pk, strategy, value,
+                              priority, reliability_score)
+        VALUES (%s,%s,%s,%s,%s,%s)
+        """,
+        [
+            (element_pk, transaction_pk, loc.get("strategy"), loc.get("value"),
+             loc.get("priority", 100), loc.get("reliability", 0.5))
+            for loc in locators
+            if loc.get("strategy") and loc.get("value")
+        ],
+    )
 
 
-class ExecutionOut(BaseModel):
-    execution_uid: str
-    transaction_id: str
-    environment: str
-    status: str
-    password_change_status: Optional[str] = None
-    teller_reset_status: Optional[str] = None
-    teller_reset_response: Optional[str] = None
-    report_path: Optional[str] = None
-    error_summary: Optional[str] = None
-    metrics: dict[str, Any] = {}
-    started_at: Optional[datetime] = None
-    finished_at: Optional[datetime] = None
-    steps: list[ExecutionStepOut] = []
+def get_elements(transaction_pk: int, only_interacted: bool = False) -> list[dict[str, Any]]:
+    clause = " AND interacted = TRUE" if only_interacted else ""
+    elements = db.query(
+        f"SELECT * FROM elements WHERE transaction_pk=%s{clause} ORDER BY id",
+        (transaction_pk,),
+    )
+    for element in elements:
+        element["locators"] = db.query(
+            "SELECT strategy, value, priority, reliability_score, active"
+            " FROM locators WHERE element_pk=%s AND active"
+            " ORDER BY priority, reliability_score DESC",
+            (element["id"],),
+        )
+    return elements
 
 
-# ── BRD ─────────────────────────────────────────────────────────────────
-class BRDImpact(BaseModel):
-    transaction_id: str
-    transaction_name: Optional[str] = None
-    change_type: Literal[
-        "new_transaction", "workflow_change", "field_change",
-        "validation_change", "locator_change", "no_change"
-    ]
-    affected_screens: list[str] = []
-    affected_fields: list[str] = []
-    requires_recording: bool = False
-    risk: Literal["low", "medium", "high"] = "medium"
-    rationale: str = ""
-    proposed_changes: list[str] = []
+def get_element_by_key(transaction_pk: int, element_key: str) -> Optional[dict[str, Any]]:
+    element = db.query_one(
+        "SELECT * FROM elements WHERE transaction_pk=%s AND element_key=%s",
+        (transaction_pk, element_key),
+    )
+    if element:
+        element["locators"] = db.query(
+            "SELECT * FROM locators WHERE element_pk=%s AND active"
+            " ORDER BY priority, reliability_score DESC",
+            (element["id"],),
+        )
+    return element
 
 
-class BRDAnalysisOut(BaseModel):
-    brd_id: int
-    filename: str
-    status: str
-    summary: str = ""
-    impacts: list[BRDImpact] = []
+def record_locator_outcome(locator_pk: int, success: bool) -> None:
+    """Continuous learning: locators that work get promoted."""
+    column = "success_count" if success else "failure_count"
+    db.execute(
+        f"""
+        UPDATE locators
+        SET {column} = {column} + 1,
+            last_used_at = now(),
+            reliability_score = LEAST(0.999, GREATEST(0.001,
+                (success_count + %s)::numeric /
+                NULLIF(success_count + failure_count + 1, 0)))
+        WHERE id = %s
+        """,
+        (1 if success else 0, locator_pk),
+    )
 
 
-# ── approvals / self-heal ───────────────────────────────────────────────
-class ApprovalDecision(BaseModel):
-    thread_id: str
-    approval_type: Literal["recording_keep", "codegen", "self_heal"]
-    decision: Literal["approved", "rejected", "discarded"]
-    decided_by: Optional[str] = None
-    notes: Optional[str] = None
+# ── actions / validation ────────────────────────────────────────────────
+def save_actions(transaction_pk: int, actions: list[dict[str, Any]]) -> None:
+    db.executemany(
+        """
+        INSERT INTO recorded_actions
+          (transaction_pk, sequence, action, element_key, field_name, value_ref,
+           page_key, dom_before_ref, dom_after_ref, screenshot_before,
+           screenshot_after, network_ref, meta)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+        """,
+        [
+            (transaction_pk, a.get("sequence", i), a.get("action"),
+             a.get("element_key"), a.get("field_name"), a.get("value_ref"),
+             a.get("page_key"), a.get("dom_before_ref"), a.get("dom_after_ref"),
+             a.get("screenshot_before"), a.get("screenshot_after"),
+             a.get("network_ref"), db.jsonb(a.get("meta", {})))
+            for i, a in enumerate(actions)
+        ],
+    )
 
 
-class SelfHealEntry(BaseModel):
-    element_key: str
-    old_locator: str
-    new_locator: str
-    strategy: str
-    confidence: float
-    reason: str
-    applied: bool = False
+def get_actions(transaction_pk: int) -> list[dict[str, Any]]:
+    return db.query(
+        "SELECT * FROM recorded_actions WHERE transaction_pk=%s ORDER BY sequence",
+        (transaction_pk,),
+    )
 
 
-# ── secrets ─────────────────────────────────────────────────────────────
-class SecretIn(BaseModel):
-    scope: Literal["global", "profile", "environment"] = "profile"
-    scope_ref: Optional[str] = None
-    key: Literal[
-        "teller_id", "teller_password", "teller_new_password",
-        "checker_id", "checker_password", "cbs_reset_string",
-    ]
-    value: str
+def save_validation_rules(transaction_pk: int, rules: list[dict[str, Any]]) -> None:
+    db.executemany(
+        """
+        INSERT INTO validation_rules
+          (transaction_pk, field_name, rule_type, expression, message_text,
+           severity, meta)
+        VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb)
+        """,
+        [
+            (transaction_pk, r.get("field_name"), r.get("rule_type"),
+             r.get("expression"), r.get("message_text"),
+             r.get("severity", "error"), db.jsonb(r.get("meta", {})))
+            for r in rules
+        ],
+    )
 
 
-class SecretOut(BaseModel):
-    scope: str
-    scope_ref: Optional[str] = None
-    key: str
-    hint: str
-    updated_at: Optional[datetime] = None
+def get_validation_rules(transaction_pk: int) -> list[dict[str, Any]]:
+    return db.query(
+        "SELECT * FROM validation_rules WHERE transaction_pk=%s ORDER BY id",
+        (transaction_pk,),
+    )
 
 
-# ── generic ─────────────────────────────────────────────────────────────
-class Ack(BaseModel):
-    ok: bool = True
-    message: str = ""
-    data: dict[str, Any] = {}
+# ── AI decisions (continuous learning) ──────────────────────────────────
+def log_decision(
+    agent: str,
+    decision: str,
+    context_type: str | None = None,
+    transaction_id: str | None = None,
+    prompt_summary: str | None = None,
+    rationale: str | None = None,
+    confidence: float | None = None,
+    outcome: str = "unknown",
+    meta: dict[str, Any] | None = None,
+) -> int:
+    row = db.insert_returning(
+        """
+        INSERT INTO ai_decisions
+          (agent, context_type, transaction_id, prompt_summary, decision,
+           rationale, confidence, outcome, meta)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+        RETURNING id
+        """,
+        (agent, context_type, transaction_id, (prompt_summary or "")[:2000],
+         (decision or "")[:4000], rationale, confidence, outcome,
+         db.jsonb(meta or {})),
+    )
+    return int((row or {}).get("id", 0))
+
+
+def update_decision_outcome(decision_id: int, outcome: str) -> None:
+    db.execute("UPDATE ai_decisions SET outcome=%s WHERE id=%s", (outcome, decision_id))
+
+
+def past_decisions(
+    transaction_id: str | None = None, agent: str | None = None, limit: int = 20
+) -> list[dict[str, Any]]:
+    clauses, params = ["TRUE"], []
+    if transaction_id:
+        clauses.append("transaction_id=%s")
+        params.append(transaction_id)
+    if agent:
+        clauses.append("agent=%s")
+        params.append(agent)
+    return db.query(
+        f"SELECT * FROM ai_decisions WHERE {' AND '.join(clauses)}"
+        " ORDER BY created_at DESC LIMIT %s",
+        (*params, limit),
+    )
+
+
+# ── knowledge package on disk (Section 16) ──────────────────────────────
+def knowledge_dir(transaction_id: str, version: str) -> Path:
+    path = settings.knowledge_path / f"transaction_{transaction_id}" / f"v{version}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def write_package_file(
+    transaction_id: str, version: str, filename: str, payload: Any
+) -> str:
+    target = knowledge_dir(transaction_id, version) / filename
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(payload, (dict, list)):
+        target.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+    else:
+        target.write_text(str(payload), encoding="utf-8")
+    return str(target)
+
+
+def read_package_file(transaction_id: str, version: str, filename: str) -> Any:
+    target = knowledge_dir(transaction_id, version) / filename
+    if not target.exists():
+        return None
+    text = target.read_text(encoding="utf-8")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def embed_transaction_knowledge(transaction_pk: int, transaction_id: str) -> int:
+    """Push a transaction's knowledge into the vector store for RAG."""
+    if not settings.llm_configured:
+        return 0
+    docs: list[dict[str, Any]] = []
+    for element in get_elements(transaction_pk):
+        locators = "; ".join(
+            f"{loc['strategy']}={loc['value']}" for loc in element.get("locators", [])[:8]
+        )
+        docs.append({
+            "namespace": "element",
+            "ref_type": "element",
+            "ref_id": str(element["id"]),
+            "transaction_id": transaction_id,
+            "content": (
+                f"Element {element['element_key']} ({element.get('element_type')}) "
+                f"label='{element.get('label')}' tag={element.get('tag')} "
+                f"visible={element.get('visible')} enabled={element.get('enabled')}\n"
+                f"Locators: {locators}"
+            ),
+            "meta": {"element_key": element["element_key"]},
+        })
+    actions = get_actions(transaction_pk)
+    if actions:
+        docs.append({
+            "namespace": "workflow",
+            "ref_type": "workflow",
+            "ref_id": str(transaction_pk),
+            "transaction_id": transaction_id,
+            "content": "Workflow for transaction " + transaction_id + ":\n" + "\n".join(
+                f"{a['sequence']}. {a['action']} {a.get('element_key') or ''} "
+                f"{a.get('field_name') or ''}".strip()
+                for a in actions
+            ),
+            "meta": {},
+        })
+    try:
+        return vectorstore.upsert_many(docs)
+    except Exception as exc:
+        log.warning("Knowledge embedding failed: %s", exc)
+        return 0
