@@ -1,284 +1,151 @@
-"""Self-Healing Engine (Section 12).
+package com.sbi.automation.core;
 
-On any locator / UI / message failure:
-  1. attempt AI repair from the multi-locator repository + DOM diff against
-     the last known-good version
-  2. write the fix back into the knowledge repository (continuous learning —
-     never repeat the same failure twice)
-  3. only if confidence stays below threshold → flag for re-recording, with
-     the reason spelled out in the report
-"""
-from __future__ import annotations
+import java.time.Duration;
+import java.util.List;
 
-import re
-from typing import Any, Optional
+import org.openqa.selenium.By;
+import org.openqa.selenium.JavascriptExecutor;
+import org.openqa.selenium.NoSuchElementException;
+import org.openqa.selenium.OutputType;
+import org.openqa.selenium.TakesScreenshot;
+import org.openqa.selenium.WebDriver;
+import org.openqa.selenium.WebElement;
+import org.openqa.selenium.support.ui.ExpectedConditions;
+import org.openqa.selenium.support.ui.Select;
+import org.openqa.selenium.support.ui.WebDriverWait;
 
-from ..codegen import generator, naming
-from ..core import db
-from ..core.config import settings
-from ..core.logging_conf import get_logger
-from ..knowledge import rag, repository as repo, versioning
-from ..recorder import locator_builder
+import com.sbi.automation.utils.ExecutionContext;
+import com.sbi.automation.utils.LocatorRepository;
 
-log = get_logger(__name__)
+/**
+ * Base class for every generated Page Object.
+ *
+ * The key method is {@link #findWithFallback(String)} — it walks the ranked
+ * locator list produced by the recorder, so a UI tweak does not fail the run
+ * and the platform can self-heal instead of demanding a re-recording.
+ */
+public abstract class BasePage {
 
-_LOCATOR_FAILURE = re.compile(
-    r"NoSuchElementException|ElementNotInteractable|StaleElementReference|"
-    r"TimeoutException|Unable to locate element",
-    re.I,
-)
-_MESSAGE_FAILURE = re.compile(
-    r"expected .* but (found|was)|AssertionError|ComparisonFailure", re.I
-)
+    protected final WebDriver driver;
+    protected final WebDriverWait wait;
+    protected final WebDriverWait shortWait;
 
-
-def classify_failure(error_text: str) -> str:
-    if not error_text:
-        return "unknown"
-    if _LOCATOR_FAILURE.search(error_text):
-        return "locator"
-    if _MESSAGE_FAILURE.search(error_text):
-        return "message"
-    if re.search(r"WebDriverException|SessionNotCreated|driver", error_text, re.I):
-        return "environment"
-    return "unknown"
-
-
-def heal(
-    transaction_id: str,
-    element_key: str,
-    error_text: str,
-    current_dom: str = "",
-    execution_pk: Optional[int] = None,
-) -> dict[str, Any]:
-    """Try to repair one broken element reference."""
-    txn = repo.get_transaction(transaction_id)
-    if not txn:
-        return {"healed": False, "reason": "transaction not in knowledge repository"}
-    transaction_pk = int(txn["id"])
-    element = repo.get_element_by_key(transaction_pk, element_key)
-    if not element:
-        return {"healed": False, "reason": f"element {element_key} unknown"}
-
-    locators = element.get("locators", [])
-    failure_type = classify_failure(error_text)
-
-    # 1 ── try the next-best known locator (free, no LLM needed)
-    for candidate in locators[1:]:
-        if candidate.get("reliability_score", 0) >= 0.4:
-            confidence = float(candidate["reliability_score"])
-            if confidence >= settings.self_heal_confidence_threshold:
-                return _apply(
-                    transaction_id, transaction_pk, element, element_key,
-                    old=locators[0], new=dict(candidate), confidence=confidence,
-                    reason=f"Promoted ranked fallback after {failure_type} failure",
-                    execution_pk=execution_pk,
-                )
-
-    # 2 ── ask the AI, grounded in the current DOM + locator repository
-    ai_candidate = _ai_repair(transaction_id, element, error_text, current_dom)
-    if ai_candidate:
-        confidence = float(ai_candidate.get("confidence", 0.0))
-        if confidence >= settings.self_heal_confidence_threshold:
-            return _apply(
-                transaction_id, transaction_pk, element, element_key,
-                old=locators[0] if locators else {},
-                new={"strategy": ai_candidate["strategy"],
-                     "value": ai_candidate["value"],
-                     "priority": 15, "reliability": confidence},
-                confidence=confidence,
-                reason=ai_candidate.get("rationale", "AI-proposed locator"),
-                execution_pk=execution_pk,
-            )
-        _log_attempt(transaction_pk, execution_pk, element_key,
-                     locators[0] if locators else {}, ai_candidate,
-                     confidence, "confidence below threshold", applied=False)
-        return {
-            "healed": False,
-            "needs_approval": True,
-            "candidate": ai_candidate,
-            "confidence": confidence,
-            "reason": "AI confidence below the auto-apply threshold — "
-                      "human approval required (Section 17)",
-        }
-
-    # 3 ── give up → flag for re-recording, and say why
-    reason = (
-        f"No viable locator found for '{element_key}' after a {failure_type} "
-        f"failure. The screen has probably changed structurally."
-    )
-    versioning.flag_for_rerecording(transaction_id, reason, confidence=0.0)
-    return {"healed": False, "requires_rerecording": True, "reason": reason}
-
-
-def _ai_repair(
-    transaction_id: str, element: dict[str, Any], error_text: str, dom: str
-) -> Optional[dict[str, Any]]:
-    if not settings.llm_configured:
-        return None
-    from ..core.llm import complete_json
-
-    context = rag.build_context(
-        f"locator repair for element {element['element_key']}",
-        transaction_id=transaction_id,
-        include=("locators", "decisions"),
-    )
-    known = "\n".join(
-        f"- {loc['strategy']}={loc['value']} (reliability {loc.get('reliability_score')})"
-        for loc in element.get("locators", [])[:10]
-    )
-    dom_excerpt = (dom or "")[:12000]
-    try:
-        payload = complete_json(
-            "You are the Locator Agent of a banking test-automation platform. "
-            "Given a failing element and the current DOM, propose ONE replacement "
-            "Selenium locator. Prefer stable attributes (id, name, data-*, aria-label) "
-            "over positional XPath. Never invent an attribute that is absent from the "
-            "DOM excerpt. Return JSON: "
-            '{"strategy":"id|name|css|xpath|relative_xpath","value":"...",'
-            '"confidence":0.0-1.0,"rationale":"..."}',
-            f"{context}\n\n"
-            f"## FAILING ELEMENT\n"
-            f"key={element['element_key']} type={element.get('element_type')} "
-            f"label={element.get('label')}\n"
-            f"Known locators:\n{known}\n\n"
-            f"## ERROR\n{error_text[:1500]}\n\n"
-            f"## CURRENT DOM (excerpt)\n{dom_excerpt}",
-        )
-    except Exception as exc:
-        log.warning("AI locator repair failed: %s", exc)
-        return None
-    if not isinstance(payload, dict) or not payload.get("value"):
-        return None
-    return payload
-
-
-def _apply(
-    transaction_id: str,
-    transaction_pk: int,
-    element: dict[str, Any],
-    element_key: str,
-    old: dict[str, Any],
-    new: dict[str, Any],
-    confidence: float,
-    reason: str,
-    execution_pk: Optional[int],
-) -> dict[str, Any]:
-    """Persist the healed locator and patch the generated page object."""
-    repo.save_locators(transaction_pk, int(element["id"]), [{
-        "strategy": new["strategy"], "value": new["value"],
-        "priority": 5, "reliability": confidence,
-    }])
-    if old.get("id"):
-        db.execute(
-            "UPDATE locators SET priority = priority + 50 WHERE id=%s", (old["id"],)
-        )
-
-    patched = False
-    txn = repo.get_transaction(transaction_id)
-    page_path = ((txn or {}).get("generated_files") or {}).get("page_object")
-    if page_path:
-        patched = generator.patch_locator(
-            page_path,
-            naming.constant(element_key.split("::")[-1]),
-            locator_builder.to_java_by(new),
-        )
-
-    _log_attempt(transaction_pk, execution_pk, element_key, old, new,
-                 confidence, reason, applied=True)
-    repo.log_decision(
-        agent="SelfHealingAgent",
-        decision=f"Healed {element_key}: {new['strategy']}={new['value']}",
-        context_type="heal",
-        transaction_id=transaction_id,
-        rationale=reason,
-        confidence=confidence,
-        outcome="success",
-    )
-    log.info("Self-healed %s -> %s=%s (conf %.2f)",
-             element_key, new["strategy"], new["value"], confidence)
-    return {
-        "healed": True,
-        "element_key": element_key,
-        "old_locator": f"{old.get('strategy')}={old.get('value')}",
-        "new_locator": f"{new['strategy']}={new['value']}",
-        "confidence": confidence,
-        "page_object_patched": patched,
-        "reason": reason,
+    protected BasePage(WebDriver driver) {
+        this.driver = driver;
+        this.wait = new WebDriverWait(driver, Duration.ofSeconds(30));
+        this.shortWait = new WebDriverWait(driver, Duration.ofSeconds(3));
     }
 
-
-def _log_attempt(
-    transaction_pk: int, execution_pk: Optional[int], element_key: str,
-    old: dict[str, Any], new: dict[str, Any], confidence: float,
-    reason: str, applied: bool,
-) -> None:
-    db.execute(
-        """
-        INSERT INTO self_heal_log
-          (transaction_pk, execution_pk, element_key, old_locator, new_locator,
-           strategy, reason, confidence, applied)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """,
-        (transaction_pk, execution_pk, element_key,
-         f"{old.get('strategy')}={old.get('value')}",
-         f"{new.get('strategy')}={new.get('value')}",
-         new.get("strategy"), reason, confidence, applied),
-    )
-
-
-def heal_from_execution(execution_pk: int, transaction_id: str) -> list[dict[str, Any]]:
-    """Scan a failed execution's steps and try to heal each locator failure.
-
-    Multiple failing elements are healed CONCURRENTLY (bounded thread pool)
-    rather than one after another — each heal attempt can involve a real
-    LLM call (~2-10s), and stacking those serially was pure wasted wall
-    time when a run had several broken locators at once.
-    """
-    failures = db.query(
-        "SELECT * FROM execution_steps WHERE execution_pk=%s AND status='failed'",
-        (execution_pk,),
-    )
-    jobs = []
-    for failure in failures:
-        error_text = failure.get("error_msg") or ""
-        if classify_failure(error_text) != "locator":
-            continue
-        element_key = (failure.get("detail") or {}).get("element_key")
-        if not element_key:
-            continue
-        jobs.append((element_key, error_text, (failure.get("detail") or {}).get("dom", "")))
-
-    if not jobs:
-        return []
-    if len(jobs) == 1:
-        element_key, error_text, dom = jobs[0]
-        return [heal(transaction_id, element_key, error_text,
-                      current_dom=dom, execution_pk=execution_pk)]
-
-    from concurrent.futures import ThreadPoolExecutor
-    results: list[dict[str, Any]] = [None] * len(jobs)  # type: ignore[list-item]
-    with ThreadPoolExecutor(max_workers=min(4, len(jobs)), thread_name_prefix="self-heal") as pool:
-        futures = {
-            pool.submit(heal, transaction_id, key, err, current_dom=dom,
-                        execution_pk=execution_pk): i
-            for i, (key, err, dom) in enumerate(jobs)
+    /* ── element resolution ─────────────────────────────────────────── */
+    protected WebElement findWithFallback(String elementKey) {
+        By[] strategies = LocatorRepository.get(elementKey);
+        if (strategies == null || strategies.length == 0) {
+            throw new NoSuchElementException("No locators registered for " + elementKey);
         }
-        for future in futures:
-            i = futures[future]
-            try:
-                results[i] = future.result()
-            except Exception as exc:  # noqa: BLE001
-                results[i] = {"healed": False, "reason": f"heal attempt errored: {exc}"}
-    return results
+        NoSuchElementException last = null;
+        for (int i = 0; i < strategies.length; i++) {
+            // Fail FAST on every strategy except the last one. A short poll
+            // is enough to catch normal async rendering; waiting the full
+            // 30s on EVERY failing strategy meant an element whose top
+            // locators had drifted could burn strategies.length * 30s
+            // before self-heal even got a chance to try the next one —
+            // this was the actual cause of single steps taking 150-350s.
+            WebDriverWait attemptWait = (i == strategies.length - 1) ? wait : shortWait;
+            try {
+                WebElement element = attemptWait.until(
+                        ExpectedConditions.presenceOfElementLocated(strategies[i]));
+                if (i > 0) {
+                    ExecutionContext.recordFallback(elementKey, i, strategies[i].toString());
+                }
+                return element;
+            } catch (Exception e) {
+                last = new NoSuchElementException(
+                        "Locator failed for " + elementKey + ": " + strategies[i], e);
+            }
+        }
+        ExecutionContext.recordLocatorFailure(elementKey, dumpDom());
+        throw last != null ? last
+                : new NoSuchElementException("Could not resolve " + elementKey);
+    }
 
+    /* ── interactions ───────────────────────────────────────────────── */
+    protected void click(String elementKey) {
+        WebElement element = findWithFallback(elementKey);
+        wait.until(ExpectedConditions.elementToBeClickable(element));
+        try {
+            element.click();
+        } catch (Exception e) {
+            ((JavascriptExecutor) driver).executeScript("arguments[0].click();", element);
+        }
+    }
 
-def heal_history(transaction_id: str) -> list[dict[str, Any]]:
-    return db.query(
-        """
-        SELECT h.* FROM self_heal_log h
-        JOIN transactions t ON t.id = h.transaction_pk
-        WHERE t.transaction_id=%s ORDER BY h.created_at DESC LIMIT 100
-        """,
-        (transaction_id,),
-    )
+    protected void type(String elementKey, String value) {
+        WebElement element = findWithFallback(elementKey);
+        element.clear();
+        element.sendKeys(value == null ? "" : value);
+    }
+
+    protected void selectByVisibleText(String elementKey, String text) {
+        new Select(findWithFallback(elementKey)).selectByVisibleText(text);
+    }
+
+    protected void setCheckbox(String elementKey, boolean checked) {
+        WebElement element = findWithFallback(elementKey);
+        if (element.isSelected() != checked) {
+            element.click();
+        }
+    }
+
+    protected void uploadFile(String elementKey, String absolutePath) {
+        findWithFallback(elementKey).sendKeys(absolutePath);
+    }
+
+    protected String textOf(String elementKey) {
+        return findWithFallback(elementKey).getText();
+    }
+
+    /* ── waits & assertions ─────────────────────────────────────────── */
+    protected void waitForPage() {
+        wait.until(d -> "complete".equals(
+                ((JavascriptExecutor) d).executeScript("return document.readyState")));
+    }
+
+    protected boolean isTextPresent(String text) {
+        try {
+            return driver.getPageSource().contains(text);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    protected boolean exists(String elementKey) {
+        try {
+            findWithFallback(elementKey);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    protected List<WebElement> findAll(By by) {
+        return driver.findElements(by);
+    }
+
+    /* ── evidence ───────────────────────────────────────────────────── */
+    public String screenshot(String name) {
+        try {
+            byte[] png = ((TakesScreenshot) driver).getScreenshotAs(OutputType.BYTES);
+            return ExecutionContext.saveScreenshot(name, png);
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    protected String dumpDom() {
+        try {
+            return driver.getPageSource();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+}
