@@ -1,223 +1,247 @@
-"""Recorder + Transaction Library endpoints (Screens 1 and 2)."""
+"""Pydantic contracts shared by the API layer and the agents."""
 from __future__ import annotations
 
-import uuid
-from typing import Any
+from datetime import datetime
+from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field
 
-from ..agents import knowledge_agent, recorder_agent
-from ..core import db
-from ..core.schemas import Ack, KeepDiscardRequest, ManualLocatorRequest, RecordingStartRequest
-from ..graphs import recording_graph
-from ..knowledge import repository as repo, versioning
-from ..recorder import cdp_recorder
-from . import jobs
-from .ws import hub
-
-router = APIRouter(prefix="/api/recorder", tags=["recorder"])
-library = APIRouter(prefix="/api/transactions", tags=["transactions"])
+Environment = Literal["PREPROD", "UAT", "PROD"]
+TransactionType = Literal["business", "system_prerequisite", "system_cleanup"]
+DataSource = Literal["framework", "profile", "runtime", "database", "api", "ai", "user"]
 
 
-# ── recording ───────────────────────────────────────────────────────────
-@router.post("/start")
-def start_recording(payload: RecordingStartRequest) -> dict[str, Any]:
-    def on_event(event: dict[str, Any]) -> None:
-        hub.publish("recorder", event)
-
-    result = recorder_agent(
-        action="start",
-        transaction_id=payload.transaction_id,
-        transaction_name=payload.transaction_name,
-        start_url=payload.start_url,
-        environment=payload.environment,
-        transaction_type=payload.transaction_type,
-        description=payload.description,
-        fullpage_crawl=payload.fullpage_crawl,
-        capture_network=payload.capture_network,
-        on_event=on_event,
-    )
-    if not result.ok:
-        raise HTTPException(500, result.get("error", "could not start recording"))
-    return {
-        "session": result["session"],
-        "prior_knowledge": result.get("prior_knowledge", {}),
-        "thread_id": f"rec_{payload.transaction_id}_{uuid.uuid4().hex[:6]}",
-    }
+# ── recorder ────────────────────────────────────────────────────────────
+class RecordingStartRequest(BaseModel):
+    transaction_id: str = Field(..., examples=["1045"])
+    transaction_name: str = Field(..., examples=["CIF Creation"])
+    environment: Environment = "PREPROD"
+    start_url: str
+    transaction_type: TransactionType = "business"
+    description: Optional[str] = None
+    fullpage_crawl: bool = True
+    capture_network: bool = True
 
 
-@router.get("/sessions")
-def list_sessions() -> dict[str, Any]:
-    return {"live": cdp_recorder.list_sessions(),
-            "history": db.query(
-                "SELECT * FROM recording_sessions ORDER BY started_at DESC LIMIT 50")}
+class RecordingSession(BaseModel):
+    session_uid: str
+    transaction_id: str
+    transaction_name: Optional[str] = None
+    environment: Optional[str] = None
+    status: str
+    start_url: Optional[str] = None
+    capture_dir: Optional[str] = None
+    stats: dict[str, Any] = {}
+    started_at: Optional[datetime] = None
+    stopped_at: Optional[datetime] = None
 
 
-@router.get("/{session_uid}/status")
-def session_status(session_uid: str) -> dict[str, Any]:
-    result = recorder_agent(action="status", session_uid=session_uid)
-    if not result.ok:
-        raise HTTPException(404, f"session {session_uid} not found")
-    return result.get("info", {})
+class RecordedActionOut(BaseModel):
+    sequence: int
+    action: str
+    element_key: Optional[str] = None
+    field_name: Optional[str] = None
+    value_ref: Optional[str] = None
+    page_key: Optional[str] = None
+    screenshot_after: Optional[str] = None
 
 
-@router.post("/{session_uid}/crawl")
-def force_crawl(session_uid: str) -> dict[str, Any]:
-    result = recorder_agent(action="crawl", session_uid=session_uid)
-    if not result.ok:
-        raise HTTPException(404, f"session {session_uid} not found")
-    return result.get("stats", {})
+class KeepDiscardRequest(BaseModel):
+    session_uid: str
+    decision: Literal["keep", "discard"]
+    reason: Optional[str] = None
+    generate_code: bool = True
 
 
-@router.post("/{session_uid}/stop")
-def stop_recording(session_uid: str) -> dict[str, Any]:
-    result = recorder_agent(action="stop", session_uid=session_uid)
-    if not result.ok:
-        raise HTTPException(400, result.get("error", "could not stop"))
-    manifest = result["manifest"]
-    return {
-        "manifest": {k: v for k, v in manifest.items()
-                     if k not in ("elements", "actions")},
-        "stats": manifest.get("stats", {}),
-        "elements_preview": manifest.get("elements", [])[:100],
-        "actions": manifest.get("actions", []),
-        "awaiting_decision": True,
-        "message": "Review the capture, then Keep or Discard. Nothing reaches "
-                   "the framework until you keep it.",
-    }
+# ── transactions / knowledge ────────────────────────────────────────────
+class TransactionOut(BaseModel):
+    id: int
+    transaction_id: str
+    name: str
+    description: Optional[str] = None
+    version: str
+    type: str
+    status: str
+    confidence: float = 1.0
+    tags: list[str] = []
+    workflow_path: list[Any] = []
+    generated_files: dict[str, Any] = {}
+    recorded_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
 
 
-@router.post("/decide")
-def keep_or_discard(payload: KeepDiscardRequest) -> dict[str, Any]:
-    """Human-in-the-loop gate (Section 5.11 / 17)."""
-    if payload.decision == "discard":
-        result = recorder_agent(action="discard", session_uid=payload.session_uid,
-                                reason=payload.reason)
-        return {"decision": "discard", "ok": result.ok}
-
-    persisted = recorder_agent(action="persist", session_uid=payload.session_uid)
-    if not persisted.ok:
-        raise HTTPException(500, persisted.get("error", "could not persist"))
-
-    response: dict[str, Any] = {
-        "decision": "keep",
-        "transaction_id": persisted["transaction_id"],
-        "version": persisted["version"],
-        "stats": persisted.get("stats", {}),
-        "fields": persisted.get("fields", []),
-    }
-    if payload.generate_code:
-        job_id = jobs.submit(
-            "codegen", _generate_and_compile,
-            transaction_id=persisted["transaction_id"],
-        )
-        response["codegen_job"] = job_id
-    return response
+class ElementOut(BaseModel):
+    element_key: str
+    tag: Optional[str] = None
+    element_type: Optional[str] = None
+    label: Optional[str] = None
+    visible: bool = True
+    enabled: bool = True
+    interacted: bool = False
+    locators: list[dict[str, Any]] = []
 
 
-def _generate_and_compile(transaction_id: str) -> dict[str, Any]:
-    from ..agents import codegen_agent, compilation_agent
-    generated = codegen_agent(transaction_id=transaction_id)
-    hub.publish("recorder", {"type": "codegen", "ok": generated.ok,
-                             "files": generated.get("files", {})})
-    compiled = compilation_agent(transaction_id=transaction_id)
-    hub.publish("recorder", {"type": "compile", "ok": compiled.ok,
-                             "summary": compiled.get("result", {}).get("summary")})
-    return {"generated": dict(generated), "compiled": dict(compiled)}
+# ── test data ───────────────────────────────────────────────────────────
+class TestDataFieldMeta(BaseModel):
+    field: str
+    datatype: Optional[str] = None
+    required: bool = False
+    pattern: Optional[str] = None
+    business_meaning: Optional[str] = None
+    sensitive: bool = False
+    editable: bool = True
+    source: DataSource = "user"
+    source_config: dict[str, Any] = {}
+    element_key: Optional[str] = None
 
 
-@router.websocket("/live")
-async def recorder_feed(websocket: WebSocket) -> None:
-    await hub.connect("recorder", websocket)
-    try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        hub.disconnect("recorder", websocket)
+class TestDataValueIn(BaseModel):
+    field: str
+    value: str
+    sensitive: bool = False
+    source: DataSource = "user"
 
 
-# ── transaction library (Screen 2) ──────────────────────────────────────
-@library.get("")
-def list_transactions(status: str | None = None,
-                      type: str | None = None) -> list[dict[str, Any]]:
-    result = knowledge_agent(action="list", status=status, type=type)
-    return result.get("transactions", [])
+class TestDataSaveRequest(BaseModel):
+    transaction_id: str
+    environment: Environment
+    profile: Optional[str] = None
+    values: list[TestDataValueIn]
 
 
-@library.get("/{transaction_id}")
-def get_transaction(transaction_id: str) -> dict[str, Any]:
-    txn = repo.get_transaction(transaction_id)
-    if not txn:
-        raise HTTPException(404, f"transaction {transaction_id} not found")
-    transaction_pk = int(txn["id"])
-    return {
-        "transaction": txn,
-        "versions": versioning.history(transaction_id),
-        "elements": repo.get_elements(transaction_pk),
-        "actions": repo.get_actions(transaction_pk),
-        "validations": repo.get_validation_rules(transaction_pk),
-        "knowledge": knowledge_agent(action="check",
-                                     transaction_id=transaction_id),
-    }
+class TestDataTemplateOut(BaseModel):
+    transaction: str
+    environment: str
+    data: dict[str, dict[str, Any]]
+    file_path: Optional[str] = None
 
 
-@library.get("/{transaction_id}/versions")
-def transaction_versions(transaction_id: str) -> list[dict[str, Any]]:
-    return versioning.history(transaction_id)
+class ManualLocatorRequest(BaseModel):
+    strategy: str            # id | name | css | xpath | data | aria | text ...
+    value: str
+    priority: int = 1        # 1 = tried first, ahead of the recorder's own locators
 
 
-@library.get("/{transaction_id}/diff")
-def transaction_diff(transaction_id: str, from_version: str,
-                     to_version: str) -> dict[str, Any]:
-    return versioning.version_diff(transaction_id, from_version, to_version)
+class ProfileIn(BaseModel):
+    name: str
+    environment: Environment
+    description: Optional[str] = None
+    values: dict[str, str] = {}
+    secrets: dict[str, str] = {}   # teller_id, teller_password, checker_id, ...
 
 
-@library.post("/{transaction_id}/promote")
-def promote_version(transaction_id: str, version: str) -> Ack:
-    versioning.promote(transaction_id, version)
-    return Ack(message=f"{transaction_id} v{version} is now active")
+class ProfileOut(BaseModel):
+    id: int
+    name: str
+    environment: str
+    description: Optional[str] = None
+    values: dict[str, Any] = {}
+    secret_keys: list[str] = []    # names only, never values
 
 
-@library.post("/{transaction_id}/regenerate")
-def regenerate(transaction_id: str) -> dict[str, Any]:
-    job_id = jobs.submit("codegen", _generate_and_compile,
-                         transaction_id=transaction_id)
-    return {"job": job_id}
+# ── execution ───────────────────────────────────────────────────────────
+class ExecutionRequest(BaseModel):
+    transaction_id: str
+    environment: Environment = "PREPROD"
+    profile: str
+    target_url: Optional[str] = None
+    runtime_values: dict[str, str] = {}
+    skip_password_change: bool = False    # audit-logged override
+    skip_teller_reset: bool = False       # audit-logged override
+    headless: bool = False
 
 
-@library.post("/{transaction_id}/elements/{element_key}/locator")
-def add_manual_locator(
-    transaction_id: str, element_key: str, payload: ManualLocatorRequest
-) -> dict[str, Any]:
-    """Manually attach a locator to an element the recorder missed.
-
-    For elements the automated crawl never captured (hidden behind a
-    toggle/icon it didn't trigger, dynamically inserted, etc.) — paste in
-    a locator inspected directly from DevTools instead of re-recording the
-    whole transaction. Added at top priority, ahead of whatever the
-    recorder did capture; existing fallback locators are kept, not
-    replaced. Automatically regenerates + recompiles so it's live on the
-    next execution.
-    """
-    try:
-        result = repo.add_manual_locator(
-            transaction_id, element_key, payload.strategy, payload.value,
-            priority=payload.priority,
-        )
-    except ValueError as exc:
-        raise HTTPException(404, str(exc))
-    job_id = jobs.submit("codegen", _generate_and_compile,
-                         transaction_id=transaction_id)
-    return {**result, "regenerate_job": job_id}
+class ExecutionStepOut(BaseModel):
+    sequence: int
+    phase: str
+    step_name: str
+    status: str
+    duration_ms: Optional[int] = None
+    screenshot_ref: Optional[str] = None
+    error_msg: Optional[str] = None
+    detail: dict[str, Any] = {}
 
 
-@library.delete("/{transaction_id}/version/{version}")
-def delete_version(transaction_id: str, version: str) -> Ack:
-    txn = repo.get_transaction(transaction_id, version)
-    if not txn:
-        raise HTTPException(404, "version not found")
-    if txn["status"] == "active":
-        raise HTTPException(400, "cannot delete the active version — promote "
-                                 "another version first")
-    db.execute("DELETE FROM transactions WHERE id=%s", (txn["id"],))
-    return Ack(message=f"{transaction_id} v{version} deleted")
+class ExecutionOut(BaseModel):
+    execution_uid: str
+    transaction_id: str
+    environment: str
+    status: str
+    password_change_status: Optional[str] = None
+    teller_reset_status: Optional[str] = None
+    teller_reset_response: Optional[str] = None
+    report_path: Optional[str] = None
+    error_summary: Optional[str] = None
+    metrics: dict[str, Any] = {}
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    steps: list[ExecutionStepOut] = []
+
+
+# ── BRD ─────────────────────────────────────────────────────────────────
+class BRDImpact(BaseModel):
+    transaction_id: str
+    transaction_name: Optional[str] = None
+    change_type: Literal[
+        "new_transaction", "workflow_change", "field_change",
+        "validation_change", "locator_change", "no_change"
+    ]
+    affected_screens: list[str] = []
+    affected_fields: list[str] = []
+    requires_recording: bool = False
+    risk: Literal["low", "medium", "high"] = "medium"
+    rationale: str = ""
+    proposed_changes: list[str] = []
+
+
+class BRDAnalysisOut(BaseModel):
+    brd_id: int
+    filename: str
+    status: str
+    summary: str = ""
+    impacts: list[BRDImpact] = []
+
+
+# ── approvals / self-heal ───────────────────────────────────────────────
+class ApprovalDecision(BaseModel):
+    thread_id: str
+    approval_type: Literal["recording_keep", "codegen", "self_heal"]
+    decision: Literal["approved", "rejected", "discarded"]
+    decided_by: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class SelfHealEntry(BaseModel):
+    element_key: str
+    old_locator: str
+    new_locator: str
+    strategy: str
+    confidence: float
+    reason: str
+    applied: bool = False
+
+
+# ── secrets ─────────────────────────────────────────────────────────────
+class SecretIn(BaseModel):
+    scope: Literal["global", "profile", "environment"] = "profile"
+    scope_ref: Optional[str] = None
+    key: Literal[
+        "teller_id", "teller_password", "teller_new_password",
+        "checker_id", "checker_password", "cbs_reset_string",
+    ]
+    value: str
+
+
+class SecretOut(BaseModel):
+    scope: str
+    scope_ref: Optional[str] = None
+    key: str
+    hint: str
+    updated_at: Optional[datetime] = None
+
+
+# ── generic ─────────────────────────────────────────────────────────────
+class Ack(BaseModel):
+    ok: bool = True
+    message: str = ""
+    data: dict[str, Any] = {}
