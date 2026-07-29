@@ -1,151 +1,85 @@
-package com.sbi.automation.core;
+package com.sbi.automation.utils;
 
-import java.time.Duration;
-import java.util.List;
-
-import org.openqa.selenium.By;
-import org.openqa.selenium.JavascriptExecutor;
-import org.openqa.selenium.NoSuchElementException;
-import org.openqa.selenium.OutputType;
-import org.openqa.selenium.TakesScreenshot;
-import org.openqa.selenium.WebDriver;
-import org.openqa.selenium.WebElement;
-import org.openqa.selenium.support.ui.ExpectedConditions;
-import org.openqa.selenium.support.ui.Select;
-import org.openqa.selenium.support.ui.WebDriverWait;
-
-import com.sbi.automation.utils.ExecutionContext;
-import com.sbi.automation.utils.LocatorRepository;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 
 /**
- * Base class for every generated Page Object.
+ * Java-side CBS teller reset (Section 11.4).
  *
- * The key method is {@link #findWithFallback(String)} — it walks the ranked
- * locator list produced by the recorder, so a UI tweak does not fail the run
- * and the platform can self-heal instead of demanding a re-recording.
+ * The authoritative reset is fired by the Python Execution Agent's cleanup
+ * node, which always runs.  This class is the belt-and-braces fallback for
+ * when a runner is launched manually, outside the platform.
+ *
+ * The reset string is never hard-coded — it arrives through the environment
+ * from the encrypted secret store.
  */
-public abstract class BasePage {
+public final class SocketResetClient {
 
-    protected final WebDriver driver;
-    protected final WebDriverWait wait;
-    protected final WebDriverWait shortWait;
+    private SocketResetClient() { }
 
-    protected BasePage(WebDriver driver) {
-        this.driver = driver;
-        this.wait = new WebDriverWait(driver, Duration.ofSeconds(30));
-        this.shortWait = new WebDriverWait(driver, Duration.ofSeconds(3));
-    }
-
-    /* ── element resolution ─────────────────────────────────────────── */
-    protected WebElement findWithFallback(String elementKey) {
-        By[] strategies = LocatorRepository.get(elementKey);
-        if (strategies == null || strategies.length == 0) {
-            throw new NoSuchElementException("No locators registered for " + elementKey);
+    public static boolean resetTeller(String host, int port, String resetString,
+                                      String tellerId, int timeoutSeconds) {
+        if (host == null || host.isEmpty() || port <= 0
+                || resetString == null || resetString.isEmpty()) {
+            // Under the platform this is the NORMAL path — Python's
+            // ExecutionPipeline.teller_reset() is the authoritative,
+            // guaranteed reset and never populates SBI_CBS_HOST/PORT/
+            // RESET_STRING for the Java process. Recording a step here
+            // used to add a confusing, always-"skipped" duplicate
+            // "CBS teller reset" row right next to the real one in every
+            // report. Only genuinely-attempted (standalone-mode) resets
+            // get recorded below.
+            return false;
         }
-        NoSuchElementException last = null;
-        for (int i = 0; i < strategies.length; i++) {
-            // Fail FAST on every strategy except the last one. A short poll
-            // is enough to catch normal async rendering; waiting the full
-            // 30s on EVERY failing strategy meant an element whose top
-            // locators had drifted could burn strategies.length * 30s
-            // before self-heal even got a chance to try the next one —
-            // this was the actual cause of single steps taking 150-350s.
-            WebDriverWait attemptWait = (i == strategies.length - 1) ? wait : shortWait;
-            try {
-                WebElement element = attemptWait.until(
-                        ExpectedConditions.presenceOfElementLocated(strategies[i]));
-                if (i > 0) {
-                    ExecutionContext.recordFallback(elementKey, i, strategies[i].toString());
-                }
-                return element;
-            } catch (Exception e) {
-                last = new NoSuchElementException(
-                        "Locator failed for " + elementKey + ": " + strategies[i], e);
+        String payload = resetString
+                .replace("{TELLER_ID}", tellerId == null ? "" : tellerId)
+                .replace("{TELLERID}", tellerId == null ? "" : tellerId);
+        long started = System.currentTimeMillis();
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(host, port), timeoutSeconds * 1000);
+            socket.setSoTimeout(timeoutSeconds * 1000);
+            try (OutputStream out = socket.getOutputStream();
+                 InputStream in = socket.getInputStream()) {
+                out.write((payload.endsWith("\n") ? payload : payload + "\n")
+                        .getBytes(StandardCharsets.UTF_8));
+                out.flush();
+                byte[] buffer = new byte[4096];
+                int read = in.read(buffer);
+                String response = read > 0
+                        ? new String(buffer, 0, read, StandardCharsets.UTF_8).trim() : "";
+                boolean ok = response.toUpperCase().contains("SUCCESS")
+                        || response.toUpperCase().contains("OK")
+                        || response.toUpperCase().contains("RESET");
+                ExecutionContext.recordStep("teller_reset", "CBS teller reset",
+                        ok ? "passed" : "failed",
+                        System.currentTimeMillis() - started, "",
+                        ok ? null : "CBS response: " + response);
+                return ok;
             }
-        }
-        ExecutionContext.recordLocatorFailure(elementKey, dumpDom());
-        throw last != null ? last
-                : new NoSuchElementException("Could not resolve " + elementKey);
-    }
-
-    /* ── interactions ───────────────────────────────────────────────── */
-    protected void click(String elementKey) {
-        WebElement element = findWithFallback(elementKey);
-        wait.until(ExpectedConditions.elementToBeClickable(element));
-        try {
-            element.click();
         } catch (Exception e) {
-            ((JavascriptExecutor) driver).executeScript("arguments[0].click();", element);
-        }
-    }
-
-    protected void type(String elementKey, String value) {
-        WebElement element = findWithFallback(elementKey);
-        element.clear();
-        element.sendKeys(value == null ? "" : value);
-    }
-
-    protected void selectByVisibleText(String elementKey, String text) {
-        new Select(findWithFallback(elementKey)).selectByVisibleText(text);
-    }
-
-    protected void setCheckbox(String elementKey, boolean checked) {
-        WebElement element = findWithFallback(elementKey);
-        if (element.isSelected() != checked) {
-            element.click();
-        }
-    }
-
-    protected void uploadFile(String elementKey, String absolutePath) {
-        findWithFallback(elementKey).sendKeys(absolutePath);
-    }
-
-    protected String textOf(String elementKey) {
-        return findWithFallback(elementKey).getText();
-    }
-
-    /* ── waits & assertions ─────────────────────────────────────────── */
-    protected void waitForPage() {
-        wait.until(d -> "complete".equals(
-                ((JavascriptExecutor) d).executeScript("return document.readyState")));
-    }
-
-    protected boolean isTextPresent(String text) {
-        try {
-            return driver.getPageSource().contains(text);
-        } catch (Exception e) {
+            ExecutionContext.recordStep("teller_reset", "CBS teller reset", "failed",
+                    System.currentTimeMillis() - started, "", e.toString());
             return false;
         }
     }
 
-    protected boolean exists(String elementKey) {
+    /** Never throws — safe to call from a finally block. */
+    public static void resetTellerQuietly() {
         try {
-            findWithFallback(elementKey);
-            return true;
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
-    protected List<WebElement> findAll(By by) {
-        return driver.findElements(by);
-    }
-
-    /* ── evidence ───────────────────────────────────────────────────── */
-    public String screenshot(String name) {
-        try {
-            byte[] png = ((TakesScreenshot) driver).getScreenshotAs(OutputType.BYTES);
-            return ExecutionContext.saveScreenshot(name, png);
-        } catch (Exception e) {
-            return "";
-        }
-    }
-
-    protected String dumpDom() {
-        try {
-            return driver.getPageSource();
-        } catch (Exception e) {
-            return "";
+            String host = System.getenv("SBI_CBS_HOST");
+            String portValue = System.getenv("SBI_CBS_PORT");
+            String resetString = System.getenv("SBI_CBS_RESET_STRING");
+            String tellerId = System.getenv("SBI_TELLER_ID");
+            int port = 0;
+            if (portValue != null && !portValue.isEmpty()) {
+                port = Integer.parseInt(portValue.trim());
+            }
+            resetTeller(host, port, resetString, tellerId, 30);
+        } catch (Throwable ignored) {
+            // cleanup must never mask the real failure
         }
     }
 }
