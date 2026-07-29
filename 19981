@@ -1,182 +1,151 @@
-"""Central configuration.  Everything the platform needs comes from here.
+package com.sbi.automation.core;
 
-Rule (Section 2):  Python orchestrates, Java executes.  This module knows
-where the Java framework lives but never rewrites it wholesale.
-"""
-from __future__ import annotations
+import java.time.Duration;
+import java.util.List;
 
-from functools import lru_cache
-from pathlib import Path
-from typing import Optional
+import org.openqa.selenium.By;
+import org.openqa.selenium.JavascriptExecutor;
+import org.openqa.selenium.NoSuchElementException;
+import org.openqa.selenium.OutputType;
+import org.openqa.selenium.TakesScreenshot;
+import org.openqa.selenium.WebDriver;
+import org.openqa.selenium.WebElement;
+import org.openqa.selenium.support.ui.ExpectedConditions;
+import org.openqa.selenium.support.ui.Select;
+import org.openqa.selenium.support.ui.WebDriverWait;
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+import com.sbi.automation.utils.ExecutionContext;
+import com.sbi.automation.utils.LocatorRepository;
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+/**
+ * Base class for every generated Page Object.
+ *
+ * The key method is {@link #findWithFallback(String)} — it walks the ranked
+ * locator list produced by the recorder, so a UI tweak does not fail the run
+ * and the platform can self-heal instead of demanding a re-recording.
+ */
+public abstract class BasePage {
 
+    protected final WebDriver driver;
+    protected final WebDriverWait wait;
+    protected final WebDriverWait shortWait;
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=str(PROJECT_ROOT / ".env"),
-        env_file_encoding="utf-8",
-        extra="ignore",
-        case_sensitive=False,
-    )
+    protected BasePage(WebDriver driver) {
+        this.driver = driver;
+        this.wait = new WebDriverWait(driver, Duration.ofSeconds(30));
+        this.shortWait = new WebDriverWait(driver, Duration.ofSeconds(3));
+    }
 
-    # ── app ──────────────────────────────────────────────────────────────
-    app_name: str = "Enterprise AI Automation Engineering Platform"
-    app_host: str = "127.0.0.1"
-    app_port: int = 8000
-    log_level: str = "INFO"
+    /* ── element resolution ─────────────────────────────────────────── */
+    protected WebElement findWithFallback(String elementKey) {
+        By[] strategies = LocatorRepository.get(elementKey);
+        if (strategies == null || strategies.length == 0) {
+            throw new NoSuchElementException("No locators registered for " + elementKey);
+        }
+        NoSuchElementException last = null;
+        for (int i = 0; i < strategies.length; i++) {
+            // Fail FAST on every strategy except the last one. A short poll
+            // is enough to catch normal async rendering; waiting the full
+            // 30s on EVERY failing strategy meant an element whose top
+            // locators had drifted could burn strategies.length * 30s
+            // before self-heal even got a chance to try the next one —
+            // this was the actual cause of single steps taking 150-350s.
+            WebDriverWait attemptWait = (i == strategies.length - 1) ? wait : shortWait;
+            try {
+                WebElement element = attemptWait.until(
+                        ExpectedConditions.presenceOfElementLocated(strategies[i]));
+                if (i > 0) {
+                    ExecutionContext.recordFallback(elementKey, i, strategies[i].toString());
+                }
+                return element;
+            } catch (Exception e) {
+                last = new NoSuchElementException(
+                        "Locator failed for " + elementKey + ": " + strategies[i], e);
+            }
+        }
+        ExecutionContext.recordLocatorFailure(elementKey, dumpDom());
+        throw last != null ? last
+                : new NoSuchElementException("Could not resolve " + elementKey);
+    }
 
-    # ── database (SQLite) ───────────────────────────────────────────────
-    sqlite_path: str = "./storage/ai_automation.db"
+    /* ── interactions ───────────────────────────────────────────────── */
+    protected void click(String elementKey) {
+        WebElement element = findWithFallback(elementKey);
+        wait.until(ExpectedConditions.elementToBeClickable(element));
+        try {
+            element.click();
+        } catch (Exception e) {
+            ((JavascriptExecutor) driver).executeScript("arguments[0].click();", element);
+        }
+    }
 
-    # ── postgres (legacy, unused now the platform runs on SQLite) ────────
-    pg_host: str = "localhost"
-    pg_port: int = 5432
-    pg_db: str = "ai_automation"
-    pg_user: str = "postgres"
-    pg_password: str = "changeme"
-    pg_schema: str = "public"
-    pg_connect_timeout: int = 5
+    protected void type(String elementKey, String value) {
+        WebElement element = findWithFallback(elementKey);
+        element.clear();
+        element.sendKeys(value == null ? "" : value);
+    }
 
-    # ── azure openai (sole LLM provider) ────────────────────────────────
-    azure_openai_api_key: str = ""
-    azure_openai_endpoint: str = ""
-    azure_openai_api_version: str = "2024-10-21"
-    azure_openai_chat_deployment: str = "gpt-4o"
-    azure_openai_embedding_deployment: str = "text-embedding-3-large"
-    embedding_dim: int = 3072
-    llm_temperature: float = 0.0
-    llm_max_tokens: int = 4096
+    protected void selectByVisibleText(String elementKey, String text) {
+        new Select(findWithFallback(elementKey)).selectByVisibleText(text);
+    }
 
-    # ── secrets ──────────────────────────────────────────────────────────
-    secrets_master_key: str = ""
+    protected void setCheckbox(String elementKey, boolean checked) {
+        WebElement element = findWithFallback(elementKey);
+        if (element.isSelected() != checked) {
+            element.click();
+        }
+    }
 
-    # ── java framework ───────────────────────────────────────────────────
-    framework_root: str = "./java-framework"
-    framework_src: str = "./java-framework/src"
-    framework_lib: str = "./java-framework/lib"
-    framework_build: str = "./java-framework/build"
-    framework_testdata: str = "./java-framework/test-data"
-    java_home: Optional[str] = None
-    javac_bin: str = "javac"
-    java_bin: str = "java"
+    protected void uploadFile(String elementKey, String absolutePath) {
+        findWithFallback(elementKey).sendKeys(absolutePath);
+    }
 
-    # ── storage ──────────────────────────────────────────────────────────
-    storage_root: str = "./storage"
-    knowledge_root: str = "./storage/knowledge"
+    protected String textOf(String elementKey) {
+        return findWithFallback(elementKey).getText();
+    }
 
-    # ── recorder / browser ───────────────────────────────────────────────
-    edge_driver_path: Optional[str] = None
-    edge_binary_path: Optional[str] = None
-    recorder_cdp_port: int = 9222
-    recorder_capture_network: bool = True
-    recorder_fullpage_crawl: bool = True
-    browser_implicit_wait: int = 10
+    /* ── waits & assertions ─────────────────────────────────────────── */
+    protected void waitForPage() {
+        wait.until(d -> "complete".equals(
+                ((JavascriptExecutor) d).executeScript("return document.readyState")));
+    }
 
-    # ── CBS socket (teller reset) ────────────────────────────────────────
-    cbs_socket_host: str = ""
-    cbs_socket_port: int = 0
-    cbs_socket_timeout: int = 30
-    cbs_socket_encoding: str = "utf-8"
-    # "bog" = the real production fixed-width CBS message protocol
-    # (backend/execution/socket_client.py: reset_teller_cbs, region "C"
-    # only for now). "generic" = the older line-terminated free-text
-    # protocol (CBSSocketClient), kept as a fallback.
-    cbs_reset_protocol: str = "bog"
-    cbs_bog_variant: str = "A"   # which fixed BASE_MESSAGE template: A / B / C
-    cbs_region: str = "C"        # only "C" is wired up currently
+    protected boolean isTextPresent(String text) {
+        try {
+            return driver.getPageSource().contains(text);
+        } catch (Exception e) {
+            return false;
+        }
+    }
 
-    # ── confidence thresholds ────────────────────────────────────────────
-    self_heal_confidence_threshold: float = 0.75
-    rerecord_confidence_threshold: float = 0.55
-    auto_approve_low_risk: bool = False
+    protected boolean exists(String elementKey) {
+        try {
+            findWithFallback(elementKey);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
 
-    # ── system transaction ids ───────────────────────────────────────────
-    password_change_transaction: str = Field(
-        default="9750",
-        description="Transaction auto-attached as pre-step to every execution.",
-    )
+    protected List<WebElement> findAll(By by) {
+        return driver.findElements(by);
+    }
 
-    # ── derived ──────────────────────────────────────────────────────────
-    @property
-    def sqlite_db_path(self) -> Path:
-        return self.path(self.sqlite_path)
+    /* ── evidence ───────────────────────────────────────────────────── */
+    public String screenshot(String name) {
+        try {
+            byte[] png = ((TakesScreenshot) driver).getScreenshotAs(OutputType.BYTES);
+            return ExecutionContext.saveScreenshot(name, png);
+        } catch (Exception e) {
+            return "";
+        }
+    }
 
-    def path(self, value: str) -> Path:
-        p = Path(value)
-        return p if p.is_absolute() else (PROJECT_ROOT / p).resolve()
-
-    @property
-    def framework_root_path(self) -> Path:
-        return self.path(self.framework_root)
-
-    @property
-    def framework_src_path(self) -> Path:
-        return self.path(self.framework_src)
-
-    @property
-    def framework_lib_path(self) -> Path:
-        return self.path(self.framework_lib)
-
-    @property
-    def framework_build_path(self) -> Path:
-        return self.path(self.framework_build)
-
-    @property
-    def framework_testdata_path(self) -> Path:
-        return self.path(self.framework_testdata)
-
-    @property
-    def storage_path(self) -> Path:
-        return self.path(self.storage_root)
-
-    @property
-    def knowledge_path(self) -> Path:
-        return self.path(self.knowledge_root)
-
-    @property
-    def screenshots_path(self) -> Path:
-        return self.storage_path / "screenshots"
-
-    @property
-    def recordings_path(self) -> Path:
-        return self.storage_path / "recordings"
-
-    @property
-    def reports_path(self) -> Path:
-        return self.storage_path / "reports"
-
-    @property
-    def uploads_path(self) -> Path:
-        return self.storage_path / "uploads"
-
-    @property
-    def llm_configured(self) -> bool:
-        return bool(self.azure_openai_api_key and self.azure_openai_endpoint)
-
-    def ensure_dirs(self) -> None:
-        for p in (
-            self.storage_path,
-            self.knowledge_path,
-            self.screenshots_path,
-            self.recordings_path,
-            self.reports_path,
-            self.uploads_path,
-            self.framework_build_path,
-            self.framework_testdata_path,
-        ):
-            p.mkdir(parents=True, exist_ok=True)
-        self.sqlite_db_path.parent.mkdir(parents=True, exist_ok=True)
-
-
-@lru_cache(maxsize=1)
-def get_settings() -> Settings:
-    s = Settings()
-    s.ensure_dirs()
-    return s
-
-
-settings = get_settings()
+    protected String dumpDom() {
+        try {
+            return driver.getPageSource();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+}
