@@ -1,85 +1,321 @@
-package com.sbi.automation.utils;
+"""Compilation Agent bridge — javac against local jars.  NO Maven, NO Gradle.
 
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.InetSocketAddress;
-import java.net.Socket;
-import java.nio.charset.StandardCharsets;
+Mirrors exactly what the office PC does:
 
-/**
- * Java-side CBS teller reset (Section 11.4).
- *
- * The authoritative reset is fired by the Python Execution Agent's cleanup
- * node, which always runs.  This class is the belt-and-braces fallback for
- * when a runner is launched manually, outside the platform.
- *
- * The reset string is never hard-coded — it arrives through the environment
- * from the encrypted secret store.
- */
-public final class SocketResetClient {
+    javac -cp "lib/*" -d build $(find src -name "*.java")
+    java  -cp "lib/*:build" com.sbi.automation.runners.Transaction400Runner
 
-    private SocketResetClient() { }
+Compiler errors are parsed and fed back to the code-generation agents so the
+AI can repair its own output.
+"""
+from __future__ import annotations
 
-    public static boolean resetTeller(String host, int port, String resetString,
-                                      String tellerId, int timeoutSeconds) {
-        if (host == null || host.isEmpty() || port <= 0
-                || resetString == null || resetString.isEmpty()) {
-            // Under the platform this is the NORMAL path — Python's
-            // ExecutionPipeline.teller_reset() is the authoritative,
-            // guaranteed reset and never populates SBI_CBS_HOST/PORT/
-            // RESET_STRING for the Java process. Recording a step here
-            // used to add a confusing, always-"skipped" duplicate
-            // "CBS teller reset" row right next to the real one in every
-            // report. Only genuinely-attempted (standalone-mode) resets
-            // get recorded below.
-            return false;
+import os
+import platform
+import re
+import subprocess
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+from ..core.config import settings
+from ..core.logging_conf import get_logger
+
+log = get_logger(__name__)
+
+_ERROR_RE = re.compile(
+    r"^(?P<file>.+\.java):(?P<line>\d+):\s*(?P<severity>error|warning):\s*(?P<message>.+)$"
+)
+
+
+def classpath_separator() -> str:
+    return ";" if platform.system().lower().startswith("win") else ":"
+
+
+def build_classpath(extra: list[str] | None = None) -> str:
+    sep = classpath_separator()
+    lib = settings.framework_lib_path
+    parts = [str(lib / "*"), str(settings.framework_build_path)]
+    parts.extend(extra or [])
+    return sep.join(parts)
+
+
+@dataclass
+class CompileError:
+    file: str
+    line: int
+    severity: str
+    message: str
+
+    @property
+    def class_name(self) -> str:
+        return Path(self.file).stem
+
+
+@dataclass
+class CompileResult:
+    ok: bool
+    returncode: int
+    errors: list[CompileError] = field(default_factory=list)
+    warnings: list[CompileError] = field(default_factory=list)
+    stdout: str = ""
+    stderr: str = ""
+    command: str = ""
+    files_compiled: int = 0
+
+    def summary(self) -> str:
+        if self.ok:
+            return f"Compiled {self.files_compiled} source file(s) successfully."
+        head = "\n".join(
+            f"  {e.file}:{e.line} — {e.message}" for e in self.errors[:15]
+        )
+        return f"{len(self.errors)} compile error(s):\n{head}"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "returncode": self.returncode,
+            "files_compiled": self.files_compiled,
+            "errors": [e.__dict__ for e in self.errors],
+            "warnings": [w.__dict__ for w in self.warnings],
+            "summary": self.summary(),
+            "command": self.command,
         }
-        String payload = resetString
-                .replace("{TELLER_ID}", tellerId == null ? "" : tellerId)
-                .replace("{TELLERID}", tellerId == null ? "" : tellerId);
-        long started = System.currentTimeMillis();
-        try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(host, port), timeoutSeconds * 1000);
-            socket.setSoTimeout(timeoutSeconds * 1000);
-            try (OutputStream out = socket.getOutputStream();
-                 InputStream in = socket.getInputStream()) {
-                out.write((payload.endsWith("\n") ? payload : payload + "\n")
-                        .getBytes(StandardCharsets.UTF_8));
-                out.flush();
-                byte[] buffer = new byte[4096];
-                int read = in.read(buffer);
-                String response = read > 0
-                        ? new String(buffer, 0, read, StandardCharsets.UTF_8).trim() : "";
-                boolean ok = response.toUpperCase().contains("SUCCESS")
-                        || response.toUpperCase().contains("OK")
-                        || response.toUpperCase().contains("RESET");
-                ExecutionContext.recordStep("teller_reset", "CBS teller reset",
-                        ok ? "passed" : "failed",
-                        System.currentTimeMillis() - started, "",
-                        ok ? null : "CBS response: " + response);
-                return ok;
-            }
-        } catch (Exception e) {
-            ExecutionContext.recordStep("teller_reset", "CBS teller reset", "failed",
-                    System.currentTimeMillis() - started, "", e.toString());
-            return false;
-        }
-    }
 
-    /** Never throws — safe to call from a finally block. */
-    public static void resetTellerQuietly() {
-        try {
-            String host = System.getenv("SBI_CBS_HOST");
-            String portValue = System.getenv("SBI_CBS_PORT");
-            String resetString = System.getenv("SBI_CBS_RESET_STRING");
-            String tellerId = System.getenv("SBI_TELLER_ID");
-            int port = 0;
-            if (portValue != null && !portValue.isEmpty()) {
-                port = Integer.parseInt(portValue.trim());
-            }
-            resetTeller(host, port, resetString, tellerId, 30);
-        } catch (Throwable ignored) {
-            // cleanup must never mask the real failure
+
+def _javac() -> str:
+    if settings.java_home:
+        candidate = Path(settings.java_home) / "bin" / settings.javac_bin
+        if candidate.exists() or candidate.with_suffix(".exe").exists():
+            return str(candidate)
+    return settings.javac_bin
+
+
+def _java() -> str:
+    if settings.java_home:
+        candidate = Path(settings.java_home) / "bin" / settings.java_bin
+        if candidate.exists() or candidate.with_suffix(".exe").exists():
+            return str(candidate)
+    return settings.java_bin
+
+
+def java_available() -> dict[str, Any]:
+    info: dict[str, Any] = {"javac": _javac(), "java": _java()}
+    for key in ("javac", "java"):
+        try:
+            proc = subprocess.run(
+                [info[key], "-version"], capture_output=True, text=True, timeout=20
+            )
+            info[f"{key}_version"] = (proc.stderr or proc.stdout).strip().splitlines()[0]
+            info[f"{key}_ok"] = True
+        except Exception as exc:
+            info[f"{key}_ok"] = False
+            info[f"{key}_error"] = str(exc)
+    jars = list(settings.framework_lib_path.glob("*.jar"))
+    info["jars_found"] = len(jars)
+    info["lib_dir"] = str(settings.framework_lib_path)
+    return info
+
+
+def collect_sources(root: Path | None = None) -> list[Path]:
+    src = root or settings.framework_src_path
+    return sorted(src.rglob("*.java"))
+
+
+def _parse(output: str) -> tuple[list[CompileError], list[CompileError]]:
+    errors, warnings = [], []
+    for line in (output or "").splitlines():
+        match = _ERROR_RE.match(line.strip())
+        if not match:
+            continue
+        entry = CompileError(
+            file=match.group("file"),
+            line=int(match.group("line")),
+            severity=match.group("severity"),
+            message=match.group("message").strip(),
+        )
+        (errors if entry.severity == "error" else warnings).append(entry)
+    return errors, warnings
+
+
+def compile_framework(
+    sources: list[Path] | None = None, timeout: int = 600
+) -> CompileResult:
+    """Compile the whole framework (or a subset) into ./build."""
+    files = sources if sources is not None else collect_sources()
+    if not files:
+        return CompileResult(ok=False, returncode=-1,
+                             stderr="No .java sources found under "
+                                    f"{settings.framework_src_path}")
+    build_dir = settings.framework_build_path
+    build_dir.mkdir(parents=True, exist_ok=True)
+
+    argfile = build_dir / "sources.txt"
+    argfile.write_text(
+        "\n".join(str(f) for f in files), encoding="utf-8"
+    )
+
+    command = [
+        _javac(),
+        "-nowarn",
+        "-encoding", "UTF-8",
+        "-cp", build_classpath(),
+        "-d", str(build_dir),
+        f"@{argfile}",
+    ]
+    log.info("Compiling %d source file(s) with local jars", len(files))
+    try:
+        proc = subprocess.run(
+            command, capture_output=True, text=True, timeout=timeout,
+            cwd=str(settings.framework_root_path),
+        )
+    except FileNotFoundError as exc:
+        return CompileResult(ok=False, returncode=-1, stderr=str(exc),
+                             command=" ".join(command))
+    except subprocess.TimeoutExpired:
+        return CompileResult(ok=False, returncode=-2,
+                             stderr=f"javac timed out after {timeout}s",
+                             command=" ".join(command))
+
+    errors, warnings = _parse(proc.stderr + "\n" + proc.stdout)
+    return CompileResult(
+        ok=proc.returncode == 0,
+        returncode=proc.returncode,
+        errors=errors,
+        warnings=warnings,
+        stdout=proc.stdout,
+        stderr=proc.stderr,
+        command=" ".join(command),
+        files_compiled=len(files),
+    )
+
+
+def _build_fingerprint(files: list[Path]) -> str:
+    """Cheap change-detection over a set of source files (path+mtime+size)."""
+    import hashlib
+    h = hashlib.sha256()
+    for f in files:
+        try:
+            stat = f.stat()
+            h.update(f"{f}:{stat.st_mtime_ns}:{stat.st_size}".encode())
+        except OSError:
+            h.update(f"{f}:MISSING".encode())
+    return h.hexdigest()
+
+
+def _fingerprint_path() -> Path:
+    return settings.framework_build_path / ".compile_fingerprint"
+
+
+def _is_build_up_to_date(files: list[Path]) -> bool:
+    fp_file = _fingerprint_path()
+    if not fp_file.exists():
+        return False
+    build_dir = settings.framework_build_path
+    if not build_dir.exists() or not any(build_dir.rglob("*.class")):
+        return False  # build/ was cleaned but the fingerprint survived
+    try:
+        stored = fp_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return bool(stored) and stored == _build_fingerprint(files)
+
+
+def _write_build_fingerprint(files: list[Path]) -> None:
+    try:
+        _fingerprint_path().write_text(_build_fingerprint(files), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def compile_transaction(transaction_id: str) -> CompileResult:
+    """Compile only what a transaction needs — faster feedback loop.
+
+    A recorded transaction shouldn't need Java rebuilt on every single
+    execution — only when its generated code (or the shared core/utils/
+    hooks) actually changed since the last successful compile. Skips
+    javac entirely when the fingerprint of all wanted source files matches
+    the last successful build.
+    """
+    src = settings.framework_src_path
+    wanted: list[Path] = []
+    wanted.extend((src / "com" / "sbi" / "automation" / "core").rglob("*.java"))
+    wanted.extend((src / "com" / "sbi" / "automation" / "utils").rglob("*.java"))
+    wanted.extend((src / "com" / "sbi" / "automation" / "hooks").rglob("*.java"))
+    for folder in ("pages", "steps", "runners"):
+        wanted.extend(
+            p for p in (src / "com" / "sbi" / "automation" / folder).rglob("*.java")
+        )
+    files = sorted(set(wanted))
+
+    if _is_build_up_to_date(files):
+        log.info("Framework build is up to date (%d files unchanged) — "
+                  "skipping recompile", len(files))
+        return CompileResult(ok=True, returncode=0, files_compiled=len(files),
+                             stdout="(skipped — build up to date)")
+
+    result = compile_framework(files)
+    if result.ok:
+        _write_build_fingerprint(files)
+    return result
+
+
+def run_runner(
+    runner_fqn: str,
+    args: list[str] | None = None,
+    timeout: int = 3600,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Launch a pure-Java runner.  This is how Java executes (Section 2)."""
+    command = [
+        _java(),
+        "-cp", build_classpath(),
+        runner_fqn,
+        *(args or []),
+    ]
+    process_env = {**os.environ, **(env or {})}
+    log.info("Launching runner %s", runner_fqn)
+    try:
+        proc = subprocess.run(
+            command, capture_output=True, text=True, timeout=timeout,
+            cwd=str(settings.framework_root_path), env=process_env,
+        )
+        return {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout[-40000:],
+            "stderr": proc.stderr[-40000:],
+            "command": " ".join(command),
         }
-    }
-}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "returncode": -2,
+                "stderr": f"Runner timed out after {timeout}s",
+                "command": " ".join(command)}
+    except FileNotFoundError as exc:
+        return {"ok": False, "returncode": -1, "stderr": str(exc),
+                "command": " ".join(command)}
+
+
+def errors_for_prompt(result: CompileResult, max_errors: int = 12) -> str:
+    """Format compiler errors for the code-generation agent to repair."""
+    if result.ok:
+        return ""
+    lines = []
+    for error in result.errors[:max_errors]:
+        source = Path(error.file)
+        context = ""
+        if source.exists():
+            try:
+                all_lines = source.read_text(encoding="utf-8",
+                                             errors="ignore").splitlines()
+                start = max(0, error.line - 4)
+                context = "\n".join(
+                    f"{n + 1:>5}| {all_lines[n]}"
+                    for n in range(start, min(len(all_lines), error.line + 2))
+                )
+            except OSError:
+                context = ""
+        lines.append(
+            f"FILE: {error.file}\nLINE {error.line}: {error.message}\n{context}"
+        )
+    return "\n\n".join(lines)
