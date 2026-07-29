@@ -1,322 +1,182 @@
-"""CBS Socket Client — teller reset (Section 11.4).
+"""Central configuration.  Everything the platform needs comes from here.
 
-Opens a raw socket to the CBS endpoint, fires the user-provided reset
-string, confirms the reset and logs the outcome into the execution report.
-
-This ALWAYS runs as the final step of every execution, success or failure,
-so a teller ID is never left locked or dirty.  The reset string itself is a
-user-supplied secret — it is decrypted only here and masked everywhere else.
+Rule (Section 2):  Python orchestrates, Java executes.  This module knows
+where the Java framework lives but never rewrites it wholesale.
 """
 from __future__ import annotations
 
-import socket
-import time
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from functools import lru_cache
+from pathlib import Path
+from typing import Optional
 
-from ..core.config import settings
-from ..core.logging_conf import get_logger, register_secret
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-log = get_logger(__name__)
-
-SUCCESS_MARKERS = ("SUCCESS", "OK", "DONE", "RESET", "00", "COMPLETED")
-FAILURE_MARKERS = ("FAIL", "ERROR", "INVALID", "DENIED", "REJECT")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
-@dataclass
-class ResetResult:
-    ok: bool
-    status: str                      # success | failed | skipped | unreachable
-    response: str = ""
-    detail: str = ""
-    duration_ms: int = 0
-    host: str = ""
-    port: int = 0
-    attempts: int = 0
-    meta: dict[str, Any] = field(default_factory=dict)
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "ok": self.ok, "status": self.status, "response": self.response,
-            "detail": self.detail, "duration_ms": self.duration_ms,
-            "host": self.host, "port": self.port, "attempts": self.attempts,
-            **self.meta,
-        }
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# CBS BOG-protocol reset (the real production message format).
-#
-# Ported from the existing `/tellerr` endpoint used elsewhere. Only the
-# "C" region is wired up here, per instruction — the rest of SERVER_CONFIG
-# is kept commented out (verbatim from the source) so adding a region
-# later is a one-line uncomment, not a rewrite.
-# ═══════════════════════════════════════════════════════════════════════
-SERVER_CONFIG: dict[str, dict[str, Any]] = {
-    "C": {"host": "10.191.169.161", "port": 3348},
-    # "X":  {"host": "10.189.15.243", "port": 5526},
-    # "Y":  {"host": "10.189.15.239", "port": 3347},
-    # "Y2": {"host": "10.191.169.33", "port": 6930},
-    # "O":  {"host": "10.189.15.243", "port": 3347},
-    # "Z":  {"host": "10.189.15.241", "port": 5526},
-    # "K":  {"host": "10.189.15.241", "port": 3348},
-    # "J":  {"host": "10.191.161.72", "port": 3305},
-    # "L":  {"host": "10.191.169.44", "port": 3348},
-    # "R1": {"host": "10.189.15.78", "port": 6930},
-}
-
-# Fixed-width base messages — copied verbatim. OLD_TELLER is replaced with
-# the real runtime teller number at send time. Because this is a
-# fixed-width record, the substituted teller number MUST be the same
-# length as OLD_TELLER (7 chars) or every field after it shifts — see the
-# length check in _build_bog_message().
-OLD_TELLER = "2348212"
-
-BOG_STRINGS = {
-    "A": " 1097                    **  0000      003004370131011405009760000000000     0         10000000        1023605000000000000000000000002348212                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    10.0.18.82     10.177.137.217 ",
-    # "B": " 1097                    **  0000      003004370131011406009760000000000     0         10000000        1011407000000000000000000000002348212                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    10.0.18.82     10.177.137.217 ",
-    # "C": " 1097                    **  0000      003004370131011408009760000000000     0         10000000        1011409000000000000000000000002348212                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    10.0.18.82     10.177.137.217 ",
-}
-
-
-def _build_bog_message(bog: str, teller_no: str) -> str:
-    base = BOG_STRINGS.get((bog or "A").upper(), BOG_STRINGS["A"])
-    if len(teller_no) != len(OLD_TELLER):
-        log.warning(
-            "CBS teller number %r is %d chars, expected %d (fixed-width "
-            "record) — the message layout may shift after substitution",
-            teller_no, len(teller_no), len(OLD_TELLER),
-        )
-    return base.replace(OLD_TELLER, teller_no)
-
-
-def reset_teller_cbs(
-    teller_no: str,
-    bog: str | None = None,
-    region: str | None = None,
-    timeout: int | None = None,
-) -> ResetResult:
-    """Fire the real CBS BOG-protocol reset message. Region "C" only."""
-    region_key = (region or settings.cbs_region or "C").upper()
-    if region_key not in SERVER_CONFIG:
-        return ResetResult(
-            ok=False, status="skipped",
-            detail=f"CBS region '{region_key}' is not enabled — only 'C' is wired up",
-        )
-    server = SERVER_CONFIG[region_key]
-    bog_key = (bog or settings.cbs_bog_variant or "A").upper()
-    if bog_key not in BOG_STRINGS:
-        return ResetResult(
-            ok=False, status="skipped",
-            detail=f"bog variant '{bog_key}' is not enabled — only 'A' is active "
-                   f"(B/C are commented out in BOG_STRINGS)",
-            host=server["host"], port=server["port"],
-        )
-    if not teller_no:
-        return ResetResult(
-            ok=False, status="skipped",
-            detail="No teller number supplied for CBS reset",
-            host=server["host"], port=server["port"],
-        )
-
-    message = _build_bog_message(bog_key, teller_no)
-    register_secret(teller_no)
-    tmo = int(timeout or settings.cbs_socket_timeout)
-    started = time.time()
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_socket:
-            client_socket.settimeout(tmo)
-            client_socket.connect((server["host"], server["port"]))
-            client_socket.sendall(message.encode("utf-8"))
-            response = client_socket.recv(1024).decode("utf-8")
-        duration = int((time.time() - started) * 1000)
-        # No response parsing — the reset is fire-and-confirm-connectivity
-        # only. A non-empty reply means the CBS endpoint answered; that's
-        # all this checks.
-        ok = bool(response.strip())
-        log.info(
-            "CBS teller reset (region=%s bog=%s) -> %s (%dms)",
-            region_key, bog_key, "response received" if ok else "empty response", duration,
-        )
-        return ResetResult(
-            ok=ok,
-            status="success" if ok else "failed",
-            response=response[:2000],
-            detail="" if ok else "CBS returned an empty response",
-            duration_ms=duration,
-            host=server["host"], port=server["port"], attempts=1,
-            meta={"bog": bog_key, "region": region_key, "final_message": message},
-        )
-    except socket.timeout as exc:
-        return ResetResult(
-            ok=False, status="unreachable", detail=f"socket timeout: {exc}",
-            duration_ms=int((time.time() - started) * 1000),
-            host=server["host"], port=server["port"], attempts=1,
-        )
-    except OSError as exc:
-        return ResetResult(
-            ok=False, status="unreachable", detail=str(exc),
-            duration_ms=int((time.time() - started) * 1000),
-            host=server["host"], port=server["port"], attempts=1,
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Generic line-terminated protocol — kept as a fallback for profiles that
-# still use a free-text `cbs_reset_string` secret instead of the BOG
-# protocol above. Selected via settings.cbs_reset_protocol="generic".
-# ═══════════════════════════════════════════════════════════════════════
-class CBSSocketClient:
-    def __init__(
-        self,
-        host: str | None = None,
-        port: int | None = None,
-        timeout: int | None = None,
-        encoding: str | None = None,
-    ) -> None:
-        self.host = host or settings.cbs_socket_host
-        self.port = int(port or settings.cbs_socket_port or 0)
-        self.timeout = int(timeout or settings.cbs_socket_timeout)
-        self.encoding = encoding or settings.cbs_socket_encoding
-
-    def configured(self) -> bool:
-        return bool(self.host and self.port)
-
-    def send(
-        self,
-        payload: str,
-        terminator: str = "\n",
-        expect_response: bool = True,
-        retries: int = 2,
-    ) -> ResetResult:
-        """Fire the reset string and read the CBS response."""
-        if not self.configured():
-            return ResetResult(
-                ok=False, status="skipped",
-                detail="CBS_SOCKET_HOST / CBS_SOCKET_PORT not configured",
-                host=self.host, port=self.port,
-            )
-        if not payload:
-            return ResetResult(
-                ok=False, status="skipped",
-                detail="No CBS reset string supplied for this profile",
-                host=self.host, port=self.port,
-            )
-        register_secret(payload)
-
-        last_error = ""
-        started = time.time()
-        for attempt in range(1, retries + 1):
-            try:
-                with socket.create_connection((self.host, self.port), self.timeout) as sock:
-                    sock.settimeout(self.timeout)
-                    message = payload if payload.endswith(terminator) else payload + terminator
-                    sock.sendall(message.encode(self.encoding, errors="replace"))
-                    response = ""
-                    if expect_response:
-                        chunks: list[bytes] = []
-                        try:
-                            while True:
-                                chunk = sock.recv(4096)
-                                if not chunk:
-                                    break
-                                chunks.append(chunk)
-                                if len(b"".join(chunks)) > 65536:
-                                    break
-                                if b"\n" in chunk:
-                                    break
-                        except socket.timeout:
-                            pass
-                        response = b"".join(chunks).decode(
-                            self.encoding, errors="replace"
-                        ).strip()
-                    duration = int((time.time() - started) * 1000)
-                    ok = self._interpret(response)
-                    log.info(
-                        "CBS teller reset attempt %d -> %s (%dms)",
-                        attempt, "OK" if ok else "NOT-CONFIRMED", duration,
-                    )
-                    return ResetResult(
-                        ok=ok,
-                        status="success" if ok else "failed",
-                        response=response[:2000],
-                        detail="" if ok else "CBS response did not confirm reset",
-                        duration_ms=duration,
-                        host=self.host, port=self.port, attempts=attempt,
-                    )
-            except (socket.timeout, OSError) as exc:
-                last_error = str(exc)
-                log.warning("CBS socket attempt %d failed: %s", attempt, exc)
-                time.sleep(min(2 * attempt, 5))
-
-        return ResetResult(
-            ok=False, status="unreachable", detail=last_error,
-            duration_ms=int((time.time() - started) * 1000),
-            host=self.host, port=self.port, attempts=retries,
-        )
-
-    @staticmethod
-    def _interpret(response: str) -> bool:
-        if not response:
-            # Some CBS endpoints acknowledge silently; treat as unconfirmed.
-            return False
-        upper = response.upper()
-        if any(marker in upper for marker in FAILURE_MARKERS):
-            return False
-        return any(marker in upper for marker in SUCCESS_MARKERS)
-
-
-def reset_teller(
-    reset_string: str,
-    host: str | None = None,
-    port: int | None = None,
-    teller_id: str | None = None,
-) -> ResetResult:
-    """Convenience wrapper used by the Execution Agent's finally-node.
-
-    Called ONLY after the transaction execution has been attempted (see
-    ExecutionPipeline.run()'s `finally:` block / execution_graph.py's
-    teller_reset_step, which every terminal path routes through) — never
-    before, and always, whether execution passed, failed, or errored.
-
-    Defaults to the real CBS BOG-protocol reset (region "C") — set
-    `cbs_reset_protocol=generic` in .env to fall back to the older
-    free-text/terminator protocol driven by a stored `reset_string` secret.
-    `{TELLER_ID}` inside a generic-protocol reset string is substituted at
-    send time so a single stored template works for any teller.
-    """
-    if (settings.cbs_reset_protocol or "bog").lower() == "bog":
-        return reset_teller_cbs(teller_no=teller_id or "")
-
-    payload = reset_string or ""
-    if teller_id:
-        payload = payload.replace("{TELLER_ID}", teller_id).replace(
-            "{TELLERID}", teller_id
-        )
-    client = CBSSocketClient(host=host, port=port)
-    result = client.send(payload)
-    result.meta["teller_id_masked"] = (
-        (teller_id[:2] + "***") if teller_id else ""
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=str(PROJECT_ROOT / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
     )
-    return result
+
+    # ── app ──────────────────────────────────────────────────────────────
+    app_name: str = "Enterprise AI Automation Engineering Platform"
+    app_host: str = "127.0.0.1"
+    app_port: int = 8000
+    log_level: str = "INFO"
+
+    # ── database (SQLite) ───────────────────────────────────────────────
+    sqlite_path: str = "./storage/ai_automation.db"
+
+    # ── postgres (legacy, unused now the platform runs on SQLite) ────────
+    pg_host: str = "localhost"
+    pg_port: int = 5432
+    pg_db: str = "ai_automation"
+    pg_user: str = "postgres"
+    pg_password: str = "changeme"
+    pg_schema: str = "public"
+    pg_connect_timeout: int = 5
+
+    # ── azure openai (sole LLM provider) ────────────────────────────────
+    azure_openai_api_key: str = ""
+    azure_openai_endpoint: str = ""
+    azure_openai_api_version: str = "2024-10-21"
+    azure_openai_chat_deployment: str = "gpt-4o"
+    azure_openai_embedding_deployment: str = "text-embedding-3-large"
+    embedding_dim: int = 3072
+    llm_temperature: float = 0.0
+    llm_max_tokens: int = 4096
+
+    # ── secrets ──────────────────────────────────────────────────────────
+    secrets_master_key: str = ""
+
+    # ── java framework ───────────────────────────────────────────────────
+    framework_root: str = "./java-framework"
+    framework_src: str = "./java-framework/src"
+    framework_lib: str = "./java-framework/lib"
+    framework_build: str = "./java-framework/build"
+    framework_testdata: str = "./java-framework/test-data"
+    java_home: Optional[str] = None
+    javac_bin: str = "javac"
+    java_bin: str = "java"
+
+    # ── storage ──────────────────────────────────────────────────────────
+    storage_root: str = "./storage"
+    knowledge_root: str = "./storage/knowledge"
+
+    # ── recorder / browser ───────────────────────────────────────────────
+    edge_driver_path: Optional[str] = None
+    edge_binary_path: Optional[str] = None
+    recorder_cdp_port: int = 9222
+    recorder_capture_network: bool = True
+    recorder_fullpage_crawl: bool = True
+    browser_implicit_wait: int = 10
+
+    # ── CBS socket (teller reset) ────────────────────────────────────────
+    cbs_socket_host: str = ""
+    cbs_socket_port: int = 0
+    cbs_socket_timeout: int = 30
+    cbs_socket_encoding: str = "utf-8"
+    # "bog" = the real production fixed-width CBS message protocol
+    # (backend/execution/socket_client.py: reset_teller_cbs, region "C"
+    # only for now). "generic" = the older line-terminated free-text
+    # protocol (CBSSocketClient), kept as a fallback.
+    cbs_reset_protocol: str = "bog"
+    cbs_bog_variant: str = "A"   # which fixed BASE_MESSAGE template: A / B / C
+    cbs_region: str = "C"        # only "C" is wired up currently
+
+    # ── confidence thresholds ────────────────────────────────────────────
+    self_heal_confidence_threshold: float = 0.75
+    rerecord_confidence_threshold: float = 0.55
+    auto_approve_low_risk: bool = False
+
+    # ── system transaction ids ───────────────────────────────────────────
+    password_change_transaction: str = Field(
+        default="9750",
+        description="Transaction auto-attached as pre-step to every execution.",
+    )
+
+    # ── derived ──────────────────────────────────────────────────────────
+    @property
+    def sqlite_db_path(self) -> Path:
+        return self.path(self.sqlite_path)
+
+    def path(self, value: str) -> Path:
+        p = Path(value)
+        return p if p.is_absolute() else (PROJECT_ROOT / p).resolve()
+
+    @property
+    def framework_root_path(self) -> Path:
+        return self.path(self.framework_root)
+
+    @property
+    def framework_src_path(self) -> Path:
+        return self.path(self.framework_src)
+
+    @property
+    def framework_lib_path(self) -> Path:
+        return self.path(self.framework_lib)
+
+    @property
+    def framework_build_path(self) -> Path:
+        return self.path(self.framework_build)
+
+    @property
+    def framework_testdata_path(self) -> Path:
+        return self.path(self.framework_testdata)
+
+    @property
+    def storage_path(self) -> Path:
+        return self.path(self.storage_root)
+
+    @property
+    def knowledge_path(self) -> Path:
+        return self.path(self.knowledge_root)
+
+    @property
+    def screenshots_path(self) -> Path:
+        return self.storage_path / "screenshots"
+
+    @property
+    def recordings_path(self) -> Path:
+        return self.storage_path / "recordings"
+
+    @property
+    def reports_path(self) -> Path:
+        return self.storage_path / "reports"
+
+    @property
+    def uploads_path(self) -> Path:
+        return self.storage_path / "uploads"
+
+    @property
+    def llm_configured(self) -> bool:
+        return bool(self.azure_openai_api_key and self.azure_openai_endpoint)
+
+    def ensure_dirs(self) -> None:
+        for p in (
+            self.storage_path,
+            self.knowledge_path,
+            self.screenshots_path,
+            self.recordings_path,
+            self.reports_path,
+            self.uploads_path,
+            self.framework_build_path,
+            self.framework_testdata_path,
+        ):
+            p.mkdir(parents=True, exist_ok=True)
+        self.sqlite_db_path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def probe(host: str | None = None, port: int | None = None,
-          timeout: int = 5) -> dict[str, Any]:
-    """Connectivity check for the Execute screen — no payload is sent."""
-    target_host = host or settings.cbs_socket_host
-    target_port = int(port or settings.cbs_socket_port or 0)
-    if not (target_host and target_port):
-        return {"reachable": False, "detail": "CBS socket not configured"}
-    started = time.time()
-    try:
-        with socket.create_connection((target_host, target_port), timeout):
-            return {
-                "reachable": True,
-                "host": target_host,
-                "port": target_port,
-                "latency_ms": int((time.time() - started) * 1000),
-            }
-    except OSError as exc:
-        return {"reachable": False, "host": target_host, "port": target_port,
-                "detail": str(exc)}
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    s = Settings()
+    s.ensure_dirs()
+    return s
+
+
+settings = get_settings()
