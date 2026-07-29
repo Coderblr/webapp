@@ -1,233 +1,465 @@
-"""Transaction Data Templates (Section 7.4).
+"""Knowledge Repository — the permanent, growing memory of the platform.
 
-test-data/<ENV>/transaction_<id>.json — one file per transaction per
-environment.  Feature files reference variables; only these files change
-when a value changes (Section 7.5).
+Everything the platform ever learns lands here: recordings, elements,
+locators, workflows, validation rules, execution outcomes and AI decisions.
+Nothing is ever overwritten — new knowledge becomes a new version
+(Section 5.10).
 """
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from ..core import db
+from ..core import db, vectorstore
 from ..core.config import settings
 from ..core.logging_conf import get_logger
-from ..core.security import get_secret_box, mask_value
-from ..knowledge import repository as repo
 
 log = get_logger(__name__)
 
-ENVIRONMENTS = ("PREPROD", "UAT", "PROD")
 
-
-def template_path(transaction_id: str, environment: str) -> Path:
-    directory = settings.framework_testdata_path / environment.upper()
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"transaction_{transaction_id}.json"
-
-
-def read(transaction_id: str, environment: str) -> dict[str, Any]:
-    path = template_path(transaction_id, environment)
-    if not path.exists():
-        return {"transaction": transaction_id, "environment": environment.upper(),
-                "data": {}}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        log.error("Corrupt test-data file %s: %s", path, exc)
-        return {"transaction": transaction_id, "environment": environment.upper(),
-                "data": {}}
-
-
-def write(transaction_id: str, environment: str, data: dict[str, Any]) -> str:
-    """Persist the template.  Sensitive values are NOT written in plaintext —
-    the file carries a placeholder and the real value lives encrypted in
-    Postgres (`test_data_values`)."""
-    path = template_path(transaction_id, environment)
-    payload = {
-        "transaction": transaction_id,
-        "environment": environment.upper(),
-        "data": data,
-    }
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    log.info("Test-data template written: %s", path)
-    return str(path)
-
-
-def scaffold_from_fields(
-    transaction_id: str, environment: str, fields: list[dict[str, Any]]
-) -> str:
-    """Create the template right after a recording is kept."""
-    existing = read(transaction_id, environment).get("data", {})
-    data: dict[str, Any] = {}
-    for meta in fields:
-        name = meta["field"]
-        previous = existing.get(name, {})
-        data[name] = {
-            "value": previous.get("value", ""),
-            "sensitive": bool(meta.get("sensitive")),
-            "datatype": meta.get("datatype"),
-            "required": bool(meta.get("required")),
-            "pattern": meta.get("pattern"),
-            "source": meta.get("source", "user"),
-        }
-    return write(transaction_id, environment, data)
-
-
-# ── DB-backed values (sensitive ones encrypted) ─────────────────────────
-def save_values(
+# ── transactions ────────────────────────────────────────────────────────
+def create_transaction(
     transaction_id: str,
-    environment: str,
-    values: list[dict[str, Any]],
-    profile_pk: Optional[int] = None,
+    name: str,
+    version: str = "1.0",
+    transaction_type: str = "business",
+    description: str | None = None,
+    status: str = "draft",
+    knowledge_json: dict[str, Any] | None = None,
+    workflow_path: list[Any] | None = None,
+    knowledge_dir: str | None = None,
+    tags: list[str] | None = None,
 ) -> dict[str, Any]:
-    box = get_secret_box()
-    file_data = read(transaction_id, environment).get("data", {})
-    saved = 0
-    for item in values:
-        field = item["field"]
-        raw = item.get("value", "")
-        sensitive = bool(item.get("sensitive"))
-        db.execute(
-            """
-            INSERT INTO test_data_values
-              (profile_pk, transaction_id, environment, field, value_plain,
-               value_encrypted, sensitive, source)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (profile_pk, transaction_id, environment, field)
-            DO UPDATE SET value_plain=EXCLUDED.value_plain,
-                          value_encrypted=EXCLUDED.value_encrypted,
-                          sensitive=EXCLUDED.sensitive,
-                          source=EXCLUDED.source,
-                          updated_at=now()
-            """,
-            (profile_pk, transaction_id, environment.upper(), field,
-             None if sensitive else raw,
-             box.encrypt(raw) if sensitive else None,
-             sensitive, item.get("source", "user")),
-        )
-        entry = file_data.get(field, {})
-        entry.update({
-            "value": "__ENCRYPTED__" if sensitive else raw,
-            "sensitive": sensitive,
-            "source": item.get("source", "user"),
-        })
-        file_data[field] = entry
-        saved += 1
-    path = write(transaction_id, environment, file_data)
-    return {"saved": saved, "file": path}
-
-
-def resolve_values(
-    transaction_id: str, environment: str, profile_pk: Optional[int] = None
-) -> dict[str, str]:
-    """Return decrypted, ready-to-inject values."""
-    box = get_secret_box()
-    rows = db.query(
+    row = db.insert_returning(
         """
-        SELECT field, value_plain, value_encrypted, sensitive
-        FROM test_data_values
-        WHERE transaction_id=%s AND environment=%s
-          AND (profile_pk = %s OR profile_pk IS NULL)
-        ORDER BY (profile_pk IS NULL)
+        INSERT INTO transactions
+          (transaction_id, name, description, version, type, status,
+           knowledge_json, workflow_path, knowledge_dir, tags, recorded_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s)
+        ON CONFLICT (transaction_id, version) DO UPDATE SET
+          name=EXCLUDED.name, description=EXCLUDED.description,
+          status=EXCLUDED.status, knowledge_json=EXCLUDED.knowledge_json,
+          workflow_path=EXCLUDED.workflow_path,
+          knowledge_dir=EXCLUDED.knowledge_dir, tags=EXCLUDED.tags
+        RETURNING *
         """,
-        (transaction_id, environment.upper(), profile_pk),
+        (transaction_id, name, description, version, transaction_type, status,
+         db.jsonb(knowledge_json or {}), db.jsonb(workflow_path or []),
+         knowledge_dir, tags or [], datetime.now(timezone.utc)),
     )
-    out: dict[str, str] = {}
-    for row in rows:
-        if row["field"] in out:
-            continue
-        out[row["field"]] = (
-            box.decrypt(row["value_encrypted"]) if row["sensitive"]
-            else (row["value_plain"] or "")
+    log.info("Transaction %s v%s stored (%s)", transaction_id, version, status)
+    return row or {}
+
+
+def next_version(transaction_id: str) -> str:
+    row = db.query_one(
+        "SELECT version FROM transactions WHERE transaction_id=%s"
+        " ORDER BY created_at DESC LIMIT 1",
+        (transaction_id,),
+    )
+    if not row:
+        return "1.0"
+    try:
+        major, _, minor = str(row["version"]).partition(".")
+        return f"{int(major) + 1}.0"
+    except Exception:
+        return "1.0"
+
+
+def get_transaction(
+    transaction_id: str, version: str | None = None
+) -> Optional[dict[str, Any]]:
+    if not db.available():
+        return None
+    if version:
+        return db.query_one(
+            "SELECT * FROM transactions WHERE transaction_id=%s AND version=%s",
+            (transaction_id, version),
         )
-    # fall back to plaintext entries in the JSON file
-    for field, entry in read(transaction_id, environment).get("data", {}).items():
-        if field not in out and entry.get("value") not in (None, "", "__ENCRYPTED__"):
-            out[field] = str(entry["value"])
-    return out
-
-
-def editor_view(
-    transaction_id: str, environment: str, profile_pk: Optional[int] = None
-) -> dict[str, Any]:
-    """What the frontend Test Data Editor renders (Section 7.8).
-
-    Scoped to the CURRENT version of the transaction only (same "active,
-    else most recently recorded" resolution used everywhere else via
-    repository.get_transaction()) — joining on transaction_id alone would
-    pull in one row per historical version (v1.0, v2.0, v3.0, ...) for any
-    field whose name/pattern hasn't changed across versions, which is
-    exactly why the editor was showing 2-3 identical-looking rows for what
-    is really a single field.
-    """
-    txn = repo.get_transaction(transaction_id)
-    if not txn:
-        return {
-            "transaction_id": transaction_id, "environment": environment.upper(),
-            "file": str(template_path(transaction_id, environment)), "fields": [],
-        }
-    metas = db.query(
-        "SELECT * FROM test_data_fields WHERE transaction_pk=%s ORDER BY id",
-        (txn["id"],),
+    return db.query_one(
+        """
+        SELECT * FROM transactions
+        WHERE transaction_id=%s
+        ORDER BY (status='active') DESC, created_at DESC
+        LIMIT 1
+        """,
+        (transaction_id,),
     )
-    values = resolve_values(transaction_id, environment, profile_pk)
-    fields = []
-    for meta in metas:
-        raw = values.get(meta["field"], "")
-        fields.append({
-            "field": meta["field"],
-            "datatype": meta["datatype"],
-            "required": meta["required"],
-            "pattern": meta["pattern"],
-            "business_meaning": meta["business_meaning"],
-            "sensitive": meta["sensitive"],
-            "editable": meta["editable"],
-            "source": meta["source"],
-            "options": (meta.get("source_config") or {}).get("options"),
-            "value": mask_value(raw) if meta["sensitive"] else raw,
-            "has_value": bool(raw),
-        })
+
+
+def list_transactions(
+    status: str | None = None, transaction_type: str | None = None
+) -> list[dict[str, Any]]:
+    clauses, params = ["TRUE"], []
+    if status:
+        clauses.append("status=%s")
+        params.append(status)
+    if transaction_type:
+        clauses.append("type=%s")
+        params.append(transaction_type)
+    return db.query(
+        f"SELECT * FROM transactions WHERE {' AND '.join(clauses)}"
+        " ORDER BY transaction_id, created_at DESC",
+        params,
+    )
+
+
+def list_versions(transaction_id: str) -> list[dict[str, Any]]:
+    return db.query(
+        "SELECT id, version, build, status, confidence, recorded_at, created_at"
+        " FROM transactions WHERE transaction_id=%s ORDER BY created_at DESC",
+        (transaction_id,),
+    )
+
+
+def set_status(transaction_pk: int, status: str) -> None:
+    db.execute("UPDATE transactions SET status=%s WHERE id=%s", (status, transaction_pk))
+
+
+def activate_version(transaction_id: str, version: str) -> None:
+    """Exactly one active version per transaction."""
+    db.execute(
+        "UPDATE transactions SET status='superseded'"
+        " WHERE transaction_id=%s AND status='active'",
+        (transaction_id,),
+    )
+    db.execute(
+        "UPDATE transactions SET status='active'"
+        " WHERE transaction_id=%s AND version=%s",
+        (transaction_id, version),
+    )
+
+
+def set_generated_files(transaction_pk: int, files: dict[str, Any]) -> None:
+    db.execute(
+        "UPDATE transactions SET generated_files=%s::jsonb WHERE id=%s",
+        (db.jsonb(files), transaction_pk),
+    )
+
+
+def system_prerequisites() -> list[dict[str, Any]]:
+    """Transactions auto-attached to every execution (e.g. 9750)."""
+    return db.query(
+        "SELECT * FROM transactions WHERE type='system_prerequisite'"
+        " AND status='active' ORDER BY transaction_id"
+    )
+
+
+# ── pages / elements / locators ─────────────────────────────────────────
+def save_page(transaction_pk: int, page: dict[str, Any]) -> int:
+    row = db.insert_returning(
+        """
+        INSERT INTO pages (transaction_pk, page_key, title, url, sequence,
+                           dom_ref, screenshot_ref, frames, shadow_roots, meta)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb)
+        RETURNING id
+        """,
+        (transaction_pk, page.get("page_key"), page.get("title"), page.get("url"),
+         page.get("sequence", 0), page.get("dom_ref"), page.get("screenshot_ref"),
+         db.jsonb(page.get("frames", [])), db.jsonb(page.get("shadow_roots", [])),
+         db.jsonb(page.get("meta", {}))),
+    )
+    return int((row or {}).get("id", 0))
+
+
+def add_manual_locator(
+    transaction_id: str,
+    element_key: str,
+    strategy: str,
+    value: str,
+    priority: int = 1,
+    reliability: float = 0.99,
+) -> dict[str, Any]:
+    """Manually add a top-priority locator for an element.
+
+    For the case where the recorder's crawl genuinely never captured the
+    element (e.g. it's hidden behind a toggle/icon the crawler didn't
+    trigger) but the user has inspected the real DOM in DevTools and knows
+    a stable locator for it. Inserted at priority=1 (tried first) with a
+    high reliability score, ahead of whatever the recorder did manage to
+    capture — it does not remove the existing fallback locators.
+    """
+    txn = get_transaction(transaction_id)
+    if not txn:
+        raise ValueError(f"transaction {transaction_id} not found")
+    element = get_element_by_key(txn["id"], element_key)
+    if not element:
+        raise ValueError(
+            f"element '{element_key}' not found on transaction {transaction_id} "
+            f"(version {txn.get('version')}) — it must exist from a recording "
+            f"before a manual locator can be attached to it"
+        )
+    db.execute(
+        """
+        INSERT INTO locators (element_pk, transaction_pk, strategy, value,
+                              priority, reliability_score)
+        VALUES (%s,%s,%s,%s,%s,%s)
+        """,
+        (element["id"], txn["id"], strategy, value, priority, reliability),
+    )
     return {
-        "transaction_id": transaction_id,
-        "environment": environment.upper(),
-        "file": str(template_path(transaction_id, environment)),
-        "fields": fields,
+        "element_key": element_key, "strategy": strategy, "value": value,
+        "priority": priority,
     }
 
 
-def save_field_metadata(transaction_pk: int, fields: list[dict[str, Any]]) -> int:
-    for meta in fields:
-        db.execute(
-            """
-            INSERT INTO test_data_fields
-              (transaction_pk, field, datatype, required, pattern,
-               business_meaning, sensitive, editable, source, source_config,
-               element_key)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
-            ON CONFLICT (transaction_pk, field) DO UPDATE SET
-              datatype=EXCLUDED.datatype, required=EXCLUDED.required,
-              pattern=EXCLUDED.pattern,
-              business_meaning=EXCLUDED.business_meaning,
-              sensitive=EXCLUDED.sensitive, editable=EXCLUDED.editable,
-              source=EXCLUDED.source, source_config=EXCLUDED.source_config,
-              element_key=EXCLUDED.element_key
-            """,
-            (transaction_pk, meta["field"], meta.get("datatype"),
-             meta.get("required", False), meta.get("pattern"),
-             meta.get("business_meaning"), meta.get("sensitive", False),
-             meta.get("editable", True), meta.get("source", "user"),
-             db.jsonb(meta.get("source_config", {})), meta.get("element_key")),
-        )
-    return len(fields)
-
-
-def get_field_metadata(transaction_id: str) -> list[dict[str, Any]]:
-    txn = repo.get_transaction(transaction_id)
-    if not txn:
-        return []
-    return db.query(
-        "SELECT * FROM test_data_fields WHERE transaction_pk=%s ORDER BY id",
-        (txn["id"],),
+def save_element(transaction_pk: int, page_pk: int | None, element: dict[str, Any]) -> int:
+    row = db.insert_returning(
+        """
+        INSERT INTO elements (transaction_pk, page_pk, element_key, tag,
+                              element_type, label, visible, enabled,
+                              interacted, element_meta)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+        RETURNING id
+        """,
+        (transaction_pk, page_pk, element.get("element_key"), element.get("tag"),
+         element.get("element_type"), element.get("label"),
+         element.get("visible", True), element.get("enabled", True),
+         element.get("interacted", False), db.jsonb(element.get("meta", {}))),
     )
+    element_pk = int((row or {}).get("id", 0))
+    save_locators(transaction_pk, element_pk, element.get("locators", []))
+    return element_pk
+
+
+def save_locators(
+    transaction_pk: int, element_pk: int, locators: list[dict[str, Any]]
+) -> None:
+    db.executemany(
+        """
+        INSERT INTO locators (element_pk, transaction_pk, strategy, value,
+                              priority, reliability_score)
+        VALUES (%s,%s,%s,%s,%s,%s)
+        """,
+        [
+            (element_pk, transaction_pk, loc.get("strategy"), loc.get("value"),
+             loc.get("priority", 100), loc.get("reliability", 0.5))
+            for loc in locators
+            if loc.get("strategy") and loc.get("value")
+        ],
+    )
+
+
+def get_elements(transaction_pk: int, only_interacted: bool = False) -> list[dict[str, Any]]:
+    clause = " AND interacted = TRUE" if only_interacted else ""
+    elements = db.query(
+        f"SELECT * FROM elements WHERE transaction_pk=%s{clause} ORDER BY id",
+        (transaction_pk,),
+    )
+    for element in elements:
+        element["locators"] = db.query(
+            "SELECT strategy, value, priority, reliability_score, active"
+            " FROM locators WHERE element_pk=%s AND active"
+            " ORDER BY priority, reliability_score DESC",
+            (element["id"],),
+        )
+    return elements
+
+
+def get_element_by_key(transaction_pk: int, element_key: str) -> Optional[dict[str, Any]]:
+    element = db.query_one(
+        "SELECT * FROM elements WHERE transaction_pk=%s AND element_key=%s",
+        (transaction_pk, element_key),
+    )
+    if element:
+        element["locators"] = db.query(
+            "SELECT * FROM locators WHERE element_pk=%s AND active"
+            " ORDER BY priority, reliability_score DESC",
+            (element["id"],),
+        )
+    return element
+
+
+def record_locator_outcome(locator_pk: int, success: bool) -> None:
+    """Continuous learning: locators that work get promoted."""
+    column = "success_count" if success else "failure_count"
+    db.execute(
+        f"""
+        UPDATE locators
+        SET {column} = {column} + 1,
+            last_used_at = now(),
+            reliability_score = LEAST(0.999, GREATEST(0.001,
+                (success_count + %s)::numeric /
+                NULLIF(success_count + failure_count + 1, 0)))
+        WHERE id = %s
+        """,
+        (1 if success else 0, locator_pk),
+    )
+
+
+# ── actions / validation ────────────────────────────────────────────────
+def save_actions(transaction_pk: int, actions: list[dict[str, Any]]) -> None:
+    db.executemany(
+        """
+        INSERT INTO recorded_actions
+          (transaction_pk, sequence, action, element_key, field_name, value_ref,
+           page_key, dom_before_ref, dom_after_ref, screenshot_before,
+           screenshot_after, network_ref, meta)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+        """,
+        [
+            (transaction_pk, a.get("sequence", i), a.get("action"),
+             a.get("element_key"), a.get("field_name"), a.get("value_ref"),
+             a.get("page_key"), a.get("dom_before_ref"), a.get("dom_after_ref"),
+             a.get("screenshot_before"), a.get("screenshot_after"),
+             a.get("network_ref"), db.jsonb(a.get("meta", {})))
+            for i, a in enumerate(actions)
+        ],
+    )
+
+
+def get_actions(transaction_pk: int) -> list[dict[str, Any]]:
+    return db.query(
+        "SELECT * FROM recorded_actions WHERE transaction_pk=%s ORDER BY sequence",
+        (transaction_pk,),
+    )
+
+
+def save_validation_rules(transaction_pk: int, rules: list[dict[str, Any]]) -> None:
+    db.executemany(
+        """
+        INSERT INTO validation_rules
+          (transaction_pk, field_name, rule_type, expression, message_text,
+           severity, meta)
+        VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb)
+        """,
+        [
+            (transaction_pk, r.get("field_name"), r.get("rule_type"),
+             r.get("expression"), r.get("message_text"),
+             r.get("severity", "error"), db.jsonb(r.get("meta", {})))
+            for r in rules
+        ],
+    )
+
+
+def get_validation_rules(transaction_pk: int) -> list[dict[str, Any]]:
+    return db.query(
+        "SELECT * FROM validation_rules WHERE transaction_pk=%s ORDER BY id",
+        (transaction_pk,),
+    )
+
+
+# ── AI decisions (continuous learning) ──────────────────────────────────
+def log_decision(
+    agent: str,
+    decision: str,
+    context_type: str | None = None,
+    transaction_id: str | None = None,
+    prompt_summary: str | None = None,
+    rationale: str | None = None,
+    confidence: float | None = None,
+    outcome: str = "unknown",
+    meta: dict[str, Any] | None = None,
+) -> int:
+    row = db.insert_returning(
+        """
+        INSERT INTO ai_decisions
+          (agent, context_type, transaction_id, prompt_summary, decision,
+           rationale, confidence, outcome, meta)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+        RETURNING id
+        """,
+        (agent, context_type, transaction_id, (prompt_summary or "")[:2000],
+         (decision or "")[:4000], rationale, confidence, outcome,
+         db.jsonb(meta or {})),
+    )
+    return int((row or {}).get("id", 0))
+
+
+def update_decision_outcome(decision_id: int, outcome: str) -> None:
+    db.execute("UPDATE ai_decisions SET outcome=%s WHERE id=%s", (outcome, decision_id))
+
+
+def past_decisions(
+    transaction_id: str | None = None, agent: str | None = None, limit: int = 20
+) -> list[dict[str, Any]]:
+    clauses, params = ["TRUE"], []
+    if transaction_id:
+        clauses.append("transaction_id=%s")
+        params.append(transaction_id)
+    if agent:
+        clauses.append("agent=%s")
+        params.append(agent)
+    return db.query(
+        f"SELECT * FROM ai_decisions WHERE {' AND '.join(clauses)}"
+        " ORDER BY created_at DESC LIMIT %s",
+        (*params, limit),
+    )
+
+
+# ── knowledge package on disk (Section 16) ──────────────────────────────
+def knowledge_dir(transaction_id: str, version: str) -> Path:
+    path = settings.knowledge_path / f"transaction_{transaction_id}" / f"v{version}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def write_package_file(
+    transaction_id: str, version: str, filename: str, payload: Any
+) -> str:
+    target = knowledge_dir(transaction_id, version) / filename
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(payload, (dict, list)):
+        target.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+    else:
+        target.write_text(str(payload), encoding="utf-8")
+    return str(target)
+
+
+def read_package_file(transaction_id: str, version: str, filename: str) -> Any:
+    target = knowledge_dir(transaction_id, version) / filename
+    if not target.exists():
+        return None
+    text = target.read_text(encoding="utf-8")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def embed_transaction_knowledge(transaction_pk: int, transaction_id: str) -> int:
+    """Push a transaction's knowledge into the vector store for RAG."""
+    if not settings.llm_configured:
+        return 0
+    docs: list[dict[str, Any]] = []
+    for element in get_elements(transaction_pk):
+        locators = "; ".join(
+            f"{loc['strategy']}={loc['value']}" for loc in element.get("locators", [])[:8]
+        )
+        docs.append({
+            "namespace": "element",
+            "ref_type": "element",
+            "ref_id": str(element["id"]),
+            "transaction_id": transaction_id,
+            "content": (
+                f"Element {element['element_key']} ({element.get('element_type')}) "
+                f"label='{element.get('label')}' tag={element.get('tag')} "
+                f"visible={element.get('visible')} enabled={element.get('enabled')}\n"
+                f"Locators: {locators}"
+            ),
+            "meta": {"element_key": element["element_key"]},
+        })
+    actions = get_actions(transaction_pk)
+    if actions:
+        docs.append({
+            "namespace": "workflow",
+            "ref_type": "workflow",
+            "ref_id": str(transaction_pk),
+            "transaction_id": transaction_id,
+            "content": "Workflow for transaction " + transaction_id + ":\n" + "\n".join(
+                f"{a['sequence']}. {a['action']} {a.get('element_key') or ''} "
+                f"{a.get('field_name') or ''}".strip()
+                for a in actions
+            ),
+            "meta": {},
+        })
+    try:
+        return vectorstore.upsert_many(docs)
+    except Exception as exc:
+        log.warning("Knowledge embedding failed: %s", exc)
+        return 0
