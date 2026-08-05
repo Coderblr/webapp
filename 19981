@@ -1,188 +1,644 @@
-"""Locator Repository builder (Section 5.3).
+"""Recorder Engine — drives Microsoft Edge via Selenium + CDP (Section 5).
 
-Turns the raw locator bundle captured in the browser into a ranked,
-multi-strategy fallback list.  Ranking is what makes self-healing cheap:
-if the top strategy dies, the next one usually still resolves.
+A recording session captures a full digital twin of one transaction:
+pages, every interactable element on every page (whole-page crawl),
+a multi-strategy locator repository, DOM before/after each action,
+screenshots, workflow path, validation rules and (optionally) network
+activity.
+
+Recording is the ONLY manual step in the platform, and it happens once
+per unique transaction.
 """
 from __future__ import annotations
 
-import re
-from typing import Any
+import json
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Optional
 
-# lower priority number = tried first
-BASE_PRIORITY = {
-    "id": 10,
-    "name": 20,
-    "data": 25,
-    "aria": 30,
-    "css": 40,
-    "relative_xpath": 50,
-    "placeholder": 55,
-    "link_text": 60,
-    "text": 70,
-    "class": 80,
-    "xpath": 90,          # absolute XPath = last resort, most brittle
-}
+from ..core import db
+from ..core.config import settings
+from ..core.logging_conf import get_logger
+from ..core.security import is_sensitive
+from . import locator_builder
+from .snapshot_store import SnapshotStore, dom_diff
 
-BASE_RELIABILITY = {
-    "id": 0.95, "name": 0.90, "data": 0.88, "aria": 0.82, "css": 0.75,
-    "relative_xpath": 0.70, "placeholder": 0.65, "link_text": 0.60,
-    "text": 0.55, "class": 0.40, "xpath": 0.30,
-}
+log = get_logger(__name__)
 
-_DYNAMIC_ID = re.compile(
-    r"(\d{4,}|[0-9a-f]{8}-[0-9a-f]{4}|__\d+|_\d{3,}|ctl\d+|:r[0-9a-z]+:)", re.I
-)
-_NOISE_CLASS = re.compile(r"^(ng-|is-|active|selected|hover|focus|open|show)", re.I)
+INJECTOR_JS = (Path(__file__).parent / "injector.js").read_text(encoding="utf-8")
+
+POLL_INTERVAL = 1.0
+DRIVER_CALL_TIMEOUT = 8.0  # seconds — a hung Edge/CDP call must never hang the caller
 
 
-def looks_dynamic(value: str) -> bool:
-    return bool(value and _DYNAMIC_ID.search(value))
+class RecorderError(RuntimeError):
+    pass
 
 
-def _penalise(strategy: str, value: str) -> tuple[int, float]:
-    priority = BASE_PRIORITY.get(strategy, 100)
-    reliability = BASE_RELIABILITY.get(strategy, 0.5)
-    if looks_dynamic(value):
-        priority += 25
-        reliability *= 0.55
-    if strategy == "css" and value.count(">") > 5:
-        priority += 10
-        reliability *= 0.8
-    if strategy == "xpath" and value.count("/") > 8:
-        priority += 10
-        reliability *= 0.7
-    if len(value) > 300:
-        priority += 15
-        reliability *= 0.7
-    return priority, round(min(reliability, 0.999), 3)
+def _call_with_timeout(fn: Callable[[], Any], timeout: float = DRIVER_CALL_TIMEOUT) -> Any:
+    """Run fn() with a hard wall-clock timeout.
 
-
-def build(raw: dict[str, Any], element_type: str = "") -> list[dict[str, Any]]:
-    """raw = the `locators` object produced by injector.js."""
-    out: list[dict[str, Any]] = []
-
-    def add(strategy: str, value: Any, verified: bool = False) -> None:
-        if value is None:
-            return
-        value = str(value).strip()
-        if not value:
-            return
-        if strategy == "class":
-            classes = [c for c in value.split() if not _NOISE_CLASS.match(c)]
-            if not classes:
-                return
-            value = ".".join(classes[:3])
-        priority, reliability = _penalise(strategy, value)
-        if verified:
-            # Confirmed at record time, against the live page, to resolve
-            # to EXACTLY this element and no other — this is strictly
-            # stronger evidence than "well-formed selector, never tested",
-            # so it jumps ahead of every unverified strategy regardless of
-            # type (a verified css beats an unverified id, because an
-            # unverified id might be one of several duplicate ids on a
-            # messy enterprise page).
-            priority = max(1, priority - 100)
-            reliability = round(min(reliability + 0.20, 0.999), 3)
-        out.append({
-            "strategy": strategy,
-            "value": value,
-            "priority": priority,
-            "reliability": reliability,
-            "dynamic": looks_dynamic(value),
-            "verified": verified,
-        })
-
-    # id/name only ever arrive here already verified page-unique by the
-    # recorder (injector.js drops them to null otherwise) — see
-    # describe()'s id_ambiguous/name_ambiguous fields for why a page with
-    # duplicate ids doesn't silently produce a broken "id" locator.
-    add("id", raw.get("id"), verified=bool(raw.get("id")))
-    add("name", raw.get("name"), verified=bool(raw.get("name")))
-    for key, value in (raw.get("data") or {}).items():
-        add("data", f"[{key}='{value}']")
-    add("aria", raw.get("aria"))
-    add("css", raw.get("css"), verified=bool(raw.get("css_verified")))
-    # relative_xpath candidates are pre-filtered by the recorder to only
-    # those verified, at capture time, to resolve to exactly this element.
-    for xpath in (raw.get("relative_xpath") or [])[:6]:
-        add("relative_xpath", xpath, verified=True)
-    add("placeholder", raw.get("placeholder"))
-    if element_type == "link":
-        add("link_text", raw.get("text"))
-    else:
-        add("text", raw.get("text"))
-    add("class", raw.get("class"))
-    add("xpath", raw.get("xpath"))  # absolute xpath — last resort, unverified
-
-    # de-duplicate, keep the best-ranked instance of each value
-    best: dict[tuple[str, str], dict[str, Any]] = {}
-    for locator in out:
-        key = (locator["strategy"], locator["value"])
-        if key not in best or locator["priority"] < best[key]["priority"]:
-            best[key] = locator
-    return sorted(best.values(), key=lambda x: (x["priority"], -x["reliability"]))
-
-
-def _python_escape(value: str) -> str:
-    """Escape a value for safe embedding inside a Python string literal
-    (double-quoted).
-
-    Order matters: backslashes MUST be escaped first, otherwise the
-    backslash inserted for a later replacement (e.g. before a quote) would
-    itself get re-escaped. A recorded locator value can legitimately
-    contain backslashes (Windows-style paths, regex-flavoured CSS
-    attribute selectors), quotes, or even embedded newlines (multi-line
-    element text) — any of those, left raw, breaks out of the Python
-    string literal and cascades into downstream syntax errors from a
-    single bad character.
+    Selenium's WebDriver HTTP client has no reliable per-call timeout of its
+    own, so a stuck browser (e.g. a native JS confirm()/alert() blocking the
+    page, or a wedged msedgedriver) can hang a call forever. We can't kill a
+    Python thread, so on timeout we abandon the worker and raise immediately,
+    letting the caller move on. The worker MUST be a daemon thread — a
+    plain (non-daemon) thread left running would block the whole process
+    from exiting later, trading one hang for another.
     """
-    return (
-        (value or "")
-        .replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\t", "\\t")
+    result: dict[str, Any] = {}
+    error: dict[str, BaseException] = {}
+
+    def runner() -> None:
+        try:
+            result["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            error["value"] = exc
+
+    worker = threading.Thread(target=runner, daemon=True, name="driver-call")
+    worker.start()
+    worker.join(timeout=timeout)
+    if worker.is_alive():
+        raise TimeoutError(f"driver call exceeded {timeout}s")
+    if "value" in error:
+        raise error["value"]
+    return result.get("value")
+
+
+class RecordingSession:
+    """One recording of one transaction."""
+
+    def __init__(
+        self,
+        transaction_id: str,
+        transaction_name: str,
+        start_url: str,
+        environment: str = "PREPROD",
+        transaction_type: str = "business",
+        description: str | None = None,
+        fullpage_crawl: bool = True,
+        capture_network: bool = True,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        self.session_uid = f"rec_{transaction_id}_{uuid.uuid4().hex[:8]}"
+        self.transaction_id = transaction_id
+        self.transaction_name = transaction_name
+        self.environment = environment
+        self.transaction_type = transaction_type
+        self.description = description
+        self.start_url = start_url
+        self.fullpage_crawl = fullpage_crawl
+        self.capture_network = capture_network and settings.recorder_capture_network
+        self.on_event = on_event
+
+        self.store = SnapshotStore(self.session_uid)
+        self.driver = None
+        self.status = "created"
+        self._poll_thread: Optional[threading.Thread] = None
+        self._stop_flag = threading.Event()
+        self._last_dom: str = ""
+        self._events: list[dict[str, Any]] = []
+        self._pages: dict[str, dict[str, Any]] = {}
+        self._elements: dict[str, dict[str, Any]] = {}
+        self._messages: list[dict[str, Any]] = []
+        self._network: list[dict[str, Any]] = []
+        self._workflow: list[str] = []
+        self._actions: list[dict[str, Any]] = []
+        self._last_dom_ref: str = ""
+        self._action_seq = 0
+
+    # ── browser lifecycle ───────────────────────────────────────────────
+    def _build_driver(self):
+        from selenium import webdriver
+        from selenium.webdriver.edge.options import Options
+        from selenium.webdriver.edge.service import Service
+
+        options = Options()
+        options.add_argument("--start-maximized")
+        options.add_argument("--disable-popup-blocking")
+        options.add_argument("--ignore-certificate-errors")
+        options.set_capability("ms:loggingPrefs", {"performance": "ALL"})
+        if settings.edge_binary_path:
+            options.binary_location = settings.edge_binary_path
+        if self.capture_network:
+            options.set_capability(
+                "ms:edgeOptions",
+                {"perfLoggingPrefs": {"enableNetwork": True}},
+            )
+        service = (
+            Service(executable_path=settings.edge_driver_path)
+            if settings.edge_driver_path else Service()
+        )
+        driver = webdriver.Edge(service=service, options=options)
+        driver.implicitly_wait(settings.browser_implicit_wait)
+        return driver
+
+    def start(self) -> dict[str, Any]:
+        log.info("Starting recording %s for transaction %s",
+                 self.session_uid, self.transaction_id)
+        self.driver = self._build_driver()
+        # Inject on every document so the collector survives navigation.
+        try:
+            self.driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument", {"source": INJECTOR_JS}
+            )
+            if self.capture_network:
+                self.driver.execute_cdp_cmd("Network.enable", {})
+        except Exception as exc:
+            log.warning("CDP injection unavailable, falling back: %s", exc)
+
+        self.driver.get(self.start_url)
+        self._ensure_injected()
+        self.status = "recording"
+
+        db.execute(
+            """
+            INSERT INTO recording_sessions
+              (session_uid, transaction_id, transaction_name, environment,
+               status, start_url, capture_dir)
+            VALUES (%s,%s,%s,%s,'recording',%s,%s)
+            ON CONFLICT (session_uid) DO NOTHING
+            """,
+            (self.session_uid, self.transaction_id, self.transaction_name,
+             self.environment, self.start_url, str(self.store.root)),
+        )
+
+        self._stop_flag.clear()
+        self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._poll_thread.start()
+        return self.info()
+
+    def _ensure_injected(self) -> None:
+        """Re-inject after navigations that bypassed the CDP hook."""
+        try:
+            present = self.driver.execute_script("return !!window.__AIREC__;")
+            if not present:
+                self.driver.execute_script(INJECTOR_JS)
+        except Exception as exc:
+            log.debug("Injection check failed: %s", exc)
+
+    # ── polling loop ────────────────────────────────────────────────────
+    def _poll_loop(self) -> None:
+        while not self._stop_flag.is_set():
+            try:
+                self._drain_once()
+            except Exception as exc:
+                log.debug("Poll iteration failed: %s", exc)
+            self._stop_flag.wait(POLL_INTERVAL)
+
+    def _drain_once(self) -> None:
+        if self.driver is None:
+            return
+        self._ensure_injected()
+        raw: list[dict[str, Any]] = []
+        try:
+            top = _call_with_timeout(
+                lambda: self.driver.execute_script(
+                    "return window.__AIREC__ && window.__AIREC__.drain();"
+                )
+            )
+            if top:
+                raw.extend(top)
+        except Exception as exc:
+            log.debug("Top-level drain failed: %s", exc)
+        try:
+            raw.extend(self._drain_frames(depth=0))
+        finally:
+            # _drain_frames always restores context on its own way out, but
+            # a raised exception partway through a switch_to chain must
+            # never leave the driver stuck inside a stale/detached iframe
+            # for every subsequent poll tick.
+            try:
+                self.driver.switch_to.default_content()
+            except Exception:
+                pass
+        if not raw:
+            return
+        for event in raw:
+            self._ingest(event)
+        self.store.append_events(raw)
+        if self.capture_network:
+            self._drain_network()
+
+    MAX_FRAME_DEPTH = 3
+
+    def _drain_frames(self, depth: int) -> list[dict[str, Any]]:
+        """Inject into AND drain every iframe, including iframes nested
+        inside iframes (a "popped-up" modal dialog is very often
+        implemented as an iframe injected into the DOM), up to
+        `MAX_FRAME_DEPTH` levels deep.
+
+        injector.js's click/change/submit listeners are attached to
+        `document` inside whichever window they're injected into — an
+        iframe has its OWN separate `window`, so a click recorded inside
+        one lands in THAT iframe's own `window.__AIREC__.events` buffer,
+        never in the top-level document's. Only injecting into iframes
+        (the old behaviour) without ALSO switching into each one to call
+        its own `.drain()` meant every interaction inside an iframe was
+        captured correctly by the in-page script but never actually read
+        back into Python — it just sat in the iframe's buffer, invisible
+        to the recorder, until the next navigation cleared it.
+        """
+        collected: list[dict[str, Any]] = []
+        if depth >= self.MAX_FRAME_DEPTH:
+            return collected
+        try:
+            frames = self.driver.find_elements("tag name", "iframe")
+        except Exception:
+            return collected
+
+        for index in range(len(frames)):
+            try:
+                # Re-fetch on every iteration: switching frames can detach
+                # earlier WebElement references, and a popped-up iframe
+                # can itself appear/disappear between poll ticks.
+                frames = self.driver.find_elements("tag name", "iframe")
+                if index >= len(frames):
+                    break
+                frame_el = frames[index]
+                frame_tag = (
+                    frame_el.get_attribute("name")
+                    or frame_el.get_attribute("id")
+                    or frame_el.get_attribute("src")
+                    or f"frame_{index}"
+                )
+                self.driver.switch_to.frame(frame_el)
+            except Exception as exc:
+                log.debug("Could not switch into frame %s at depth %s: %s",
+                          index, depth, exc)
+                try:
+                    self.driver.switch_to.default_content()
+                    for _ in range(depth):
+                        pass  # already at top; nothing more to unwind
+                except Exception:
+                    pass
+                continue
+
+            try:
+                if not self.driver.execute_script("return !!window.__AIREC__;"):
+                    self.driver.execute_script(INJECTOR_JS)
+                frame_events = _call_with_timeout(
+                    lambda: self.driver.execute_script(
+                        "return window.__AIREC__ && window.__AIREC__.drain();"
+                    )
+                )
+                if frame_events:
+                    for event in frame_events:
+                        event["frame_path"] = f"{depth}:{index}:{frame_tag}"
+                    collected.extend(frame_events)
+                # Recurse into any iframe nested inside this one BEFORE
+                # leaving its context.
+                collected.extend(self._drain_frames(depth + 1))
+            except Exception as exc:
+                log.debug("Frame drain failed at depth %s index %s: %s",
+                          depth, index, exc)
+            finally:
+                try:
+                    self.driver.switch_to.parent_frame()
+                except Exception:
+                    try:
+                        self.driver.switch_to.default_content()
+                    except Exception:
+                        pass
+        return collected
+
+    def _drain_network(self) -> None:
+        try:
+            logs = self.driver.get_log("performance")
+        except Exception:
+            return
+        for entry in logs[-200:]:
+            try:
+                message = json.loads(entry["message"])["message"]
+            except Exception:
+                continue
+            method = message.get("method", "")
+            if method in ("Network.responseReceived", "Network.requestWillBeSent"):
+                params = message.get("params", {})
+                self._network.append({
+                    "method": method,
+                    "url": (params.get("response") or params.get("request") or {}).get("url"),
+                    "status": (params.get("response") or {}).get("status"),
+                    "ts": entry.get("timestamp"),
+                })
+
+    # ── event ingestion ─────────────────────────────────────────────────
+    def _ingest(self, event: dict[str, Any]) -> None:
+        etype = event.get("type")
+        if etype == "crawl":
+            self._ingest_crawl(event)
+        elif etype == "action":
+            self._ingest_action(event)
+        elif etype == "messages":
+            self._messages.extend(event.get("messages", []))
+        self._events.append(event)
+        if self.on_event:
+            try:
+                self.on_event(self._public_event(event))
+            except Exception:
+                pass
+
+    def _ingest_crawl(self, event: dict[str, Any]) -> None:
+        page = event.get("page", {})
+        page_key = page.get("page_key") or "page"
+        if page_key not in self._pages:
+            dom = self._snapshot_dom(f"page_{len(self._pages):02d}_{page_key}")
+            self._pages[page_key] = {
+                "page_key": page_key,
+                "title": page.get("title"),
+                "url": page.get("url"),
+                "sequence": len(self._pages),
+                "dom_ref": dom.get("ref"),
+                "screenshot_ref": self._screenshot(f"page_{page_key}"),
+                "frames": page.get("frames", []),
+                "shadow_roots": [{"count": page.get("shadow_roots", 0)}],
+                "meta": {"element_count": event.get("element_count", 0)},
+            }
+            self._workflow.append(page.get("title") or page_key)
+        for raw_element in event.get("elements", []):
+            self._merge_element(raw_element, page_key, interacted=False)
+
+    def _ingest_action(self, event: dict[str, Any]) -> None:
+        raw_element = event.get("element") or {}
+        page_key = event.get("page_key") or "page"
+        element_key = self._merge_element(raw_element, page_key, interacted=True)
+        name = f"action_{self._action_seq:03d}_{event.get('action')}"
+        before_ref = self._last_dom_ref or ""
+        shot_before = self._screenshot(name + "_before")
+        dom_after = self._snapshot_dom(name + "_after")
+        shot_after = self._screenshot(name + "_after")
+
+        field_name = (
+            raw_element.get("label")
+            or raw_element.get("locators", {}).get("name")
+            or element_key
+        )
+        variable = _variable_name(field_name)
+        self._events_action(
+            {
+                "sequence": self._action_seq,
+                "action": event.get("action"),
+                "element_key": element_key,
+                "field_name": field_name,
+                # NEVER the raw value — only the variable reference (Section 7)
+                "value_ref": variable if event.get("action") in
+                             ("type", "select", "upload") else None,
+                "page_key": page_key,
+                "dom_before_ref": before_ref,
+                "dom_after_ref": dom_after.get("ref"),
+                "screenshot_before": shot_before,
+                "screenshot_after": shot_after,
+                "meta": {
+                    "url": event.get("url"),
+                    "value_length": event.get("value_length"),
+                    "selected_text": event.get("selected_text"),
+                    "sensitive": bool(event.get("sensitive"))
+                                 or is_sensitive(field_name or ""),
+                    "element_type": raw_element.get("element_type"),
+                    "dom_diff": dom_diff(self._last_dom, dom_after.get("html", "")),
+                },
+            }
+        )
+        self._last_dom = dom_after.get("html", "")
+        self._action_seq += 1
+
+    def _events_action(self, action: dict[str, Any]) -> None:
+        self._actions.append(action)
+
+    def _merge_element(
+        self, raw: dict[str, Any], page_key: str, interacted: bool
+    ) -> str:
+        key = raw.get("element_key") or "element"
+        unique = f"{page_key}::{key}"
+        existing = self._elements.get(unique)
+        locators = locator_builder.build(
+            raw.get("locators", {}), raw.get("element_type", "")
+        )
+        if existing:
+            existing["interacted"] = existing["interacted"] or interacted
+            known = {(l["strategy"], l["value"]) for l in existing["locators"]}
+            existing["locators"].extend(
+                l for l in locators if (l["strategy"], l["value"]) not in known
+            )
+            return unique
+        self._elements[unique] = {
+            "element_key": unique,
+            "tag": raw.get("tag"),
+            "element_type": raw.get("element_type"),
+            "label": raw.get("label"),
+            "visible": raw.get("visible", True),
+            "enabled": raw.get("enabled", True),
+            "interacted": interacted,
+            "page_key": page_key,
+            "locators": locators,
+            "meta": {
+                "text": raw.get("text"),
+                "attributes": raw.get("attributes", {}),
+                "options": raw.get("options"),
+                "required": raw.get("required"),
+                "pattern": raw.get("pattern"),
+                "maxlength": raw.get("maxlength"),
+                "readonly": raw.get("readonly"),
+                "position": raw.get("position"),
+                "parent": raw.get("parent"),
+                "frame_url": raw.get("frame_url"),
+            },
+        }
+        return unique
+
+    # ── capture helpers ─────────────────────────────────────────────────
+    def _snapshot_dom(self, name: str) -> dict[str, Any]:
+        try:
+            payload = self.driver.execute_script(
+                "return window.__AIREC__ ? window.__AIREC__.snapshotDom() : null;"
+            ) or {}
+        except Exception:
+            payload = {}
+        html = payload.get("html") or (self.driver.page_source if self.driver else "")
+        ref = self.store.save_dom(name, html, {"url": payload.get("url"),
+                                               "title": payload.get("title")})
+        self._last_dom_ref = ref
+        return {"ref": ref, "html": html}
+
+    def _screenshot(self, name: str) -> str:
+        try:
+            data = self.driver.get_screenshot_as_png()
+            return self.store.save_screenshot_bytes(name, data)
+        except Exception as exc:
+            log.debug("Screenshot %s failed: %s", name, exc)
+            return ""
+
+    @staticmethod
+    def _public_event(event: dict[str, Any]) -> dict[str, Any]:
+        """Trimmed event for the live UI feed."""
+        if event.get("type") == "crawl":
+            return {
+                "type": "crawl",
+                "page": (event.get("page") or {}).get("title"),
+                "elements": event.get("element_count"),
+            }
+        if event.get("type") == "action":
+            element = event.get("element") or {}
+            return {
+                "type": "action",
+                "action": event.get("action"),
+                "element": element.get("label") or element.get("element_key"),
+                "element_type": element.get("element_type"),
+                "page": event.get("page_key"),
+            }
+        return {"type": event.get("type")}
+
+    # ── control ─────────────────────────────────────────────────────────
+    def force_crawl(self) -> dict[str, Any]:
+        try:
+            _call_with_timeout(
+                lambda: self.driver.execute_script(
+                    "window.__AIREC__ && window.__AIREC__.forceCrawl();"
+                )
+            )
+            time.sleep(0.5)
+            self._drain_once()
+        except Exception as exc:
+            log.warning("Manual crawl failed: %s", exc)
+        return {"elements": len(self._elements), "pages": len(self._pages)}
+
+    def stop(self) -> dict[str, Any]:
+        log.info("Stopping recording %s", self.session_uid)
+        self._stop_flag.set()
+        poll_thread_done = True
+        if self._poll_thread:
+            self._poll_thread.join(timeout=DRIVER_CALL_TIMEOUT + 2)
+            poll_thread_done = not self._poll_thread.is_alive()
+        if poll_thread_done:
+            # Safe to touch self.driver from this thread — the poll thread
+            # has fully exited, so there's no concurrent WebDriver access.
+            try:
+                self._drain_once()
+                _call_with_timeout(
+                    lambda: self.driver.execute_script(
+                        "window.__AIREC__ && window.__AIREC__.stop();"
+                    )
+                )
+            except Exception as exc:
+                log.warning("Final drain before stop failed (continuing): %s", exc)
+        else:
+            # The poll thread is still busy against the driver (a stuck page,
+            # a wedged msedgedriver, ...). Do NOT call driver.* from here too
+            # — concurrent WebDriver calls from two threads can hang forever
+            # with no exception raised. Skip straight to closing out the
+            # session with whatever was captured so far.
+            log.warning(
+                "Recorder poll thread for %s did not stop in time — "
+                "skipping final drain and browser close to avoid a hang. "
+                "The browser window may need to be closed manually.",
+                self.session_uid,
+            )
+        network_ref = ""
+        if self._network:
+            network_ref = self.store.save_network("network", self._network)
+        if poll_thread_done and self.driver:
+            try:
+                _call_with_timeout(self.driver.quit)
+            except Exception as exc:
+                log.warning("driver.quit() for %s failed/timed out: %s",
+                            self.session_uid, exc)
+        self.status = "stopped"
+        manifest = self.build_manifest(network_ref)
+        self.store.write_manifest(manifest)
+        db.execute(
+            "UPDATE recording_sessions SET status='stopped', stopped_at=now(),"
+            " stats=%s::jsonb WHERE session_uid=%s",
+            (db.jsonb(manifest["stats"]), self.session_uid),
+        )
+        return manifest
+
+    # ── the knowledge package ───────────────────────────────────────────
+    def build_manifest(self, network_ref: str = "") -> dict[str, Any]:
+        elements = list(self._elements.values())
+        return {
+            "session_uid": self.session_uid,
+            "transaction_id": self.transaction_id,
+            "transaction_name": self.transaction_name,
+            "transaction_type": self.transaction_type,
+            "description": self.description,
+            "environment": self.environment,
+            "start_url": self.start_url,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "workflow_path": self._workflow,
+            "pages": list(self._pages.values()),
+            "elements": elements,
+            "actions": self._actions,
+            "messages": self._messages,
+            "network_ref": network_ref,
+            "capture_dir": str(self.store.root),
+            "stats": {
+                "pages": len(self._pages),
+                "elements": len(elements),
+                "elements_interacted": sum(1 for e in elements if e["interacted"]),
+                "actions": len(self._actions),
+                "messages": len(self._messages),
+                "network_events": len(self._network),
+                "capture_bytes": self.store.size_bytes(),
+            },
+        }
+
+    def info(self) -> dict[str, Any]:
+        return {
+            "session_uid": self.session_uid,
+            "transaction_id": self.transaction_id,
+            "transaction_name": self.transaction_name,
+            "environment": self.environment,
+            "status": self.status,
+            "start_url": self.start_url,
+            "capture_dir": str(self.store.root),
+            "stats": {
+                "pages": len(self._pages),
+                "elements": len(self._elements),
+                "actions": len(self._actions),
+            },
+        }
+
+
+def _variable_name(field_name: str) -> str:
+    """CustomerName → <CustomerName>  (Section 7.5)."""
+    cleaned = "".join(
+        part.capitalize()
+        for part in "".join(
+            ch if ch.isalnum() else " " for ch in (field_name or "field")
+        ).split()
     )
+    return cleaned or "Field"
 
 
-def to_python_by(locator: dict[str, Any]) -> str:
-    """Render a locator as a Selenium Python `(By.X, "value")` tuple —
-    directly usable by python-framework/utils/locator_repository.py and
-    core/element_resolver.py."""
-    strategy, value = locator["strategy"], _python_escape(locator["value"])
-    mapping = {
-        "id": f'(By.ID, "{value}")',
-        "name": f'(By.NAME, "{value}")',
-        "css": f'(By.CSS_SELECTOR, "{value}")',
-        "data": f'(By.CSS_SELECTOR, "{value}")',
-        "aria": f'(By.CSS_SELECTOR, "[aria-label=\'{value}\']")',
-        "class": f'(By.CSS_SELECTOR, ".{value}")',
-        "xpath": f'(By.XPATH, "{value}")',
-        "relative_xpath": f'(By.XPATH, "{value}")',
-        "placeholder": f'(By.CSS_SELECTOR, "[placeholder=\'{value}\']")',
-        "link_text": f'(By.LINK_TEXT, "{value}")',
-        "text": f'(By.XPATH, "//*[normalize-space(text())=\'{value}\']")',
-    }
-    return mapping.get(strategy, f'(By.XPATH, "{value}")')
+# ── session registry (one active recording at a time per transaction) ───
+_sessions: dict[str, RecordingSession] = {}
+_lock = threading.Lock()
 
 
-def primary(locators: list[dict[str, Any]]) -> dict[str, Any]:
-    return locators[0] if locators else {"strategy": "xpath", "value": "//*", "priority": 999}
+def start_session(**kwargs: Any) -> dict[str, Any]:
+    session = RecordingSession(**kwargs)
+    with _lock:
+        _sessions[session.session_uid] = session
+    return session.start()
 
 
-def fallbacks(locators: list[dict[str, Any]], limit: int = 4) -> list[dict[str, Any]]:
-    return locators[1 : 1 + limit]
+def get_session(session_uid: str) -> Optional[RecordingSession]:
+    return _sessions.get(session_uid)
 
 
-def score_change(old: dict[str, Any], new: dict[str, Any]) -> float:
-    """How confident are we that `new` replaces `old`?  Used by self-healing."""
-    if old.get("strategy") == new.get("strategy") and old.get("value") == new.get("value"):
-        return 1.0
-    score = new.get("reliability", 0.5)
-    if old.get("strategy") == new.get("strategy"):
-        score += 0.10
-    if not new.get("dynamic", False):
-        score += 0.05
-    return round(min(score, 0.99), 3)
+def stop_session(session_uid: str) -> dict[str, Any]:
+    session = _sessions.get(session_uid)
+    if not session:
+        raise RecorderError(f"No such recording session: {session_uid}")
+    return session.stop()
+
+
+def list_sessions() -> list[dict[str, Any]]:
+    return [s.info() for s in _sessions.values()]
+
+
+def drop_session(session_uid: str) -> None:
+    _sessions.pop(session_uid, None)
