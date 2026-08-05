@@ -1,253 +1,884 @@
-"""Pydantic contracts shared by the API layer and the agents."""
+/* ═══════════════════════════════════════════════════════════════════════
+   Application Knowledge Collector — in-page agent  (Section 5)
+
+   Injected on every document (via CDP Page.addScriptToEvaluateOnNewDocument)
+   so it survives navigation.  It:
+     • records every user interaction (click / type / select / check / submit)
+     • crawls the WHOLE page for interactable elements — not just the ones
+       the user touched — so future BRDs already know about them
+     • builds a multi-strategy locator repository per element
+     • captures validation / error / success messages
+     • traverses iframes and open shadow roots
+
+   It buffers events on window.__AIREC__ ; the Python side drains the buffer.
+   ═══════════════════════════════════════════════════════════════════════ */
+(function () {
+  if (window.__AIREC__) { return; }
+
+  const REC = {
+    version: '1.0',
+    enabled: true,
+    events: [],
+    crawls: [],
+    messages: [],
+    seq: 0,
+    pageKey: null
+  };
+  window.__AIREC__ = REC;
+
+  /* ── helpers ───────────────────────────────────────────────────────── */
+  const SENSITIVE_HINT = /pass|pwd|pin|otp|cvv|secret|token/i;
+
+  /* ── live-DOM uniqueness verification (Section 5.3 accuracy fix) ────
+     A locator candidate is only useful if it resolves to EXACTLY the
+     element the user interacted with — not "probably", verified right
+     now against the real page. Every css/xpath candidate below is
+     checked here before being offered as a locator; ambiguous or
+     non-matching candidates are dropped instead of being passed
+     downstream with false confidence, since a fallback that quietly
+     clicks the WRONG element (because it also matched something else)
+     is worse than no fallback at all. */
+  function cssCount(sel) {
+    try { return document.querySelectorAll(sel).length; } catch (e) { return -1; }
+  }
+  function cssResolvesToElement(sel, el) {
+    try {
+      const nodes = document.querySelectorAll(sel);
+      return nodes.length === 1 && nodes[0] === el;
+    } catch (e) { return false; }
+  }
+  function xpathResolvesToElement(xp, el) {
+    try {
+      const result = document.evaluate(
+        xp, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null
+      );
+      return result.snapshotLength === 1 && result.snapshotItem(0) === el;
+    } catch (e) { return false; }
+  }
+
+  function slug(text) {
+    return (text || '')
+      .toString().trim().toLowerCase()
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 60);
+  }
+
+  function pageKey() {
+    if (!REC.pageKey) {
+      REC.pageKey = slug(document.title) || slug(location.pathname) || 'page';
+    }
+    return REC.pageKey;
+  }
+
+  function visibleText(el) {
+    if (!el) return '';
+    const t = (el.innerText || el.textContent || '').trim();
+    return t.length > 120 ? t.slice(0, 120) : t;
+  }
+
+  function labelFor(el) {
+    if (!el) return '';
+    if (el.getAttribute && el.getAttribute('aria-label')) return el.getAttribute('aria-label');
+    if (el.id) {
+      const lab = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+      if (lab) return visibleText(lab);
+    }
+    let p = el.parentElement;
+    for (let i = 0; i < 3 && p; i++, p = p.parentElement) {
+      if (p.tagName === 'LABEL') return visibleText(p);
+      const lab = p.querySelector && p.querySelector('label');
+      if (lab && lab.contains && !lab.contains(el)) return visibleText(lab);
+    }
+    if (el.placeholder) return el.placeholder;
+    if (el.title) return el.title;
+    if (el.name) return el.name;
+    return visibleText(el);
+  }
+
+  function elementType(el) {
+    const tag = (el.tagName || '').toLowerCase();
+    const type = (el.getAttribute && (el.getAttribute('type') || '')).toLowerCase();
+    if (tag === 'select') return 'dropdown';
+    if (tag === 'textarea') return 'textarea';
+    if (tag === 'a') return 'link';
+    if (tag === 'table') return 'table';
+    if (tag === 'input') {
+      if (type === 'checkbox') return 'checkbox';
+      if (type === 'radio') return 'radio';
+      if (type === 'file') return 'upload';
+      if (type === 'submit' || type === 'button') return 'button';
+      if (type === 'date' || type === 'datetime-local') return 'calendar';
+      if (type === 'password') return 'password';
+      return 'textbox';
+    }
+    if (tag === 'button') return 'button';
+    const role = el.getAttribute && el.getAttribute('role');
+    if (role) return role;
+    if (el.onclick || (el.className && /btn|button|clickable/i.test(el.className))) {
+      return 'button';
+    }
+    return tag || 'element';
+  }
+
+  function absoluteXPath(el) {
+    if (!el || el.nodeType !== 1) return '';
+    if (el.id) return '//*[@id="' + el.id + '"]';
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === 1 && node !== document.documentElement) {
+      let index = 1;
+      let sib = node.previousElementSibling;
+      while (sib) {
+        if (sib.tagName === node.tagName) index++;
+        sib = sib.previousElementSibling;
+      }
+      parts.unshift(node.tagName.toLowerCase() + '[' + index + ']');
+      node = node.parentElement;
+    }
+    return '/html/' + parts.join('/');
+  }
+
+  function cssPath(el) {
+    if (!el || el.nodeType !== 1) return '';
+    if (el.id) {
+      const idSel = '#' + CSS.escape(el.id);
+      // An id that ISN'T actually unique on this page (duplicate ids do
+      // happen on messy enterprise markup) is worse than useless as a
+      // locator — verify before trusting it.
+      if (cssResolvesToElement(idSel, el)) return idSel;
+    }
+    const segments = [];
+    let node = el;
+    while (node && node.nodeType === 1 && segments.length < 8) {
+      let seg = node.tagName.toLowerCase();
+      if (node.classList && node.classList.length) {
+        const cls = Array.from(node.classList)
+          .filter(c => !/^(ng-|is-|active|selected|hover|focus)/.test(c))
+          .slice(0, 2);
+        if (cls.length) seg += '.' + cls.map(c => CSS.escape(c)).join('.');
+      }
+      const parent = node.parentElement;
+      let indexedSeg = seg;
+      if (parent) {
+        const same = Array.from(parent.children).filter(c => c.tagName === node.tagName);
+        if (same.length > 1) indexedSeg = seg + ':nth-of-type(' + (same.indexOf(node) + 1) + ')';
+      }
+      if (node.id) { indexedSeg = '#' + CSS.escape(node.id); }
+
+      // Try the class/tag-only segment FIRST (survives DOM reordering /
+      // row insertion) — only fall back to the position-based
+      // :nth-of-type segment if the plain one isn't unique enough yet.
+      segments.unshift(seg);
+      let candidate = segments.join(' > ');
+      if (cssResolvesToElement(candidate, el)) return candidate;
+
+      if (indexedSeg !== seg) {
+        segments[0] = indexedSeg;
+        candidate = segments.join(' > ');
+        if (cssResolvesToElement(candidate, el)) return candidate;
+        segments[0] = seg; // keep the non-positional form for the next ancestor level
+      }
+
+      if (node.id) { segments[0] = '#' + CSS.escape(node.id); break; }
+      node = parent;
+    }
+    // Nothing became unique within 8 ancestor levels (rare) — return the
+    // best-effort deepest path; locator_builder.py penalises anything
+    // that wasn't marked verified, below.
+    return segments.join(' > ');
+  }
+
+  function relativeXPaths(el) {
+    const out = [];
+    const tag = (el.tagName || '').toLowerCase();
+    const type = (el.getAttribute && (el.getAttribute('type') || '')).toLowerCase();
+    // 'value' is deliberately EXCLUDED for free-text inputs — for a
+    // textbox/textarea it's whatever the user just TYPED during
+    // recording (an account number, a name, ...), which is both
+    // guaranteed to differ on every future run and a way for recorded
+    // data to leak into a "locator". It's kept only for elements whose
+    // value IS the static, unchanging label (a <input type="submit"
+    // value="Save">-style button), where it behaves like button text.
+    const attrs = ['name', 'placeholder', 'aria-label', 'title'];
+    if (tag !== 'input' || type === 'submit' || type === 'button' || type === 'reset') {
+      attrs.push('value');
+    }
+    attrs.push('type');
+    const candidates = [];
+    attrs.forEach(function (a) {
+      const v = el.getAttribute && el.getAttribute(a);
+      if (v) candidates.push('//' + tag + '[@' + a + '="' + v + '"]');
+    });
+    Array.from(el.attributes || []).forEach(function (a) {
+      if (a.name.indexOf('data-') === 0 && a.value) {
+        candidates.push('//' + tag + '[@' + a.name + '="' + a.value + '"]');
+      }
+    });
+    const txt = visibleText(el);
+    if (txt && txt.length < 40) {
+      candidates.push('//' + tag + '[normalize-space(text())="' + txt + '"]');
+      candidates.push('//' + tag + '[contains(normalize-space(.),"' + txt + '")]');
+    }
+    const lab = labelFor(el);
+    if (lab && lab.length < 40 && (tag === 'input' || tag === 'select' || tag === 'textarea')) {
+      candidates.push('//label[contains(normalize-space(.),"' + lab + '")]/following::'
+        + tag + '[1]');
+      candidates.push('//td[contains(normalize-space(.),"' + lab + '")]/following::'
+        + tag + '[1]');
+    }
+    // Keep only candidates VERIFIED, right now, to resolve to exactly
+    // this element — an xpath that also matches other elements on the
+    // page is a locator that can silently act on the wrong one, which is
+    // worse than not offering it as a fallback at all.
+    candidates.forEach(function (xp) {
+      if (xpathResolvesToElement(xp, el)) out.push(xp);
+    });
+    return out;
+  }
+
+  function describe(el, interacted) {
+    if (!el || el.nodeType !== 1) return null;
+    const rect = (el.getBoundingClientRect && el.getBoundingClientRect()) || {};
+    const style = window.getComputedStyle ? window.getComputedStyle(el) : {};
+    const attrs = {};
+    Array.from(el.attributes || []).forEach(function (a) {
+      if (!SENSITIVE_HINT.test(a.name)) attrs[a.name] = a.value;
+    });
+    const label = labelFor(el);
+    const key = slug(
+      el.id || el.getAttribute('name') || label || elementType(el) + '_' + (REC.seq)
+    ) || ('el_' + REC.seq);
+
+    return {
+      element_key: key,
+      tag: (el.tagName || '').toLowerCase(),
+      element_type: elementType(el),
+      label: label,
+      text: visibleText(el),
+      visible: !!(rect.width || rect.height) && style.visibility !== 'hidden'
+        && style.display !== 'none',
+      enabled: !el.disabled,
+      readonly: !!el.readOnly,
+      required: !!el.required,
+      maxlength: el.maxLength && el.maxLength > 0 ? el.maxLength : null,
+      pattern: el.pattern || null,
+      interacted: !!interacted,
+      page_key: pageKey(),
+      frame_url: location.href,
+      attributes: attrs,
+      options: (el.tagName === 'SELECT')
+        ? Array.from(el.options || []).slice(0, 100)
+            .map(function (o) { return { value: o.value, text: o.text }; })
+        : null,
+      position: { x: Math.round(rect.left || 0), y: Math.round(rect.top || 0),
+                  w: Math.round(rect.width || 0), h: Math.round(rect.height || 0) },
+      parent: el.parentElement ? {
+        tag: el.parentElement.tagName.toLowerCase(),
+        id: el.parentElement.id || null,
+        cls: el.parentElement.className || null
+      } : null,
+      siblings: el.parentElement ? el.parentElement.children.length : 0,
+      locators: (function () {
+        const cssCandidate = cssPath(el);
+        const cssVerified = cssCandidate ? cssResolvesToElement(cssCandidate, el) : false;
+        // A duplicate id/name on the page (messy enterprise markup is
+        // full of these) is not a usable locator even though the
+        // attribute exists — verify before offering it, same as css/xpath
+        // above. An id/name that fails verification is dropped (set to
+        // null) rather than passed downstream with false confidence;
+        // the verified css/xpath/relative_xpath candidates still cover
+        // the element.
+        const rawId = el.id || null;
+        const idVerified = rawId ? cssResolvesToElement('#' + CSS.escape(rawId), el) : false;
+        const rawName = el.getAttribute ? el.getAttribute('name') : null;
+        const nameVerified = rawName
+          ? cssResolvesToElement(
+              (el.tagName || '').toLowerCase() + '[name="' + rawName + '"]', el
+            )
+          : false;
+        return {
+          id: idVerified ? rawId : null,
+          id_ambiguous: !!(rawId && !idVerified),
+          name: nameVerified ? rawName : null,
+          name_ambiguous: !!(rawName && !nameVerified),
+          css: cssCandidate,
+          css_verified: cssVerified,
+          xpath: absoluteXPath(el),
+          relative_xpath: relativeXPaths(el),
+          text: visibleText(el) || null,
+          class: el.className || null,
+          placeholder: el.placeholder || null,
+          aria: el.getAttribute ? el.getAttribute('aria-label') : null,
+          data: Object.keys(attrs)
+            .filter(function (k) { return k.indexOf('data-') === 0; })
+            .reduce(function (acc, k) { acc[k] = attrs[k]; return acc; }, {})
+        };
+      })()
+    };
+  }
+
+  /* ── whole-page crawl (Section 5.2) ────────────────────────────────── */
+  const CRAWL_SELECTOR = [
+    'input', 'textarea', 'select', 'button', 'a[href]', 'table',
+    '[role=button]', '[role=tab]', '[role=menuitem]', '[role=checkbox]',
+    '[role=radio]', '[role=combobox]', '[role=link]', '[onclick]',
+    '[contenteditable=true]', 'label', 'li[class*=menu]', 'div[class*=btn]',
+    'span[class*=btn]', 'img[onclick]', 'i[class*=icon][onclick]'
+  ].join(',');
+
+  function collectRoots() {
+    const roots = [document];
+    document.querySelectorAll('*').forEach(function (el) {
+      if (el.shadowRoot) roots.push(el.shadowRoot);
+    });
+    return roots;
+  }
+
+  function crawlPage(reason) {
+    if (!REC.enabled) return null;
+    const elements = [];
+    const seen = new Set();
+    collectRoots().forEach(function (root) {
+      let nodes = [];
+      try { nodes = Array.from(root.querySelectorAll(CRAWL_SELECTOR)); } catch (e) { }
+      nodes.slice(0, 4000).forEach(function (el) {
+        if (seen.has(el)) return;
+        seen.add(el);
+        const d = describe(el, false);
+        if (d) elements.push(d);
+      });
+    });
+    const crawl = {
+      type: 'crawl',
+      reason: reason || 'page_change',
+      seq: REC.seq++,
+      ts: Date.now(),
+      page: {
+        page_key: pageKey(),
+        url: location.href,
+        title: document.title,
+        frames: Array.from(document.querySelectorAll('iframe,frame')).map(function (f) {
+          return { src: f.getAttribute('src'), id: f.id || null, name: f.name || null };
+        }),
+        shadow_roots: collectRoots().length - 1
+      },
+      elements: elements,
+      element_count: elements.length
+    };
+    REC.crawls.push(crawl);
+    REC.events.push(crawl);
+    return crawl;
+  }
+
+  /* ── validation / message capture (Section 5.8) ────────────────────── */
+  const MESSAGE_SELECTOR = [
+    '.error', '.errorMessage', '.error-message', '.alert', '.alert-danger',
+    '.alert-success', '.alert-warning', '.validation-message', '.help-block',
+    '[role=alert]', '.msg', '.message', '.success', '.warning', '.toast',
+    'span[class*=err]', 'div[class*=err]', 'label[class*=err]'
+  ].join(',');
+
+  function captureMessages() {
+    const found = [];
+    document.querySelectorAll(MESSAGE_SELECTOR).forEach(function (el) {
+      const txt = visibleText(el);
+      const rect = el.getBoundingClientRect();
+      if (!txt || !(rect.width || rect.height)) return;
+      let severity = 'info';
+      const cls = (el.className || '') + ' ' + (el.getAttribute('role') || '');
+      if (/err|danger|invalid|fail/i.test(cls)) severity = 'error';
+      else if (/succ|ok|valid/i.test(cls)) severity = 'success';
+      else if (/warn/i.test(cls)) severity = 'warning';
+      found.push({ text: txt, severity: severity, page_key: pageKey(),
+                   selector: cssPath(el) });
+    });
+    if (found.length) {
+      const evt = { type: 'messages', seq: REC.seq++, ts: Date.now(),
+                    page_key: pageKey(), messages: found };
+      REC.messages.push(evt);
+      REC.events.push(evt);
+    }
+    return found;
+  }
+
+  /* ── interaction hooks (Section 5.1 / 5.4) ─────────────────────────── */
+  function pushAction(action, el, extra) {
+    if (!REC.enabled) return;
+    const d = describe(el, true);
+    if (!d) return;
+    const evt = Object.assign({
+      type: 'action',
+      action: action,
+      seq: REC.seq++,
+      ts: Date.now(),
+      page_key: pageKey(),
+      url: location.href,
+      element: d
+    }, extra || {});
+    REC.events.push(evt);
+  }
+
+  document.addEventListener('click', function (e) {
+    // composedPath()[0] is the TRUE originally-clicked element even when
+    // it's inside a Shadow DOM component (a common way modern frameworks
+    // render floaters/menus) — plain e.target can get "retargeted" to an
+    // outer wrapper in that case, describing the wrong thing.
+    const clicked = (e.composedPath && e.composedPath()[0]) || e.target;
+
+    // Submit-type buttons/inputs are a special case: clicking one usually
+    // triggers an IMMEDIATE form submission or AJAX navigation. The click
+    // gets recorded into memory just fine (pushAction is synchronous), but
+    // Python only DRAINS that memory periodically (~1s poll) — if the page
+    // navigates before the next poll, the whole in-memory event queue is
+    // destroyed with it, and the click is silently lost even though it was
+    // captured correctly. This is why "Submit" buttons in particular kept
+    // going unrecorded. Fix: briefly hold the real submission back long
+    // enough for the recorded click to be safely drained, then let it
+    // through exactly as the user intended.
+    const submitEl = clicked.closest
+        ? clicked.closest('button[type="submit"], input[type="submit"]')
+        : null;
+    if (submitEl) {
+      if (submitEl.__aiRecReleased) {
+        // This is our own re-dispatched click going through for real —
+        // don't intercept it again, just let it proceed natively.
+        submitEl.__aiRecReleased = false;
+        return;
+      }
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      pushAction('click', submitEl, {via: 'submit_button_delayed'});
+      setTimeout(function () {
+        captureMessages();
+        submitEl.__aiRecReleased = true;
+        submitEl.click(); // re-dispatch — the real submit happens now
+      }, 300);
+      return;
+    }
+
+    pushAction('click', clicked, {});
+    // A click is overwhelmingly the most common way a floater/popup/
+    // dropdown gets opened. Re-crawl shortly after, rather than waiting
+    // for the debounced MutationObserver — this is what actually makes a
+    // just-opened floater's contents locatable in time for the user's
+    // very next interaction inside it.
+    setTimeout(function () { crawlPage('post_click'); captureMessages(); }, 350);
+  }, true);
+
+  document.addEventListener('change', function (e) {
+    const el = e.target;
+    const t = elementType(el);
+    if (t === 'dropdown') {
+      pushAction('select', el, {
+        selected_text: el.options && el.options[el.selectedIndex]
+          ? el.options[el.selectedIndex].text : null,
+        value_length: (el.value || '').length
+      });
+    } else if (t === 'checkbox' || t === 'radio') {
+      pushAction(el.checked ? 'check' : 'uncheck', el, {});
+    } else if (t === 'upload') {
+      pushAction('upload', el, { file_count: (el.files || []).length });
+    } else {
+      /* NEVER store the raw value — only metadata (Section 7.1) */
+      const now = Date.now();
+      if (el.__aiRecLastCapture && now - el.__aiRecLastCapture < 400) return;
+      el.__aiRecLastCapture = now;
+      pushAction('type', el, {
+        value_length: (el.value || '').length,
+        sensitive: SENSITIVE_HINT.test(el.name || '') ||
+                   SENSITIVE_HINT.test(el.id || '') ||
+                   (el.type || '') === 'password'
+      });
+    }
+    setTimeout(captureMessages, 350);
+  }, true);
+
+  document.addEventListener('submit', function (e) {
+    pushAction('submit', e.target, {});
+    setTimeout(captureMessages, 500);
+  }, true);
+
+  /* Search/query boxes overwhelmingly submit on Enter, with the page's
+   * own JS intercepting the keydown (often via preventDefault()) to fire
+   * an AJAX search or navigate immediately — the field never blurs in the
+   * way needed for a native 'change' event to fire, so the standard
+   * change-listener above never captures it. This was the actual cause of
+   * a search box that's auto-focused after login (never clicked, typed
+   * into immediately, Enter pressed) going completely unrecorded. Capture
+   * on Enter BEFORE that navigation/AJAX can happen. */
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter' && e.keyCode !== 13) return;
+    const el = e.target;
+    const tag = (el.tagName || '').toLowerCase();
+    if (tag !== 'input' && tag !== 'textarea') return;
+    const t = elementType(el);
+    if (t === 'dropdown' || t === 'checkbox' || t === 'radio' || t === 'upload') return;
+    // Dedup: if a native 'change' already captured this exact field very
+    // recently, don't double-record the same keystroke as two steps.
+    const now = Date.now();
+    if (el.__aiRecLastCapture && now - el.__aiRecLastCapture < 400) return;
+    el.__aiRecLastCapture = now;
+    pushAction('type', el, {
+      value_length: (el.value || '').length,
+      sensitive: SENSITIVE_HINT.test(el.name || '') ||
+                 SENSITIVE_HINT.test(el.id || '') ||
+                 (el.type || '') === 'password',
+      via: 'enter_key'
+    });
+    setTimeout(captureMessages, 350);
+  }, true);
+
+  window.addEventListener('load', function () {
+    setTimeout(function () { crawlPage('load'); captureMessages(); }, 400);
+  });
+
+  /* SPA / dynamic DOM: re-crawl when the page materially changes.
+   * Used to require >=3 new interactive elements before bothering to
+   * re-crawl — small floaters/popups (a 2-button "Update Later / Update
+   * Now" panel, a short dropdown) never crossed that threshold and were
+   * silently never captured. Any change now triggers a re-crawl. */
+  let mutationTimer = null;
+  let lastCount = 0;
+  const observer = new MutationObserver(function () {
+    if (!REC.enabled) return;
+    clearTimeout(mutationTimer);
+    mutationTimer = setTimeout(function () {
+      const count = document.querySelectorAll(CRAWL_SELECTOR).length;
+      if (count !== lastCount) {
+        lastCount = count;
+        REC.pageKey = null;           // title may have changed
+        crawlPage('dom_mutation');
+      }
+      captureMessages();
+    }, 500);
+  });
+  try {
+    observer.observe(document.documentElement || document.body,
+      { childList: true, subtree: true, attributes: false });
+  } catch (e) { }
+
+  /* ── drain API used by the Python recorder ─────────────────────────── */
+  REC.drain = function () {
+    const batch = REC.events.splice(0, REC.events.length);
+    return batch;
+  };
+  REC.snapshotDom = function () {
+    return {
+      url: location.href,
+      title: document.title,
+      html: document.documentElement ? document.documentElement.outerHTML : '',
+      page_key: pageKey()
+    };
+  };
+  REC.forceCrawl = function () { return crawlPage('manual'); };
+  REC.stop = function () { REC.enabled = false; try { observer.disconnect(); } catch (e) { } };
+
+  setTimeout(function () { crawlPage('init'); }, 600);
+})();
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""Locator Repository builder (Section 5.3).
+
+Turns the raw locator bundle captured in the browser into a ranked,
+multi-strategy fallback list.  Ranking is what makes self-healing cheap:
+if the top strategy dies, the next one usually still resolves.
+"""
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Literal, Optional
+import re
+from typing import Any
 
-from pydantic import BaseModel, Field
+# lower priority number = tried first
+BASE_PRIORITY = {
+    "id": 10,
+    "name": 20,
+    "data": 25,
+    "aria": 30,
+    "css": 40,
+    "relative_xpath": 50,
+    "placeholder": 55,
+    "link_text": 60,
+    "text": 70,
+    "class": 80,
+    "xpath": 90,          # absolute XPath = last resort, most brittle
+}
 
-Environment = Literal["PREPROD", "UAT", "PROD"]
-TransactionType = Literal["business", "system_prerequisite", "system_cleanup"]
-DataSource = Literal["framework", "profile", "runtime", "database", "api", "ai", "user"]
+BASE_RELIABILITY = {
+    "id": 0.95, "name": 0.90, "data": 0.88, "aria": 0.82, "css": 0.75,
+    "relative_xpath": 0.70, "placeholder": 0.65, "link_text": 0.60,
+    "text": 0.55, "class": 0.40, "xpath": 0.30,
+}
 
-
-# ── recorder ────────────────────────────────────────────────────────────
-class RecordingStartRequest(BaseModel):
-    transaction_id: str = Field(..., examples=["1045"])
-    transaction_name: str = Field(..., examples=["CIF Creation"])
-    environment: Environment = "PREPROD"
-    start_url: str
-    transaction_type: TransactionType = "business"
-    description: Optional[str] = None
-    fullpage_crawl: bool = True
-    capture_network: bool = True
-
-
-class RecordingSession(BaseModel):
-    session_uid: str
-    transaction_id: str
-    transaction_name: Optional[str] = None
-    environment: Optional[str] = None
-    status: str
-    start_url: Optional[str] = None
-    capture_dir: Optional[str] = None
-    stats: dict[str, Any] = {}
-    started_at: Optional[datetime] = None
-    stopped_at: Optional[datetime] = None
+_DYNAMIC_ID = re.compile(
+    r"(\d{4,}|[0-9a-f]{8}-[0-9a-f]{4}|__\d+|_\d{3,}|ctl\d+|:r[0-9a-z]+:)", re.I
+)
+_NOISE_CLASS = re.compile(r"^(ng-|is-|active|selected|hover|focus|open|show)", re.I)
 
 
-class RecordedActionOut(BaseModel):
-    sequence: int
-    action: str
-    element_key: Optional[str] = None
-    field_name: Optional[str] = None
-    value_ref: Optional[str] = None
-    page_key: Optional[str] = None
-    screenshot_after: Optional[str] = None
+def looks_dynamic(value: str) -> bool:
+    return bool(value and _DYNAMIC_ID.search(value))
 
 
-class KeepDiscardRequest(BaseModel):
-    session_uid: str
-    decision: Literal["keep", "discard"]
-    reason: Optional[str] = None
-    generate_code: bool = True
+def _penalise(strategy: str, value: str) -> tuple[int, float]:
+    priority = BASE_PRIORITY.get(strategy, 100)
+    reliability = BASE_RELIABILITY.get(strategy, 0.5)
+    if looks_dynamic(value):
+        priority += 25
+        reliability *= 0.55
+    if strategy == "css" and value.count(">") > 5:
+        priority += 10
+        reliability *= 0.8
+    if strategy == "xpath" and value.count("/") > 8:
+        priority += 10
+        reliability *= 0.7
+    if len(value) > 300:
+        priority += 15
+        reliability *= 0.7
+    return priority, round(min(reliability, 0.999), 3)
 
 
-# ── transactions / knowledge ────────────────────────────────────────────
-class TransactionOut(BaseModel):
-    id: int
-    transaction_id: str
-    name: str
-    description: Optional[str] = None
-    version: str
-    type: str
-    status: str
-    confidence: float = 1.0
-    tags: list[str] = []
-    workflow_path: list[Any] = []
-    generated_files: dict[str, Any] = {}
-    recorded_at: Optional[datetime] = None
-    created_at: Optional[datetime] = None
+def build(raw: dict[str, Any], element_type: str = "") -> list[dict[str, Any]]:
+    """raw = the `locators` object produced by injector.js."""
+    out: list[dict[str, Any]] = []
+
+    def add(strategy: str, value: Any, verified: bool = False) -> None:
+        if value is None:
+            return
+        value = str(value).strip()
+        if not value:
+            return
+        if strategy == "class":
+            classes = [c for c in value.split() if not _NOISE_CLASS.match(c)]
+            if not classes:
+                return
+            value = ".".join(classes[:3])
+        priority, reliability = _penalise(strategy, value)
+        if verified:
+            # Confirmed at record time, against the live page, to resolve
+            # to EXACTLY this element and no other — this is strictly
+            # stronger evidence than "well-formed selector, never tested",
+            # so it jumps ahead of every unverified strategy regardless of
+            # type (a verified css beats an unverified id, because an
+            # unverified id might be one of several duplicate ids on a
+            # messy enterprise page).
+            priority = max(1, priority - 100)
+            reliability = round(min(reliability + 0.20, 0.999), 3)
+        out.append({
+            "strategy": strategy,
+            "value": value,
+            "priority": priority,
+            "reliability": reliability,
+            "dynamic": looks_dynamic(value),
+            "verified": verified,
+        })
+
+    # id/name only ever arrive here already verified page-unique by the
+    # recorder (injector.js drops them to null otherwise) — see
+    # describe()'s id_ambiguous/name_ambiguous fields for why a page with
+    # duplicate ids doesn't silently produce a broken "id" locator.
+    add("id", raw.get("id"), verified=bool(raw.get("id")))
+    add("name", raw.get("name"), verified=bool(raw.get("name")))
+    for key, value in (raw.get("data") or {}).items():
+        add("data", f"[{key}='{value}']")
+    add("aria", raw.get("aria"))
+    add("css", raw.get("css"), verified=bool(raw.get("css_verified")))
+    # relative_xpath candidates are pre-filtered by the recorder to only
+    # those verified, at capture time, to resolve to exactly this element.
+    for xpath in (raw.get("relative_xpath") or [])[:6]:
+        add("relative_xpath", xpath, verified=True)
+    add("placeholder", raw.get("placeholder"))
+    if element_type == "link":
+        add("link_text", raw.get("text"))
+    else:
+        add("text", raw.get("text"))
+    add("class", raw.get("class"))
+    add("xpath", raw.get("xpath"))  # absolute xpath — last resort, unverified
+
+    # de-duplicate, keep the best-ranked instance of each value
+    best: dict[tuple[str, str], dict[str, Any]] = {}
+    for locator in out:
+        key = (locator["strategy"], locator["value"])
+        if key not in best or locator["priority"] < best[key]["priority"]:
+            best[key] = locator
+    return sorted(best.values(), key=lambda x: (x["priority"], -x["reliability"]))
 
 
-class ElementOut(BaseModel):
-    element_key: str
-    tag: Optional[str] = None
-    element_type: Optional[str] = None
-    label: Optional[str] = None
-    visible: bool = True
-    enabled: bool = True
-    interacted: bool = False
-    locators: list[dict[str, Any]] = []
+def _python_escape(value: str) -> str:
+    """Escape a value for safe embedding inside a Python string literal
+    (double-quoted).
+
+    Order matters: backslashes MUST be escaped first, otherwise the
+    backslash inserted for a later replacement (e.g. before a quote) would
+    itself get re-escaped. A recorded locator value can legitimately
+    contain backslashes (Windows-style paths, regex-flavoured CSS
+    attribute selectors), quotes, or even embedded newlines (multi-line
+    element text) — any of those, left raw, breaks out of the Python
+    string literal and cascades into downstream syntax errors from a
+    single bad character.
+    """
+    return (
+        (value or "")
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
 
 
-# ── test data ───────────────────────────────────────────────────────────
-class TestDataFieldMeta(BaseModel):
-    field: str
-    datatype: Optional[str] = None
-    required: bool = False
-    pattern: Optional[str] = None
-    business_meaning: Optional[str] = None
-    sensitive: bool = False
-    editable: bool = True
-    source: DataSource = "user"
-    source_config: dict[str, Any] = {}
-    element_key: Optional[str] = None
+def to_python_by(locator: dict[str, Any]) -> str:
+    """Render a locator as a Selenium Python `(By.X, "value")` tuple —
+    directly usable by python-framework/utils/locator_repository.py and
+    core/element_resolver.py."""
+    strategy, value = locator["strategy"], _python_escape(locator["value"])
+    mapping = {
+        "id": f'(By.ID, "{value}")',
+        "name": f'(By.NAME, "{value}")',
+        "css": f'(By.CSS_SELECTOR, "{value}")',
+        "data": f'(By.CSS_SELECTOR, "{value}")',
+        "aria": f'(By.CSS_SELECTOR, "[aria-label=\'{value}\']")',
+        "class": f'(By.CSS_SELECTOR, ".{value}")',
+        "xpath": f'(By.XPATH, "{value}")',
+        "relative_xpath": f'(By.XPATH, "{value}")',
+        "placeholder": f'(By.CSS_SELECTOR, "[placeholder=\'{value}\']")',
+        "link_text": f'(By.LINK_TEXT, "{value}")',
+        "text": f'(By.XPATH, "//*[normalize-space(text())=\'{value}\']")',
+    }
+    return mapping.get(strategy, f'(By.XPATH, "{value}")')
 
 
-class TestDataValueIn(BaseModel):
-    field: str
-    value: str
-    sensitive: bool = False
-    source: DataSource = "user"
+def primary(locators: list[dict[str, Any]]) -> dict[str, Any]:
+    return locators[0] if locators else {"strategy": "xpath", "value": "//*", "priority": 999}
 
 
-class TestDataSaveRequest(BaseModel):
-    transaction_id: str
-    environment: Environment
-    profile: Optional[str] = None
-    values: list[TestDataValueIn]
+def fallbacks(locators: list[dict[str, Any]], limit: int = 4) -> list[dict[str, Any]]:
+    return locators[1 : 1 + limit]
 
 
-class TestDataTemplateOut(BaseModel):
-    transaction: str
-    environment: str
-    data: dict[str, dict[str, Any]]
-    file_path: Optional[str] = None
-
-
-class ManualLocatorRequest(BaseModel):
-    strategy: str            # id | name | css | xpath | data | aria | text ...
-    value: str
-    priority: int = 1        # 1 = tried first, ahead of the recorder's own locators
-    # Only used if the element doesn't exist yet (recorder never captured it):
-    tag: str = "input"
-    element_type: str = "textbox"
-    label: str | None = None
-    page_key: str | None = None
-    action: str | None = None   # click | type | select ... defaults from element_type
-
-
-class ProfileIn(BaseModel):
-    name: str
-    environment: Environment
-    description: Optional[str] = None
-    values: dict[str, str] = {}
-    secrets: dict[str, str] = {}   # teller_id, teller_password, checker_id, ...
-
-
-class ProfileOut(BaseModel):
-    id: int
-    name: str
-    environment: str
-    description: Optional[str] = None
-    values: dict[str, Any] = {}
-    secret_keys: list[str] = []    # names only, never values
-
-
-# ── execution ───────────────────────────────────────────────────────────
-class ExecutionRequest(BaseModel):
-    transaction_id: str
-    environment: Environment = "PREPROD"
-    profile: str
-    target_url: Optional[str] = None
-    runtime_values: dict[str, str] = {}
-    skip_password_change: bool = False    # audit-logged override
-    skip_teller_reset: bool = False       # audit-logged override
-    headless: bool = False
-
-
-class ExecutionStepOut(BaseModel):
-    sequence: int
-    phase: str
-    step_name: str
-    status: str
-    duration_ms: Optional[int] = None
-    screenshot_ref: Optional[str] = None
-    error_msg: Optional[str] = None
-    detail: dict[str, Any] = {}
-
-
-class ExecutionOut(BaseModel):
-    execution_uid: str
-    transaction_id: str
-    environment: str
-    status: str
-    password_change_status: Optional[str] = None
-    teller_reset_status: Optional[str] = None
-    teller_reset_response: Optional[str] = None
-    report_path: Optional[str] = None
-    error_summary: Optional[str] = None
-    metrics: dict[str, Any] = {}
-    started_at: Optional[datetime] = None
-    finished_at: Optional[datetime] = None
-    steps: list[ExecutionStepOut] = []
-
-
-# ── BRD ─────────────────────────────────────────────────────────────────
-class BRDImpact(BaseModel):
-    transaction_id: str
-    transaction_name: Optional[str] = None
-    change_type: Literal[
-        "new_transaction", "workflow_change", "field_change",
-        "validation_change", "locator_change", "no_change"
-    ]
-    affected_screens: list[str] = []
-    affected_fields: list[str] = []
-    requires_recording: bool = False
-    risk: Literal["low", "medium", "high"] = "medium"
-    rationale: str = ""
-    proposed_changes: list[str] = []
-
-
-class BRDAnalysisOut(BaseModel):
-    brd_id: int
-    filename: str
-    status: str
-    summary: str = ""
-    impacts: list[BRDImpact] = []
-
-
-# ── approvals / self-heal ───────────────────────────────────────────────
-class ApprovalDecision(BaseModel):
-    thread_id: str
-    approval_type: Literal["recording_keep", "codegen", "self_heal"]
-    decision: Literal["approved", "rejected", "discarded"]
-    decided_by: Optional[str] = None
-    notes: Optional[str] = None
-
-
-class SelfHealEntry(BaseModel):
-    element_key: str
-    old_locator: str
-    new_locator: str
-    strategy: str
-    confidence: float
-    reason: str
-    applied: bool = False
-
-
-# ── secrets ─────────────────────────────────────────────────────────────
-class SecretIn(BaseModel):
-    scope: Literal["global", "profile", "environment"] = "profile"
-    scope_ref: Optional[str] = None
-    key: Literal[
-        "teller_id", "teller_password", "teller_new_password",
-        "checker_id", "checker_password", "cbs_reset_string",
-    ]
-    value: str
-
-
-class SecretOut(BaseModel):
-    scope: str
-    scope_ref: Optional[str] = None
-    key: str
-    hint: str
-    updated_at: Optional[datetime] = None
-
-
-# ── generic ─────────────────────────────────────────────────────────────
-class Ack(BaseModel):
-    ok: bool = True
-    message: str = ""
-    data: dict[str, Any] = {}
+def score_change(old: dict[str, Any], new: dict[str, Any]) -> float:
+    """How confident are we that `new` replaces `old`?  Used by self-healing."""
+    if old.get("strategy") == new.get("strategy") and old.get("value") == new.get("value"):
+        return 1.0
+    score = new.get("reliability", 0.5)
+    if old.get("strategy") == new.get("strategy"):
+        score += 0.10
+    if not new.get("dynamic", False):
+        score += 0.05
+    return round(min(score, 0.99), 3)
