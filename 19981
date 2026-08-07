@@ -1,70 +1,140 @@
-"""Logs viewer (backend + errors-only, both persisted to storage/logs/ by
-backend/core/logging_conf.py's RotatingFileHandlers)."""
+"""FastAPI application — the orchestration layer of Section 2.
+
+    Frontend (HTML/CSS/JS)  →  THIS  →  LangGraph agents  →  Knowledge repo
+                                                          →  python-framework/
+"""
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
-from ..core.config import settings
+from .api import routes_brd, routes_execution, routes_framework, routes_recorder
+from .api import routes_logs, routes_testdata
+from .api.ws import hub
+from .core import db
+from .core.config import PROJECT_ROOT, settings
+from .core.logging_conf import configure_logging, get_logger
 
-router = APIRouter(prefix="/api/logs", tags=["logs"])
+configure_logging()
+log = get_logger(__name__)
 
-_FILES = {
-    "all": "backend.log",
-    "errors": "errors.log",
-}
-
-
-def _tail_lines(path, lines: int) -> list[str]:
-    """Reads only the last `lines` lines without loading the whole
-    (potentially many-MB, rotated-at-10MB) file into memory at once."""
-    import collections
-
-    if not path.exists():
-        return []
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        return list(collections.deque(fh, maxlen=lines))
+FRONTEND_DIR = PROJECT_ROOT / "frontend"
 
 
-@router.get("")
-def get_logs(kind: str = "all", lines: int = 500,
-             search: str | None = None) -> dict[str, Any]:
-    """kind: "all" (everything) or "errors" (WARNING/ERROR/CRITICAL only).
-    `lines` caps how far back to read (most-recent-first isn't done here —
-    returned in natural, oldest-first file order, same as `tail`)."""
-    filename = _FILES.get(kind)
-    if not filename:
-        raise HTTPException(400, f"Unknown log kind '{kind}' — use 'all' or 'errors'")
-    lines = max(1, min(lines, 5000))
-    path = settings.logs_path / filename
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    hub.bind_loop(asyncio.get_running_loop())
+    log.info("=" * 78)
+    log.info(" %s", settings.app_name)
+    log.info(" Python orchestrates AND executes · AI never replaces the framework")
+    log.info("=" * 78)
+    settings.ensure_dirs()
+    # Probe once (cheap, cached) so an unreachable database costs a single
+    # timeout at startup instead of blocking behind pool reconnect attempts.
+    if db.available():
+        try:
+            db.init_schema()
+            log.info("Knowledge repository ready at %s", settings.sqlite_db_path)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Schema could not be applied: %s", exc)
+            log.error("Fix the error above, then POST /api/framework/db/init")
+    else:
+        log.error("SQLite database is not reachable at %s — the UI will load, "
+                  "but every knowledge operation will fail.",
+                  settings.sqlite_db_path)
+        log.error("Run 'python scripts/init_db.py', then restart (or POST "
+                  "/api/framework/db/init).")
+    if not settings.llm_configured:
+        log.warning("Azure OpenAI is not configured — recording, indexing and "
+                    "execution still work; AI generation and healing do not.")
+    yield
+    db.close_pool()
+    log.info("Shutdown complete")
 
-    entries = _tail_lines(path, lines)
-    if search:
-        needle = search.lower()
-        entries = [line for line in entries if needle in line.lower()]
 
+app = FastAPI(
+    title=settings.app_name,
+    version="1.0.0",
+    description=(
+        "Self-learning AI Automation Engineer for a Python Selenium+behave "
+        "banking framework. Record once, learn forever."
+    ),
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(routes_recorder.router)
+app.include_router(routes_recorder.library)
+app.include_router(routes_testdata.router)
+app.include_router(routes_testdata.profile_router)
+app.include_router(routes_testdata.secret_router)
+app.include_router(routes_execution.router)
+app.include_router(routes_execution.reports)
+app.include_router(routes_brd.router)
+app.include_router(routes_framework.router)
+app.include_router(routes_logs.router)
+
+
+@app.exception_handler(Exception)
+async def unhandled(request: Any, exc: Exception) -> JSONResponse:
+    log.exception("Unhandled error on %s", getattr(request, "url", "?"))
+    return JSONResponse(status_code=500,
+                        content={"error": str(exc), "type": type(exc).__name__})
+
+
+@app.get("/api", tags=["meta"])
+def api_root() -> dict[str, Any]:
     return {
-        "kind": kind,
-        "file": str(path),
-        "exists": path.exists(),
-        "size_bytes": path.stat().st_size if path.exists() else 0,
-        "returned_lines": len(entries),
-        "lines": entries,
+        "app": settings.app_name,
+        "screens": [
+            "record", "library", "testdata", "profiles", "brd", "execute", "reports"
+        ],
+        "agents": 16,
+        "docs": "/docs",
     }
 
 
-@router.get("/files")
-def list_log_files() -> dict[str, Any]:
-    """What's actually on disk, including rotated backups
-    (backend.log.1, backend.log.2, ...) — mainly so a much older error
-    isn't assumed lost just because it scrolled out of the active file."""
-    settings.logs_path.mkdir(parents=True, exist_ok=True)
-    files = []
-    for path in sorted(settings.logs_path.glob("*.log*")):
-        files.append({
-            "name": path.name,
-            "size_bytes": path.stat().st_size,
-            "modified": path.stat().st_mtime,
-        })
-    return {"directory": str(settings.logs_path), "files": files}
+if FRONTEND_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+    app.mount("/css", StaticFiles(directory=str(FRONTEND_DIR / "css")), name="css")
+    app.mount("/js", StaticFiles(directory=str(FRONTEND_DIR / "js")), name="js")
+
+    @app.get("/", include_in_schema=False)
+    def index() -> Any:
+        return FileResponse(str(FRONTEND_DIR / "index.html"))
+
+    @app.get("/{page}.html", include_in_schema=False)
+    def page(page: str) -> Any:
+        target = FRONTEND_DIR / f"{page}.html"
+        if not target.exists():
+            return JSONResponse(status_code=404, content={"error": "page not found"})
+        return FileResponse(str(target))
+
+
+def main() -> None:
+    import uvicorn
+    uvicorn.run(
+        "backend.main:app",
+        host=settings.app_host,
+        port=settings.app_port,
+        reload=False,
+        log_level=settings.log_level.lower(),
+    )
+
+
+if __name__ == "__main__":
+    main()
