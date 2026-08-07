@@ -1,132 +1,172 @@
-/* Shared API client + tiny helpers. No framework, on purpose. */
-const API = {
-  async request(method, url, body, isForm) {
-    const opts = { method, headers: {} };
-    if (body !== undefined && body !== null) {
-      if (isForm) { opts.body = body; }
-      else { opts.headers['Content-Type'] = 'application/json';
-             opts.body = JSON.stringify(body); }
-    }
-    const res = await fetch(url, opts);
-    const text = await res.text();
-    let data = null;
-    try { data = text ? JSON.parse(text) : null; } catch (e) { data = { raw: text }; }
-    if (!res.ok) {
-      const message = (data && (data.detail || data.error)) || res.statusText;
-      throw new Error(typeof message === 'string' ? message : JSON.stringify(message));
-    }
-    return data;
-  },
-  get(url)          { return API.request('GET', url); },
-  post(url, body)   { return API.request('POST', url, body); },
-  del(url)          { return API.request('DELETE', url); },
-  upload(url, file) { const fd = new FormData(); fd.append('file', file);
-                      return API.request('POST', url, fd, true); }
-};
+"""behave hooks — evidence capture for every step, a per-scenario CBS
+teller reset, and a guaranteed browser teardown.
 
-function $(sel, root) { return (root || document).querySelector(sel); }
-function $$(sel, root) { return Array.from((root || document).querySelectorAll(sel)); }
+Argument parsing / final teardown live in ``run.py`` at the project
+root, which invokes `behave` as a subprocess — see run.py's module
+docstring.
 
-function el(tag, attrs, children) {
-  const node = document.createElement(tag);
-  Object.entries(attrs || {}).forEach(([k, v]) => {
-    if (k === 'class') node.className = v;
-    else if (k === 'html') node.innerHTML = v;
-    else if (k.startsWith('on') && typeof v === 'function') node[k] = v;
-    else if (v !== null && v !== undefined) node.setAttribute(k, v);
-  });
-  (children || []).forEach(c => node.appendChild(
-    typeof c === 'string' ? document.createTextNode(c) : c));
-  return node;
-}
+A feature file can hold several scenarios (the main positive one plus
+auto-derived negative ones — see backend/codegen/generator.py::
+_negative_scenarios) — a scenario that leaves the teller session dirty
+must not bleed into the next one, so a reset fires after EVERY scenario
+here, not just once at the very end. CBS credentials/protocol stay
+exclusively in the platform's Python backend
+(backend/execution/socket_client.py) — this hook only ever calls back
+with execution_uid/profile/environment, never a teller_id or the reset
+message format itself. The single GUARANTEED final reset in
+ExecutionPipeline.run()'s finally block is unchanged and still covers the
+case where this process dies before the hook can even fire.
+"""
+from __future__ import annotations
 
-function badge(status) {
-  return `<span class="badge b-${(status || 'unknown')
-    .toString().toLowerCase()}">${status || '—'}</span>`;
-}
+import os
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
 
-function toast(message, kind) {
-  const node = el('div', { class: 'toast ' + (kind || '') }, [String(message)]);
-  document.body.appendChild(node);
-  setTimeout(() => node.remove(), kind === 'err' ? 7000 : 4000);
-}
+# Make `core`, `utils`, `pages` importable regardless of the cwd behave
+# was launched from.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-function fmtTime(value) {
-  if (!value) return '—';
-  try { return new Date(value).toLocaleString(); } catch (e) { return value; }
-}
+from core.driver_factory import get_driver, quit_quietly  # noqa: E402
+from utils import execution_context as ctx  # noqa: E402
+from utils.socket_reset_client import reset_teller_quietly  # noqa: E402
 
-function fmtMs(ms) {
-  if (!ms && ms !== 0) return '—';
-  return ms > 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms';
-}
+# How many scenarios have started in THIS behave process so far — module-
+# level rather than on `context`, since `context` itself is reset/rebuilt
+# by behave between scenarios and isn't a reliable place to keep a
+# running counter across scenario boundaries.
+_scenario_count = 0
 
-function qs(name, fallback) {
-  return new URLSearchParams(location.search).get(name) || fallback || '';
-}
+# Per-step timer — ALSO kept module-level rather than as a `context`
+# attribute. behave's `Context` class treats underscore-prefixed
+# attributes specially: looking one up before it's ever been set on the
+# CURRENT context layer raises `KeyError`, not `AttributeError` — and
+# Python's `getattr(obj, name, default)` only falls back to `default` on
+# an `AttributeError` from `__getattr__`; any OTHER exception (a KeyError
+# here) propagates straight through, default value or not. That combination
+# turned what looked like a safe `getattr(context, "_step_started", now)`
+# into `HOOK-ERROR in after_step: KeyError: '_step_started'` on the very
+# first step of every single scenario — which behave treats as the whole
+# scenario failing, not just that one step, so this one bug failed EVERY
+# scenario in the run. A plain module-level variable sidesteps Context's
+# internals entirely; behave runs one process per execution, single-
+# threaded, one step at a time, so there's nothing to race here.
+_step_started = 0.0
 
-/* Sidebar — identical on every screen, rendered once here. */
-function renderShell(active, title, subtitle) {
-  const nav = [
-    ['Knowledge', [
-      ['record.html',   'Record Transaction'],
-      ['library.html',  'Transaction Library'],
-    ]],
-    ['Test Data', [
-      ['testdata.html', 'Test Data Editor'],
-      ['profiles.html', 'Profile Manager'],
-    ]],
-    ['Change & Run', [
-      ['brd.html',      'BRD Upload & Impact'],
-      ['execute.html',  'Execute'],
-      ['reports.html',  'Reports Dashboard'],
-      ['logs.html',     'Logs'],
-    ]],
-  ];
-  const links = nav.map(([group, items]) =>
-    `<div class="group">${group}</div>` + items.map(([href, label]) =>
-      `<a href="${href}" class="${href === active ? 'active' : ''}">${label}</a>`
-    ).join('')).join('');
 
-  document.body.insertAdjacentHTML('afterbegin', `
-    <div class="app">
-      <aside class="sidebar">
-        <div class="brand">
-          <h1>AI Automation Engineer</h1>
-          <span>Record once · Learn forever</span>
-        </div>
-        <nav class="nav">
-          <a href="index.html" class="${active === 'index.html' ? 'active' : ''}">Overview</a>
-          ${links}
-        </nav>
-      </aside>
-      <div class="main">
-        <div class="topbar">
-          <div><h2>${title}</h2><div class="sub">${subtitle || ''}</div></div>
-          <div id="topbar-extra"></div>
-        </div>
-        <div class="content" id="content"></div>
-      </div>
-    </div>`);
-  return $('#content');
-}
+def before_all(context):
+    # ExecutionContext is initialised from CLI-style --key=value userdata,
+    # (see run.py for how they get here).
+    args = [f"--{k}={v}" for k, v in context.config.userdata.items()]
+    ctx.init_from_args(args)
+    global _scenario_count
+    _scenario_count = 0
 
-/* Poll a background job until it finishes. */
-async function waitForJob(jobId, onTick) {
-  for (;;) {
-    const job = await API.get('/api/execution/job/' + jobId).catch(() => null);
-    if (job) {
-      if (onTick) onTick(job);
-      if (job.status !== 'running') return job;
-    }
-    await new Promise(r => setTimeout(r, 1500));
-  }
-}
 
-function openSocket(path, onMessage) {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const socket = new WebSocket(`${proto}://${location.host}${path}`);
-  socket.onmessage = e => { try { onMessage(JSON.parse(e.data)); } catch (x) {} };
-  socket.onclose = () => setTimeout(() => openSocket(path, onMessage), 4000);
-  return socket;
-}
+def before_scenario(context, scenario):
+    global _scenario_count, _step_started
+    _scenario_count += 1
+    _step_started = time.time()
+    # Per-scenario shared data map — Python equivalent of the Java
+    # CommonSteps' `txnDataMap` (a fresh Map<String,String> per Scenario,
+    # passed between step definitions and page objects). Fresh dict per
+    # scenario, same lifetime as the Java version's per-Scenario map.
+    context.txn_data = {}
+
+    # The app logs the teller out at the end of every scenario (the
+    # generated feature's closing "And user logs out" step, or CommonSteps'
+    # logout step). Starting the NEXT scenario should land back on a fresh
+    # login page — but sometimes it doesn't actually finish loading before
+    # the first step tries to interact with it (a stale/blank page left
+    # over from the previous scenario's logout navigation). A fresh
+    # navigation before every scenario EXCEPT the very first one (there's
+    # nothing to reset yet — the browser hasn't navigated anywhere on the
+    # first scenario until the login step itself does) gives that page a
+    # second, clean load attempt before any step touches it.
+    #
+    # This deliberately navigates to the app's own URL (driver.get) rather
+    # than driver.refresh() — refresh() only reloads whatever page the
+    # browser is CURRENTLY sitting on, and if the PREVIOUS scenario failed
+    # partway through (stuck on a validation error, a stale form, a
+    # confirmation dialog — not a clean logout at all), refresh() just
+    # reloads that same broken state instead of recovering from it. That
+    # was actively making things worse: several scenarios in a row failed
+    # to find the login form or the search box specifically right after a
+    # "Refreshed page before scenario" step, immediately following an
+    # earlier scenario that failed mid-transaction rather than reaching
+    # its own logout step. Navigating to the known-good entry URL recovers
+    # regardless of what state the previous scenario left the browser in.
+    if _scenario_count > 1:
+        try:
+            driver = get_driver()
+            target_url = ctx.get("url", os.environ.get("SBI_TARGET_URL"))
+            if target_url:
+                driver.get(target_url)
+            else:
+                driver.refresh()
+            ctx.record_step("transaction", f"Reset to entry URL before scenario: {scenario.name}",
+                             "passed", 0, "", None)
+        except Exception as exc:
+            # A failure here must never abort the scenario — the login
+            # step's own retry/open logic is still the real fallback.
+            ctx.record_step("transaction", f"Pre-scenario URL reset failed: {scenario.name}",
+                             "skipped", 0, "", str(exc))
+
+    ctx.record_step("transaction", f"Scenario start: {scenario.name}", "passed", 0, "", None)
+
+
+def after_step(context, step):
+    global _step_started
+    now = time.time()
+    duration_ms = int((now - (_step_started or now)) * 1000)
+    _step_started = now
+    screenshot = ""
+    try:
+        driver = get_driver()
+        png = driver.get_screenshot_as_png()
+        screenshot = ctx.save_screenshot(f"step_{int(now * 1000)}", png)
+    except Exception:
+        pass  # a screenshot failure is not a test failure
+    ctx.record_step("transaction", step.name,
+                     "failed" if step.status == "failed" else "passed",
+                     duration_ms, screenshot,
+                     "see behave report" if step.status == "failed" else None)
+
+
+def after_scenario(context, scenario):
+    ctx.record_step("transaction", f"Scenario end: {scenario.name}",
+                     "failed" if scenario.status == "failed" else "passed", 0, "", None)
+    _reset_teller_for_this_scenario()
+
+
+def after_all(context):
+    # Always tear down and always attempt the teller reset, mirroring
+    # PlatformRunner's `finally` block.
+    quit_quietly()
+    reset_teller_quietly()
+    ctx.flush()
+
+
+def _reset_teller_for_this_scenario():
+    api_base = ctx.get("apibase", "")
+    if not api_base:
+        return  # older callers without --apibase: the final reset still covers it
+    try:
+        query = urllib.parse.urlencode({
+            "profile": ctx.profile(),
+            "environment": ctx.environment(),
+        })
+        url = f"{api_base}/api/execution/{ctx.execution_uid()}/teller-reset-now?{query}"
+        request = urllib.request.Request(url, method="POST")
+        urllib.request.urlopen(request, timeout=12)
+    except Exception as exc:
+        # Never let a reset-callback failure fail the scenario itself —
+        # the guaranteed final reset in the Python pipeline is the real
+        # safety net; this per-scenario call is best-effort.
+        ctx.record_step("teller_reset", "Per-scenario CBS reset callback failed",
+                         "skipped", 0, "", str(exc))
