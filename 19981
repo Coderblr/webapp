@@ -1,172 +1,159 @@
-"""behave hooks — evidence capture for every step, a per-scenario CBS
-teller reset, and a guaranteed browser teardown.
-
-Argument parsing / final teardown live in ``run.py`` at the project
-root, which invokes `behave` as a subprocess — see run.py's module
-docstring.
-
-A feature file can hold several scenarios (the main positive one plus
-auto-derived negative ones — see backend/codegen/generator.py::
-_negative_scenarios) — a scenario that leaves the teller session dirty
-must not bleed into the next one, so a reset fires after EVERY scenario
-here, not just once at the very end. CBS credentials/protocol stay
-exclusively in the platform's Python backend
-(backend/execution/socket_client.py) — this hook only ever calls back
-with execution_uid/profile/environment, never a teller_id or the reset
-message format itself. The single GUARANTEED final reset in
-ExecutionPipeline.run()'s finally block is unchanged and still covers the
-case where this process dies before the hook can even fire.
-"""
+"""Test Data Editor + Profile Manager endpoints (Screens 3 and 4)."""
 from __future__ import annotations
 
-import os
-import sys
-import time
-import urllib.parse
-import urllib.request
-from pathlib import Path
+from typing import Any
 
-# Make `core`, `utils`, `pages` importable regardless of the cwd behave
-# was launched from.
-_ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+from fastapi import APIRouter, HTTPException
 
-from core.driver_factory import get_driver, quit_quietly  # noqa: E402
-from utils import execution_context as ctx  # noqa: E402
-from utils.socket_reset_client import reset_teller_quietly  # noqa: E402
+from ..agents import test_data_agent
+from ..core.schemas import (
+    Ack, ProfileIn, ProfileOut, SecretIn, SecretOut, TestDataSaveRequest,
+)
+from ..tdm import profiles as tdm_profiles, resolver, templates
 
-# How many scenarios have started in THIS behave process so far — module-
-# level rather than on `context`, since `context` itself is reset/rebuilt
-# by behave between scenarios and isn't a reliable place to keep a
-# running counter across scenario boundaries.
-_scenario_count = 0
-
-# Per-step timer — ALSO kept module-level rather than as a `context`
-# attribute. behave's `Context` class treats underscore-prefixed
-# attributes specially: looking one up before it's ever been set on the
-# CURRENT context layer raises `KeyError`, not `AttributeError` — and
-# Python's `getattr(obj, name, default)` only falls back to `default` on
-# an `AttributeError` from `__getattr__`; any OTHER exception (a KeyError
-# here) propagates straight through, default value or not. That combination
-# turned what looked like a safe `getattr(context, "_step_started", now)`
-# into `HOOK-ERROR in after_step: KeyError: '_step_started'` on the very
-# first step of every single scenario — which behave treats as the whole
-# scenario failing, not just that one step, so this one bug failed EVERY
-# scenario in the run. A plain module-level variable sidesteps Context's
-# internals entirely; behave runs one process per execution, single-
-# threaded, one step at a time, so there's nothing to race here.
-_step_started = 0.0
+router = APIRouter(prefix="/api/testdata", tags=["test-data"])
+profile_router = APIRouter(prefix="/api/profiles", tags=["profiles"])
+secret_router = APIRouter(prefix="/api/secrets", tags=["secrets"])
 
 
-def before_all(context):
-    # ExecutionContext is initialised from CLI-style --key=value userdata,
-    # (see run.py for how they get here).
-    args = [f"--{k}={v}" for k, v in context.config.userdata.items()]
-    ctx.init_from_args(args)
-    global _scenario_count
-    _scenario_count = 0
+# ── test data ───────────────────────────────────────────────────────────
+@router.get("/{transaction_id}")
+def get_editor(transaction_id: str, environment: str = "PREPROD",
+               profile: str | None = None) -> dict[str, Any]:
+    result = test_data_agent(action="editor", transaction_id=transaction_id,
+                             environment=environment, profile=profile)
+    return result.get("view", {})
 
 
-def before_scenario(context, scenario):
-    global _scenario_count, _step_started
-    _scenario_count += 1
-    _step_started = time.time()
-    # Per-scenario shared data map — Python equivalent of the Java
-    # CommonSteps' `txnDataMap` (a fresh Map<String,String> per Scenario,
-    # passed between step definitions and page objects). Fresh dict per
-    # scenario, same lifetime as the Java version's per-Scenario map.
-    context.txn_data = {}
-
-    # The app logs the teller out at the end of every scenario (the
-    # generated feature's closing "And user logs out" step, or CommonSteps'
-    # logout step). Starting the NEXT scenario should land back on a fresh
-    # login page — but sometimes it doesn't actually finish loading before
-    # the first step tries to interact with it (a stale/blank page left
-    # over from the previous scenario's logout navigation). A fresh
-    # navigation before every scenario EXCEPT the very first one (there's
-    # nothing to reset yet — the browser hasn't navigated anywhere on the
-    # first scenario until the login step itself does) gives that page a
-    # second, clean load attempt before any step touches it.
-    #
-    # This deliberately navigates to the app's own URL (driver.get) rather
-    # than driver.refresh() — refresh() only reloads whatever page the
-    # browser is CURRENTLY sitting on, and if the PREVIOUS scenario failed
-    # partway through (stuck on a validation error, a stale form, a
-    # confirmation dialog — not a clean logout at all), refresh() just
-    # reloads that same broken state instead of recovering from it. That
-    # was actively making things worse: several scenarios in a row failed
-    # to find the login form or the search box specifically right after a
-    # "Refreshed page before scenario" step, immediately following an
-    # earlier scenario that failed mid-transaction rather than reaching
-    # its own logout step. Navigating to the known-good entry URL recovers
-    # regardless of what state the previous scenario left the browser in.
-    if _scenario_count > 1:
-        try:
-            driver = get_driver()
-            target_url = ctx.get("url", os.environ.get("SBI_TARGET_URL"))
-            if target_url:
-                driver.get(target_url)
-            else:
-                driver.refresh()
-            ctx.record_step("transaction", f"Reset to entry URL before scenario: {scenario.name}",
-                             "passed", 0, "", None)
-        except Exception as exc:
-            # A failure here must never abort the scenario — the login
-            # step's own retry/open logic is still the real fallback.
-            ctx.record_step("transaction", f"Pre-scenario URL reset failed: {scenario.name}",
-                             "skipped", 0, "", str(exc))
-
-    ctx.record_step("transaction", f"Scenario start: {scenario.name}", "passed", 0, "", None)
+@router.post("/save")
+def save(payload: TestDataSaveRequest) -> dict[str, Any]:
+    result = test_data_agent(
+        action="save",
+        transaction_id=payload.transaction_id,
+        environment=payload.environment,
+        profile=payload.profile,
+        values=[v.model_dump() for v in payload.values],
+    )
+    if not result.ok:
+        raise HTTPException(500, result.get("error", "save failed"))
+    return {"saved": result.get("saved"), "file": result.get("file")}
 
 
-def after_step(context, step):
-    global _step_started
-    now = time.time()
-    duration_ms = int((now - (_step_started or now)) * 1000)
-    _step_started = now
-    screenshot = ""
+@router.get("/{transaction_id}/resolve")
+def resolve_preview(transaction_id: str, environment: str = "PREPROD",
+                    profile: str = "") -> dict[str, Any]:
+    result = test_data_agent(action="resolve", transaction_id=transaction_id,
+                             environment=environment, profile=profile,
+                             strict=False)
+    payload = dict(result)
+    # never leak resolved sensitive values to the UI
+    sensitive = set(payload.get("sensitive_fields", []))
+    payload["values"] = {
+        k: ("****" if k in sensitive else v)
+        for k, v in (payload.get("values") or {}).items()
+    }
+    return payload
+
+
+@router.get("/{transaction_id}/prompts")
+def runtime_prompts(transaction_id: str, environment: str = "PREPROD",
+                    profile: str = "") -> list[dict[str, Any]]:
+    result = test_data_agent(action="prompts", transaction_id=transaction_id,
+                             environment=environment, profile=profile)
+    return result.get("prompts", [])
+
+
+@router.get("/{transaction_id}/template")
+def get_template(transaction_id: str, environment: str = "PREPROD") -> dict[str, Any]:
+    return templates.read(transaction_id, environment)
+
+
+@router.post("/{transaction_id}/refresh-field-metadata")
+def refresh_field_metadata(transaction_id: str) -> dict[str, Any]:
+    """Re-derive datatype/pattern/business_meaning for every field of this
+    transaction from its already-recorded elements/actions, using the
+    CURRENT field_meta.py classification rules, and re-save it.
+
+    Field classification is computed once, at recording time, and stored
+    — a transaction recorded before a field_meta.py classification fix
+    landed keeps failing test-data validation with the OLD rule until its
+    stored metadata is explicitly refreshed. This is that refresh, and it
+    does not require re-recording the transaction.
+    """
     try:
-        driver = get_driver()
-        png = driver.get_screenshot_as_png()
-        screenshot = ctx.save_screenshot(f"step_{int(now * 1000)}", png)
-    except Exception:
-        pass  # a screenshot failure is not a test failure
-    ctx.record_step("transaction", step.name,
-                     "failed" if step.status == "failed" else "passed",
-                     duration_ms, screenshot,
-                     "see behave report" if step.status == "failed" else None)
+        return templates.recompute_field_metadata(transaction_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
 
 
-def after_scenario(context, scenario):
-    ctx.record_step("transaction", f"Scenario end: {scenario.name}",
-                     "failed" if scenario.status == "failed" else "passed", 0, "", None)
-    _reset_teller_for_this_scenario()
+# ── profiles ────────────────────────────────────────────────────────────
+@profile_router.get("")
+def list_profiles() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": p["id"], "name": p["name"], "environment": p["environment"],
+            "description": p.get("description"),
+            "values": p.get("values_json") or {},
+            "secret_keys": p.get("secret_keys", []),
+        }
+        for p in tdm_profiles.list_profiles()
+    ]
 
 
-def after_all(context):
-    # Always tear down and always attempt the teller reset, mirroring
-    # PlatformRunner's `finally` block.
-    quit_quietly()
-    reset_teller_quietly()
-    ctx.flush()
+@profile_router.post("")
+def save_profile(payload: ProfileIn) -> dict[str, Any]:
+    profile = tdm_profiles.upsert_profile(
+        name=payload.name, environment=payload.environment,
+        description=payload.description, values=payload.values,
+        secrets=payload.secrets,
+    )
+    return {
+        "id": profile.get("id"), "name": payload.name,
+        "environment": payload.environment,
+        "missing_credentials": tdm_profiles.missing_credentials(
+            payload.name, payload.environment
+        ),
+    }
 
 
-def _reset_teller_for_this_scenario():
-    api_base = ctx.get("apibase", "")
-    if not api_base:
-        return  # older callers without --apibase: the final reset still covers it
-    try:
-        query = urllib.parse.urlencode({
-            "profile": ctx.profile(),
-            "environment": ctx.environment(),
-        })
-        url = f"{api_base}/api/execution/{ctx.execution_uid()}/teller-reset-now?{query}"
-        request = urllib.request.Request(url, method="POST")
-        urllib.request.urlopen(request, timeout=12)
-    except Exception as exc:
-        # Never let a reset-callback failure fail the scenario itself —
-        # the guaranteed final reset in the Python pipeline is the real
-        # safety net; this per-scenario call is best-effort.
-        ctx.record_step("teller_reset", "Per-scenario CBS reset callback failed",
-                         "skipped", 0, "", str(exc))
+@profile_router.get("/{name}")
+def get_profile(name: str) -> dict[str, Any]:
+    profile = tdm_profiles.get_profile(name)
+    if not profile:
+        raise HTTPException(404, f"profile {name} not found")
+    return {
+        "id": profile["id"], "name": profile["name"],
+        "environment": profile["environment"],
+        "description": profile.get("description"),
+        "values": profile.get("values_json") or {},
+        "secrets": tdm_profiles.list_secrets("profile", name),
+        "missing_credentials": tdm_profiles.missing_credentials(
+            name, profile["environment"]
+        ),
+    }
+
+
+@profile_router.delete("/{name}")
+def delete_profile(name: str) -> Ack:
+    tdm_profiles.delete_profile(name)
+    return Ack(message=f"profile {name} deleted")
+
+
+# ── secrets (never returned in plaintext) ───────────────────────────────
+@secret_router.get("")
+def list_secrets(scope: str | None = None,
+                 scope_ref: str | None = None) -> list[dict[str, Any]]:
+    return tdm_profiles.list_secrets(scope, scope_ref)
+
+
+@secret_router.post("")
+def set_secret(payload: SecretIn) -> Ack:
+    tdm_profiles.set_secret(payload.scope, payload.scope_ref, payload.key,
+                            payload.value)
+    return Ack(message=f"{payload.key} stored (encrypted at rest)")
+
+
+@secret_router.delete("")
+def delete_secret(scope: str, key: str, scope_ref: str | None = None) -> Ack:
+    tdm_profiles.delete_secret(scope, scope_ref, key)
+    return Ack(message=f"{key} removed")
