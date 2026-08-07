@@ -1,196 +1,131 @@
-"""Central configuration.  Everything the platform needs comes from here.
-
-Rule (Section 2):  Python orchestrates AND executes.  The execution layer
-is `python-framework/` — pure Python, Selenium + `behave` (BDD), no
-JDK/Maven/Gradle/Java involved anywhere. This module knows where that
-framework lives but never rewrites it wholesale (the CUSTOM CODE markers
-still apply, see backend/codegen/generator.py).
-"""
+"""Structured logging with automatic masking of sensitive values."""
 from __future__ import annotations
 
-from functools import lru_cache
-from pathlib import Path
-from typing import Optional
+import logging
+import re
+import sys
+from typing import Any, Iterable
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from .config import settings
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_MASK_PATTERNS = [
+    re.compile(r"(?i)(password\"?\s*[:=]\s*\"?)([^\",\s}]+)"),
+    re.compile(r"(?i)(tellerid\"?\s*[:=]\s*\"?)([^\",\s}]+)"),
+    re.compile(r"(?i)(checkerid\"?\s*[:=]\s*\"?)([^\",\s}]+)"),
+    re.compile(r"(?i)(reset[_ ]?string\"?\s*[:=]\s*\"?)([^\",\s}]+)"),
+    re.compile(r"(?i)(api[_-]?key\"?\s*[:=]\s*\"?)([^\",\s}]+)"),
+]
+
+_EXTRA_SECRETS: set[str] = set()
 
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=str(PROJECT_ROOT / ".env"),
-        env_file_encoding="utf-8",
-        extra="ignore",
-        case_sensitive=False,
+def register_secret(value: str) -> None:
+    """Register a runtime secret so it is masked everywhere it appears."""
+    if value and len(value) > 2:
+        _EXTRA_SECRETS.add(value)
+
+
+def mask(text: str) -> str:
+    if not text:
+        return text
+    for pattern in _MASK_PATTERNS:
+        text = pattern.sub(lambda m: f"{m.group(1)}****", text)
+    for secret in _EXTRA_SECRETS:
+        text = text.replace(secret, "****")
+    return text
+
+
+class MaskingFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            record.msg = mask(str(record.msg))
+            if record.args:
+                # Only mask actual strings. Blindly str()-ing every arg (the
+                # old behaviour) turns numbers like 1488 into "1488", which
+                # then blows up any %d/%-2d-style format spec downstream
+                # with "TypeError: %d format: a real number is required,
+                # not str" — silently swallowed by logging's own error
+                # handler, but flooding the console with tracebacks on
+                # nearly every log call in the app.
+                if isinstance(record.args, dict):
+                    record.args = {
+                        k: (mask(v) if isinstance(v, str) else v)
+                        for k, v in record.args.items()
+                    }
+                else:
+                    record.args = tuple(
+                        mask(a) if isinstance(a, str) else a
+                        for a in record.args
+                    )
+        except Exception:  # never let logging break the run
+            pass
+        return True
+
+
+def configure_logging(level: str | None = None) -> None:
+    lvl = getattr(logging, (level or settings.log_level).upper(), logging.INFO)
+    fmt = logging.Formatter(
+        "%(asctime)s | %(levelname)-7s | %(name)-34s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # ── app ──────────────────────────────────────────────────────────────
-    app_name: str = "Enterprise AI Automation Engineering Platform"
-    app_host: str = "127.0.0.1"
-    app_port: int = 8000
-    log_level: str = "INFO"
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(fmt)
+    console.addFilter(MaskingFilter())
 
-    # ── database (SQLite) ───────────────────────────────────────────────
-    sqlite_path: str = "./storage/ai_automation.db"
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(console)
 
-    # ── postgres (legacy, unused now the platform runs on SQLite) ────────
-    pg_host: str = "localhost"
-    pg_port: int = 5432
-    pg_db: str = "ai_automation"
-    pg_user: str = "postgres"
-    pg_password: str = "changeme"
-    pg_schema: str = "public"
-    pg_connect_timeout: int = 5
+    # Persisted logging (Section — "logs / error logs" viewer). Console
+    # output alone disappears the moment the terminal scrolls past it or
+    # the process is relaunched — there was previously no way to see a
+    # backend log line after the fact, from the UI or anywhere else.
+    # Called here rather than only via settings.ensure_dirs() because
+    # configure_logging() runs at import time, before the FastAPI
+    # lifespan (where ensure_dirs() normally runs) has had a chance to
+    # create storage/logs/ — this creates it directly so the handler
+    # always has somewhere to write from the very first log line.
+    try:
+        from logging.handlers import RotatingFileHandler
 
-    # ── azure openai (sole LLM provider) ────────────────────────────────
-    azure_openai_api_key: str = ""
-    azure_openai_endpoint: str = ""
-    azure_openai_api_version: str = "2024-10-21"
-    azure_openai_chat_deployment: str = "gpt-4o"
-    azure_openai_embedding_deployment: str = "text-embedding-3-large"
-    embedding_dim: int = 3072
-    llm_temperature: float = 0.0
-    llm_max_tokens: int = 4096
+        settings.logs_path.mkdir(parents=True, exist_ok=True)
 
-    # ── secrets ──────────────────────────────────────────────────────────
-    secrets_master_key: str = ""
+        all_handler = RotatingFileHandler(
+            settings.logs_path / "backend.log", maxBytes=10_000_000,
+            backupCount=5, encoding="utf-8",
+        )
+        all_handler.setFormatter(fmt)
+        all_handler.addFilter(MaskingFilter())
+        root.addHandler(all_handler)
 
-    # ── execution framework (Python + Selenium + behave) ──────────────────
-    # Targets python-framework/ — codegen/templates/page.py.j2 +
-    # steps.py.j2 generate its pages/steps, and backend/execution/
-    # pipeline.py invokes `python run.py` there for every execution.
-    framework_root: str = "./python-framework"
-    framework_src: str = "./python-framework"
-    framework_testdata: str = "./python-framework/test-data"
-    framework_cache: str = "./python-framework/.cache"  # syntax-check fingerprints
-    # Empty by default -> falls back to sys.executable (the exact
-    # interpreter running THIS backend process). A literal "python" here
-    # instead would be resolved fresh via PATH every time a subprocess is
-    # spawned, and on a machine with more than one Python on PATH (very
-    # common on Windows — python.org install, Microsoft Store alias,
-    # Anaconda, a venv) that can silently be a DIFFERENT interpreter than
-    # the one `pip install -r requirements.txt` was run in, making an
-    # already-installed package look "NOT INSTALLED". Only set this
-    # explicitly if python-framework/ deliberately runs in its own,
-    # separate venv from the backend.
-    python_bin: str = ""
+        # A SEPARATE errors-only file — "just show me what broke" without
+        # scrolling through thousands of routine INFO lines first.
+        error_handler = RotatingFileHandler(
+            settings.logs_path / "errors.log", maxBytes=10_000_000,
+            backupCount=5, encoding="utf-8",
+        )
+        error_handler.setLevel(logging.WARNING)
+        error_handler.setFormatter(fmt)
+        error_handler.addFilter(MaskingFilter())
+        root.addHandler(error_handler)
+    except Exception:
+        # Persisted logging is a convenience, not a dependency — console
+        # logging above already covers the platform's actual operation,
+        # so a permissions/disk issue here must never block startup.
+        pass
 
-    # ── storage ──────────────────────────────────────────────────────────
-    storage_root: str = "./storage"
-    knowledge_root: str = "./storage/knowledge"
-
-    # ── recorder / browser ───────────────────────────────────────────────
-    edge_driver_path: Optional[str] = None
-    edge_binary_path: Optional[str] = None
-    recorder_cdp_port: int = 9222
-    recorder_capture_network: bool = True
-    recorder_fullpage_crawl: bool = True
-    browser_implicit_wait: int = 10
-
-    # ── CBS socket (teller reset) ────────────────────────────────────────
-    cbs_socket_host: str = ""
-    cbs_socket_port: int = 0
-    cbs_socket_timeout: int = 30
-    cbs_socket_encoding: str = "utf-8"
-    # "bog" = the real production fixed-width CBS message protocol
-    # (backend/execution/socket_client.py: reset_teller_cbs, region "C"
-    # only for now). "generic" = the older line-terminated free-text
-    # protocol (CBSSocketClient), kept as a fallback.
-    cbs_reset_protocol: str = "bog"
-    cbs_bog_variant: str = "A"   # which fixed BASE_MESSAGE template: A / B / C
-    cbs_region: str = "C"        # only "C" is wired up currently
-
-    # ── confidence thresholds ────────────────────────────────────────────
-    self_heal_confidence_threshold: float = 0.75
-    rerecord_confidence_threshold: float = 0.55
-    auto_approve_low_risk: bool = False
-
-    # ── system transaction ids ───────────────────────────────────────────
-    password_change_transaction: str = Field(
-        default="9750",
-        description="Transaction auto-attached as pre-step to every execution.",
-    )
-
-    # ── derived ──────────────────────────────────────────────────────────
-    @property
-    def sqlite_db_path(self) -> Path:
-        return self.path(self.sqlite_path)
-
-    def path(self, value: str) -> Path:
-        p = Path(value)
-        return p if p.is_absolute() else (PROJECT_ROOT / p).resolve()
-
-    @property
-    def framework_root_path(self) -> Path:
-        return self.path(self.framework_root)
-
-    @property
-    def framework_src_path(self) -> Path:
-        return self.path(self.framework_src)
-
-    @property
-    def framework_testdata_path(self) -> Path:
-        return self.path(self.framework_testdata)
-
-    @property
-    def framework_cache_path(self) -> Path:
-        return self.path(self.framework_cache)
-
-    @property
-    def storage_path(self) -> Path:
-        return self.path(self.storage_root)
-
-    @property
-    def knowledge_path(self) -> Path:
-        return self.path(self.knowledge_root)
-
-    @property
-    def screenshots_path(self) -> Path:
-        return self.storage_path / "screenshots"
-
-    @property
-    def recordings_path(self) -> Path:
-        return self.storage_path / "recordings"
-
-    @property
-    def reports_path(self) -> Path:
-        return self.storage_path / "reports"
-
-    @property
-    def uploads_path(self) -> Path:
-        return self.storage_path / "uploads"
-
-    @property
-    def logs_path(self) -> Path:
-        return self.storage_path / "logs"
-
-    @property
-    def llm_configured(self) -> bool:
-        return bool(self.azure_openai_api_key and self.azure_openai_endpoint)
-
-    def ensure_dirs(self) -> None:
-        for p in (
-            self.storage_path,
-            self.knowledge_path,
-            self.screenshots_path,
-            self.recordings_path,
-            self.reports_path,
-            self.uploads_path,
-            self.logs_path,
-            self.framework_cache_path,
-            self.framework_testdata_path,
-        ):
-            p.mkdir(parents=True, exist_ok=True)
-        self.sqlite_db_path.parent.mkdir(parents=True, exist_ok=True)
+    root.setLevel(lvl)
+    for noisy in ("httpx", "urllib3", "selenium", "openai"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-@lru_cache(maxsize=1)
-def get_settings() -> Settings:
-    s = Settings()
-    s.ensure_dirs()
-    return s
+def get_logger(name: str) -> logging.Logger:
+    return logging.getLogger(name)
 
 
-settings = get_settings()
+def mask_dict(data: dict[str, Any], sensitive_keys: Iterable[str]) -> dict[str, Any]:
+    keys = {k.lower() for k in sensitive_keys}
+    return {
+        k: ("****" if k.lower() in keys else v) for k, v in data.items()
+    }
