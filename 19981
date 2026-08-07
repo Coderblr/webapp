@@ -1,156 +1,196 @@
-"""behave hooks — evidence capture for every step, a per-scenario CBS
-teller reset, and a guaranteed browser teardown.
+"""Central configuration.  Everything the platform needs comes from here.
 
-Argument parsing / final teardown live in ``run.py`` at the project
-root, which invokes `behave` as a subprocess — see run.py's module
-docstring.
-
-A feature file can hold several scenarios (the main positive one plus
-auto-derived negative ones — see backend/codegen/generator.py::
-_negative_scenarios) — a scenario that leaves the teller session dirty
-must not bleed into the next one, so a reset fires after EVERY scenario
-here, not just once at the very end. CBS credentials/protocol stay
-exclusively in the platform's Python backend
-(backend/execution/socket_client.py) — this hook only ever calls back
-with execution_uid/profile/environment, never a teller_id or the reset
-message format itself. The single GUARANTEED final reset in
-ExecutionPipeline.run()'s finally block is unchanged and still covers the
-case where this process dies before the hook can even fire.
+Rule (Section 2):  Python orchestrates AND executes.  The execution layer
+is `python-framework/` — pure Python, Selenium + `behave` (BDD), no
+JDK/Maven/Gradle/Java involved anywhere. This module knows where that
+framework lives but never rewrites it wholesale (the CUSTOM CODE markers
+still apply, see backend/codegen/generator.py).
 """
 from __future__ import annotations
 
-import os
-import sys
-import time
-import urllib.parse
-import urllib.request
+from functools import lru_cache
 from pathlib import Path
+from typing import Optional
 
-# Make `core`, `utils`, `pages` importable regardless of the cwd behave
-# was launched from.
-_ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from core.driver_factory import get_driver, quit_quietly  # noqa: E402
-from utils import execution_context as ctx  # noqa: E402
-from utils.socket_reset_client import reset_teller_quietly  # noqa: E402
-
-# How many scenarios have started in THIS behave process so far — module-
-# level rather than on `context`, since `context` itself is reset/rebuilt
-# by behave between scenarios and isn't a reliable place to keep a
-# running counter across scenario boundaries.
-_scenario_count = 0
-
-# Per-step timer — ALSO kept module-level rather than as a `context`
-# attribute. behave's `Context` class treats underscore-prefixed
-# attributes specially: looking one up before it's ever been set on the
-# CURRENT context layer raises `KeyError`, not `AttributeError` — and
-# Python's `getattr(obj, name, default)` only falls back to `default` on
-# an `AttributeError` from `__getattr__`; any OTHER exception (a KeyError
-# here) propagates straight through, default value or not. That combination
-# turned what looked like a safe `getattr(context, "_step_started", now)`
-# into `HOOK-ERROR in after_step: KeyError: '_step_started'` on the very
-# first step of every single scenario — which behave treats as the whole
-# scenario failing, not just that one step, so this one bug failed EVERY
-# scenario in the run. A plain module-level variable sidesteps Context's
-# internals entirely; behave runs one process per execution, single-
-# threaded, one step at a time, so there's nothing to race here.
-_step_started = 0.0
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
-def before_all(context):
-    # ExecutionContext is initialised from CLI-style --key=value userdata,
-    # (see run.py for how they get here).
-    args = [f"--{k}={v}" for k, v in context.config.userdata.items()]
-    ctx.init_from_args(args)
-    global _scenario_count
-    _scenario_count = 0
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=str(PROJECT_ROOT / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    # ── app ──────────────────────────────────────────────────────────────
+    app_name: str = "Enterprise AI Automation Engineering Platform"
+    app_host: str = "127.0.0.1"
+    app_port: int = 8000
+    log_level: str = "INFO"
+
+    # ── database (SQLite) ───────────────────────────────────────────────
+    sqlite_path: str = "./storage/ai_automation.db"
+
+    # ── postgres (legacy, unused now the platform runs on SQLite) ────────
+    pg_host: str = "localhost"
+    pg_port: int = 5432
+    pg_db: str = "ai_automation"
+    pg_user: str = "postgres"
+    pg_password: str = "changeme"
+    pg_schema: str = "public"
+    pg_connect_timeout: int = 5
+
+    # ── azure openai (sole LLM provider) ────────────────────────────────
+    azure_openai_api_key: str = ""
+    azure_openai_endpoint: str = ""
+    azure_openai_api_version: str = "2024-10-21"
+    azure_openai_chat_deployment: str = "gpt-4o"
+    azure_openai_embedding_deployment: str = "text-embedding-3-large"
+    embedding_dim: int = 3072
+    llm_temperature: float = 0.0
+    llm_max_tokens: int = 4096
+
+    # ── secrets ──────────────────────────────────────────────────────────
+    secrets_master_key: str = ""
+
+    # ── execution framework (Python + Selenium + behave) ──────────────────
+    # Targets python-framework/ — codegen/templates/page.py.j2 +
+    # steps.py.j2 generate its pages/steps, and backend/execution/
+    # pipeline.py invokes `python run.py` there for every execution.
+    framework_root: str = "./python-framework"
+    framework_src: str = "./python-framework"
+    framework_testdata: str = "./python-framework/test-data"
+    framework_cache: str = "./python-framework/.cache"  # syntax-check fingerprints
+    # Empty by default -> falls back to sys.executable (the exact
+    # interpreter running THIS backend process). A literal "python" here
+    # instead would be resolved fresh via PATH every time a subprocess is
+    # spawned, and on a machine with more than one Python on PATH (very
+    # common on Windows — python.org install, Microsoft Store alias,
+    # Anaconda, a venv) that can silently be a DIFFERENT interpreter than
+    # the one `pip install -r requirements.txt` was run in, making an
+    # already-installed package look "NOT INSTALLED". Only set this
+    # explicitly if python-framework/ deliberately runs in its own,
+    # separate venv from the backend.
+    python_bin: str = ""
+
+    # ── storage ──────────────────────────────────────────────────────────
+    storage_root: str = "./storage"
+    knowledge_root: str = "./storage/knowledge"
+
+    # ── recorder / browser ───────────────────────────────────────────────
+    edge_driver_path: Optional[str] = None
+    edge_binary_path: Optional[str] = None
+    recorder_cdp_port: int = 9222
+    recorder_capture_network: bool = True
+    recorder_fullpage_crawl: bool = True
+    browser_implicit_wait: int = 10
+
+    # ── CBS socket (teller reset) ────────────────────────────────────────
+    cbs_socket_host: str = ""
+    cbs_socket_port: int = 0
+    cbs_socket_timeout: int = 30
+    cbs_socket_encoding: str = "utf-8"
+    # "bog" = the real production fixed-width CBS message protocol
+    # (backend/execution/socket_client.py: reset_teller_cbs, region "C"
+    # only for now). "generic" = the older line-terminated free-text
+    # protocol (CBSSocketClient), kept as a fallback.
+    cbs_reset_protocol: str = "bog"
+    cbs_bog_variant: str = "A"   # which fixed BASE_MESSAGE template: A / B / C
+    cbs_region: str = "C"        # only "C" is wired up currently
+
+    # ── confidence thresholds ────────────────────────────────────────────
+    self_heal_confidence_threshold: float = 0.75
+    rerecord_confidence_threshold: float = 0.55
+    auto_approve_low_risk: bool = False
+
+    # ── system transaction ids ───────────────────────────────────────────
+    password_change_transaction: str = Field(
+        default="9750",
+        description="Transaction auto-attached as pre-step to every execution.",
+    )
+
+    # ── derived ──────────────────────────────────────────────────────────
+    @property
+    def sqlite_db_path(self) -> Path:
+        return self.path(self.sqlite_path)
+
+    def path(self, value: str) -> Path:
+        p = Path(value)
+        return p if p.is_absolute() else (PROJECT_ROOT / p).resolve()
+
+    @property
+    def framework_root_path(self) -> Path:
+        return self.path(self.framework_root)
+
+    @property
+    def framework_src_path(self) -> Path:
+        return self.path(self.framework_src)
+
+    @property
+    def framework_testdata_path(self) -> Path:
+        return self.path(self.framework_testdata)
+
+    @property
+    def framework_cache_path(self) -> Path:
+        return self.path(self.framework_cache)
+
+    @property
+    def storage_path(self) -> Path:
+        return self.path(self.storage_root)
+
+    @property
+    def knowledge_path(self) -> Path:
+        return self.path(self.knowledge_root)
+
+    @property
+    def screenshots_path(self) -> Path:
+        return self.storage_path / "screenshots"
+
+    @property
+    def recordings_path(self) -> Path:
+        return self.storage_path / "recordings"
+
+    @property
+    def reports_path(self) -> Path:
+        return self.storage_path / "reports"
+
+    @property
+    def uploads_path(self) -> Path:
+        return self.storage_path / "uploads"
+
+    @property
+    def logs_path(self) -> Path:
+        return self.storage_path / "logs"
+
+    @property
+    def llm_configured(self) -> bool:
+        return bool(self.azure_openai_api_key and self.azure_openai_endpoint)
+
+    def ensure_dirs(self) -> None:
+        for p in (
+            self.storage_path,
+            self.knowledge_path,
+            self.screenshots_path,
+            self.recordings_path,
+            self.reports_path,
+            self.uploads_path,
+            self.logs_path,
+            self.framework_cache_path,
+            self.framework_testdata_path,
+        ):
+            p.mkdir(parents=True, exist_ok=True)
+        self.sqlite_db_path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def before_scenario(context, scenario):
-    global _scenario_count, _step_started
-    _scenario_count += 1
-    _step_started = time.time()
-    # Per-scenario shared data map — Python equivalent of the Java
-    # CommonSteps' `txnDataMap` (a fresh Map<String,String> per Scenario,
-    # passed between step definitions and page objects). Fresh dict per
-    # scenario, same lifetime as the Java version's per-Scenario map.
-    context.txn_data = {}
-
-    # The app logs the teller out at the end of every scenario (the
-    # generated feature's closing "And user logs out" step, or CommonSteps'
-    # logout step). Starting the NEXT scenario should land back on a fresh
-    # login page — but sometimes it doesn't actually finish loading before
-    # the first step tries to interact with it (a stale/blank page left
-    # over from the previous scenario's logout navigation). A refresh
-    # before every scenario EXCEPT the very first one (there's nothing to
-    # refresh yet — the browser hasn't navigated anywhere on the first
-    # scenario until the login step itself does) gives that page a second,
-    # clean load attempt before any step touches it.
-    if _scenario_count > 1:
-        try:
-            driver = get_driver()
-            driver.refresh()
-            ctx.record_step("transaction", f"Refreshed page before scenario: {scenario.name}",
-                             "passed", 0, "", None)
-        except Exception as exc:
-            # A refresh failing here (e.g. driver not ready yet) must
-            # never abort the scenario — the login step's own retry/open
-            # logic is still the real fallback.
-            ctx.record_step("transaction", f"Pre-scenario refresh failed: {scenario.name}",
-                             "skipped", 0, "", str(exc))
-
-    ctx.record_step("transaction", f"Scenario start: {scenario.name}", "passed", 0, "", None)
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    s = Settings()
+    s.ensure_dirs()
+    return s
 
 
-def after_step(context, step):
-    global _step_started
-    now = time.time()
-    duration_ms = int((now - (_step_started or now)) * 1000)
-    _step_started = now
-    screenshot = ""
-    try:
-        driver = get_driver()
-        png = driver.get_screenshot_as_png()
-        screenshot = ctx.save_screenshot(f"step_{int(now * 1000)}", png)
-    except Exception:
-        pass  # a screenshot failure is not a test failure
-    ctx.record_step("transaction", step.name,
-                     "failed" if step.status == "failed" else "passed",
-                     duration_ms, screenshot,
-                     "see behave report" if step.status == "failed" else None)
-
-
-def after_scenario(context, scenario):
-    ctx.record_step("transaction", f"Scenario end: {scenario.name}",
-                     "failed" if scenario.status == "failed" else "passed", 0, "", None)
-    _reset_teller_for_this_scenario()
-
-
-def after_all(context):
-    # Always tear down and always attempt the teller reset, mirroring
-    # PlatformRunner's `finally` block.
-    quit_quietly()
-    reset_teller_quietly()
-    ctx.flush()
-
-
-def _reset_teller_for_this_scenario():
-    api_base = ctx.get("apibase", "")
-    if not api_base:
-        return  # older callers without --apibase: the final reset still covers it
-    try:
-        query = urllib.parse.urlencode({
-            "profile": ctx.profile(),
-            "environment": ctx.environment(),
-        })
-        url = f"{api_base}/api/execution/{ctx.execution_uid()}/teller-reset-now?{query}"
-        request = urllib.request.Request(url, method="POST")
-        urllib.request.urlopen(request, timeout=12)
-    except Exception as exc:
-        # Never let a reset-callback failure fail the scenario itself —
-        # the guaranteed final reset in the Python pipeline is the real
-        # safety net; this per-scenario call is best-effort.
-        ctx.record_step("teller_reset", "Per-scenario CBS reset callback failed",
-                         "skipped", 0, "", str(exc))
+settings = get_settings()
