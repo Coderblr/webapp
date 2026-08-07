@@ -1,131 +1,70 @@
-"""Structured logging with automatic masking of sensitive values."""
+"""Logs viewer (backend + errors-only, both persisted to storage/logs/ by
+backend/core/logging_conf.py's RotatingFileHandlers)."""
 from __future__ import annotations
 
-import logging
-import re
-import sys
-from typing import Any, Iterable
+from typing import Any
 
-from .config import settings
+from fastapi import APIRouter, HTTPException
 
-_MASK_PATTERNS = [
-    re.compile(r"(?i)(password\"?\s*[:=]\s*\"?)([^\",\s}]+)"),
-    re.compile(r"(?i)(tellerid\"?\s*[:=]\s*\"?)([^\",\s}]+)"),
-    re.compile(r"(?i)(checkerid\"?\s*[:=]\s*\"?)([^\",\s}]+)"),
-    re.compile(r"(?i)(reset[_ ]?string\"?\s*[:=]\s*\"?)([^\",\s}]+)"),
-    re.compile(r"(?i)(api[_-]?key\"?\s*[:=]\s*\"?)([^\",\s}]+)"),
-]
+from ..core.config import settings
 
-_EXTRA_SECRETS: set[str] = set()
+router = APIRouter(prefix="/api/logs", tags=["logs"])
+
+_FILES = {
+    "all": "backend.log",
+    "errors": "errors.log",
+}
 
 
-def register_secret(value: str) -> None:
-    """Register a runtime secret so it is masked everywhere it appears."""
-    if value and len(value) > 2:
-        _EXTRA_SECRETS.add(value)
+def _tail_lines(path, lines: int) -> list[str]:
+    """Reads only the last `lines` lines without loading the whole
+    (potentially many-MB, rotated-at-10MB) file into memory at once."""
+    import collections
+
+    if not path.exists():
+        return []
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        return list(collections.deque(fh, maxlen=lines))
 
 
-def mask(text: str) -> str:
-    if not text:
-        return text
-    for pattern in _MASK_PATTERNS:
-        text = pattern.sub(lambda m: f"{m.group(1)}****", text)
-    for secret in _EXTRA_SECRETS:
-        text = text.replace(secret, "****")
-    return text
+@router.get("")
+def get_logs(kind: str = "all", lines: int = 500,
+             search: str | None = None) -> dict[str, Any]:
+    """kind: "all" (everything) or "errors" (WARNING/ERROR/CRITICAL only).
+    `lines` caps how far back to read (most-recent-first isn't done here —
+    returned in natural, oldest-first file order, same as `tail`)."""
+    filename = _FILES.get(kind)
+    if not filename:
+        raise HTTPException(400, f"Unknown log kind '{kind}' — use 'all' or 'errors'")
+    lines = max(1, min(lines, 5000))
+    path = settings.logs_path / filename
 
+    entries = _tail_lines(path, lines)
+    if search:
+        needle = search.lower()
+        entries = [line for line in entries if needle in line.lower()]
 
-class MaskingFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            record.msg = mask(str(record.msg))
-            if record.args:
-                # Only mask actual strings. Blindly str()-ing every arg (the
-                # old behaviour) turns numbers like 1488 into "1488", which
-                # then blows up any %d/%-2d-style format spec downstream
-                # with "TypeError: %d format: a real number is required,
-                # not str" — silently swallowed by logging's own error
-                # handler, but flooding the console with tracebacks on
-                # nearly every log call in the app.
-                if isinstance(record.args, dict):
-                    record.args = {
-                        k: (mask(v) if isinstance(v, str) else v)
-                        for k, v in record.args.items()
-                    }
-                else:
-                    record.args = tuple(
-                        mask(a) if isinstance(a, str) else a
-                        for a in record.args
-                    )
-        except Exception:  # never let logging break the run
-            pass
-        return True
-
-
-def configure_logging(level: str | None = None) -> None:
-    lvl = getattr(logging, (level or settings.log_level).upper(), logging.INFO)
-    fmt = logging.Formatter(
-        "%(asctime)s | %(levelname)-7s | %(name)-34s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(fmt)
-    console.addFilter(MaskingFilter())
-
-    root = logging.getLogger()
-    root.handlers.clear()
-    root.addHandler(console)
-
-    # Persisted logging (Section — "logs / error logs" viewer). Console
-    # output alone disappears the moment the terminal scrolls past it or
-    # the process is relaunched — there was previously no way to see a
-    # backend log line after the fact, from the UI or anywhere else.
-    # Called here rather than only via settings.ensure_dirs() because
-    # configure_logging() runs at import time, before the FastAPI
-    # lifespan (where ensure_dirs() normally runs) has had a chance to
-    # create storage/logs/ — this creates it directly so the handler
-    # always has somewhere to write from the very first log line.
-    try:
-        from logging.handlers import RotatingFileHandler
-
-        settings.logs_path.mkdir(parents=True, exist_ok=True)
-
-        all_handler = RotatingFileHandler(
-            settings.logs_path / "backend.log", maxBytes=10_000_000,
-            backupCount=5, encoding="utf-8",
-        )
-        all_handler.setFormatter(fmt)
-        all_handler.addFilter(MaskingFilter())
-        root.addHandler(all_handler)
-
-        # A SEPARATE errors-only file — "just show me what broke" without
-        # scrolling through thousands of routine INFO lines first.
-        error_handler = RotatingFileHandler(
-            settings.logs_path / "errors.log", maxBytes=10_000_000,
-            backupCount=5, encoding="utf-8",
-        )
-        error_handler.setLevel(logging.WARNING)
-        error_handler.setFormatter(fmt)
-        error_handler.addFilter(MaskingFilter())
-        root.addHandler(error_handler)
-    except Exception:
-        # Persisted logging is a convenience, not a dependency — console
-        # logging above already covers the platform's actual operation,
-        # so a permissions/disk issue here must never block startup.
-        pass
-
-    root.setLevel(lvl)
-    for noisy in ("httpx", "urllib3", "selenium", "openai"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-
-
-def get_logger(name: str) -> logging.Logger:
-    return logging.getLogger(name)
-
-
-def mask_dict(data: dict[str, Any], sensitive_keys: Iterable[str]) -> dict[str, Any]:
-    keys = {k.lower() for k in sensitive_keys}
     return {
-        k: ("****" if k.lower() in keys else v) for k, v in data.items()
+        "kind": kind,
+        "file": str(path),
+        "exists": path.exists(),
+        "size_bytes": path.stat().st_size if path.exists() else 0,
+        "returned_lines": len(entries),
+        "lines": entries,
     }
+
+
+@router.get("/files")
+def list_log_files() -> dict[str, Any]:
+    """What's actually on disk, including rotated backups
+    (backend.log.1, backend.log.2, ...) — mainly so a much older error
+    isn't assumed lost just because it scrolled out of the active file."""
+    settings.logs_path.mkdir(parents=True, exist_ok=True)
+    files = []
+    for path in sorted(settings.logs_path.glob("*.log*")):
+        files.append({
+            "name": path.name,
+            "size_bytes": path.stat().st_size,
+            "modified": path.stat().st_mtime,
+        })
+    return {"directory": str(settings.logs_path), "files": files}
