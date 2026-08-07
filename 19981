@@ -1,116 +1,132 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Logs</title>
-<link rel="stylesheet" href="css/style.css">
-<style>
-  #logView {
-    background:#0c1220; border:1px solid var(--line, #2a3448); border-radius:8px;
-    padding:14px; font-family:ui-monospace,Consolas,monospace; font-size:12px;
-    line-height:1.6; white-space:pre-wrap; word-break:break-all;
-    max-height:70vh; overflow:auto; color:#cbd5e1;
+/* Shared API client + tiny helpers. No framework, on purpose. */
+const API = {
+  async request(method, url, body, isForm) {
+    const opts = { method, headers: {} };
+    if (body !== undefined && body !== null) {
+      if (isForm) { opts.body = body; }
+      else { opts.headers['Content-Type'] = 'application/json';
+             opts.body = JSON.stringify(body); }
+    }
+    const res = await fetch(url, opts);
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (e) { data = { raw: text }; }
+    if (!res.ok) {
+      const message = (data && (data.detail || data.error)) || res.statusText;
+      throw new Error(typeof message === 'string' ? message : JSON.stringify(message));
+    }
+    return data;
+  },
+  get(url)          { return API.request('GET', url); },
+  post(url, body)   { return API.request('POST', url, body); },
+  del(url)          { return API.request('DELETE', url); },
+  upload(url, file) { const fd = new FormData(); fd.append('file', file);
+                      return API.request('POST', url, fd, true); }
+};
+
+function $(sel, root) { return (root || document).querySelector(sel); }
+function $$(sel, root) { return Array.from((root || document).querySelectorAll(sel)); }
+
+function el(tag, attrs, children) {
+  const node = document.createElement(tag);
+  Object.entries(attrs || {}).forEach(([k, v]) => {
+    if (k === 'class') node.className = v;
+    else if (k === 'html') node.innerHTML = v;
+    else if (k.startsWith('on') && typeof v === 'function') node[k] = v;
+    else if (v !== null && v !== undefined) node.setAttribute(k, v);
+  });
+  (children || []).forEach(c => node.appendChild(
+    typeof c === 'string' ? document.createTextNode(c) : c));
+  return node;
+}
+
+function badge(status) {
+  return `<span class="badge b-${(status || 'unknown')
+    .toString().toLowerCase()}">${status || '—'}</span>`;
+}
+
+function toast(message, kind) {
+  const node = el('div', { class: 'toast ' + (kind || '') }, [String(message)]);
+  document.body.appendChild(node);
+  setTimeout(() => node.remove(), kind === 'err' ? 7000 : 4000);
+}
+
+function fmtTime(value) {
+  if (!value) return '—';
+  try { return new Date(value).toLocaleString(); } catch (e) { return value; }
+}
+
+function fmtMs(ms) {
+  if (!ms && ms !== 0) return '—';
+  return ms > 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms';
+}
+
+function qs(name, fallback) {
+  return new URLSearchParams(location.search).get(name) || fallback || '';
+}
+
+/* Sidebar — identical on every screen, rendered once here. */
+function renderShell(active, title, subtitle) {
+  const nav = [
+    ['Knowledge', [
+      ['record.html',   'Record Transaction'],
+      ['library.html',  'Transaction Library'],
+    ]],
+    ['Test Data', [
+      ['testdata.html', 'Test Data Editor'],
+      ['profiles.html', 'Profile Manager'],
+    ]],
+    ['Change & Run', [
+      ['brd.html',      'BRD Upload & Impact'],
+      ['execute.html',  'Execute'],
+      ['reports.html',  'Reports Dashboard'],
+      ['logs.html',     'Logs'],
+    ]],
+  ];
+  const links = nav.map(([group, items]) =>
+    `<div class="group">${group}</div>` + items.map(([href, label]) =>
+      `<a href="${href}" class="${href === active ? 'active' : ''}">${label}</a>`
+    ).join('')).join('');
+
+  document.body.insertAdjacentHTML('afterbegin', `
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <h1>AI Automation Engineer</h1>
+          <span>Record once · Learn forever</span>
+        </div>
+        <nav class="nav">
+          <a href="index.html" class="${active === 'index.html' ? 'active' : ''}">Overview</a>
+          ${links}
+        </nav>
+      </aside>
+      <div class="main">
+        <div class="topbar">
+          <div><h2>${title}</h2><div class="sub">${subtitle || ''}</div></div>
+          <div id="topbar-extra"></div>
+        </div>
+        <div class="content" id="content"></div>
+      </div>
+    </div>`);
+  return $('#content');
+}
+
+/* Poll a background job until it finishes. */
+async function waitForJob(jobId, onTick) {
+  for (;;) {
+    const job = await API.get('/api/execution/job/' + jobId).catch(() => null);
+    if (job) {
+      if (onTick) onTick(job);
+      if (job.status !== 'running') return job;
+    }
+    await new Promise(r => setTimeout(r, 1500));
   }
-  #logView .err-line { color:#fca5a5; }
-  #logView .warn-line { color:#fcd34d; }
-</style>
-</head>
-<body>
-<script src="js/api.js"></script>
-<script>
-const content = renderShell('logs.html', 'Logs',
-  'Backend log lines, persisted to storage/logs/ — console output alone disappears once the terminal scrolls past it.');
-
-content.innerHTML = `
-  <div class="card">
-    <div class="row">
-      <div class="field"><label>Show</label>
-        <select id="kind" onchange="load()">
-          <option value="all">All logs</option>
-          <option value="errors">Errors only (WARNING+)</option>
-        </select></div>
-      <div class="field"><label>Last N lines</label>
-        <select id="lines" onchange="load()">
-          <option value="200">200</option>
-          <option value="500" selected>500</option>
-          <option value="1000">1000</option>
-          <option value="5000">5000</option>
-        </select></div>
-      <div class="field"><label>Search</label>
-        <input id="search" type="text" placeholder="filter text..." oninput="debouncedLoad()"></div>
-      <div class="field"><label>Auto-refresh</label>
-        <select id="autoRefresh" onchange="toggleAutoRefresh()">
-          <option value="0">Off</option>
-          <option value="5000">Every 5s</option>
-          <option value="15000">Every 15s</option>
-        </select></div>
-    </div>
-    <div id="meta" class="hint"></div>
-  </div>
-
-  <div class="card">
-    <div class="actions" style="margin-bottom:10px">
-      <button onclick="load()">Refresh now</button>
-      <button class="ghost" onclick="copyLogs()">Copy to clipboard</button>
-    </div>
-    <div id="logView">Loading…</div>
-  </div>`;
-
-let autoRefreshTimer = null;
-let debounceTimer = null;
-let lastLines = [];
-
-function debouncedLoad() {
-  clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(load, 300);
 }
 
-function toggleAutoRefresh() {
-  clearInterval(autoRefreshTimer);
-  const ms = Number($('#autoRefresh').value);
-  if (ms > 0) autoRefreshTimer = setInterval(load, ms);
+function openSocket(path, onMessage) {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const socket = new WebSocket(`${proto}://${location.host}${path}`);
+  socket.onmessage = e => { try { onMessage(JSON.parse(e.data)); } catch (x) {} };
+  socket.onclose = () => setTimeout(() => openSocket(path, onMessage), 4000);
+  return socket;
 }
-
-function escapeHtml(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-function renderLine(line) {
-  const escaped = escapeHtml(line);
-  if (/\|\s*(ERROR|CRITICAL)\s*\|/.test(line)) return `<span class="err-line">${escaped}</span>`;
-  if (/\|\s*WARNING\s*\|/.test(line)) return `<span class="warn-line">${escaped}</span>`;
-  return escaped;
-}
-
-async function load() {
-  const kind = $('#kind').value;
-  const lines = $('#lines').value;
-  const search = $('#search').value.trim();
-  const params = new URLSearchParams({ kind, lines });
-  if (search) params.set('search', search);
-  try {
-    const r = await API.get('/api/logs?' + params);
-    lastLines = r.lines || [];
-    $('#meta').innerHTML = `<span class="mono">${r.file}</span> ·
-      ${r.exists ? (r.size_bytes / 1024).toFixed(1) + ' KB on disk' : 'not created yet'} ·
-      showing ${r.returned_lines} line(s)`;
-    const view = $('#logView');
-    view.innerHTML = lastLines.length
-      ? lastLines.map(renderLine).join('\n')
-      : '<span class="muted">No log lines yet.</span>';
-    view.scrollTop = view.scrollHeight;
-  } catch (e) { toast(e.message, 'err'); }
-}
-
-function copyLogs() {
-  if (!lastLines.length) return toast('Nothing to copy', 'err');
-  navigator.clipboard.writeText(lastLines.join('\n'))
-    .then(() => toast('Copied to clipboard', 'ok'))
-    .catch(() => toast('Could not copy — select and copy manually', 'err'));
-}
-
-load();
-</script>
-</body>
-</html>
