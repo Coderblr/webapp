@@ -1,140 +1,116 @@
-"""FastAPI application — the orchestration layer of Section 2.
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Logs</title>
+<link rel="stylesheet" href="css/style.css">
+<style>
+  #logView {
+    background:#0c1220; border:1px solid var(--line, #2a3448); border-radius:8px;
+    padding:14px; font-family:ui-monospace,Consolas,monospace; font-size:12px;
+    line-height:1.6; white-space:pre-wrap; word-break:break-all;
+    max-height:70vh; overflow:auto; color:#cbd5e1;
+  }
+  #logView .err-line { color:#fca5a5; }
+  #logView .warn-line { color:#fcd34d; }
+</style>
+</head>
+<body>
+<script src="js/api.js"></script>
+<script>
+const content = renderShell('logs.html', 'Logs',
+  'Backend log lines, persisted to storage/logs/ — console output alone disappears once the terminal scrolls past it.');
 
-    Frontend (HTML/CSS/JS)  →  THIS  →  LangGraph agents  →  Knowledge repo
-                                                          →  python-framework/
-"""
-from __future__ import annotations
+content.innerHTML = `
+  <div class="card">
+    <div class="row">
+      <div class="field"><label>Show</label>
+        <select id="kind" onchange="load()">
+          <option value="all">All logs</option>
+          <option value="errors">Errors only (WARNING+)</option>
+        </select></div>
+      <div class="field"><label>Last N lines</label>
+        <select id="lines" onchange="load()">
+          <option value="200">200</option>
+          <option value="500" selected>500</option>
+          <option value="1000">1000</option>
+          <option value="5000">5000</option>
+        </select></div>
+      <div class="field"><label>Search</label>
+        <input id="search" type="text" placeholder="filter text..." oninput="debouncedLoad()"></div>
+      <div class="field"><label>Auto-refresh</label>
+        <select id="autoRefresh" onchange="toggleAutoRefresh()">
+          <option value="0">Off</option>
+          <option value="5000">Every 5s</option>
+          <option value="15000">Every 15s</option>
+        </select></div>
+    </div>
+    <div id="meta" class="hint"></div>
+  </div>
 
-import asyncio
-from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Any
+  <div class="card">
+    <div class="actions" style="margin-bottom:10px">
+      <button onclick="load()">Refresh now</button>
+      <button class="ghost" onclick="copyLogs()">Copy to clipboard</button>
+    </div>
+    <div id="logView">Loading…</div>
+  </div>`;
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+let autoRefreshTimer = null;
+let debounceTimer = null;
+let lastLines = [];
 
-from .api import routes_brd, routes_execution, routes_framework, routes_recorder
-from .api import routes_logs, routes_testdata
-from .api.ws import hub
-from .core import db
-from .core.config import PROJECT_ROOT, settings
-from .core.logging_conf import configure_logging, get_logger
+function debouncedLoad() {
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(load, 300);
+}
 
-configure_logging()
-log = get_logger(__name__)
+function toggleAutoRefresh() {
+  clearInterval(autoRefreshTimer);
+  const ms = Number($('#autoRefresh').value);
+  if (ms > 0) autoRefreshTimer = setInterval(load, ms);
+}
 
-FRONTEND_DIR = PROJECT_ROOT / "frontend"
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
 
+function renderLine(line) {
+  const escaped = escapeHtml(line);
+  if (/\|\s*(ERROR|CRITICAL)\s*\|/.test(line)) return `<span class="err-line">${escaped}</span>`;
+  if (/\|\s*WARNING\s*\|/.test(line)) return `<span class="warn-line">${escaped}</span>`;
+  return escaped;
+}
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    hub.bind_loop(asyncio.get_running_loop())
-    log.info("=" * 78)
-    log.info(" %s", settings.app_name)
-    log.info(" Python orchestrates AND executes · AI never replaces the framework")
-    log.info("=" * 78)
-    settings.ensure_dirs()
-    # Probe once (cheap, cached) so an unreachable database costs a single
-    # timeout at startup instead of blocking behind pool reconnect attempts.
-    if db.available():
-        try:
-            db.init_schema()
-            log.info("Knowledge repository ready at %s", settings.sqlite_db_path)
-        except Exception as exc:  # noqa: BLE001
-            log.error("Schema could not be applied: %s", exc)
-            log.error("Fix the error above, then POST /api/framework/db/init")
-    else:
-        log.error("SQLite database is not reachable at %s — the UI will load, "
-                  "but every knowledge operation will fail.",
-                  settings.sqlite_db_path)
-        log.error("Run 'python scripts/init_db.py', then restart (or POST "
-                  "/api/framework/db/init).")
-    if not settings.llm_configured:
-        log.warning("Azure OpenAI is not configured — recording, indexing and "
-                    "execution still work; AI generation and healing do not.")
-    yield
-    db.close_pool()
-    log.info("Shutdown complete")
+async function load() {
+  const kind = $('#kind').value;
+  const lines = $('#lines').value;
+  const search = $('#search').value.trim();
+  const params = new URLSearchParams({ kind, lines });
+  if (search) params.set('search', search);
+  try {
+    const r = await API.get('/api/logs?' + params);
+    lastLines = r.lines || [];
+    $('#meta').innerHTML = `<span class="mono">${r.file}</span> ·
+      ${r.exists ? (r.size_bytes / 1024).toFixed(1) + ' KB on disk' : 'not created yet'} ·
+      showing ${r.returned_lines} line(s)`;
+    const view = $('#logView');
+    view.innerHTML = lastLines.length
+      ? lastLines.map(renderLine).join('\n')
+      : '<span class="muted">No log lines yet.</span>';
+    view.scrollTop = view.scrollHeight;
+  } catch (e) { toast(e.message, 'err'); }
+}
 
+function copyLogs() {
+  if (!lastLines.length) return toast('Nothing to copy', 'err');
+  navigator.clipboard.writeText(lastLines.join('\n'))
+    .then(() => toast('Copied to clipboard', 'ok'))
+    .catch(() => toast('Could not copy — select and copy manually', 'err'));
+}
 
-app = FastAPI(
-    title=settings.app_name,
-    version="1.0.0",
-    description=(
-        "Self-learning AI Automation Engineer for a Python Selenium+behave "
-        "banking framework. Record once, learn forever."
-    ),
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-app.include_router(routes_recorder.router)
-app.include_router(routes_recorder.library)
-app.include_router(routes_testdata.router)
-app.include_router(routes_testdata.profile_router)
-app.include_router(routes_testdata.secret_router)
-app.include_router(routes_execution.router)
-app.include_router(routes_execution.reports)
-app.include_router(routes_brd.router)
-app.include_router(routes_framework.router)
-app.include_router(routes_logs.router)
-
-
-@app.exception_handler(Exception)
-async def unhandled(request: Any, exc: Exception) -> JSONResponse:
-    log.exception("Unhandled error on %s", getattr(request, "url", "?"))
-    return JSONResponse(status_code=500,
-                        content={"error": str(exc), "type": type(exc).__name__})
-
-
-@app.get("/api", tags=["meta"])
-def api_root() -> dict[str, Any]:
-    return {
-        "app": settings.app_name,
-        "screens": [
-            "record", "library", "testdata", "profiles", "brd", "execute", "reports"
-        ],
-        "agents": 16,
-        "docs": "/docs",
-    }
-
-
-if FRONTEND_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
-    app.mount("/css", StaticFiles(directory=str(FRONTEND_DIR / "css")), name="css")
-    app.mount("/js", StaticFiles(directory=str(FRONTEND_DIR / "js")), name="js")
-
-    @app.get("/", include_in_schema=False)
-    def index() -> Any:
-        return FileResponse(str(FRONTEND_DIR / "index.html"))
-
-    @app.get("/{page}.html", include_in_schema=False)
-    def page(page: str) -> Any:
-        target = FRONTEND_DIR / f"{page}.html"
-        if not target.exists():
-            return JSONResponse(status_code=404, content={"error": "page not found"})
-        return FileResponse(str(target))
-
-
-def main() -> None:
-    import uvicorn
-    uvicorn.run(
-        "backend.main:app",
-        host=settings.app_host,
-        port=settings.app_port,
-        reload=False,
-        log_level=settings.log_level.lower(),
-    )
-
-
-if __name__ == "__main__":
-    main()
+load();
+</script>
+</body>
+</html>
