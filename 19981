@@ -1,284 +1,145 @@
-"""Single source of truth for "find this element on this app" — every
-caller (generated Page Objects via BasePage, AND the shared
-negative_steps.py used by every auto-derived negative scenario) must go
-through here.
+"""Microsoft Edge driver factory (thread-local — one WebDriver per
+execution process).
 
-Kept as ONE resolver for both
-positive- and negative-path steps for the exact reason documented in the
-original: this app loads per-screen content inside an iframe, and a
-second/simpler resolver with no iframe fallback silently fails for any
-field living inside one (e.g. AccountNumber) even though the same element
-resolves fine through BasePage.
+No Maven/Gradle/JDK needed — Selenium + msedgedriver come straight from
+``pip install selenium`` and the driver binary on PATH / ``SBI_EDGE_DRIVER``.
 """
 from __future__ import annotations
 
-import re
-import time
-from typing import Optional
+import os
+import threading
 
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
-from selenium.webdriver.remote.webdriver import WebDriver
-from selenium.webdriver.remote.webelement import WebElement
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from selenium import webdriver
+from selenium.webdriver.edge.options import Options as EdgeOptions
+from selenium.webdriver.edge.service import Service as EdgeService
 
 from utils import execution_context as ctx
-from utils import locator_repository as locator_repo
 
-# How long to give a POPPED-UP iframe (a dialog/modal implemented as its
-# own <iframe>, injected into the DOM a moment after whatever action
-# triggered it — a supervisor-override prompt, a lookup picker, ...) to
-# actually appear before giving up. Generic — no screen-specific
-# knowledge required, since this only reacts to the iframe COUNT
-# changing, not to any particular popup's content.
-_NEW_IFRAME_WAIT_SECONDS = 6.0
-_NEW_IFRAME_POLL_INTERVAL = 0.25
+_local = threading.local()
 
 
-def resolve(driver: WebDriver, long_wait: WebDriverWait, short_wait: WebDriverWait,
-            element_key: str, silent: bool) -> WebElement:
+def get_driver() -> webdriver.Edge:
+    driver = getattr(_local, "driver", None)
+    if driver is None:
+        driver = _create()
+        _local.driver = driver
+    return driver
+
+
+def _bypass_proxy_for_local_webdriver() -> None:
+    """Exclude localhost/127.0.0.1 from the corporate HTTP proxy.
+
+    Same fix as backend/recorder/cdp_recorder.py::_bypass_proxy_for_local_webdriver
+    — see that docstring for the full "Access Denied (authentication_failed)"
+    explanation. This execution-side driver factory needs it independently:
+    the recorder and the execution framework are separate processes, so the
+    NO_PROXY fix applied in one does not carry over to the other.
     """
-    :param silent: when True (used by exists()-style checks): every
-        strategy gets the short wait — including the last one — and a
-        total failure is NOT recorded as a "Locator failure" report step.
-    """
-    strategies = locator_repo.get(element_key)
-    if not strategies:
-        raise NoSuchElementException(f"No locators registered for {element_key}")
+    for var in ("NO_PROXY", "no_proxy"):
+        current = os.environ.get(var, "")
+        entries = {e.strip() for e in current.split(",") if e.strip()}
+        entries.update({"localhost", "127.0.0.1", "::1"})
+        os.environ[var] = ",".join(sorted(entries))
 
+
+def _create() -> webdriver.Edge:
+    _bypass_proxy_for_local_webdriver()
+    driver_path = ctx.get("edgeDriver", os.environ.get("SBI_EDGE_DRIVER"))
+
+    options = EdgeOptions()
+    options.add_argument("--start-maximized")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--disable-notifications")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+
+    # Every one of these is scoped to THIS ONE isolated automation browser
+    # session — a fresh Edge instance launched per execution, never a
+    # shared or production browser — so relaxing them here doesn't expose
+    # a real end user to anything. They exist because the target
+    # environment (nbcppuatweb4.sbi.co.in, an internal UAT host) commonly
+    # presents an internally-issued/self-signed certificate and other
+    # browser-security UI that Chrome/Edge would otherwise surface as an
+    # interstitial warning or a blocking prompt — which a human clicks
+    # past without a second thought, but which silently stalls or breaks
+    # unattended Selenium automation (a cert warning page has none of the
+    # locators the recorded flow expects).
+    #
+    # DELIBERATELY NOT included (removed after a real, confirmed
+    # incident): --disable-web-security and --allow-running-insecure-
+    # content. Both disable the browser's OWN CORS/same-origin/mixed-
+    # content enforcement — this app's own server-side session-security
+    # layer (the "BCF0070: Security breached, user session invalidated"
+    # message, seen specifically on LOGOUT) appears to rely on that
+    # enforcement actually being intact to validate a request as
+    # legitimate; a normal, unmodified browser (a manual logout) never
+    # triggers it, only the automated one with these two flags did. If a
+    # genuine mixed-content/CORS blocking issue shows up again on some
+    # OTHER screen, re-add these ONE AT A TIME and confirm logout still
+    # works cleanly before keeping either — don't restore both together
+    # without re-testing, since this is exactly how the regression
+    # slipped in the first time.
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--allow-insecure-localhost")
+    options.add_argument("--disable-blink-features=BlockCredentialedSubresources")
+
+    # Hides `navigator.webdriver` and the "Chrome/Edge is being controlled
+    # by automated test software" infobar. Several enterprise banking UIs
+    # (this one included, going by how brittle some interactions have
+    # been) run client-side bot-detection or defensive JS that behaves
+    # differently — extra validation, disabled fields, unexpected popups —
+    # when it detects an automated browser; this is what actually
+    # prevents that class of interference, not just cosmetic. Kept
+    # (unlike the two removed above) — this affects only client-side JS
+    # automation-detection signals, not the CORS/session-security layer
+    # that produced the logout failure, so it isn't implicated the same
+    # way. If logout issues persist even after removing the two flags
+    # above, try removing this one too, one change at a time.
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+
+    if (ctx.get("headless", "false") or "false").lower() == "true":
+        options.add_argument("--headless=new")
+    options.add_experimental_option("prefs", {
+        "credentials_enable_service": False,
+        "profile.password_manager_enabled": False,
+        # Notification/popup prompts blocked at the content-settings level
+        # too (belt-and-braces alongside --disable-notifications above —
+        # some prompts are governed by this preference specifically, not
+        # the command-line flag).
+        "profile.default_content_setting_values.notifications": 2,
+    })
+
+    service = EdgeService(executable_path=driver_path) if driver_path else EdgeService()
+    driver = webdriver.Edge(service=service, options=options)
+
+    # NO implicit wait — this codebase relies entirely on the explicit
+    # waits in BasePage (wait / short_wait). Mixing implicit and explicit
+    # waits is a known Selenium anti-pattern: it silently inflates every
+    # failing locator attempt toward the implicit timeout regardless of
+    # how short the explicit wait around it is set to.
+    driver.set_page_load_timeout(90)
+    return driver
+
+
+def execute_cdp(command: str, params: dict) -> dict:
+    """CDP escape hatch — used for network capture and DOM inspection."""
+    driver = get_driver()
     try:
-        driver.switch_to.default_content()
+        return driver.execute_cdp_cmd(command, params or {})
     except Exception:
-        pass
+        return {}
 
-    found = _try_strategies(driver, long_wait, short_wait, strategies, element_key, silent)
-    if found is not None:
-        return found
 
-    # Not found in the top-level document — check every iframe before
-    # giving up. Each frame attempt uses only the short wait; the
-    # top-level pass above already gave this element a full, patient attempt.
-    try:
-        frames = driver.find_elements("tag name", "iframe")
-    except Exception:
-        frames = []
-
-    found_in_frame = _search_frames(driver, long_wait, short_wait, strategies, element_key, frames)
-    if found_in_frame is not None:
-        return found_in_frame
-
-    # Generic new-iframe-popup handling: an element genuinely not found
-    # anywhere YET can simply mean a popup iframe (a supervisor-override
-    # dialog, a lookup/picker, any modal implemented as its own <iframe>
-    # rather than a plain DOM overlay) hasn't been INJECTED into the DOM
-    # yet at the moment this search ran — the click/action that triggers
-    # it can take a beat to actually add the <iframe> tag, well after
-    # this function's own top-level+existing-iframes pass already
-    # finished. Polling for the iframe COUNT to increase — rather than
-    # just re-trying the same fixed set once — is what actually catches
-    # a frame that didn't exist a moment ago; this has no per-screen
-    # knowledge baked in (works identically everywhere an iframe-based
-    # popup can appear, not just one hand-picked screen).
-    try:
-        driver.switch_to.default_content()
-    except Exception:
-        pass
-    new_frames = _wait_for_new_iframe(driver, known_count=len(frames))
-    if len(new_frames) > len(frames):
-        # Newest-first — a just-injected popup is overwhelmingly likely
-        # to be the LAST iframe in DOM order, and there's no cost to
-        # trying it before the older, already-known ones.
-        newly_appeared = list(reversed(new_frames))
-        found_in_new_frame = _search_frames(
-            driver, long_wait, short_wait, strategies, element_key, newly_appeared
-        )
-        if found_in_new_frame is not None:
-            return found_in_new_frame
-        frames = new_frames
-
-    try:
-        driver.switch_to.default_content()
-    except Exception:
-        pass
-
-    if not silent:
+def quit_quietly() -> None:
+    driver = getattr(_local, "driver", None)
+    if driver is not None:
         try:
-            current_url = driver.current_url
+            driver.quit()
         except Exception:
-            current_url = ""
-        try:
-            page_text = driver.page_source
-        except Exception:
-            page_text = ""
-        # Session-expiry recovery: if the app redirected to a logout URL,
-        # OR is showing an explicit security/session-invalidation message
-        # (the real, confirmed trigger: "BCF0070: Security breached, user
-        # session invalidated" appearing specifically on an automated
-        # logout, never on a manual one — refreshing makes it go away,
-        # which is exactly why this was invisible in the execution report
-        # until now: the refresh below used to happen SILENTLY, with
-        # nothing ever recorded, so there was no evidence this had
-        # happened at all). `driver.refresh()` is used deliberately over
-        # re-navigating to a URL — this app hash-routes (`#!`), where
-        # `driver.get()` to a URL the browser is already sitting on is a
-        # no-op; `refresh()` forces an actual reload regardless.
-        breach_signal = _looks_like_security_breach(page_text)
-        if _looks_session_expired(current_url) or breach_signal:
-            # Recorded EXPLICITLY, before attempting recovery — this is
-            # the actual fix for "this doesn't show up in the report":
-            # the event is now on the record even when the refresh below
-            # succeeds and the step goes on to pass. `evidence` carries
-            # the real matched text, not just "something happened", so a
-            # later look at the report shows the literal BCF0070 message.
-            ctx.record_step(
-                "transaction",
-                f"Security/session anomaly detected before resolving {element_key} "
-                f"— refreshing and retrying",
-                "healed", 0, "",
-                f"current_url={current_url!r}; evidence={breach_signal!r}",
-            )
-            try:
-                driver.refresh()
-                WebDriverWait(driver, 15).until(
-                    lambda d: d.execute_script("return document.readyState") == "complete"
-                )
-            except Exception:
-                pass
-            recovered = _try_strategies(driver, long_wait, short_wait, strategies, element_key, True)
-            if recovered is not None:
-                return recovered
-            # Re-query iframes fresh — the `frames` list found BEFORE the
-            # refresh now holds stale WebElement references (the DOM was
-            # just reloaded); switching to one of those raises
-            # StaleElementReferenceException rather than actually
-            # re-checking anything.
-            try:
-                fresh_frames = driver.find_elements("tag name", "iframe")
-            except Exception:
-                fresh_frames = []
-            recovered = _search_frames(
-                driver, long_wait, short_wait, strategies, element_key, fresh_frames
-            )
-            if recovered is not None:
-                return recovered
-            try:
-                driver.switch_to.default_content()
-            except Exception:
-                pass
-
-    if not silent:
-        try:
-            dom = driver.page_source
-        except Exception:
-            dom = ""
-        try:
-            current_url = driver.current_url
-            page_title = driver.title
-        except Exception:
-            current_url, page_title = "", ""
-        ctx.record_locator_failure(element_key, dom, current_url, page_title)
-
-    raise NoSuchElementException(
-        f"Could not resolve {element_key} (checked the top-level document and "
-        f"{len(frames)} iframe(s))")
-
-
-def _search_frames(driver: WebDriver, long_wait: WebDriverWait, short_wait: WebDriverWait,
-                    strategies: list, element_key: str, frames: list) -> Optional[WebElement]:
-    """Tries every frame in `frames`, leaving the driver positioned
-    inside whichever one the element was actually found in (needed for
-    the interaction that immediately follows), or back at
-    default_content if none of them had it."""
-    for frame in frames:
-        try:
-            driver.switch_to.default_content()
-            driver.switch_to.frame(frame)
-        except Exception:
-            continue
-        in_frame = _try_strategies(driver, long_wait, short_wait, strategies, element_key, True)
-        if in_frame is not None:
-            return in_frame  # leave the driver positioned in this frame
-    return None
-
-
-def _wait_for_new_iframe(driver: WebDriver, known_count: int,
-                          timeout: float = _NEW_IFRAME_WAIT_SECONDS) -> list:
-    """Polls for the iframe count to exceed `known_count` — i.e. a NEW
-    one being injected into the DOM, as opposed to one that was already
-    there and simply didn't contain the target element. Never raises;
-    returns whatever the iframe list looks like once either a new one
-    shows up or the timeout elapses."""
-    deadline = time.time() + timeout
-    frames: list = []
-    while time.time() < deadline:
-        try:
-            frames = driver.find_elements("tag name", "iframe")
-        except Exception:
-            frames = []
-        if len(frames) > known_count:
-            return frames
-        time.sleep(_NEW_IFRAME_POLL_INTERVAL)
-    return frames
-
-
-def _looks_session_expired(current_url: str) -> bool:
-    url = (current_url or "").lower()
-    return "logout" in url or "session_expired" in url or "sessiontimeout" in url
-
-
-def _looks_like_security_breach(page_text: str) -> str | None:
-    """Returns the matched evidence text if the page shows an explicit
-    security/session-invalidation message — the real, confirmed trigger
-    for this whole recovery path: "BCF0070: Security breached, user
-    session invalidated", seen specifically on an AUTOMATED logout, never
-    a manual one. Returns None (not a bool) so the caller can record the
-    literal matched text as evidence rather than just "something
-    happened"."""
-    if not page_text:
-        return None
-    match = re.search(
-        r"(BCF\d{4}\s*:?\s*[^<\n]{0,120}|security\s+breach[^<\n]{0,120}|"
-        r"session\s+invalidated[^<\n]{0,120})",
-        page_text, re.I,
-    )
-    return match.group(0).strip() if match else None
-
-
-def _try_strategies(driver: WebDriver, long_wait: WebDriverWait, short_wait: WebDriverWait,
-                     strategies: list, element_key: str, silent: bool) -> Optional[WebElement]:
-    """Tries every strategy in the CURRENT frame context. Returns None
-    (never raises) so the caller can decide whether to try more frames."""
-    n = len(strategies)
-    for i, strategy in enumerate(strategies):
-        # Fail FAST on every strategy except the last one — waiting the
-        # full timeout on every failing strategy would let a drifted top
-        # locator burn n * timeout before the next strategy (or self-heal)
-        # even gets a chance.
-        is_last = i == n - 1
-        attempt_wait = long_wait if (is_last and not silent) else short_wait
-        try:
-            element = attempt_wait.until(EC.presence_of_element_located(strategy))
-            if not silent:
-                if i > 0:
-                    ctx.record_fallback(element_key, i, str(strategy))
-                else:
-                    # Succeeded on the FIRST try — no fallback needed, so
-                    # nothing would otherwise be recorded here at all;
-                    # Part 8's execution-history tallies need this quiet
-                    # success too, not just the moments something went
-                    # wrong (see record_locator_resolved()'s docstring).
-                    ctx.record_locator_resolved(element_key, i, str(strategy))
-            return element
-        except TimeoutException:
-            continue
-        except Exception:
-            continue
-    return None
-
-
-def resolve_default(driver: WebDriver, element_key: str, silent: bool) -> WebElement:
-    """Convenience overload with the framework's standard wait durations
-    (30s patient / 3s short) for callers that don't keep their own."""
-    long_wait = WebDriverWait(driver, 30)
-    short_wait = WebDriverWait(driver, 3)
-    return resolve(driver, long_wait, short_wait, element_key, silent)
+            # never let cleanup break the run
+            pass
+        finally:
+            _local.driver = None
