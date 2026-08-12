@@ -1,557 +1,735 @@
-"""Shared steps every generated feature file reuses.
-
-The Framework Indexing Engine finds these first, so the code generator
-never duplicates login / search / logout logic per transaction.
-
-Every step here is registered with @step (matches ANY of Given/When/Then)
-rather than @given/@when/@then. behave partitions its step registry BY
-type and resolves "And"/"But" to whatever concrete keyword the PRECEDING
-step in the same block used — e.g. feature.j2 renders the closing step as
-"And user logs out" straight after "Then transaction ... completes
-successfully", which resolves to a THEN step. A step registered with
-@given only ever matches a Given-typed step, so that exact, correctly-
-spelled step text still comes back "undefined" at run time. Since these
-shared steps get reused across different feature files where the
-preceding keyword (and therefore the resolved type) isn't fixed, @step is
-the only decorator that's safe here.
-"""
-from __future__ import annotations
-
-import os
-import time
-
-from behave import step
-
-from core.driver_factory import get_driver
-from core.base_page import BasePage
-from pages.login_page import LoginPage
-from pages.transaction_search_page import TransactionSearchPage
-from utils import execution_context as ctx
-
-
-def _login_page() -> LoginPage:
-    return LoginPage(get_driver())
-
-
-def _search_page() -> TransactionSearchPage:
-    return TransactionSearchPage(get_driver())
-
-
-@step("the teller is logged in to the application")
-def step_teller_is_logged_in(context):
-    started = time.time()
-    login = _login_page()
-
-    # If the 9750 password-change pre-step already ran in THIS same browser
-    # session, the teller is already logged in (with the NEW password) by
-    # the time this Background step runs for the target transaction's
-    # scenarios. Re-submitting credentials here used to blindly type the
-    # OLD (now-invalid) password into whatever text input the login
-    # field's loose fallback selector happened to match on the
-    # already-loaded transaction screen — corrupting a real field like
-    # AccountNumber and causing failures further into the run. Skip login
-    # entirely when a session is already active.
-    if login.is_logged_in():
-        ctx.record_step("login", "Already logged in — skipping re-login", "passed",
-                         int((time.time() - started) * 1000), "", None)
-        return
-
-    url = ctx.get("url", os.environ.get("SBI_TARGET_URL"))
-    teller_id = os.environ.get("SBI_TELLER_ID")
-    # Use the NEW password once 9750 has been attached to this run
-    # (it changes the password before this step ever runs standalone on
-    # its own) — otherwise the ORIGINAL password, for a transaction
-    # executed with the password-change pre-step skipped/unavailable.
-    prestep_attached = bool(ctx.prestep())
-    password = (os.environ.get("SBI_TELLER_NEW_PASSWORD") if prestep_attached
-                else os.environ.get("SBI_TELLER_PASSWORD"))
-    assert teller_id, "Teller ID was not supplied by the platform"
-
-    login.open(url)
-    login.login_as(teller_id, password)
-    ctx.record_step("login", "Login with teller credentials", "passed",
-                     int((time.time() - started) * 1000), "", None)
-
-
-@step("the mandatory password change is completed")
-def step_password_change_completed(context):
-    """Transaction 9750 runs as a separate feature ahead of this one.
-    Here we only assert that the application is past the change screen."""
-    login = _login_page()
-    still_on_change_screen = login.is_password_change_screen_visible()
-    ctx.record_step("password_change", "Password change window cleared",
-                     "failed" if still_on_change_screen else "passed", 0, "",
-                     "Application is still showing the Change Password window"
-                     if still_on_change_screen else None)
-    assert not still_on_change_screen, "Password change window is still open"
-
-
-@step('user searches for transaction "{transaction_id}"')
-def step_user_searches_for_transaction(context, transaction_id):
-    started = time.time()
-    _search_page().search_transaction(transaction_id)
-    ctx.record_step("search", f"Search transaction {transaction_id}", "passed",
-                     int((time.time() - started) * 1000), "", None)
-
-
-@step('transaction "{transaction_id}" completes successfully')
-def step_transaction_completes_successfully(context, transaction_id):
-    ctx.record_step("transaction", f"Transaction {transaction_id} completed",
-                     "passed", 0, "", None)
-
-
-@step("user logs out")
-def step_user_logs_out(context):
-    started = time.time()
-    _login_page().logout()
-    ctx.record_step("logout", "Logout", "passed", int((time.time() - started) * 1000), "", None)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Generic "note a value now, verify it later" steps — for flows like
-# "check balance → do a transaction → check balance again". `context`
-# (behave's own per-scenario shared object, passed into every step
-# automatically) is where the "before" value lives between steps; it's
-# reset fresh for every new Scenario, so nothing leaks between runs.
-#
-# Reusable for ANY numeric/text value on ANY screen — not hardcoded to
-# "balance" specifically — pass whatever element_key holds the value you
-# want to note, and a short label of your own choosing to refer back to
-# it by (lets one scenario note more than one value if it needs to).
-# ═══════════════════════════════════════════════════════════════════════
-def _normalize_amount(text: str) -> str:
-    """Same loose numeric-string normalisation BasePage.assert_element_text's
-    "amount" mode already uses — this app renders amounts with commas/
-    trailing ".00" inconsistently across screens, so a straight string
-    compare would false-negative on a value that's actually unchanged."""
-    return (text or "").replace(",", "").replace(".00", "").strip()
-
-
-@step('user notes the current value of "{element_key}" as "{label}"')
-def step_notes_current_value(context, element_key, label):
-    page = BasePage(get_driver())
-    value = page.text_of(element_key) or page.get_element_value(element_key)
-    if not hasattr(context, "noted_values"):
-        context.noted_values = {}
-    context.noted_values[label] = value
-    ctx.record_step("transaction", f'Noted "{label}" = {value!r} (from {element_key})',
-                     "passed", 0, "", None)
-
-
-@step('the value of "{element_key}" should have changed from the noted "{label}"')
-def step_value_should_have_changed(context, element_key, label):
-    page = BasePage(get_driver())
-    before = (context.noted_values or {}).get(label)
-    after = page.text_of(element_key) or page.get_element_value(element_key)
-    if before is None:
-        raise AssertionError(f'No value was noted as "{label}" earlier in this scenario '
-                             f'— add a "user notes the current value of ... as \"{label}\"" '
-                             f'step before this one.')
-    if _normalize_amount(before) == _normalize_amount(after):
-        raise AssertionError(f'Expected "{element_key}" to change from the noted '
-                             f'"{label}" ({before!r}), but it still reads {after!r}')
-    ctx.record_step("transaction",
-                     f'"{element_key}" changed from {before!r} to {after!r} as expected',
-                     "passed", 0, "", None)
-
-
-@step('the value of "{element_key}" should equal the noted "{label}" minus "{amount}"')
-def step_value_should_equal_noted_minus(context, element_key, label, amount):
-    page = BasePage(get_driver())
-    before_raw = (context.noted_values or {}).get(label)
-    if before_raw is None:
-        raise AssertionError(f'No value was noted as "{label}" earlier in this scenario.')
-    after_raw = page.text_of(element_key) or page.get_element_value(element_key)
-    try:
-        before_num = float(_normalize_amount(before_raw))
-        after_num = float(_normalize_amount(after_raw))
-        delta = float(_normalize_amount(amount))
-    except ValueError as exc:
-        raise AssertionError(f'Could not parse a number from before={before_raw!r}, '
-                             f'after={after_raw!r}, or amount={amount!r}: {exc}')
-    expected = round(before_num - delta, 2)
-    actual = round(after_num, 2)
-    if abs(expected - actual) > 0.01:
-        raise AssertionError(f'Expected "{element_key}" to be {expected} '
-                             f'(noted "{label}" {before_num} minus {delta}), '
-                             f'but it reads {actual}')
-    ctx.record_step("transaction",
-                     f'"{element_key}" correctly went from {before_num} to {actual} '
-                     f'(decreased by {delta})',
-                     "passed", 0, "", None)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Ported from the real production com.nbc.stepDefinitions.common.
-# CommonSteps.java — the platform's own generic login/search/logout steps
-# above stay as they are (different Gherkin text, no collision); these
-# are the actual NBC framework's step vocabulary, so recordings/features
-# written against the real framework match these directly.
-# ═══════════════════════════════════════════════════════════════════════
-from core import config_reader
-from pages.home_page import HomePage
-from pages.top_menu import TopMenu
-from pages.sup_override_page import SupOverridePage
-from pages.electronic_journal_page import ElectronicJournalPage
-from pages.negative_scenario_method import NegativeScenarioMethod
-from pages.transaction_9750_page import Transaction9750Page
-from utils import execution_key as key
-from utils import reporter
-from utils.telnet_handler import TelnetHandler
-
-
-def _home_page() -> HomePage:
-    return HomePage(get_driver())
-
-
-def _top_menu() -> TopMenu:
-    return TopMenu(get_driver())
-
-
-def _sup_override_page() -> SupOverridePage:
-    return SupOverridePage(get_driver())
-
-
-def _electronic_journal_page() -> ElectronicJournalPage:
-    return ElectronicJournalPage(get_driver())
-
-
-def _negative_scenario_method() -> NegativeScenarioMethod:
-    return NegativeScenarioMethod(get_driver())
-
-
-def _password_change_page() -> Transaction9750Page:
-    return Transaction9750Page(get_driver())
-
-
-def _get_property(name: str) -> str | None:
-    """Same lookup CommonSteps.java's inherited `getProperty(...)` does —
-    reads python-framework/config/*.properties, falling back to an OS
-    environment variable of the same name."""
-    return config_reader.get(name)
-
-
-# Fixed-width CBS "1097" pre-authorization telnet messages — copied
-# verbatim from CommonSteps.java. Whitespace is significant; do not
-# reformat these strings.
-_TELNET_REQUEST_DEFAULT = (
-    " 1097                    **  0000      003004371230109109009760000000000     0"
-    "         00000000        000000000000000000000000000000{maker_id}"
-    "                                                                                "
-    "                                                                                "
-    "                                                                                "
-    "                                                                                "
-    "                                                                                "
-    "                                                                                "
-    "                                                                   10.30.80.97"
-    "    10.177.137.220 "
-)
-_TELNET_REQUEST_BY_BRANCH = {
-    "00437": (
-        " 1097                    **  0000      003004370099930010009755000000000     0"
-        "         00000000        000000000000000000000001349877{maker_id}''?@ @C $3000000"
-        "                                                                                "
-        "                                                                                "
-        "                                                                                "
-        "                                                                                "
-        "                                                                                "
-        "                                                                   10.0.18.100"
-        "    10.177.137.217 "
-    ),
-    "04791": (
-        " 1097                    **  0000      003047911709930011009755000000000     0"
-        "         00000000        000000000000000000000001349877{maker_id}''?@ @C $3000000"
-        "                                                                                "
-        "                                                                                "
-        "                                                                                "
-        "                                                                                "
-        "                                                                                "
-        "                                                                   10.0.18.100"
-        "    10.189.176.92  "
-    ),
-    "04234": (
-        " 1097                    **  0000      003042341709930012009755000000000     0"
-        "         00000000        000000000000000000000001349877{maker_id}''?@ @C $3000000"
-        "                                                                                "
-        "                                                                                "
-        "                                                                                "
-        "                                                                                "
-        "                                                                                "
-        "                                                                   10.0.18.100"
-        "    10.189.176.92  "
-    ),
-}
-
-
-def _telnet_pre_auth(maker_id: str) -> None:
-    server = _get_property("server")
-    port = _get_property("port")
-    if not server or not port:
-        return  # environment not configured for the telnet pre-step — skip rather than fail hard
-    telnet = TelnetHandler(server, int(port))
-    telnet.send_command(_TELNET_REQUEST_DEFAULT.format(maker_id=maker_id))
-    telnet.disconnect()
-
-
-def _telnet_pre_auth_for_branch(maker_id: str, branch: str) -> None:
-    server = _get_property("server")
-    port = _get_property("port")
-    if not server or not port:
-        return
-    for code, template in _TELNET_REQUEST_BY_BRANCH.items():
-        if code in (branch or ""):
-            telnet = TelnetHandler(server, int(port))
-            telnet.send_command(template.format(maker_id=maker_id))
-            telnet.disconnect()
-            return
-
-
-def _do_login_and_password_change(context, maker_id: str, maker_password: str) -> None:
-    login = _login_page()
-    context.txn_data[key.USER_ID] = maker_id
-    context.txn_data[key.USER_PASSWORD] = maker_password
-    reporter.add_step_log("Initiating login")
-    login.open(_get_property("baseUrl"))
-    login.login_as(maker_id, maker_password)
-    reporter.add_step_log("Clicked on Login")
-
-    password_change = _password_change_page()
-    context.txn_data = password_change.change_password(context.txn_data)
-    reporter.add_step_log("Re-login after password change")
-    login.login_as(maker_id, context.txn_data.get(key.USER_PASSWORD))
-    reporter.add_step_log("Clicked on Login")
-
-
-@step('the user is logged into NBC using "{user_id_prop:w}" and "{password_prop:w}"')
-def step_user_logged_into_nbc(context, user_id_prop, password_prop):
-    maker_id = _get_property(user_id_prop)
-    maker_password = _get_property(password_prop)
-    _telnet_pre_auth(maker_id)
-    _do_login_and_password_change(context, maker_id, maker_password)
-
-
-@step('the user is logged into NBC using "{user_id_prop:w}" and "{password_prop:w}" in "{branch:w}"')
-def step_user_logged_into_nbc_in_branch(context, user_id_prop, password_prop, branch):
-    maker_id = _get_property(user_id_prop)
-    maker_password = _get_property(password_prop)
-    _telnet_pre_auth_for_branch(maker_id, branch)
-    _do_login_and_password_change(context, maker_id, maker_password)
-
-
-@step('we search for the transaction "{txn_no}"')
-def step_we_search_for_the_transaction(context, txn_no):
-    _home_page().search_transaction(txn_no)
-    reporter.add_step_log(f"Searched for Transaction number: {txn_no}")
-
-
-@step('we search the transaction "{txn_no}"')
-def step_we_search_the_transaction(context, txn_no):
-    _home_page().search_transaction(txn_no)
-    reporter.add_step_log(f"Searched transaction: {txn_no}")
-
-
-@step('capture all elements of "{txn_no}"')
-def step_capture_all_elements(context, txn_no):
-    path = _login_page().screenshot(f"elements_{txn_no}")
-    ctx.record_step("capture", f"Captured elements of {txn_no}", "passed", 0, path, None)
-
-
-@step("clicks on logout button")
-def step_clicks_on_logout_button(context):
-    _top_menu().logout_nbc()
-
-
-@step("retrieve the journal number from alert and click on ok")
-def step_retrieve_journal_number(context):
-    context.txn_data = _sup_override_page().retrieve_journal_number(context.txn_data)
-    reporter.add_step_log(
-        f"retrieving the JOURNAL NUMBER: {context.txn_data.get(key.JOURNAL_NUMBER)} and click on ok")
-
-
-@step("retrieve the request ID from alert and click on ok")
-def step_retrieve_request_id_from_alert(context):
-    _sup_override_page().retrieve_request_id(context.txn_data)
-    reporter.add_step_log(
-        f"retrieving the REQUEST ID: {context.txn_data.get(key.REQUEST_NUMBER)} and click on ok")
-
-
-@step("authorize the transaction using journal number account number and amount")
-def step_authorize_txn_journal_account_amount(context):
-    _electronic_journal_page().authorize_transaction(context.txn_data)
-    reporter.add_step_log("Authorized the transaction using journal number and account number")
-
-
-@step("authorize the transaction using journal number")
-def step_authorize_txn_journal(context):
-    _electronic_journal_page().authorize_transaction_without_account_n_amount(context.txn_data)
-    reporter.add_step_log(
-        f"Authorized the transaction using JOURNAL NUMBER: {context.txn_data.get(key.JOURNAL_NUMBER)}")
-
-
-@step("authorize the transaction using journal number and account number")
-def step_authorize_txn_journal_account(context):
-    _electronic_journal_page().authorize_transaction_without_amount(context.txn_data)
-    reporter.add_step_log(
-        f"Authorized the transaction using JOURNAL NUMBER: {context.txn_data.get(key.JOURNAL_NUMBER)}"
-        f" and ACCOUNT NUMBER: {context.txn_data.get(key.TRANSACTION_ACCOUNT)}")
-
-
-@step("authorize the transaction using journal number and Amount")
-def step_authorize_txn_journal_amount(context):
-    _electronic_journal_page().authorize_transaction_without_account(context.txn_data)
-    reporter.add_step_log(
-        f"Authorized the transaction using JOURNAL NUMBER: {context.txn_data.get(key.JOURNAL_NUMBER)}"
-        f" and AMOUNT: {context.txn_data.get(key.AMOUNT)}")
-
-
-@step("authorize the transaction using journal number to get UTR number")
-def step_authorize_txn_get_utr(context):
-    _electronic_journal_page().authorize_transaction_to_get_utr_number(context.txn_data)
-    reporter.add_step_log(
-        f"Authorized the transaction using JOURNAL NUMBER: {context.txn_data.get(key.JOURNAL_NUMBER)}"
-        f" to get UTR NUMBER: {context.txn_data.get(key.UTR_NO)}")
-
-
-@step("authorize the transaction using journal number without pop up")
-def step_authorize_txn_without_popup(context):
-    _electronic_journal_page().authorize_transaction_without_pop_up(context.txn_data)
-    reporter.add_step_log(
-        f"Authorized the transaction using JOURNAL NUMBER: {context.txn_data.get(key.JOURNAL_NUMBER)}"
-        " without pop up")
-
-
-@step("authorize the transaction using journal number and get account number")
-def step_authorize_txn_get_account_number(context):
-    _electronic_journal_page().authorize_transaction_and_get_account_no(context.txn_data)
-    reporter.add_step_log(
-        f"Authorized the transaction using JOURNAL NUMBER: {context.txn_data.get(key.JOURNAL_NUMBER)}"
-        " and fetched account number")
-
-
-@step("click on Electronic Journal to authorize transaction and collect reference number")
-def step_ej_collect_reference_number(context):
-    _home_page().click_electronic_journal()
-    reporter.add_step_log("Clicked on Electronic journal Option")
-    _electronic_journal_page().authorize_transaction_and_get_reference_number(context.txn_data)
-    reporter.add_step_log(f"Authorized and collected Reference Number{context.txn_data.get(key.REFERENCE_NUMBER)}")
-    context.txn_data[key.TEMP_REFERENCE_NUMBER] = context.txn_data.get(key.REFERENCE_NUMBER)
-
-
-@step("click on Electronic Journal to authorize transaction and collect reference number "
-      "and BGL account Number")
-def step_ej_collect_reference_and_bgl(context):
-    _home_page().click_electronic_journal()
-    reporter.add_step_log("Clicked on Electronic journal Option")
-    _electronic_journal_page().authorize_transaction_and_get_reference_number_and_bgl_account_number(
-        context.txn_data)
-    reporter.add_step_log(f"Authorized and collected Reference Number{context.txn_data.get(key.REFERENCE_NUMBER)}")
-
-
-@step("supervisory override without journal number")
-def step_sup_override_without_journal_number(context):
-    _sup_override_page().supervisory_override_without_journal_number(context.txn_data)
-    reporter.add_step_log("supervisory override without journal number")
-
-
-@step("we accept supervisor override success alert")
-def step_accept_sup_override_success_alert(context):
-    _sup_override_page().validate_success_alert(context.txn_data)
-    reporter.add_step_log("supervisory override success alert")
-
-
-@step("click on Electronic Journal to authorize transaction and collect reference number "
-      "for COB screen")
-def step_ej_collect_reference_for_cob(context):
-    _home_page().click_electronic_journal()
-    reporter.add_step_log("Clicked on Electronic journal Option")
-    _electronic_journal_page().authorize_transaction_and_get_reference_number_for_cob(context.txn_data)
-    reporter.add_step_log(f"Authorized and collected Reference Number{context.txn_data.get(key.REFERENCE_NUMBER)}")
-    context.txn_data[key.TEMP_REFERENCE_NUMBER] = context.txn_data.get(key.REFERENCE_NUMBER)
-
-
-@step("retrieve the request id")
-def step_retrieve_the_request_id(context):
-    _electronic_journal_page().retrieve_request_id(context.txn_data)
-    reporter.add_step_log(f"retrieved request number {context.txn_data.get(key.REQUEST_NUMBER)}")
-
-
-@step('validate the error message for pop up as "{error_msg}"')
-def step_validate_error_message_popup(context, error_msg):
-    _negative_scenario_method().validate_error_message_pop_up(error_msg)
-    reporter.add_step_log(f"validated the error message as {error_msg} in CIF change details screen")
-
-
-@step('validate the error message for field as "{field}" as "{expected_error_msg}"')
-def step_validate_error_message_for_field(context, field, expected_error_msg):
-    _negative_scenario_method().validate_negative_error_message_for_field(field, expected_error_msg)
-    reporter.add_step_log(f"validated the error message for {field} and error message as {expected_error_msg}")
-
-
-@step('validate the error message for second field as "{field}" as "{expected_error_msg}"')
-def step_validate_error_message_for_second_field(context, field, expected_error_msg):
-    _negative_scenario_method().validate_negative_error_message_for_second_field(field, expected_error_msg)
-    reporter.add_step_log(f"validated the error message for {field} and error message as {expected_error_msg}")
-
-
-@step('validate the error message for third field as "{field}" as "{expected_error_msg}"')
-def step_validate_error_message_for_third_field(context, field, expected_error_msg):
-    _negative_scenario_method().validate_negative_error_message_for_third_field(field, expected_error_msg)
-    reporter.add_step_log(f"validated the error message for {field} and error message as {expected_error_msg}")
-
-
-@step('validate the error message in table for "{field}" as "{expected_error_msg}"')
-def step_validate_error_message_in_table(context, field, expected_error_msg):
-    _negative_scenario_method().validate_negative_error_message_for_table(field, expected_error_msg)
-    reporter.add_step_log(f"validated the error message for {field} and error message as {expected_error_msg}")
-
-
-@step("we verify if home page is displayed")
-def step_verify_home_page_displayed(context):
-    _home_page().validate_home_page_and_tiles()
-    reporter.add_step_log("validate details of screen")
-
-
-@step("we verify if branch and region date is present")
-def step_verify_branch_and_region_date(context):
-    _home_page().validate_branch_and_region_date()
-    reporter.add_step_log("validate details of Branch and region date")
-
-
-@step("verify if search bar and minimize screen and bancs link and lock and lockout are present")
-def step_verify_search_bar_minimize_bancs_lock(context):
-    _home_page().validate_search_bar_and_minimize_and_lock_and_logout_and_bancslink()
-    reporter.add_step_log("validate search bar,minimize screen, lock,Bancs link and logout")
-
-
-@step("verify if user is able to search")
-def step_verify_user_able_to_search(context):
-    _home_page().validate_search_functionality()
-    reporter.add_step_log("Take screenshot if we come back on home page from search function")
-
-
-@step("click on Electronic Journal to authorize transaction and collect request number")
-def step_ej_collect_request_number(context):
-    _home_page().click_electronic_journal()
-    reporter.add_step_log("Clicked on Electronic journal Option")
-    _electronic_journal_page().authorize_transaction_and_get_request_number(context.txn_data)
-    reporter.add_step_log(f"Authorized and collected request Number{context.txn_data.get(key.REQUEST_NUMBER)}")
-
-
-@step('we validate page header as "{expected_title}"')
-def step_validate_page_header(context, expected_title):
-    _login_page().validate_page_header(expected_title)
-    reporter.add_step_log("Page title validated successfully")
-
-
-@step('validate the pop-up message as "{arg0}"')
-def step_validate_popup_notification_message(context, arg0):
-    # Ported as-is — the original Java method body also just asserts and
-    # then unconditionally throws PendingException, so this step has
-    # never actually completed in the source framework either.
-    pop_up_msg = (
-        "Dear Staff Member, Did you know? Stop Cheque Request services can be availed conveniently by our "
-        "customers through our 24X7 Contact Centre. Encourage customers to utilize these services for quicker, "
-        "hassle-free assistance from the comfort of their homes."
-    )
-    assert pop_up_msg in arg0
-    raise NotImplementedError("validate the pop-up message as ...")
+/* ═══════════════════════════════════════════════════════════════════════
+   Application Knowledge Collector — in-page agent  (Section 5)
+
+   Injected on every document (via CDP Page.addScriptToEvaluateOnNewDocument)
+   so it survives navigation.  It:
+     • records every user interaction (click / type / select / check / submit)
+     • crawls the WHOLE page for interactable elements — not just the ones
+       the user touched — so future BRDs already know about them
+     • builds a multi-strategy locator repository per element
+     • captures validation / error / success messages
+     • traverses iframes and open shadow roots
+
+   It buffers events on window.__AIREC__ ; the Python side drains the buffer.
+   ═══════════════════════════════════════════════════════════════════════ */
+(function () {
+  if (window.__AIREC__) { return; }
+
+  const REC = {
+    version: '1.0',
+    enabled: true,
+    events: [],
+    crawls: [],
+    messages: [],
+    seq: 0,
+    pageKey: null
+  };
+  window.__AIREC__ = REC;
+
+  /* ── helpers ───────────────────────────────────────────────────────── */
+  const SENSITIVE_HINT = /pass|pwd|pin|otp|cvv|secret|token/i;
+
+  /* ── live-DOM uniqueness verification (Section 5.3 accuracy fix) ────
+     A locator candidate is only useful if it resolves to EXACTLY the
+     element the user interacted with — not "probably", verified right
+     now against the real page. Every css/xpath candidate below is
+     checked here before being offered as a locator; ambiguous or
+     non-matching candidates are dropped instead of being passed
+     downstream with false confidence, since a fallback that quietly
+     clicks the WRONG element (because it also matched something else)
+     is worse than no fallback at all. */
+  function cssCount(sel) {
+    try { return document.querySelectorAll(sel).length; } catch (e) { return -1; }
+  }
+  function cssResolvesToElement(sel, el) {
+    try {
+      const nodes = document.querySelectorAll(sel);
+      return nodes.length === 1 && nodes[0] === el;
+    } catch (e) { return false; }
+  }
+  function xpathResolvesToElement(xp, el) {
+    try {
+      const result = document.evaluate(
+        xp, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null
+      );
+      return result.snapshotLength === 1 && result.snapshotItem(0) === el;
+    } catch (e) { return false; }
+  }
+
+  /* ── cross-frame relay (fixes the "popup iframe closes right after
+     the action" race) ──────────────────────────────────────────────
+     Python's poll loop drains buffers roughly once a second. A popped-up
+     iframe that closes (gets removed from the DOM) within that window —
+     a very common pattern for a confirm/OK modal — destroys its own
+     `window.__AIREC__` buffer along with it, taking any not-yet-drained
+     events with it, no matter how well Python switches into iframes to
+     read them; by the time the NEXT poll tick runs, the iframe (and its
+     buffer) is simply gone.
+
+     The fix is to stop RELYING on being polled in time at all: every
+     non-top frame pushes its own event straight into window.top's
+     buffer over postMessage the INSTANT the event happens — synchronously,
+     inside the very same click/change/submit handler that captured it,
+     before the browser's event loop gets a chance to run whatever closes
+     the popup next. By the time anything else can happen, the event
+     already safely lives in the top document's buffer, which survives
+     the iframe's removal and which Python already drains reliably every
+     poll tick regardless of what happened to the iframe afterwards. */
+  function relayToTop(kind, payload) {
+    if (window === window.top) return;
+    try {
+      window.top.postMessage({ __airec_relay__: true, kind: kind, payload: payload }, '*');
+    } catch (e) {
+      // cross-origin postMessage failures (rare, sandboxed iframes) are
+      // not fatal — the frame's own buffer still holds the event as a
+      // fallback for the regular per-frame poll-drain.
+    }
+  }
+  if (window === window.top) {
+    window.addEventListener('message', function (e) {
+      const data = e && e.data;
+      if (!data || !data.__airec_relay__ || !REC.enabled) return;
+      if (data.kind === 'action') { REC.events.push(data.payload); }
+      else if (data.kind === 'crawl') { REC.crawls.push(data.payload); REC.events.push(data.payload); }
+      else if (data.kind === 'messages') { REC.messages.push(data.payload); REC.events.push(data.payload); }
+    });
+  }
+
+  function slug(text) {
+    return (text || '')
+      .toString().trim().toLowerCase()
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 60);
+  }
+
+  /* Section 8 fix: the previous version computed this ONCE and cached
+   * it forever (`if (!REC.pageKey)`), which was correct only for a
+   * classic full-page-reload navigation (this script re-injects fresh
+   * via Page.addScriptToEvaluateOnNewDocument on every real navigation
+   * anyway, so a fresh REC object naturally gets a fresh pageKey then).
+   * It silently broke for a client-side-routed SPA screen change —
+   * title/pathname change WITHOUT a full reload, this script is NOT
+   * re-injected, and every element/action after that point kept
+   * getting attributed to the FIRST screen's stale page_key forever.
+   * Now recomputes whenever title/pathname has actually changed since
+   * the last check, and flags the transition so Python can treat it as
+   * an action-grouping boundary (Section 7) the same way a real
+   * navigation already is. */
+  function pageKey() {
+    const currentSignature = document.title + '|' + location.pathname;
+    if (!REC.pageKey || REC._pageSignature !== currentSignature) {
+      REC._pageSignature = currentSignature;
+      REC.pageKey = slug(document.title) || slug(location.pathname) || 'page';
+      REC._pageTransitioned = true;
+    }
+    return REC.pageKey;
+  }
+
+  function visibleText(el) {
+    if (!el) return '';
+    const t = (el.innerText || el.textContent || '').trim();
+    return t.length > 120 ? t.slice(0, 120) : t;
+  }
+
+  function labelFor(el) {
+    if (!el) return '';
+    if (el.getAttribute && el.getAttribute('aria-label')) return el.getAttribute('aria-label');
+    if (el.id) {
+      const lab = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+      if (lab) return visibleText(lab);
+    }
+    let p = el.parentElement;
+    for (let i = 0; i < 3 && p; i++, p = p.parentElement) {
+      if (p.tagName === 'LABEL') return visibleText(p);
+      const lab = p.querySelector && p.querySelector('label');
+      if (lab && lab.contains && !lab.contains(el)) return visibleText(lab);
+    }
+    if (el.placeholder) return el.placeholder;
+    if (el.title) return el.title;
+    if (el.name) return el.name;
+    return visibleText(el);
+  }
+
+  function elementType(el) {
+    const tag = (el.tagName || '').toLowerCase();
+    const type = (el.getAttribute && (el.getAttribute('type') || '')).toLowerCase();
+    if (tag === 'select') return 'dropdown';
+    if (tag === 'textarea') return 'textarea';
+    if (tag === 'a') return 'link';
+    if (tag === 'table') return 'table';
+    if (tag === 'input') {
+      if (type === 'checkbox') return 'checkbox';
+      if (type === 'radio') return 'radio';
+      if (type === 'file') return 'upload';
+      if (type === 'submit' || type === 'button') return 'button';
+      if (type === 'date' || type === 'datetime-local') return 'calendar';
+      if (type === 'password') return 'password';
+      return 'textbox';
+    }
+    if (tag === 'button') return 'button';
+    const role = el.getAttribute && el.getAttribute('role');
+    if (role) return role;
+    if (el.onclick || (el.className && /btn|button|clickable/i.test(el.className))) {
+      return 'button';
+    }
+    return tag || 'element';
+  }
+
+  function absoluteXPath(el) {
+    if (!el || el.nodeType !== 1) return '';
+    if (el.id) return '//*[@id="' + el.id + '"]';
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === 1 && node !== document.documentElement) {
+      let index = 1;
+      let sib = node.previousElementSibling;
+      while (sib) {
+        if (sib.tagName === node.tagName) index++;
+        sib = sib.previousElementSibling;
+      }
+      parts.unshift(node.tagName.toLowerCase() + '[' + index + ']');
+      node = node.parentElement;
+    }
+    return '/html/' + parts.join('/');
+  }
+
+  function cssPath(el) {
+    if (!el || el.nodeType !== 1) return '';
+    if (el.id) {
+      const idSel = '#' + CSS.escape(el.id);
+      // An id that ISN'T actually unique on this page (duplicate ids do
+      // happen on messy enterprise markup) is worse than useless as a
+      // locator — verify before trusting it.
+      if (cssResolvesToElement(idSel, el)) return idSel;
+    }
+    const segments = [];
+    let node = el;
+    while (node && node.nodeType === 1 && segments.length < 8) {
+      let seg = node.tagName.toLowerCase();
+      if (node.classList && node.classList.length) {
+        const cls = Array.from(node.classList)
+          .filter(c => !/^(ng-|is-|active|selected|hover|focus)/.test(c))
+          .slice(0, 2);
+        if (cls.length) seg += '.' + cls.map(c => CSS.escape(c)).join('.');
+      }
+      const parent = node.parentElement;
+      let indexedSeg = seg;
+      if (parent) {
+        const same = Array.from(parent.children).filter(c => c.tagName === node.tagName);
+        if (same.length > 1) indexedSeg = seg + ':nth-of-type(' + (same.indexOf(node) + 1) + ')';
+      }
+      if (node.id) { indexedSeg = '#' + CSS.escape(node.id); }
+
+      // Try the class/tag-only segment FIRST (survives DOM reordering /
+      // row insertion) — only fall back to the position-based
+      // :nth-of-type segment if the plain one isn't unique enough yet.
+      segments.unshift(seg);
+      let candidate = segments.join(' > ');
+      if (cssResolvesToElement(candidate, el)) return candidate;
+
+      if (indexedSeg !== seg) {
+        segments[0] = indexedSeg;
+        candidate = segments.join(' > ');
+        if (cssResolvesToElement(candidate, el)) return candidate;
+        segments[0] = seg; // keep the non-positional form for the next ancestor level
+      }
+
+      if (node.id) { segments[0] = '#' + CSS.escape(node.id); break; }
+      node = parent;
+    }
+    // Nothing became unique within 8 ancestor levels (rare) — return the
+    // best-effort deepest path; locator_builder.py penalises anything
+    // that wasn't marked verified, below.
+    return segments.join(' > ');
+  }
+
+  function relativeXPaths(el) {
+    const out = [];
+    const tag = (el.tagName || '').toLowerCase();
+    const type = (el.getAttribute && (el.getAttribute('type') || '')).toLowerCase();
+    // 'value' is deliberately EXCLUDED for free-text inputs — for a
+    // textbox/textarea it's whatever the user just TYPED during
+    // recording (an account number, a name, ...), which is both
+    // guaranteed to differ on every future run and a way for recorded
+    // data to leak into a "locator". It's kept only for elements whose
+    // value IS the static, unchanging label (a <input type="submit"
+    // value="Save">-style button), where it behaves like button text.
+    const attrs = ['name', 'placeholder', 'aria-label', 'title'];
+    if (tag !== 'input' || type === 'submit' || type === 'button' || type === 'reset') {
+      attrs.push('value');
+    }
+    attrs.push('type');
+    const candidates = [];
+    attrs.forEach(function (a) {
+      const v = el.getAttribute && el.getAttribute(a);
+      if (v) candidates.push('//' + tag + '[@' + a + '="' + v + '"]');
+    });
+    Array.from(el.attributes || []).forEach(function (a) {
+      if (a.name.indexOf('data-') === 0 && a.value) {
+        candidates.push('//' + tag + '[@' + a.name + '="' + a.value + '"]');
+      }
+    });
+    const txt = visibleText(el);
+    if (txt && txt.length < 40) {
+      candidates.push('//' + tag + '[normalize-space(text())="' + txt + '"]');
+      candidates.push('//' + tag + '[contains(normalize-space(.),"' + txt + '")]');
+    }
+    const lab = labelFor(el);
+    if (lab && lab.length < 40 && (tag === 'input' || tag === 'select' || tag === 'textarea')) {
+      candidates.push('//label[contains(normalize-space(.),"' + lab + '")]/following::'
+        + tag + '[1]');
+      candidates.push('//td[contains(normalize-space(.),"' + lab + '")]/following::'
+        + tag + '[1]');
+    }
+    // Keep only candidates VERIFIED, right now, to resolve to exactly
+    // this element — an xpath that also matches other elements on the
+    // page is a locator that can silently act on the wrong one, which is
+    // worse than not offering it as a fallback at all.
+    candidates.forEach(function (xp) {
+      if (xpathResolvesToElement(xp, el)) out.push(xp);
+    });
+    return out;
+  }
+
+  function describe(el, interacted) {
+    if (!el || el.nodeType !== 1) return null;
+    const rect = (el.getBoundingClientRect && el.getBoundingClientRect()) || {};
+    const style = window.getComputedStyle ? window.getComputedStyle(el) : {};
+    const attrs = {};
+    Array.from(el.attributes || []).forEach(function (a) {
+      if (!SENSITIVE_HINT.test(a.name)) attrs[a.name] = a.value;
+    });
+    const label = labelFor(el);
+    const key = slug(
+      el.id || el.getAttribute('name') || label || elementType(el) + '_' + (REC.seq)
+    ) || ('el_' + REC.seq);
+
+    return {
+      element_key: key,
+      tag: (el.tagName || '').toLowerCase(),
+      element_type: elementType(el),
+      label: label,
+      text: visibleText(el),
+      visible: !!(rect.width || rect.height) && style.visibility !== 'hidden'
+        && style.display !== 'none',
+      enabled: !el.disabled,
+      readonly: !!el.readOnly,
+      required: !!el.required,
+      maxlength: el.maxLength && el.maxLength > 0 ? el.maxLength : null,
+      pattern: el.pattern || null,
+      interacted: !!interacted,
+      page_key: pageKey(),
+      frame_url: location.href,
+      attributes: attrs,
+      options: (el.tagName === 'SELECT')
+        ? Array.from(el.options || []).slice(0, 100)
+            .map(function (o) { return { value: o.value, text: o.text }; })
+        : null,
+      position: { x: Math.round(rect.left || 0), y: Math.round(rect.top || 0),
+                  w: Math.round(rect.width || 0), h: Math.round(rect.height || 0) },
+      parent: el.parentElement ? {
+        tag: el.parentElement.tagName.toLowerCase(),
+        id: el.parentElement.id || null,
+        cls: el.parentElement.className || null
+      } : null,
+      siblings: el.parentElement ? el.parentElement.children.length : 0,
+      locators: (function () {
+        const cssCandidate = cssPath(el);
+        const cssVerified = cssCandidate ? cssResolvesToElement(cssCandidate, el) : false;
+        // A duplicate id/name on the page (messy enterprise markup is
+        // full of these) is not a usable locator even though the
+        // attribute exists — verify before offering it, same as css/xpath
+        // above. An id/name that fails verification is dropped (set to
+        // null) rather than passed downstream with false confidence;
+        // the verified css/xpath/relative_xpath candidates still cover
+        // the element.
+        const rawId = el.id || null;
+        const idVerified = rawId ? cssResolvesToElement('#' + CSS.escape(rawId), el) : false;
+        const rawName = el.getAttribute ? el.getAttribute('name') : null;
+        const nameVerified = rawName
+          ? cssResolvesToElement(
+              (el.tagName || '').toLowerCase() + '[name="' + rawName + '"]', el
+            )
+          : false;
+        return {
+          id: idVerified ? rawId : null,
+          id_ambiguous: !!(rawId && !idVerified),
+          name: nameVerified ? rawName : null,
+          name_ambiguous: !!(rawName && !nameVerified),
+          css: cssCandidate,
+          css_verified: cssVerified,
+          xpath: absoluteXPath(el),
+          relative_xpath: relativeXPaths(el),
+          text: visibleText(el) || null,
+          class: el.className || null,
+          placeholder: el.placeholder || null,
+          aria: el.getAttribute ? el.getAttribute('aria-label') : null,
+          data: Object.keys(attrs)
+            .filter(function (k) { return k.indexOf('data-') === 0; })
+            .reduce(function (acc, k) { acc[k] = attrs[k]; return acc; }, {})
+        };
+      })()
+    };
+  }
+
+  /* ── whole-page crawl (Section 5.2) ────────────────────────────────── */
+  const CRAWL_SELECTOR = [
+    'input', 'textarea', 'select', 'button', 'a[href]', 'table',
+    '[role=button]', '[role=tab]', '[role=menuitem]', '[role=checkbox]',
+    '[role=radio]', '[role=combobox]', '[role=link]', '[onclick]',
+    '[contenteditable=true]', 'label', 'li[class*=menu]', 'div[class*=btn]',
+    'span[class*=btn]', 'img[onclick]', 'i[class*=icon][onclick]'
+  ].join(',');
+
+  function collectRoots() {
+    const roots = [document];
+    document.querySelectorAll('*').forEach(function (el) {
+      if (el.shadowRoot) roots.push(el.shadowRoot);
+    });
+    return roots;
+  }
+
+  function crawlPage(reason) {
+    if (!REC.enabled) return null;
+    const elements = [];
+    const seen = new Set();
+    collectRoots().forEach(function (root) {
+      let nodes = [];
+      try { nodes = Array.from(root.querySelectorAll(CRAWL_SELECTOR)); } catch (e) { }
+      nodes.slice(0, 4000).forEach(function (el) {
+        if (seen.has(el)) return;
+        seen.add(el);
+        const d = describe(el, false);
+        if (d) elements.push(d);
+      });
+    });
+    const crawl = {
+      type: 'crawl',
+      reason: reason || 'page_change',
+      seq: REC.seq++,
+      ts: Date.now(),
+      page: {
+        page_key: pageKey(),
+        url: location.href,
+        title: document.title,
+        page_transitioned: !!REC._pageTransitioned,
+        frames: Array.from(document.querySelectorAll('iframe,frame')).map(function (f) {
+          return { src: f.getAttribute('src'), id: f.id || null, name: f.name || null };
+        }),
+        shadow_roots: collectRoots().length - 1
+      },
+      elements: elements,
+      element_count: elements.length
+    };
+    // Reported once per genuine transition — the NEXT crawl on this same
+    // page (no title/pathname change since) reports it as false again.
+    REC._pageTransitioned = false;
+    REC.crawls.push(crawl);
+    REC.events.push(crawl);
+    relayToTop('crawl', crawl);
+    return crawl;
+  }
+
+  /* ── validation / message capture (Section 5.8) ────────────────────── */
+  const MESSAGE_SELECTOR = [
+    '.error', '.errorMessage', '.error-message', '.alert', '.alert-danger',
+    '.alert-success', '.alert-warning', '.validation-message', '.help-block',
+    '[role=alert]', '.msg', '.message', '.success', '.warning', '.toast',
+    'span[class*=err]', 'div[class*=err]', 'label[class*=err]'
+  ].join(',');
+
+  function captureMessages() {
+    const found = [];
+    document.querySelectorAll(MESSAGE_SELECTOR).forEach(function (el) {
+      const txt = visibleText(el);
+      const rect = el.getBoundingClientRect();
+      if (!txt || !(rect.width || rect.height)) return;
+      let severity = 'info';
+      const cls = (el.className || '') + ' ' + (el.getAttribute('role') || '');
+      if (/err|danger|invalid|fail/i.test(cls)) severity = 'error';
+      else if (/succ|ok|valid/i.test(cls)) severity = 'success';
+      else if (/warn/i.test(cls)) severity = 'warning';
+      found.push({ text: txt, severity: severity, page_key: pageKey(),
+                   selector: cssPath(el) });
+    });
+    if (found.length) {
+      const evt = { type: 'messages', seq: REC.seq++, ts: Date.now(),
+                    page_key: pageKey(), messages: found };
+      REC.messages.push(evt);
+      REC.events.push(evt);
+      relayToTop('messages', evt);
+    }
+    return found;
+  }
+
+  /* ── interaction hooks (Section 5.1 / 5.4) ─────────────────────────── */
+  function pushAction(action, el, extra) {
+    if (!REC.enabled) return;
+    const d = describe(el, true);
+    if (!d) return;
+    const evt = Object.assign({
+      type: 'action',
+      action: action,
+      seq: REC.seq++,
+      ts: Date.now(),
+      page_key: pageKey(),
+      url: location.href,
+      element: d
+    }, extra || {});
+    REC.events.push(evt);
+    // Synchronous, same tick as the click/change/submit that produced
+    // this event — see relayToTop()'s comment for why this has to happen
+    // here and not on some later timer.
+    relayToTop('action', evt);
+  }
+
+  document.addEventListener('click', function (e) {
+    // composedPath()[0] is the TRUE originally-clicked element even when
+    // it's inside a Shadow DOM component (a common way modern frameworks
+    // render floaters/menus) — plain e.target can get "retargeted" to an
+    // outer wrapper in that case, describing the wrong thing.
+    const clicked = (e.composedPath && e.composedPath()[0]) || e.target;
+
+    // ANY click can turn out to trigger an immediate navigation/AJAX
+    // reload — not just a literal `type="submit"` element. A plain <a>
+    // link, a "Home"/menu item, or a JS onclick handler that does its
+    // own `location.href = ...` or triggers a client-side route change
+    // all look identical to an ordinary click until they fire — there's
+    // no reliable way to know in advance which ones will navigate and
+    // which won't. The click gets recorded into memory just fine
+    // either way (pushAction is synchronous), but Python only DRAINS
+    // that memory periodically (~400ms poll) — if the page navigates
+    // before the next poll, the whole in-memory event queue is
+    // destroyed with it, and the click is silently lost even though it
+    // was captured correctly. This used to only be guarded for
+    // type="submit" elements specifically; generalised to (almost)
+    // every click is what actually stops "some actions just don't get
+    // recorded" for the (very common, in a banking UI) case of a
+    // styled link or JS-driven nav button doing the same thing a
+    // submit button does.
+    //
+    // Deliberately EXCLUDED: checkbox/radio inputs. Those already work
+    // correctly via the separate 'change' listener below, which relies
+    // on the click's NATIVE toggle behaviour actually happening —
+    // preventDefault()-ing it here first, then re-dispatching 300ms
+    // later, risks breaking that toggle (and the resulting 'change'
+    // event) for no benefit, since a checkbox/radio click essentially
+    // never triggers an immediate navigation the way a link/button does.
+    const tag = (clicked.tagName || '').toLowerCase();
+    const inputType = (clicked.type || '').toLowerCase();
+    const isCheckboxLike = tag === 'input' && (inputType === 'checkbox' || inputType === 'radio');
+
+    if (isCheckboxLike) {
+      // Already recorded correctly by the 'change' listener elsewhere
+      // in this file — do NOT push here too (that would double-record
+      // every checkbox/radio toggle); just let the native click proceed
+      // untouched, same as before this whole fix existed.
+      return;
+    }
+
+    if (clicked.__aiRecReleased) {
+      // This is our own re-dispatched click going through for real —
+      // don't intercept it again, just let it proceed natively.
+      clicked.__aiRecReleased = false;
+      return;
+    }
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    pushAction('click', clicked, {via: 'delayed_for_safe_drain'});
+    setTimeout(function () {
+      captureMessages();
+      crawlPage('post_click');
+      clicked.__aiRecReleased = true;
+      try {
+        clicked.click(); // re-dispatch — the real click/navigation happens now
+      } catch (err) {
+        // A detached/disabled element by the time this fires — nothing
+        // more to do; the recorded event itself is already safe.
+      }
+    }, 300);
+  }, true);
+
+  document.addEventListener('change', function (e) {
+    const el = e.target;
+    const t = elementType(el);
+    if (t === 'dropdown') {
+      pushAction('select', el, {
+        selected_text: el.options && el.options[el.selectedIndex]
+          ? el.options[el.selectedIndex].text : null,
+        value_length: (el.value || '').length
+      });
+    } else if (t === 'checkbox' || t === 'radio') {
+      pushAction(el.checked ? 'check' : 'uncheck', el, {});
+    } else if (t === 'upload') {
+      pushAction('upload', el, { file_count: (el.files || []).length });
+    } else {
+      /* NEVER store the raw value — only metadata (Section 7.1) */
+      const now = Date.now();
+      if (el.__aiRecLastCapture && now - el.__aiRecLastCapture < 400) return;
+      el.__aiRecLastCapture = now;
+      pushAction('type', el, {
+        value_length: (el.value || '').length,
+        sensitive: SENSITIVE_HINT.test(el.name || '') ||
+                   SENSITIVE_HINT.test(el.id || '') ||
+                   (el.type || '') === 'password'
+      });
+    }
+    setTimeout(captureMessages, 350);
+  }, true);
+
+  document.addEventListener('submit', function (e) {
+    // Same "hold back until safely drained" reasoning as the click
+    // handler above — a form submit is the SINGLE MOST LIKELY trigger
+    // for an immediate navigation (that's the entire point of submit),
+    // so this had NO protection at all before this fix, unlike clicks.
+    // `HTMLFormElement.submit()` (used to release it below) bypasses the
+    // 'submit' event entirely per spec — no re-entry guard needed the
+    // way clicked.click() needed one, this genuinely just submits.
+    const form = e.target;
+    if (form.__aiRecReleased) { form.__aiRecReleased = false; return; }
+    e.preventDefault();
+    pushAction('submit', form, {});
+    setTimeout(function () {
+      captureMessages();
+      try { form.submit(); } catch (err) { /* form already gone — nothing to do */ }
+    }, 300);
+  }, true);
+
+  /* Search/query boxes overwhelmingly submit on Enter, with the page's
+   * own JS intercepting the keydown (often via preventDefault()) to fire
+   * an AJAX search or navigate immediately — the field never blurs in the
+   * way needed for a native 'change' event to fire, so the standard
+   * change-listener above never captures it. This was the actual cause of
+   * a search box that's auto-focused after login (never clicked, typed
+   * into immediately, Enter pressed) going completely unrecorded. Capture
+   * on Enter BEFORE that navigation/AJAX can happen. */
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter' && e.keyCode !== 13) return;
+    const el = e.target;
+    const tag = (el.tagName || '').toLowerCase();
+    if (tag !== 'input' && tag !== 'textarea') return;
+    const t = elementType(el);
+    if (t === 'dropdown' || t === 'checkbox' || t === 'radio' || t === 'upload') return;
+    // Dedup: if a native 'change' already captured this exact field very
+    // recently, don't double-record the same keystroke as two steps.
+    const now = Date.now();
+    if (el.__aiRecLastCapture && now - el.__aiRecLastCapture < 400) return;
+    el.__aiRecLastCapture = now;
+
+    // Same "hold back until safely drained" reasoning as click/submit
+    // above. Pressing Enter in a search box (this platform's own
+    // confirmed real-world case: type a transaction number, press
+    // Enter, the transaction screen opens immediately) is exactly the
+    // shape of action most likely to have been silently lost before
+    // this fix — no protection existed here at all previously.
+    if (el.__aiRecEnterReleased) { el.__aiRecEnterReleased = false; return; }
+    e.preventDefault();
+    pushAction('type', el, {
+      value_length: (el.value || '').length,
+      sensitive: SENSITIVE_HINT.test(el.name || '') ||
+                 SENSITIVE_HINT.test(el.id || '') ||
+                 (el.type || '') === 'password',
+      via: 'enter_key'
+    });
+    setTimeout(function () {
+      captureMessages();
+      el.__aiRecEnterReleased = true;
+      const form = el.form || (el.closest ? el.closest('form') : null);
+      if (form) {
+        // A standard HTML form's native auto-submit-on-Enter — bypass
+        // the trusted-event restriction entirely by submitting directly,
+        // the same way the 'submit' handler above releases itself.
+        try { form.submit(); return; } catch (err) { /* fall through */ }
+      }
+      // No enclosing form (a JS-driven search box handling its own
+      // keydown listener and doing its own navigation/AJAX call, which
+      // this app's search box is — confirmed) — re-dispatch a synthetic
+      // Enter keydown. The page's OWN JS listener still fires for a
+      // synthetic event (only the BROWSER's native default action, e.g.
+      // auto-submitting a real <form>, requires a trusted one — and
+      // that case is already handled above).
+      try {
+        el.dispatchEvent(new KeyboardEvent('keydown', {
+          key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+          bubbles: true, cancelable: true,
+        }));
+      } catch (err) { /* nothing more to do */ }
+    }, 300);
+  }, true);
+
+
+  window.addEventListener('load', function () {
+    setTimeout(function () { crawlPage('load'); captureMessages(); }, 400);
+  });
+
+  /* SPA / dynamic DOM: re-crawl when the page materially changes.
+   * Used to require >=3 new interactive elements before bothering to
+   * re-crawl — small floaters/popups (a 2-button "Update Later / Update
+   * Now" panel, a short dropdown) never crossed that threshold and were
+   * silently never captured. Any change now triggers a re-crawl. */
+  let mutationTimer = null;
+  let lastCount = 0;
+  const observer = new MutationObserver(function () {
+    if (!REC.enabled) return;
+    clearTimeout(mutationTimer);
+    mutationTimer = setTimeout(function () {
+      const count = document.querySelectorAll(CRAWL_SELECTOR).length;
+      if (count !== lastCount) {
+        lastCount = count;
+        REC.pageKey = null;           // title may have changed
+        crawlPage('dom_mutation');
+      }
+      captureMessages();
+    }, 500);
+  });
+  try {
+    observer.observe(document.documentElement || document.body,
+      { childList: true, subtree: true, attributes: false });
+  } catch (e) { }
+
+  /* ── drain API used by the Python recorder ─────────────────────────── */
+  REC.drain = function () {
+    const batch = REC.events.splice(0, REC.events.length);
+    return batch;
+  };
+  REC.snapshotDom = function () {
+    return {
+      url: location.href,
+      title: document.title,
+      html: document.documentElement ? document.documentElement.outerHTML : '',
+      page_key: pageKey()
+    };
+  };
+  REC.forceCrawl = function () { return crawlPage('manual'); };
+  REC.stop = function () { REC.enabled = false; try { observer.disconnect(); } catch (e) { } };
+  /* Pause/Resume (Section 25) — unlike stop(), does NOT disconnect the
+   * MutationObserver permanently; click/change/submit/keydown listeners
+   * already all check `REC.enabled` first thing, so toggling it back to
+   * true picks capture back up exactly where it left off, in the same
+   * browser session, without a fresh injection. */
+  REC.pause = function () { REC.enabled = false; };
+  REC.resume = function () { REC.enabled = true; };
+
+  /* Progressive re-crawl, not a single fixed-delay snapshot. A slow-
+   * rendering SPA (this platform's own hash-routed UAT login screen is
+   * exactly this shape) can easily still be rendering its login form —
+   * including the password/id fields — well past a single 600ms window.
+   * A crawl that only ever fires once at a fixed delay silently misses
+   * whatever hadn't rendered yet at that exact moment, with no second
+   * chance to catch it later — which is the direct, confirmed cause of
+   * "the recorder doesn't reliably capture the password/id field in
+   * UAT". cdp_recorder.py's `_merge_element()` already de-dupes and
+   * merges elements across repeated crawl events by their unique key
+   * (locators accumulate, nothing gets overwritten) — so simply
+   * crawling AGAIN at increasing intervals, rather than replacing the
+   * single crawl with a longer fixed delay, is what actually closes
+   * this gap: an early crawl still catches whatever's already there
+   * fast, and each later one has another chance at anything that took
+   * longer to render, all merging into the same knowledge instead of
+   * requiring a guess at "the one right delay" for every screen.
+   */
+  [600, 1500, 3000, 6000].forEach(function (delay) {
+    setTimeout(function () { crawlPage('init'); }, delay);
+  });
+})();
