@@ -1,145 +1,141 @@
-"""Microsoft Edge driver factory (thread-local — one WebDriver per
-execution process).
+"""Login / logout page.
 
-No Maven/Gradle/JDK needed — Selenium + msedgedriver come straight from
-``pip install selenium`` and the driver binary on PATH / ``SBI_EDGE_DRIVER``.
+SEED page object:
+the locators below are placeholders that the Locator Agent overwrites the
+first time transaction 9750 is recorded against the real SBI environment.
+Recording once replaces every guess here.
 """
 from __future__ import annotations
 
-import os
-import threading
+from selenium.webdriver.common.by import By
+from selenium.webdriver.remote.webdriver import WebDriver
 
-from selenium import webdriver
-from selenium.webdriver.edge.options import Options as EdgeOptions
-from selenium.webdriver.edge.service import Service as EdgeService
+from core.base_page import BasePage
+from core.config_reader import get as config_get
+from utils import locator_repository as locator_repo
 
-from utils import execution_context as ctx
-
-_local = threading.local()
-
-
-def get_driver() -> webdriver.Edge:
-    driver = getattr(_local, "driver", None)
-    if driver is None:
-        driver = _create()
-        _local.driver = driver
-    return driver
+USER_ID = "login::user_id"
+PASSWORD = "login::password"
+SUBMIT = "login::submit"
+LOGOUT = "login::logout"
+CHANGE_PASSWORD_TITLE = "login::change_password_title"
 
 
-def _bypass_proxy_for_local_webdriver() -> None:
-    """Exclude localhost/127.0.0.1 from the corporate HTTP proxy.
+class LoginPage(BasePage):
+    def __init__(self, driver: WebDriver):
+        super().__init__(driver)
+        self._register_locators()
 
-    Same fix as backend/recorder/cdp_recorder.py::_bypass_proxy_for_local_webdriver
-    — see that docstring for the full "Access Denied (authentication_failed)"
-    explanation. This execution-side driver factory needs it independently:
-    the recorder and the execution framework are separate processes, so the
-    NO_PROXY fix applied in one does not carry over to the other.
-    """
-    for var in ("NO_PROXY", "no_proxy"):
-        current = os.environ.get(var, "")
-        entries = {e.strip() for e in current.split(",") if e.strip()}
-        entries.update({"localhost", "127.0.0.1", "::1"})
-        os.environ[var] = ",".join(sorted(entries))
+    def _register_locators(self) -> None:
+        if locator_repo.contains(USER_ID):
+            return
+        # Real locators confirmed from com.nbc.pages.common.LoginPage.java
+        # (the actual production NBC framework) — put FIRST/highest
+        # priority; the old guessed fallbacks stay in the list below them
+        # in case a future UI change moves away from these exact ones.
+        locator_repo.register(USER_ID, [
+            (By.NAME, "loginId"),
+            (By.ID, "userId"), (By.NAME, "username"),
+            (By.CSS_SELECTOR, "input[type='text']"),
+            (By.XPATH, "//label[contains(.,'User')]/following::input[1]"),
+        ])
+        locator_repo.register(PASSWORD, [
+            (By.NAME, "password"),
+            (By.ID, "password"),
+            (By.CSS_SELECTOR, "input[type='password']"),
+            (By.XPATH, "//label[contains(.,'Password')]/following::input[1]"),
+        ])
+        locator_repo.register(SUBMIT, [
+            (By.ID, "login_button"),
+            (By.ID, "loginBtn"), (By.NAME, "login"),
+            (By.CSS_SELECTOR, "button[type='submit']"),
+            (By.XPATH, "//button[contains(.,'Login') or contains(.,'Sign')]"),
+            (By.XPATH, "//input[@type='submit']"),
+        ])
+        locator_repo.register(LOGOUT, [
+            (By.ID, "logout"), (By.LINK_TEXT, "Logout"), (By.LINK_TEXT, "Sign Out"),
+            (By.XPATH, "//a[contains(.,'Logout') or contains(.,'Sign Out')]"),
+        ])
+        locator_repo.register(CHANGE_PASSWORD_TITLE, [
+            (By.ID, "changePassword"),
+            (By.XPATH, "//*[contains(.,'Change Password')]"),
+        ])
 
+    def open(self, url: str | None) -> "LoginPage":
+        target = url if url else config_get("app.url", "")
+        if target:
+            self.driver.get(target)
+        self.wait_for_page()
+        self._wait_for_login_form_rendered()
+        return self
 
-def _create() -> webdriver.Edge:
-    _bypass_proxy_for_local_webdriver()
-    driver_path = ctx.get("edgeDriver", os.environ.get("SBI_EDGE_DRIVER"))
+    def _wait_for_login_form_rendered(self, timeout: float = 20.0) -> None:
+        """`wait_for_page()` only checks `document.readyState == "complete"`
+        — satisfied the instant the base HTML/JS shell finishes loading,
+        which for a HASH-ROUTED single-page app (this login URL ends in
+        `#!` — confirmed real-world evidence: `.../login_cbs.action#!`)
+        happens WELL BEFORE the client-side JS router has actually
+        rendered the login FORM into the DOM. `readyState` says "done"
+        almost immediately; the actual username/password fields don't
+        exist yet for a few more moments while the SPA finishes its own
+        routing/rendering pass. Interacting (or even just resolving a
+        locator for) the username field before that finishes is exactly
+        what an empty page TITLE alongside a "Locator failure:
+        login::user_id" on the correct URL indicates — the shell loaded,
+        the SPA hasn't rendered its content into it yet.
 
-    options = EdgeOptions()
-    options.add_argument("--start-maximized")
-    options.add_argument("--disable-popup-blocking")
-    options.add_argument("--disable-notifications")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--no-first-run")
-    options.add_argument("--no-default-browser-check")
+        Waits here for the username field to become genuinely FINDABLE
+        before `open()` returns, so every caller (the login step itself,
+        and the pre-scenario recovery navigation in environment.py)
+        gets a page that's actually ready, not just one whose initial
+        HTTP response finished.
 
-    # Every one of these is scoped to THIS ONE isolated automation browser
-    # session — a fresh Edge instance launched per execution, never a
-    # shared or production browser — so relaxing them here doesn't expose
-    # a real end user to anything. They exist because the target
-    # environment (nbcppuatweb4.sbi.co.in, an internal UAT host) commonly
-    # presents an internally-issued/self-signed certificate and other
-    # browser-security UI that Chrome/Edge would otherwise surface as an
-    # interstitial warning or a blocking prompt — which a human clicks
-    # past without a second thought, but which silently stalls or breaks
-    # unattended Selenium automation (a cert warning page has none of the
-    # locators the recorded flow expects).
-    #
-    # DELIBERATELY NOT included (removed after a real, confirmed
-    # incident): --disable-web-security and --allow-running-insecure-
-    # content. Both disable the browser's OWN CORS/same-origin/mixed-
-    # content enforcement — this app's own server-side session-security
-    # layer (the "BCF0070: Security breached, user session invalidated"
-    # message, seen specifically on LOGOUT) appears to rely on that
-    # enforcement actually being intact to validate a request as
-    # legitimate; a normal, unmodified browser (a manual logout) never
-    # triggers it, only the automated one with these two flags did. If a
-    # genuine mixed-content/CORS blocking issue shows up again on some
-    # OTHER screen, re-add these ONE AT A TIME and confirm logout still
-    # works cleanly before keeping either — don't restore both together
-    # without re-testing, since this is exactly how the regression
-    # slipped in the first time.
-    options.add_argument("--ignore-certificate-errors")
-    options.add_argument("--allow-insecure-localhost")
-    options.add_argument("--disable-blink-features=BlockCredentialedSubresources")
+        Deliberately does NOT call `self._find()` in this polling loop —
+        `_find()`/`element_resolver.resolve()` itself waits up to
+        `long_wait` (30s) per attempt when nothing matches, which
+        combined with a retry loop here would badly overshoot this
+        method's own `timeout`. Checking each registered candidate
+        directly via `find_elements()` (plural — returns an empty list
+        immediately rather than waiting) keeps every poll fast, so the
+        actual time spent here stays close to the intended timeout.
+        """
+        import time as _time
+        from utils import locator_repository as _locator_repo
 
-    # Hides `navigator.webdriver` and the "Chrome/Edge is being controlled
-    # by automated test software" infobar. Several enterprise banking UIs
-    # (this one included, going by how brittle some interactions have
-    # been) run client-side bot-detection or defensive JS that behaves
-    # differently — extra validation, disabled fields, unexpected popups —
-    # when it detects an automated browser; this is what actually
-    # prevents that class of interference, not just cosmetic. Kept
-    # (unlike the two removed above) — this affects only client-side JS
-    # automation-detection signals, not the CORS/session-security layer
-    # that produced the logout failure, so it isn't implicated the same
-    # way. If logout issues persist even after removing the two flags
-    # above, try removing this one too, one change at a time.
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
+        candidates = _locator_repo.get(USER_ID) or []
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            for strategy, value in candidates:
+                try:
+                    if self.driver.find_elements(strategy, value):
+                        return
+                except Exception:
+                    continue
+            _time.sleep(0.3)
+        # Never hard-fail the settle-wait itself — login_as()'s own
+        # locator resolution (with its own full wait budget) is still
+        # the real, authoritative attempt; this is just giving it the
+        # best possible starting point.
 
-    if (ctx.get("headless", "false") or "false").lower() == "true":
-        options.add_argument("--headless=new")
-    options.add_experimental_option("prefs", {
-        "credentials_enable_service": False,
-        "profile.password_manager_enabled": False,
-        # Notification/popup prompts blocked at the content-settings level
-        # too (belt-and-braces alongside --disable-notifications above —
-        # some prompts are governed by this preference specifically, not
-        # the command-line flag).
-        "profile.default_content_setting_values.notifications": 2,
-    })
+    def login_as(self, user_id: str, password: str) -> "LoginPage":
+        self.type(USER_ID, user_id)
+        self.type(PASSWORD, password)
+        self.click(SUBMIT)
+        self.wait_for_page()
+        return self
 
-    service = EdgeService(executable_path=driver_path) if driver_path else EdgeService()
-    driver = webdriver.Edge(service=service, options=options)
+    def is_password_change_screen_visible(self) -> bool:
+        """True while the forced Change Password window (transaction 9750) is open."""
+        return self.is_text_present("Change Password") or self.is_text_present("change password")
 
-    # NO implicit wait — this codebase relies entirely on the explicit
-    # waits in BasePage (wait / short_wait). Mixing implicit and explicit
-    # waits is a known Selenium anti-pattern: it silently inflates every
-    # failing locator attempt toward the implicit timeout regardless of
-    # how short the explicit wait around it is set to.
-    driver.set_page_load_timeout(90)
-    return driver
+    def logout(self) -> None:
+        if self.exists(LOGOUT):
+            self.click(LOGOUT)
+            self.wait_for_page()
+            self.recover_from_security_breach_if_present()
 
-
-def execute_cdp(command: str, params: dict) -> dict:
-    """CDP escape hatch — used for network capture and DOM inspection."""
-    driver = get_driver()
-    try:
-        return driver.execute_cdp_cmd(command, params or {})
-    except Exception:
-        return {}
-
-
-def quit_quietly() -> None:
-    driver = getattr(_local, "driver", None)
-    if driver is not None:
-        try:
-            driver.quit()
-        except Exception:
-            # never let cleanup break the run
-            pass
-        finally:
-            _local.driver = None
+    def is_logged_in(self) -> bool:
+        """True once a session is already active (the Logout link/button is
+        present) — used to avoid re-submitting login credentials into a
+        session that's already open."""
+        return self.exists(LOGOUT)
