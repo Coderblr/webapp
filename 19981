@@ -1,271 +1,916 @@
-"""Semantic generated-code validation (Part 5).
+"""Recorder Engine — drives Microsoft Edge via Selenium + CDP (Section 5).
 
-The existing compiler (backend/codegen/compiler.py) checks Python
-SYNTAX — but syntax-correct code can still be semantically broken in
-ways that only surface deep inside a live browser session, wasting the
-whole Section-11 pipeline before anyone finds out:
+A recording session captures a full digital twin of one transaction:
+pages, every interactable element on every page (whole-page crawl),
+a multi-strategy locator repository, DOM before/after each action,
+screenshots, workflow path, validation rules and (optionally) network
+activity.
 
-  - a Gherkin step with no matching (or an ambiguous) step definition
-  - a step definition that calls a page-object method that doesn't exist
-  - a locator that's empty, missing a strategy, or plainly fabricated
-  - a <Placeholder> the feature file references that no test-data field
-    actually supplies
-
-This module catches all of those STATICALLY, right after codegen and
-before compile/execute — for the cost of parsing files that are already
-sitting on disk, not a browser session.
-
-Reuses backend/framework_index/{python_parser,text_formats}.py rather
-than re-implementing Python/Gherkin parsing a second time — those are
-already the platform's single source of truth for "what does this file
-actually define".
+Recording is the ONLY manual step in the platform, and it happens once
+per unique transaction.
 """
 from __future__ import annotations
 
-import re
+import json
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 
+from ..core import db
 from ..core.config import settings
 from ..core.logging_conf import get_logger
-from ..framework_index import python_parser, text_formats
-from ..knowledge import repository as repo
-from ..tdm import templates as tdm_templates
-from . import compiler
+from ..core.security import is_sensitive
+from . import action_grouping, checkpoint_detector, component_detector, locator_builder
+from . import dom_diff as recorder_dom_diff
+from . import network_capture, quality_score
+from .action_normalizer import ActionNormalizer
+from .snapshot_store import SnapshotStore, dom_diff
 
 log = get_logger(__name__)
 
-_GHERKIN_KEYWORD_RE = re.compile(r"^(Given|When|Then|And|But)\s+", re.I)
-_PLACEHOLDER_RE = re.compile(r"<([A-Za-z_][A-Za-z0-9_]*)>")
-_FABRICATED_MARKERS = ("todo", "placeholder", "fixme", "xxx", "fabricated",
-                        "changeme", "dummy_locator", "unknown")
+INJECTOR_JS = (Path(__file__).parent / "injector.js").read_text(encoding="utf-8")
+
+POLL_INTERVAL = 0.4  # Reduced from 1.0s — per-action processing used to
+                      # include a full-page DOM parse+diff synchronously
+                      # in the hot path (moved to a deferred pass at
+                      # stop() instead), which was slow enough that a
+                      # 1-second poll interval on top of it meant capture
+                      # routinely fell behind normal-speed clicking/
+                      # typing. With that heavy work out of the loop, a
+                      # tighter poll keeps up much more reliably.
+DRIVER_CALL_TIMEOUT = 8.0  # seconds — a hung Edge/CDP call must never hang the caller
 
 
-def _pattern_to_regex(pattern: str) -> re.Pattern[str]:
-    """Converts a behave `parse`-style pattern (`user enters "{value}" in
-    "Account Name"`) into a regex that matches an actual Gherkin step's
-    text, so step-existence checking doesn't need a real behave runtime."""
-    parts = re.split(r"(\{[a-zA-Z_][a-zA-Z0-9_]*(?::\w+)?\})", pattern)
-    out = []
-    for part in parts:
-        if part.startswith("{") and part.endswith("}"):
-            out.append(r".+?")
-        else:
-            out.append(re.escape(part))
-    return re.compile("^" + "".join(out) + "$")
+class RecorderError(RuntimeError):
+    pass
 
 
-def collect_step_registry(steps_dir: Path) -> dict[str, list[str]]:
-    """pattern -> [file:line, ...] across EVERY step file — this must be
-    global, not scoped to one transaction, because behave itself loads
-    every file under features/steps/ into one shared registry (this is
-    exactly the mechanism that produced the real AmbiguousStep failures
-    this platform hit — two independently-generated transactions each
-    defining an identical step for a shared field label, and separately,
-    a STALE leftover generated file — e.g. a transaction re-generated
-    under a corrected id/naming convention, with its old file never
-    deleted — silently reintroducing a duplicate no amount of correct
-    NEW-generation logic can catch, since it's an old file sitting
-    there, not something this run just produced).
+def _bypass_proxy_for_local_webdriver() -> None:
+    """Exclude localhost/127.0.0.1 from the corporate HTTP proxy.
+
+    On a machine where a corporate proxy (visible in browser and CLI
+    traffic — SBI's helpdesk.proxy@sbi.co.in gateway shows up here) is
+    configured system-wide via HTTP_PROXY/HTTPS_PROXY, Selenium's
+    internal HTTP client (talking to msedgedriver's local server at
+    http://localhost:<port>, purely on this machine) inherits that proxy
+    setting too unless localhost is explicitly excluded. The proxy then
+    intercepts what should be a purely local WebDriver-protocol call,
+    can't authenticate it (no corporate credentials attached to an
+    internal loopback request), and returns an "Access Denied
+    (authentication_failed)" HTML page — which Selenium can't parse as
+    the JSON response it expected, and raises WebDriverException.
+    Merges into any existing NO_PROXY/no_proxy value rather than
+    overwriting it, in case other exclusions are already configured.
     """
-    registry: dict[str, list[str]] = {}
-    if not steps_dir.exists():
-        return registry
-    for steps_file in sorted(steps_dir.glob("*.py")):
+    import os
+    for var in ("NO_PROXY", "no_proxy"):
+        current = os.environ.get(var, "")
+        entries = {e.strip() for e in current.split(",") if e.strip()}
+        entries.update({"localhost", "127.0.0.1", "::1"})
+        os.environ[var] = ",".join(sorted(entries))
+
+
+def _call_with_timeout(fn: Callable[[], Any], timeout: float = DRIVER_CALL_TIMEOUT) -> Any:
+    """Run fn() with a hard wall-clock timeout.
+
+    Selenium's WebDriver HTTP client has no reliable per-call timeout of its
+    own, so a stuck browser (e.g. a native JS confirm()/alert() blocking the
+    page, or a wedged msedgedriver) can hang a call forever. We can't kill a
+    Python thread, so on timeout we abandon the worker and raise immediately,
+    letting the caller move on. The worker MUST be a daemon thread — a
+    plain (non-daemon) thread left running would block the whole process
+    from exiting later, trading one hang for another.
+    """
+    result: dict[str, Any] = {}
+    error: dict[str, BaseException] = {}
+
+    def runner() -> None:
         try:
-            for cls in python_parser.parse_file(steps_file):
-                for method in cls.methods:
-                    if method.gherkin_pattern:
-                        registry.setdefault(method.gherkin_pattern, []).append(
-                            f"{steps_file.name}:{method.line_start}"
-                        )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Could not parse %s for step registry: %s", steps_file, exc)
-    return registry
+            result["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            error["value"] = exc
+
+    worker = threading.Thread(target=runner, daemon=True, name="driver-call")
+    worker.start()
+    worker.join(timeout=timeout)
+    if worker.is_alive():
+        raise TimeoutError(f"driver call exceeded {timeout}s")
+    if "value" in error:
+        raise error["value"]
+    return result.get("value")
 
 
-def find_ambiguous_steps(steps_dir: Path) -> dict[str, list[str]]:
-    """Public entry point for anything OUTSIDE the full
-    `validate_transaction()` flow that just wants the duplicate-step
-    check on its own — e.g. execution/pipeline.py's preflight, which
-    needs to catch a stale/orphaned generated file BEFORE handing off to
-    behave (an `AmbiguousStep` there is a hard crash 30-90+ seconds into
-    a live browser session, not a clean, immediate, actionable
-    pre-flight failure). Returns only the patterns with more than one
-    definition."""
-    registry = collect_step_registry(steps_dir)
-    return {p: locs for p, locs in registry.items() if len(locs) > 1}
+class RecordingSession:
+    """One recording of one transaction."""
+
+    def __init__(
+        self,
+        transaction_id: str,
+        transaction_name: str,
+        start_url: str,
+        environment: str = "PREPROD",
+        transaction_type: str = "business",
+        description: str | None = None,
+        fullpage_crawl: bool = True,
+        capture_network: bool = True,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        self.session_uid = f"rec_{transaction_id}_{uuid.uuid4().hex[:8]}"
+        self.transaction_id = transaction_id
+        self.transaction_name = transaction_name
+        self.environment = environment
+        self.transaction_type = transaction_type
+        self.description = description
+        self.start_url = start_url
+        self.fullpage_crawl = fullpage_crawl
+        self.capture_network = capture_network and settings.recorder_capture_network
+        self.on_event = on_event
+
+        self.store = SnapshotStore(self.session_uid)
+        self.driver = None
+        self.status = "created"
+        self._poll_thread: Optional[threading.Thread] = None
+        self._stop_flag = threading.Event()
+        self._last_dom: str = ""
+        self._events: list[dict[str, Any]] = []
+        self._pages: dict[str, dict[str, Any]] = {}
+        self._elements: dict[str, dict[str, Any]] = {}
+        self._messages: list[dict[str, Any]] = []
+        self._network: list[dict[str, Any]] = []
+        self._workflow: list[str] = []
+        self._actions: list[dict[str, Any]] = []
+        self._last_dom_ref: str = ""
+        self._action_seq = 0
+        # Recorder-enhancement Sections 5/6/7 — normalization/dedup runs
+        # per-event as actions are ingested; grouping runs once, on
+        # demand, over the full action list (it needs to see the whole
+        # sequence to find step boundaries).
+        self._normalizer = ActionNormalizer()
+        self._page_boundary_sequences: set[int] = set()
+        # Section 15/16 — checkpoints and business-validation records are
+        # stored SEPARATELY from `_actions`, never mixed in — this is
+        # what makes "ACTION vs EXPECTED OUTCOME" a structural distinction
+        # rather than just a label on the same list.
+        self._checkpoints: list[dict[str, Any]] = []
+        self._validations: list[dict[str, Any]] = []
+        self._last_url: str = ""
+
+    # ── browser lifecycle ───────────────────────────────────────────────
+    def _build_driver(self):
+        from selenium import webdriver
+        from selenium.webdriver.edge.options import Options
+        from selenium.webdriver.edge.service import Service
+
+        _bypass_proxy_for_local_webdriver()
+
+        options = Options()
+        options.add_argument("--start-maximized")
+        options.add_argument("--disable-popup-blocking")
+        options.add_argument("--disable-notifications")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        # Same rationale as python-framework/core/driver_factory.py's
+        # execution-side driver — kept in sync deliberately. See that
+        # file's docstring for the full explanation, INCLUDING why
+        # --disable-web-security and --allow-running-insecure-content are
+        # deliberately NOT here (removed after a confirmed real incident:
+        # they caused a "BCF0070: Security breached, user session
+        # invalidated" error on logout, specifically because they disable
+        # the browser's own CORS/same-origin enforcement that this app's
+        # server-side session-security layer relies on to consider a
+        # request legitimate).
+        options.add_argument("--ignore-certificate-errors")
+        options.add_argument("--allow-insecure-localhost")
+        options.add_argument("--disable-blink-features=BlockCredentialedSubresources")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+        options.set_capability("ms:loggingPrefs", {"performance": "ALL"})
+        if settings.edge_binary_path:
+            options.binary_location = settings.edge_binary_path
+        if self.capture_network:
+            # NOT options.set_capability("ms:edgeOptions", {...}) — that
+            # was a real, pre-existing bug found while wiring in the
+            # options above: Selenium's own `to_capabilities()` REBUILDS
+            # the `ms:edgeOptions` capability from its internal
+            # args/extensions/experimental_options state, discarding
+            # anything set directly via `set_capability("ms:edgeOptions",
+            # ...)` — so `perfLoggingPrefs` was silently never actually
+            # reaching the browser at all, regardless of
+            # `capture_network`. `add_experimental_option()` is the
+            # mechanism that actually survives into the final
+            # capabilities (confirmed directly: excludeSwitches/
+            # useAutomationExtension/prefs above all do, via this exact
+            # path) — using it here for perfLoggingPrefs too.
+            options.add_experimental_option("perfLoggingPrefs", {"enableNetwork": True})
+        service = (
+            Service(executable_path=settings.edge_driver_path)
+            if settings.edge_driver_path else Service()
+        )
+        driver = webdriver.Edge(service=service, options=options)
+        driver.implicitly_wait(settings.browser_implicit_wait)
+        return driver
+
+    def start(self) -> dict[str, Any]:
+        log.info("Starting recording %s for transaction %s",
+                 self.session_uid, self.transaction_id)
+        self.driver = self._build_driver()
+        # Inject on every document so the collector survives navigation.
+        try:
+            self.driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument", {"source": INJECTOR_JS}
+            )
+            if self.capture_network:
+                self.driver.execute_cdp_cmd("Network.enable", {})
+        except Exception as exc:
+            log.warning("CDP injection unavailable, falling back: %s", exc)
+
+        self.driver.get(self.start_url)
+        self._ensure_injected()
+        self.status = "recording"
+
+        db.execute(
+            """
+            INSERT INTO recording_sessions
+              (session_uid, transaction_id, transaction_name, environment,
+               status, start_url, capture_dir)
+            VALUES (%s,%s,%s,%s,'recording',%s,%s)
+            ON CONFLICT (session_uid) DO NOTHING
+            """,
+            (self.session_uid, self.transaction_id, self.transaction_name,
+             self.environment, self.start_url, str(self.store.root)),
+        )
+
+        self._stop_flag.clear()
+        self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._poll_thread.start()
+        return self.info()
+
+    def _ensure_injected(self) -> None:
+        """Re-inject after navigations that bypassed the CDP hook."""
+        try:
+            present = self.driver.execute_script("return !!window.__AIREC__;")
+            if not present:
+                self.driver.execute_script(INJECTOR_JS)
+        except Exception as exc:
+            log.debug("Injection check failed: %s", exc)
+
+    # ── polling loop ────────────────────────────────────────────────────
+    def _poll_loop(self) -> None:
+        while not self._stop_flag.is_set():
+            try:
+                self._drain_once()
+            except Exception as exc:
+                log.debug("Poll iteration failed: %s", exc)
+            self._stop_flag.wait(POLL_INTERVAL)
+
+    def _drain_once(self) -> None:
+        if self.driver is None:
+            return
+        if self.status == "paused":
+            # Nothing to drain while paused — skip the CDP round-trips
+            # entirely rather than polling a browser that was told not
+            # to be capturing anything (Section 27: don't do unnecessary
+            # work on every tick).
+            return
+        self._ensure_injected()
+        raw: list[dict[str, Any]] = []
+        try:
+            top = _call_with_timeout(
+                lambda: self.driver.execute_script(
+                    "return window.__AIREC__ && window.__AIREC__.drain();"
+                )
+            )
+            if top:
+                raw.extend(top)
+        except Exception as exc:
+            log.debug("Top-level drain failed: %s", exc)
+        try:
+            raw.extend(self._drain_frames(depth=0))
+        finally:
+            # _drain_frames always restores context on its own way out, but
+            # a raised exception partway through a switch_to chain must
+            # never leave the driver stuck inside a stale/detached iframe
+            # for every subsequent poll tick.
+            try:
+                self.driver.switch_to.default_content()
+            except Exception:
+                pass
+        if not raw:
+            return
+        # Section 27 / correctness: EACH event gets its own isolated
+        # try/except. Before this fix, a single exception from ANY event
+        # in the batch (a screenshot call failing during a page
+        # transition, a DOM-diff parse hiccup, ...) propagated straight
+        # out of this whole function — which meant every event AFTER
+        # the one that failed was silently never ingested, AND never
+        # even reached the raw-events append below, so there was no way
+        # to recover them afterward either. This was the direct,
+        # confirmed cause of actions going missing during a real
+        # recording — one bad event could take out the rest of an
+        # entire poll batch with it.
+        for event in raw:
+            try:
+                self._ingest(event)
+            except Exception as exc:
+                log.warning("Failed to ingest one recorder event (sequence "
+                           "continues with the rest of this batch): %s", exc)
+        # Persisted regardless of whether every individual ingest above
+        # succeeded — the raw capture is never lost even if enrichment
+        # failed for some of it.
+        self.store.append_events(raw)
+        if self.capture_network:
+            self._drain_network()
+
+    MAX_FRAME_DEPTH = 3
+
+    def _drain_frames(self, depth: int) -> list[dict[str, Any]]:
+        """Inject into AND drain every iframe, including iframes nested
+        inside iframes (a "popped-up" modal dialog is very often
+        implemented as an iframe injected into the DOM), up to
+        `MAX_FRAME_DEPTH` levels deep.
+
+        injector.js's click/change/submit listeners are attached to
+        `document` inside whichever window they're injected into — an
+        iframe has its OWN separate `window`, so a click recorded inside
+        one lands in THAT iframe's own `window.__AIREC__.events` buffer,
+        never in the top-level document's. Only injecting into iframes
+        (the old behaviour) without ALSO switching into each one to call
+        its own `.drain()` meant every interaction inside an iframe was
+        captured correctly by the in-page script but never actually read
+        back into Python — it just sat in the iframe's buffer, invisible
+        to the recorder, until the next navigation cleared it.
+        """
+        collected: list[dict[str, Any]] = []
+        if depth >= self.MAX_FRAME_DEPTH:
+            return collected
+        try:
+            frames = self.driver.find_elements("tag name", "iframe")
+        except Exception:
+            return collected
+
+        for index in range(len(frames)):
+            try:
+                # Re-fetch on every iteration: switching frames can detach
+                # earlier WebElement references, and a popped-up iframe
+                # can itself appear/disappear between poll ticks.
+                frames = self.driver.find_elements("tag name", "iframe")
+                if index >= len(frames):
+                    break
+                frame_el = frames[index]
+                frame_tag = (
+                    frame_el.get_attribute("name")
+                    or frame_el.get_attribute("id")
+                    or frame_el.get_attribute("src")
+                    or f"frame_{index}"
+                )
+                self.driver.switch_to.frame(frame_el)
+            except Exception as exc:
+                log.debug("Could not switch into frame %s at depth %s: %s",
+                          index, depth, exc)
+                try:
+                    self.driver.switch_to.default_content()
+                    for _ in range(depth):
+                        pass  # already at top; nothing more to unwind
+                except Exception:
+                    pass
+                continue
+
+            try:
+                if not self.driver.execute_script("return !!window.__AIREC__;"):
+                    self.driver.execute_script(INJECTOR_JS)
+                frame_events = _call_with_timeout(
+                    lambda: self.driver.execute_script(
+                        "return window.__AIREC__ && window.__AIREC__.drain();"
+                    )
+                )
+                if frame_events:
+                    for event in frame_events:
+                        event["frame_path"] = f"{depth}:{index}:{frame_tag}"
+                    collected.extend(frame_events)
+                # Recurse into any iframe nested inside this one BEFORE
+                # leaving its context.
+                collected.extend(self._drain_frames(depth + 1))
+            except Exception as exc:
+                log.debug("Frame drain failed at depth %s index %s: %s",
+                          depth, index, exc)
+            finally:
+                try:
+                    self.driver.switch_to.parent_frame()
+                except Exception:
+                    try:
+                        self.driver.switch_to.default_content()
+                    except Exception:
+                        pass
+        return collected
+
+    def _drain_network(self) -> None:
+        try:
+            logs = self.driver.get_log("performance")
+        except Exception:
+            return
+        for entry in logs[-200:]:
+            try:
+                message = json.loads(entry["message"])["message"]
+            except Exception:
+                continue
+            # Section 17 — masked URL, HTTP method, status, timing, and a
+            # correlation id (requestId), via network_capture.py rather
+            # than the previous method/url/status-only capture. Never a
+            # request/response BODY — see that module's docstring for why.
+            #
+            # Selenium's performance-log `timestamp` is milliseconds
+            # since epoch (CDP/JS convention); every action's own `ts`
+            # (cdp_recorder.py's `_ingest_action`) is `time.time()` —
+            # SECONDS since epoch. Comparing them directly in
+            # network_capture.correlate() without normalising first
+            # would be off by a factor of 1000 and never match anything
+            # — converted to seconds here, once, at the source.
+            raw_ts = entry.get("timestamp")
+            ts_seconds = raw_ts / 1000.0 if isinstance(raw_ts, (int, float)) else raw_ts
+            normalized = network_capture.normalize_event(message, ts_seconds)
+            if normalized:
+                self._network.append(normalized)
+
+    # ── event ingestion ─────────────────────────────────────────────────
+    def _ingest(self, event: dict[str, Any]) -> None:
+        etype = event.get("type")
+        if etype == "crawl":
+            self._ingest_crawl(event)
+        elif etype == "action":
+            self._ingest_action(event)
+        elif etype == "messages":
+            self._messages.extend(event.get("messages", []))
+        self._events.append(event)
+        if self.on_event:
+            try:
+                self.on_event(self._public_event(event))
+            except Exception:
+                pass
+
+    def _ingest_crawl(self, event: dict[str, Any]) -> None:
+        page = event.get("page", {})
+        page_key = page.get("page_key") or "page"
+        if page_key not in self._pages:
+            dom = self._snapshot_dom(f"page_{len(self._pages):02d}_{page_key}")
+            self._pages[page_key] = {
+                "page_key": page_key,
+                "title": page.get("title"),
+                "url": page.get("url"),
+                "sequence": len(self._pages),
+                "dom_ref": dom.get("ref"),
+                "screenshot_ref": self._screenshot(f"page_{page_key}"),
+                "frames": page.get("frames", []),
+                "shadow_roots": [{"count": page.get("shadow_roots", 0)}],
+                "meta": {"element_count": event.get("element_count", 0)},
+            }
+            self._workflow.append(page.get("title") or page_key)
+            # Section 7: a page/URL transition is an unconditional action-
+            # grouping boundary — the NEXT action recorded belongs to a
+            # new logical step no matter how quickly it follows the last
+            # one on the previous page.
+            self._page_boundary_sequences.add(self._action_seq)
+        for raw_element in event.get("elements", []):
+            self._merge_element(raw_element, page_key, interacted=False)
+
+    def _ingest_action(self, event: dict[str, Any]) -> None:
+        normalized = self._normalizer.process(event)
+        if normalized is None:
+            # A duplicate of the immediately-preceding action on the same
+            # element (Section 6) — never reaches the knowledge package.
+            log.debug("Dropped duplicate action: %s", self._normalizer._identity(event))
+            return
+        event = normalized
+
+        raw_element = event.get("element") or {}
+        page_key = event.get("page_key") or "page"
+        element_key = self._merge_element(raw_element, page_key, interacted=True)
+        name = f"action_{self._action_seq:03d}_{event.get('action')}"
+        before_ref = self._last_dom_ref or ""
+        shot_before = self._screenshot(name + "_before")
+        dom_after = self._snapshot_dom(name + "_after")
+        shot_after = self._screenshot(name + "_after")
+
+        field_name = (
+            raw_element.get("label")
+            or raw_element.get("locators", {}).get("name")
+            or element_key
+        )
+        variable = _variable_name(field_name)
+        current_url = event.get("url") or self._last_url
+        action_record = {
+            "sequence": self._action_seq,
+            "ts": time.time(),
+            "action": event.get("action"),
+            "element": {"element_key": element_key, "label": raw_element.get("label")},
+            "element_key": element_key,
+            "field_name": field_name,
+            # NEVER the raw value — only the variable reference (Section 7)
+            "value_ref": variable if event.get("action") in
+                         ("type", "select", "upload") else None,
+            "page_key": page_key,
+            "dom_before_ref": before_ref,
+            "dom_after_ref": dom_after.get("ref"),
+            "screenshot_before": shot_before,
+            "screenshot_after": shot_after,
+            "meta": {
+                "url": event.get("url"),
+                "value_length": event.get("value_length"),
+                "selected_text": event.get("selected_text"),
+                "sensitive": bool(event.get("sensitive"))
+                             or is_sensitive(field_name or ""),
+                "element_type": raw_element.get("element_type"),
+                "dom_diff": dom_diff(self._last_dom, dom_after.get("html", "")),
+            },
+        }
+        self._events_action(action_record)
+        self._last_dom = dom_after.get("html", "")
+        self._last_url = current_url
+        self._action_seq += 1
+
+    def _run_checkpoint_detection_pass(self) -> None:
+        """Section 15/16's checkpoint + business-validation detection —
+        moved OUT of the per-action synchronous capture path (where it
+        used to run on every single click/type) and into a single pass
+        over the whole action list, run once at stop(). This is the
+        actual fix for "recorder is lagging": `whole_page_diff()` parses
+        the FULL before/after page HTML with `html.parser` and diffs the
+        resulting trees — a genuinely non-trivial cost that, per-action,
+        stacked with 2 screenshots and a DOM snapshot, meant Python's
+        capture loop routinely fell behind a person clicking/typing at
+        completely normal speed. None of that analysis needs to happen
+        WHILE someone is still actively recording — Section 24's own
+        principle ("AI/heavier processing happens after recording, not
+        per-event") applies here even though this specific step isn't
+        AI at all, just expensive.
+        """
+        by_seq = {a["sequence"]: a for a in self._actions}
+        for action in self._actions:
+            dom_before_ref = action.get("dom_before_ref") or ""
+            dom_after_ref = action.get("dom_after_ref") or ""
+            html_before = self.store.load_dom(dom_before_ref) if dom_before_ref else ""
+            html_after = self.store.load_dom(dom_after_ref) if dom_after_ref else ""
+            if not html_after:
+                continue
+            try:
+                rich_diff = recorder_dom_diff.whole_page_diff(html_before, html_after)
+                new_checkpoints = checkpoint_detector.detect(
+                    action, rich_diff,
+                    url_before=(action.get("meta") or {}).get("url"),
+                    url_after=(action.get("meta") or {}).get("url"),
+                )
+                self._checkpoints.extend(new_checkpoints)
+                validation = checkpoint_detector.detect_business_validation(
+                    action, new_checkpoints
+                )
+                if validation:
+                    self._validations.append(validation)
+            except Exception as exc:
+                log.debug("Checkpoint detection failed for action %s: %s",
+                         action.get("sequence"), exc)
+
+    def _events_action(self, action: dict[str, Any]) -> None:
+        self._actions.append(action)
+
+    def _merge_element(
+        self, raw: dict[str, Any], page_key: str, interacted: bool
+    ) -> str:
+        key = raw.get("element_key") or "element"
+        unique = f"{page_key}::{key}"
+        existing = self._elements.get(unique)
+        locators = locator_builder.build(
+            raw.get("locators", {}), raw.get("element_type", "")
+        )
+        if existing:
+            existing["interacted"] = existing["interacted"] or interacted
+            known = {(l["strategy"], l["value"]) for l in existing["locators"]}
+            existing["locators"].extend(
+                l for l in locators if (l["strategy"], l["value"]) not in known
+            )
+            return unique
+        # Section 12 — a "locator profile" alongside the existing flat
+        # `locators` list (kept exactly as-is, unchanged shape, for every
+        # existing consumer — generator.py, self_healing.py, etc.).
+        # `locator_profile` is purely additive: a named, SCORED candidate
+        # list using Part 9's multi-factor ranker (stability +
+        # historical_success + uniqueness + semantic_match against the
+        # recorded label), computed at record time instead of only ever
+        # at self-healing time.
+        profile = locator_builder.build_profile(
+            unique, raw.get("locators", {}), raw.get("element_type", ""),
+            label=raw.get("label"),
+        )
+        self._elements[unique] = {
+            "element_key": unique,
+            "tag": raw.get("tag"),
+            "element_type": raw.get("element_type"),
+            "label": raw.get("label"),
+            "visible": raw.get("visible", True),
+            "enabled": raw.get("enabled", True),
+            "interacted": interacted,
+            "page_key": page_key,
+            "locators": locators,
+            "locator_profile": profile,
+            "meta": {
+                "text": raw.get("text"),
+                "attributes": raw.get("attributes", {}),
+                "options": raw.get("options"),
+                "required": raw.get("required"),
+                "pattern": raw.get("pattern"),
+                "maxlength": raw.get("maxlength"),
+                "readonly": raw.get("readonly"),
+                "position": raw.get("position"),
+                "parent": raw.get("parent"),
+                "frame_url": raw.get("frame_url"),
+            },
+        }
+        return unique
+
+    # ── capture helpers ─────────────────────────────────────────────────
+    def _snapshot_dom(self, name: str) -> dict[str, Any]:
+        try:
+            payload = self.driver.execute_script(
+                "return window.__AIREC__ ? window.__AIREC__.snapshotDom() : null;"
+            ) or {}
+        except Exception:
+            payload = {}
+        html = payload.get("html") or (self.driver.page_source if self.driver else "")
+        ref = self.store.save_dom(name, html, {"url": payload.get("url"),
+                                               "title": payload.get("title")})
+        self._last_dom_ref = ref
+        return {"ref": ref, "html": html}
+
+    def _screenshot(self, name: str) -> str:
+        try:
+            data = self.driver.get_screenshot_as_png()
+            return self.store.save_screenshot_bytes(name, data)
+        except Exception as exc:
+            log.debug("Screenshot %s failed: %s", name, exc)
+            return ""
+
+    @staticmethod
+    def _public_event(event: dict[str, Any]) -> dict[str, Any]:
+        """Trimmed event for the live UI feed."""
+        if event.get("type") == "crawl":
+            return {
+                "type": "crawl",
+                "page": (event.get("page") or {}).get("title"),
+                "elements": event.get("element_count"),
+            }
+        if event.get("type") == "action":
+            element = event.get("element") or {}
+            return {
+                "type": "action",
+                "action": event.get("action"),
+                "element": element.get("label") or element.get("element_key"),
+                "element_type": element.get("element_type"),
+                "page": event.get("page_key"),
+            }
+        return {"type": event.get("type")}
+
+    # ── control ─────────────────────────────────────────────────────────
+    def force_crawl(self) -> dict[str, Any]:
+        try:
+            _call_with_timeout(
+                lambda: self.driver.execute_script(
+                    "window.__AIREC__ && window.__AIREC__.forceCrawl();"
+                )
+            )
+            time.sleep(0.5)
+            self._drain_once()
+        except Exception as exc:
+            log.warning("Manual crawl failed: %s", exc)
+        return {"elements": len(self._elements), "pages": len(self._pages)}
+
+    # ── pause / resume (Section 25) ─────────────────────────────────────
+    # Distinct from stop(): the browser stays open, the poll thread keeps
+    # running (so a resume doesn't need to re-establish anything), but
+    # the in-page collector stops capturing new events and the drain
+    # loop stops ingesting — a person can click around to get to the
+    # right screen without every one of THOSE clicks becoming part of
+    # the recorded transaction.
+    def pause(self) -> dict[str, Any]:
+        if self.status != "recording":
+            raise RecorderError(f"Cannot pause a session in status '{self.status}'")
+        try:
+            _call_with_timeout(
+                lambda: self.driver.execute_script(
+                    "window.__AIREC__ && window.__AIREC__.pause();"
+                )
+            )
+        except Exception as exc:
+            log.warning("Pause signal to browser failed (continuing): %s", exc)
+        self.status = "paused"
+        db.execute("UPDATE recording_sessions SET status='paused' WHERE session_uid=%s",
+                   (self.session_uid,))
+        log.info("Paused recording %s", self.session_uid)
+        return self.info()
+
+    def resume(self) -> dict[str, Any]:
+        if self.status != "paused":
+            raise RecorderError(f"Cannot resume a session in status '{self.status}'")
+        try:
+            _call_with_timeout(
+                lambda: self.driver.execute_script(
+                    "window.__AIREC__ && window.__AIREC__.resume();"
+                )
+            )
+        except Exception as exc:
+            log.warning("Resume signal to browser failed (continuing): %s", exc)
+        self.status = "recording"
+        db.execute("UPDATE recording_sessions SET status='recording' WHERE session_uid=%s",
+                   (self.session_uid,))
+        log.info("Resumed recording %s", self.session_uid)
+        return self.info()
+
+    def stop(self) -> dict[str, Any]:
+        log.info("Stopping recording %s", self.session_uid)
+        self._stop_flag.set()
+        poll_thread_done = True
+        if self._poll_thread:
+            self._poll_thread.join(timeout=DRIVER_CALL_TIMEOUT + 2)
+            poll_thread_done = not self._poll_thread.is_alive()
+        if poll_thread_done:
+            # Safe to touch self.driver from this thread — the poll thread
+            # has fully exited, so there's no concurrent WebDriver access.
+            try:
+                self._drain_once()
+                _call_with_timeout(
+                    lambda: self.driver.execute_script(
+                        "window.__AIREC__ && window.__AIREC__.stop();"
+                    )
+                )
+            except Exception as exc:
+                log.warning("Final drain before stop failed (continuing): %s", exc)
+        else:
+            # The poll thread is still busy against the driver (a stuck page,
+            # a wedged msedgedriver, ...). Do NOT call driver.* from here too
+            # — concurrent WebDriver calls from two threads can hang forever
+            # with no exception raised. Skip straight to closing out the
+            # session with whatever was captured so far.
+            log.warning(
+                "Recorder poll thread for %s did not stop in time — "
+                "skipping final drain and browser close to avoid a hang. "
+                "The browser window may need to be closed manually.",
+                self.session_uid,
+            )
+        network_ref = ""
+        if self._network:
+            network_ref = self.store.save_network("network", self._network)
+        # Deferred checkpoint/business-validation detection (see
+        # _run_checkpoint_detection_pass's own docstring) — runs ONCE
+        # here, after recording has actually finished, never while
+        # someone is still live-clicking through the transaction.
+        try:
+            self._run_checkpoint_detection_pass()
+        except Exception as exc:
+            log.warning("Checkpoint detection pass failed (continuing "
+                       "without it): %s", exc)
+        if poll_thread_done and self.driver:
+            try:
+                _call_with_timeout(self.driver.quit)
+            except Exception as exc:
+                log.warning("driver.quit() for %s failed/timed out: %s",
+                            self.session_uid, exc)
+        self.status = "stopped"
+        manifest = self.build_manifest(network_ref)
+        self.store.write_manifest(manifest)
+        self.store.write_knowledge_package(manifest)
+        db.execute(
+            "UPDATE recording_sessions SET status='stopped', stopped_at=now(),"
+            " stats=%s::jsonb WHERE session_uid=%s",
+            (db.jsonb(manifest["stats"]), self.session_uid),
+        )
+        return manifest
+
+    # ── the knowledge package ───────────────────────────────────────────
+    def build_manifest(self, network_ref: str = "") -> dict[str, Any]:
+        elements = list(self._elements.values())
+        # Section 7 — grouped into logical steps, computed once here
+        # (needs the whole final action list to find boundaries, unlike
+        # normalization/dedup which happen per-event as actions arrive).
+        steps = action_grouping.group_actions(
+            self._actions, page_boundaries=self._page_boundary_sequences
+        )
+        # Section 18 — computed once here (needs the whole action list +
+        # whole network-event list, unlike per-event processing above).
+        network_correlations = network_capture.correlate(self._actions, self._network)
+        # Section 19 — component candidates found WITHIN this one
+        # recording (cross-transaction detection needs a transaction_id
+        # already saved in the knowledge repository — that only exists
+        # after Keep, so it happens as part of the Keep flow instead,
+        # not here at raw manifest-build time).
+        component_candidates = component_detector.detect_within_recording(
+            list(self._pages.values()), elements
+        )
+        manifest = {
+            "schema_version": "2",
+            "session_uid": self.session_uid,
+            "transaction_id": self.transaction_id,
+            "transaction_name": self.transaction_name,
+            "transaction_type": self.transaction_type,
+            "description": self.description,
+            "environment": self.environment,
+            "start_url": self.start_url,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "workflow_path": self._workflow,
+            "pages": list(self._pages.values()),
+            "elements": elements,
+            "actions": self._actions,
+            "steps": steps,
+            "checkpoints": self._checkpoints,
+            "validations": self._validations,
+            "network_events": self._network,
+            "network_correlations": network_correlations,
+            "messages": self._messages,
+            "network_ref": network_ref,
+            "capture_dir": str(self.store.root),
+            "stats": {
+                "pages": len(self._pages),
+                "elements": len(elements),
+                "elements_interacted": sum(1 for e in elements if e["interacted"]),
+                "actions": len(self._actions),
+                "steps": len(steps),
+                "checkpoints": len(self._checkpoints),
+                "validations": len(self._validations),
+                "messages": len(self._messages),
+                "network_events": len(self._network),
+                "capture_bytes": self.store.size_bytes(),
+                "normalization": self._normalizer.stats,
+            },
+            "components": component_candidates,
+        }
+        # Section 21 — computed from the manifest just built above; added
+        # to it last since it needs the finished stats/checkpoints/etc.
+        manifest["quality"] = quality_score.score(manifest)
+        return manifest
+
+    def info(self) -> dict[str, Any]:
+        return {
+            "session_uid": self.session_uid,
+            "transaction_id": self.transaction_id,
+            "transaction_name": self.transaction_name,
+            "environment": self.environment,
+            "status": self.status,
+            "start_url": self.start_url,
+            "capture_dir": str(self.store.root),
+            "current_page": self._last_page_key(),
+            "stats": {
+                "pages": len(self._pages),
+                "elements": len(self._elements),
+                "actions": len(self._actions),
+                "checkpoints": len(self._checkpoints),
+                "validations": len(self._validations),
+                "network_events": len(self._network),
+                "duplicates_filtered": self._normalizer.stats.get("deduplicated", 0),
+            },
+        }
+
+    def _last_page_key(self) -> str | None:
+        return list(self._pages.keys())[-1] if self._pages else None
 
 
-def _collect_page_methods(page_path: Path) -> set[str]:
-    if not page_path.exists():
-        return set()
-    methods: set[str] = set()
-    for cls in python_parser.parse_file(page_path):
-        methods.update(m.name for m in cls.methods)
-    return methods
-
-
-def _collect_called_page_methods(steps_path: Path) -> set[str]:
-    """`page.something(...)` calls anywhere in a steps file — a plain
-    regex is deliberately used here instead of a full AST call-graph:
-    every generated steps file follows the fixed `page.<method>(...)`
-    convention from steps.py.j2, so this is exact for generated code and
-    still a reasonable best-effort for hand-edited CUSTOM CODE blocks."""
-    if not steps_path.exists():
-        return set()
-    text = steps_path.read_text(encoding="utf-8", errors="ignore")
-    return set(re.findall(r"\bpage\.([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", text))
-
-
-def _validate_locators(page_path: Path, transaction_id: str) -> tuple[list[str], list[str]]:
-    errors: list[str] = []
-    warnings: list[str] = []
-    if not page_path.exists():
-        return errors, warnings
-
-    known_keys: set[str] | None = None
-    try:
-        txn = repo.get_transaction(transaction_id)
-        if txn:
-            known_keys = {e["element_key"] for e in repo.get_elements(int(txn["id"]))}
-    except Exception:
-        known_keys = None  # knowledge repo not reachable — skip the cross-reference, don't fail the whole check
-
-    text = page_path.read_text(encoding="utf-8", errors="ignore")
-    for match in re.finditer(
-        r'locator_repo\.register\(\s*(\w+)\s*,\s*\[(.*?)\]\s*\)', text, re.S
-    ):
-        constant_name, body = match.group(1), match.group(2)
-        entries = re.findall(r'\(By\.([A-Z_]+)\s*,\s*"((?:[^"\\]|\\.)*)"\)', body)
-        if not entries:
-            errors.append(f"{page_path.name}: {constant_name} has no valid "
-                           f"(By.X, \"value\") locator entries — empty or unparsable")
-            continue
-        for strategy, value in entries:
-            if not value.strip():
-                errors.append(f"{page_path.name}: {constant_name} has an empty locator value")
-            elif any(marker in value.lower() for marker in _FABRICATED_MARKERS):
-                errors.append(f"{page_path.name}: {constant_name} locator value "
-                               f"'{value}' looks fabricated/placeholder, not a real "
-                               f"recorded selector")
-
-    if known_keys is not None:
-        registered_element_keys = set(re.findall(r'^([A-Z_][A-Z0-9_]*)\s*=\s*"([^"]+)"',
-                                                   text, re.M))
-        for _const, key in registered_element_keys:
-            if "::" in key and key not in known_keys:
-                warnings.append(f"{page_path.name}: element_key '{key}' is not in the "
-                                 f"knowledge repository for transaction {transaction_id} "
-                                 f"— locator may have been hand-added rather than recorded")
-    return errors, warnings
-
-
-def _validate_test_data_placeholders(feature_path: Path, transaction_id: str) -> list[str]:
-    errors: list[str] = []
-    if not feature_path.exists():
-        return errors
-    text = feature_path.read_text(encoding="utf-8", errors="ignore")
-    placeholders = set(_PLACEHOLDER_RE.findall(text))
-    if not placeholders:
-        return errors
-    try:
-        known_fields = {m["field"] for m in tdm_templates.get_field_metadata(transaction_id)}
-    except Exception:
-        return errors  # can't reach test-data metadata — don't fail the whole check on that
-    for token in placeholders:
-        if token not in known_fields:
-            errors.append(f"{feature_path.name}: <{token}> has no matching test-data field "
-                           f"— an AI-invented or stale variable would silently fail at "
-                           f"execution time instead of being caught here")
-    return errors
-
-
-def validate_transaction(transaction_id: str) -> dict[str, Any]:
-    """The main entry point — run every check for one transaction's
-    generated artefacts and return Part 5's exact response shape."""
-    errors: list[str] = []
-    warnings: list[str] = []
-    checks: dict[str, Any] = {}
-
-    src = settings.framework_src_path
-    txn_dir = src / "features" / "transactions" / f"Transaction_{transaction_id}"
-    steps_dir = src / "features" / "steps"
-    from ..codegen import naming
-    page_class = naming.transaction_class(transaction_id, "Page")
-    steps_class = naming.transaction_class(transaction_id, "Steps")
-    from ..codegen.generator import _python_module_name
-    page_path = src / "pages" / f"{_python_module_name(page_class)}.py"
-    steps_path = steps_dir / f"{_python_module_name(steps_class)}.py"
-    feature_files = sorted(txn_dir.glob("*.feature")) if txn_dir.exists() else []
-
-    # A. Python syntax — delegates to the existing compiler (Part 5A)
-    py_result = compiler.compile_transaction(transaction_id)
-    checks["python_syntax"] = {"ok": py_result.ok, "files": py_result.files_compiled}
-    if not py_result.ok:
-        errors.extend(f"{e.file}:{e.line}: {e.message}" for e in py_result.errors)
-
-    # B. Gherkin validity
-    gherkin_ok = bool(feature_files)
-    if not feature_files:
-        errors.append(f"No .feature file found under {txn_dir}")
-    for feature_path in feature_files:
-        parsed = text_formats.parse_feature_file(feature_path)
-        if not parsed["feature"]:
-            errors.append(f"{feature_path.name}: no 'Feature:' line found")
-            gherkin_ok = False
-        if not parsed["scenarios"]:
-            errors.append(f"{feature_path.name}: no Scenario found")
-            gherkin_ok = False
-        if not parsed["steps"]:
-            warnings.append(f"{feature_path.name}: no steps found in any scenario")
-    checks["gherkin_valid"] = gherkin_ok
-
-    # C. Step-definition matching (missing / duplicate / ambiguous)
-    registry = collect_step_registry(steps_dir)
-    duplicates = {p: locs for p, locs in registry.items() if len(locs) > 1}
-    if duplicates:
-        for pattern, locations in duplicates.items():
-            errors.append(f"Ambiguous step '{pattern}' defined in: {', '.join(locations)}")
-    checks["duplicate_step_definitions"] = list(duplicates.keys())
-
-    compiled_patterns = [(p, _pattern_to_regex(p)) for p in registry]
-    missing_steps: list[str] = []
-    for feature_path in feature_files:
-        parsed = text_formats.parse_feature_file(feature_path)
-        for raw_step in parsed["steps"]:
-            step_text = _GHERKIN_KEYWORD_RE.sub("", raw_step).strip()
-            if not any(rx.match(step_text) for _p, rx in compiled_patterns):
-                missing_steps.append(f"{feature_path.name}: {raw_step}")
-    if missing_steps:
-        errors.extend(f"No step definition matches: {m}" for m in missing_steps)
-    checks["missing_step_definitions"] = missing_steps
-
-    # D. Page-object validation
-    page_methods = _collect_page_methods(page_path)
-    called_methods = _collect_called_page_methods(steps_path)
-    unknown_calls = sorted(called_methods - page_methods) if page_methods else []
-    if page_path.exists() and unknown_calls:
-        errors.extend(f"{steps_path.name} calls page.{m}() which "
-                       f"{page_path.name} does not implement" for m in unknown_calls)
-    checks["page_object_methods_ok"] = not unknown_calls
-
-    # E. Locator validation
-    locator_errors, locator_warnings = _validate_locators(page_path, transaction_id)
-    errors.extend(locator_errors)
-    warnings.extend(locator_warnings)
-    checks["locators_ok"] = not locator_errors
-
-    # F. Test-data validation
-    for feature_path in feature_files:
-        errors.extend(_validate_test_data_placeholders(feature_path, transaction_id))
-    checks["test_data_variables_ok"] = not any(
-        "no matching test-data field" in e for e in errors
+def _variable_name(field_name: str) -> str:
+    """CustomerName → <CustomerName>  (Section 7.5)."""
+    cleaned = "".join(
+        part.capitalize()
+        for part in "".join(
+            ch if ch.isalnum() else " " for ch in (field_name or "field")
+        ).split()
     )
+    return cleaned or "Field"
 
-    # G. Framework reuse — an ambiguous/duplicate step (checked in C above)
-    # IS the concrete, detectable symptom of a missed reuse opportunity,
-    # so it's not duplicated as a separate check here.
-    checks["framework_reuse_checked"] = True
 
-    return {"ok": not errors, "errors": errors, "warnings": warnings, "checks": checks}
+# ── session registry (one active recording at a time per transaction) ───
+_sessions: dict[str, RecordingSession] = {}
+_lock = threading.Lock()
+
+
+def start_session(**kwargs: Any) -> dict[str, Any]:
+    session = RecordingSession(**kwargs)
+    with _lock:
+        _sessions[session.session_uid] = session
+    return session.start()
+
+
+def get_session(session_uid: str) -> Optional[RecordingSession]:
+    return _sessions.get(session_uid)
+
+
+def stop_session(session_uid: str) -> dict[str, Any]:
+    session = _sessions.get(session_uid)
+    if not session:
+        raise RecorderError(f"No such recording session: {session_uid}")
+    return session.stop()
+
+
+def list_sessions() -> list[dict[str, Any]]:
+    return [s.info() for s in _sessions.values()]
+
+
+def drop_session(session_uid: str) -> None:
+    _sessions.pop(session_uid, None)
