@@ -1,432 +1,185 @@
--- ═══════════════════════════════════════════════════════════════════════
---  Enterprise AI Automation Engineering Platform — Knowledge Repository
---  SQLite (ported from PostgreSQL + pgvector)
---  Section 15 of the Master Build Specification
--- ═══════════════════════════════════════════════════════════════════════
+"""Field metadata inference (Section 7.2).
+
+The recorder stores metadata about every input, never the raw value.
+Banking data is ALWAYS supplied by the SBI user — this module classifies
+fields so the platform knows what to ask for and how to validate it.
+"""
+from __future__ import annotations
+
+import re
+from typing import Any, Optional
+
+from ..core.security import is_sensitive
+
+# datatype → (regex pattern, business meaning, sensitive, ai_generatable)
+DATATYPES: dict[str, tuple[str, str, bool, bool]] = {
+    "PAN":        (r"[A-Z]{5}[0-9]{4}[A-Z]", "Permanent Account Number", False, False),
+    "CIF":        (r"\d{11}", "Customer Information File number", True, False),
+    "ACCOUNT":    (r"\d{9,18}", "Bank account number", True, False),
+    "IFSC":       (r"[A-Z]{4}0[A-Z0-9]{6}", "IFSC code", False, False),
+    "AADHAAR":    (r"\d{12}", "Aadhaar number", True, False),
+    "MOBILE":     (r"[6-9]\d{9}", "Indian mobile number", False, False),
+    "EMAIL":      (r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}", "Email address", False, True),
+    "AMOUNT":     (r"\d+(\.\d{1,2})?", "Monetary amount", False, False),
+    "BRANCHCODE": (r"\d{4,5}", "Branch code", False, False),
+    "TELLERID":   (r"[A-Za-z0-9]{4,12}", "Teller / maker user id", True, False),
+    "CHECKERID":  (r"[A-Za-z0-9]{4,12}", "Checker user id", True, False),
+    "PASSWORD":   (r".{6,}", "Login password", True, False),
+    "DATE":       (r"\d{2}[-/]\d{2}[-/]\d{4}", "Date value", False, False),
+    "CURRENCY":   (r"[A-Z]{3}", "Currency code", False, False),
+    "NAME":       (r"[A-Za-z .'-]{2,}", "Customer / person name", False, False),
+    "TEXT":       (r".*", "Free text", False, False),
+    "REMARKS":    (r".*", "Cosmetic remarks / narration", False, True),
+}
+
+_HINTS: list[tuple[re.Pattern[str], str]] = [
+    # Must come before every specific-datatype hint below — a field name
+    # ENDING in "Only"/"Flag"/"Indicator" is almost always a configuration
+    # toggle (e.g. "PasswordLocalOverrideOnly" is a Y/N setting about WHEN
+    # a password override applies, not a password value itself; likewise
+    # "AccountLockFlag", "AmountCapIndicator"), even though it may contain
+    # an unrelated datatype keyword like "password"/"account"/"amount" as
+    # a substring earlier in the name. Force these through the permissive
+    # TEXT pattern instead of whatever specific, over-strict pattern the
+    # embedded keyword would otherwise trigger — a real toggle value
+    # ("Y"/"N", "true"/"false", "1"/"0") would fail almost any of the
+    # specific datatype patterns (e.g. PASSWORD's `.{6,}` minimum length).
+    (re.compile(r"(only|flag|indicator)\s*$", re.I), "TEXT"),
+    (re.compile(r"\bpan\b", re.I), "PAN"),
+    (re.compile(r"\bcif\b|customer\s*info", re.I), "CIF"),
+    (re.compile(r"account\s*(no|num|number)|\bacct\b", re.I), "ACCOUNT"),
+    (re.compile(r"\bifsc\b", re.I), "IFSC"),
+    (re.compile(r"aadha?ar|uid", re.I), "AADHAAR"),
+    (re.compile(r"mobile|phone|contact\s*no", re.I), "MOBILE"),
+    (re.compile(r"e-?mail", re.I), "EMAIL"),
+    (re.compile(r"amount|amt|deposit|withdraw|balance|principal", re.I), "AMOUNT"),
+    (re.compile(r"branch\s*code|\bsol\b", re.I), "BRANCHCODE"),
+    (re.compile(r"teller|maker", re.I), "TELLERID"),
+    # Must come before the generic "name" hint below — a login/user-ID
+    # field's HTML `name`/`id` attribute very commonly looks like
+    # "userName"/"userId"/"loginId" (a routine naming convention, not a
+    # person's name), and that attribute value feeds straight into the
+    # haystack infer_datatype() searches. Without this, such a field gets
+    # misclassified as NAME (letters/spaces/dots/hyphens only), and any
+    # real alphanumeric SBI user id then fails validation against that
+    # letters-only pattern before it ever reaches the browser.
+    (re.compile(r"user\s*-?\s*(id|name)|login\s*-?\s*(id|name)", re.I), "TELLERID"),
+    (re.compile(r"checker|approver|supervisor", re.I), "CHECKERID"),
+    (re.compile(r"pass\s*word|\bpwd\b|\bpin\b", re.I), "PASSWORD"),
+    (re.compile(r"date|dob|\bdt\b", re.I), "DATE"),
+    (re.compile(r"currency|\bccy\b", re.I), "CURRENCY"),
+    (re.compile(r"remark|narration|comment|description", re.I), "REMARKS"),
+    # Must come before the generic "name" hint below — navigation/search
+    # fields like "Enter screen number or part of screen name" contain the
+    # substring "name" but hold a transaction number or partial screen
+    # title, not a person's name, and must not be forced through the
+    # letters-only NAME pattern.
+    (re.compile(r"screen\s*(no|number|name)|search\s*(box|field|transaction)",
+                re.I), "TEXT"),
+    (re.compile(r"name", re.I), "NAME"),
+]
+
+# Which sources are allowed to supply which datatype (Section 7.1)
+USER_ONLY = {
+    "PAN", "CIF", "ACCOUNT", "IFSC", "AADHAAR", "BRANCHCODE",
+    "TELLERID", "CHECKERID", "PASSWORD", "AMOUNT", "MOBILE",
+    "NAME", "DATE", "CURRENCY", "TEXT", "EMAIL",
+}
+# Section 7.1: AI may generate ONLY cosmetic, non-validated filler.
+AI_ALLOWED = {"REMARKS"}
 
 
--- ── 1. TRANSACTIONS ────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS transactions (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    transaction_id  TEXT        NOT NULL,          -- e.g. '1045', '9750'
-    name            TEXT        NOT NULL,
-    description     TEXT,
-    version         TEXT        NOT NULL DEFAULT '1.0',
-    build           TEXT,
-    type            TEXT        NOT NULL DEFAULT 'business',
-        -- 'business' | 'system_prerequisite' | 'system_cleanup'
-    status          TEXT        NOT NULL DEFAULT 'draft',
-        -- draft | pending_review | active | superseded | needs_rerecording
-    confidence      NUMERIC(4,3) DEFAULT 1.000,     -- overall, aggregated (Part 13)
-    workflow_confidence  NUMERIC(4,3),               -- did the step sequence hold together
-    locator_confidence   NUMERIC(4,3),               -- Part 8/9 locator reliability, averaged
-    data_confidence      NUMERIC(4,3),               -- test-data validation pass rate
-    execution_confidence NUMERIC(4,3),               -- raw step pass rate
-    healing_confidence   NUMERIC(4,3),               -- confidence of applied self-heals
-    knowledge_json  TEXT       NOT NULL DEFAULT '{}',
-    workflow_path   TEXT       NOT NULL DEFAULT '[]',
-    knowledge_dir   TEXT,                          -- storage/knowledge/<txn>/<ver>
-    generated_files TEXT       NOT NULL DEFAULT '{}',
-    tags            TEXT        NOT NULL DEFAULT '[]',
-    recorded_at     TEXT,
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (transaction_id, version)
-);
-CREATE INDEX IF NOT EXISTS idx_txn_txnid   ON transactions (transaction_id);
-CREATE INDEX IF NOT EXISTS idx_txn_status  ON transactions (status);
-CREATE INDEX IF NOT EXISTS idx_txn_type    ON transactions (type);
-CREATE INDEX IF NOT EXISTS idx_txn_version ON transactions (version);
+def infer_datatype(field_name: str, element_meta: dict[str, Any] | None = None) -> str:
+    haystack = " ".join(
+        str(x) for x in [
+            field_name,
+            (element_meta or {}).get("label"),
+            ((element_meta or {}).get("attributes") or {}).get("name"),
+            ((element_meta or {}).get("attributes") or {}).get("id"),
+            ((element_meta or {}).get("attributes") or {}).get("placeholder"),
+        ] if x
+    )
+    for pattern, datatype in _HINTS:
+        if pattern.search(haystack):
+            return datatype
+    element_type = (element_meta or {}).get("element_type") or ""
+    if element_type == "password":
+        return "PASSWORD"
+    if element_type == "calendar":
+        return "DATE"
+    return "TEXT"
 
--- ── 2. PAGES captured during a recording ───────────────────────────────
-CREATE TABLE IF NOT EXISTS pages (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    transaction_pk  BIGINT      NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
-    page_key        TEXT        NOT NULL,          -- stable slug for the screen
-    title           TEXT,
-    url             TEXT,
-    sequence        INT         NOT NULL DEFAULT 0,
-    dom_ref         TEXT,                          -- file ref to full DOM snapshot
-    screenshot_ref  TEXT,
-    frames          TEXT       NOT NULL DEFAULT '[]',
-    shadow_roots    TEXT       NOT NULL DEFAULT '[]',
-    meta            TEXT       NOT NULL DEFAULT '{}',
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_pages_txn ON pages (transaction_pk);
 
--- ── 3. ELEMENTS (whole-page crawl, not only clicked elements) ──────────
-CREATE TABLE IF NOT EXISTS elements (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    transaction_pk  BIGINT      NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
-    page_pk         BIGINT      REFERENCES pages(id) ON DELETE CASCADE,
-    element_key     TEXT        NOT NULL,
-    tag             TEXT,
-    element_type    TEXT,        -- button | textbox | dropdown | checkbox | ...
-    label           TEXT,
-    visible         BOOLEAN     DEFAULT TRUE,
-    enabled         BOOLEAN     DEFAULT TRUE,
-    interacted      BOOLEAN     DEFAULT FALSE,     -- touched in this recording?
-    element_meta    TEXT       NOT NULL DEFAULT '{}',
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_elements_txn  ON elements (transaction_pk);
-CREATE INDEX IF NOT EXISTS idx_elements_page ON elements (page_pk);
-CREATE INDEX IF NOT EXISTS idx_elements_key  ON elements (element_key);
+def build(
+    field_name: str,
+    element_meta: dict[str, Any] | None = None,
+    required: Optional[bool] = None,
+    element_key: str | None = None,
+    recorded_value: str | None = None,
+    allow_sensitive_recorded_value: bool = False,
+) -> dict[str, Any]:
+    """Produce the Section 7.2 metadata block for one field."""
+    meta = element_meta or {}
+    datatype = infer_datatype(field_name, meta)
+    pattern, meaning, sensitive_default, ai_ok = DATATYPES.get(
+        datatype, DATATYPES["TEXT"]
+    )
+    element_pattern = meta.get("pattern") or (meta.get("attributes") or {}).get("pattern")
+    sensitive = sensitive_default or is_sensitive(field_name)
+    return {
+        "field": field_name,
+        "datatype": datatype,
+        "required": bool(
+            required if required is not None
+            else meta.get("required") or (meta.get("attributes") or {}).get("required")
+        ),
+        "pattern": element_pattern or pattern,
+        "business_meaning": meaning,
+        "sensitive": bool(sensitive),
+        "editable": not bool(meta.get("readonly")),
+        "source": "ai" if datatype in AI_ALLOWED else "user",
+        "source_config": {
+            "ai_generatable": datatype in AI_ALLOWED,
+            "user_only": datatype in USER_ONLY,
+            "max_length": meta.get("maxlength"),
+            "options": (meta.get("options") or None),
+        },
+        "element_key": element_key,
+        # A sensitive field only ever gets its recorded_value stored when
+        # the recording session ITSELF explicitly opted into
+        # `capture_sensitive_values` — a deliberate, informed, per-
+        # session choice (e.g. a UAT environment that only ever uses
+        # dummy/test credentials, never real ones), never the default.
+        "recorded_value": (
+            recorded_value if (not sensitive or allow_sensitive_recorded_value) else None
+        ),
+    }
 
--- ── 4. LOCATORS (multi-strategy fallback repository) ───────────────────
-CREATE TABLE IF NOT EXISTS locators (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    element_pk          BIGINT      NOT NULL REFERENCES elements(id) ON DELETE CASCADE,
-    transaction_pk      BIGINT      NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
-    strategy            TEXT        NOT NULL,      -- id|name|css|xpath|relative_xpath|text|aria|data
-    value               TEXT        NOT NULL,
-    priority            INT         NOT NULL DEFAULT 100,
-    reliability_score   NUMERIC(4,3) NOT NULL DEFAULT 0.500,
-    success_count       INT         NOT NULL DEFAULT 0,
-    failure_count       INT         NOT NULL DEFAULT 0,
-    last_used_at        TEXT,
-    active              BOOLEAN     NOT NULL DEFAULT TRUE,
-    created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_loc_element ON locators (element_pk, priority);
-CREATE INDEX IF NOT EXISTS idx_loc_txn     ON locators (transaction_pk);
-CREATE INDEX IF NOT EXISTS idx_loc_key     ON locators (element_pk, strategy);
 
--- ── 5. RECORDED ACTIONS / workflow steps ───────────────────────────────
-CREATE TABLE IF NOT EXISTS recorded_actions (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    transaction_pk  BIGINT      NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
-    sequence        INT         NOT NULL,
-    action          TEXT        NOT NULL,          -- click|type|select|check|navigate|wait|assert
-    element_key     TEXT,
-    field_name      TEXT,
-    value_ref       TEXT,                          -- variable name, NEVER a raw value
-    page_key        TEXT,
-    dom_before_ref  TEXT,
-    dom_after_ref   TEXT,
-    screenshot_before TEXT,
-    screenshot_after  TEXT,
-    network_ref     TEXT,
-    meta            TEXT       NOT NULL DEFAULT '{}',
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_actions_txn ON recorded_actions (transaction_pk, sequence);
+def validate(value: str, meta: dict[str, Any]) -> tuple[bool, str]:
+    """Check a user-supplied value against the field's pattern."""
+    if meta.get("required") and not (value or "").strip():
+        return False, f"{meta['field']} is mandatory"
+    if not value:
+        return True, ""
+    pattern = meta.get("pattern")
+    if pattern:
+        try:
+            if not re.fullmatch(pattern, value):
+                return False, (
+                    f"{meta['field']} does not match expected format for "
+                    f"{meta.get('datatype')} ({pattern})"
+                )
+        except re.error:
+            return True, ""
+    max_length = (meta.get("source_config") or {}).get("max_length")
+    if max_length and len(value) > int(max_length):
+        return False, f"{meta['field']} exceeds max length {max_length}"
+    return True, ""
 
--- ── 6. VALIDATION RULES ────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS validation_rules (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    transaction_pk  BIGINT      NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
-    field_name      TEXT,
-    rule_type       TEXT,                          -- mandatory|format|business|message
-    expression      TEXT,
-    message_text    TEXT,
-    severity        TEXT        DEFAULT 'error',   -- error|warning|success|info
-    meta            TEXT       NOT NULL DEFAULT '{}',
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_valrules_txn ON validation_rules (transaction_pk);
 
--- ── 7. TEST DATA — field metadata (Section 7.2) ────────────────────────
-CREATE TABLE IF NOT EXISTS test_data_fields (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    transaction_pk  BIGINT      NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
-    field           TEXT        NOT NULL,
-    datatype        TEXT,                          -- PAN | CIF | AMOUNT | TEXT | DATE ...
-    required        BOOLEAN     NOT NULL DEFAULT FALSE,
-    pattern         TEXT,
-    business_meaning TEXT,
-    sensitive       BOOLEAN     NOT NULL DEFAULT FALSE,
-    editable        BOOLEAN     NOT NULL DEFAULT TRUE,
-    source          TEXT        NOT NULL DEFAULT 'user',
-        -- framework | profile | runtime | database | api | ai | recorded
-    source_config   TEXT       NOT NULL DEFAULT '{}',
-    element_key     TEXT,
-    recorded_value  TEXT,
-        -- the value the human actually typed during recording — ONLY
-        -- ever populated for non-sensitive fields, ONLY when the
-        -- recorder's opt-in "use typed values as default test data"
-        -- setting was on for that session (Part: manual-recording
-        -- value reuse). NEVER populated for password/PIN/OTP/etc.
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (transaction_pk, field)
-);
-
--- ── 8. DATA PROFILES (Section 7.6) ─────────────────────────────────────
-CREATE TABLE IF NOT EXISTS test_data_profiles (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    name            TEXT        NOT NULL UNIQUE,   -- e.g. SBI_PREPROD
-    environment     TEXT        NOT NULL,          -- PREPROD | UAT | PROD
-    description     TEXT,
-    values_json     TEXT       NOT NULL DEFAULT '{}',  -- non-sensitive
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS test_data_values (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    profile_pk      BIGINT      REFERENCES test_data_profiles(id) ON DELETE CASCADE,
-    transaction_id  TEXT,
-    environment     TEXT        NOT NULL,
-    field           TEXT        NOT NULL,
-    value_plain     TEXT,                          -- non-sensitive only
-    value_encrypted TEXT,                          -- sensitive values, Fernet
-    sensitive       BOOLEAN     NOT NULL DEFAULT FALSE,
-    source          TEXT        NOT NULL DEFAULT 'user',
-    updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (profile_pk, transaction_id, environment, field)
-);
-CREATE INDEX IF NOT EXISTS idx_tdv_lookup
-    ON test_data_values (transaction_id, environment);
-
--- ── 9. SECRETS (Section 11.3) — never plaintext ────────────────────────
-CREATE TABLE IF NOT EXISTS secrets (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    scope           TEXT        NOT NULL,          -- global | profile | environment
-    scope_ref       TEXT,                          -- profile name / environment
-    key             TEXT        NOT NULL,          -- teller_id|teller_password|checker_id|
-                                                   -- checker_password|cbs_reset_string
-    value_encrypted TEXT        NOT NULL,
-    hint            TEXT,                          -- masked preview for the UI
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (scope, scope_ref, key)
-);
-
--- ── 10. EXECUTIONS ─────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS executions (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    execution_uid   TEXT        NOT NULL UNIQUE,
-    transaction_id  TEXT        NOT NULL,
-    transaction_pk  BIGINT      REFERENCES transactions(id) ON DELETE SET NULL,
-    environment     TEXT        NOT NULL,
-    profile_pk      BIGINT      REFERENCES test_data_profiles(id) ON DELETE SET NULL,
-    status          TEXT        NOT NULL DEFAULT 'queued',
-        -- queued|running|passed|failed|aborted|partial
-    thread_id       TEXT,                          -- LangGraph checkpoint thread
-    report_id       TEXT,
-    report_path     TEXT,
-    password_change_status TEXT,                   -- 9750 sub-step result
-    teller_reset_status    TEXT,
-    teller_reset_response  TEXT,
-    error_summary   TEXT,
-    error_category  TEXT,                           -- Part 6: structured error classification
-                                                      -- (LOCATOR|TIMEOUT|AUTHENTICATION|...) —
-                                                      -- see backend/execution/error_classifier.py
-    metrics         TEXT       NOT NULL DEFAULT '{}',
-    started_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    finished_at     TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_exec_txn    ON executions (transaction_id);
-CREATE INDEX IF NOT EXISTS idx_exec_status ON executions (status);
-CREATE INDEX IF NOT EXISTS idx_exec_start  ON executions (started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_exec_env    ON executions (environment);
-CREATE INDEX IF NOT EXISTS idx_exec_errcat ON executions (error_category);
-
--- ── 11. EXECUTION STEPS ────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS execution_steps (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    execution_pk    BIGINT      NOT NULL REFERENCES executions(id) ON DELETE CASCADE,
-    sequence        INT         NOT NULL,
-    phase           TEXT        NOT NULL DEFAULT 'transaction',
-        -- launch|login|password_change|relogin|search|transaction|logout|teller_reset|report
-    step_name       TEXT        NOT NULL,
-    status          TEXT        NOT NULL,          -- passed|failed|skipped|healed
-    duration_ms     INT,
-    screenshot_ref  TEXT,
-    error_msg       TEXT,
-    error_category  TEXT,                           -- Part 6: per-step classification
-    element_key     TEXT,                           -- Part 8: execution-history lookup by element
-    detail          TEXT       NOT NULL DEFAULT '{}',
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_steps_exec   ON execution_steps (execution_pk, sequence);
-CREATE INDEX IF NOT EXISTS idx_steps_errcat ON execution_steps (error_category);
-CREATE INDEX IF NOT EXISTS idx_steps_elkey  ON execution_steps (element_key);
-
--- ── 12. SELF-HEALING LOG (Section 12) ──────────────────────────────────
-CREATE TABLE IF NOT EXISTS self_heal_log (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    transaction_pk  BIGINT      REFERENCES transactions(id) ON DELETE CASCADE,
-    execution_pk    BIGINT      REFERENCES executions(id) ON DELETE SET NULL,
-    element_key     TEXT,
-    old_locator     TEXT,
-    new_locator     TEXT,
-    strategy        TEXT,
-    reason          TEXT,
-    confidence      NUMERIC(4,3),
-    applied         BOOLEAN     NOT NULL DEFAULT FALSE,
-    approved_by     TEXT,
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_heal_txn ON self_heal_log (transaction_pk);
-CREATE INDEX IF NOT EXISTS idx_heal_elkey ON self_heal_log (element_key);
-
--- ── 13. BRD UPLOADS (Section 11.5) ─────────────────────────────────────
-CREATE TABLE IF NOT EXISTS brd_uploads (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    filename            TEXT        NOT NULL,
-    file_ref            TEXT        NOT NULL,
-    content_hash        TEXT,
-    parsed_text         TEXT,
-    parsed_impact_json  TEXT       NOT NULL DEFAULT '{}',
-    status              TEXT        NOT NULL DEFAULT 'uploaded',
-        -- uploaded|analysed|approved|rejected|applied
-    approved_by         TEXT,
-    created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
--- ── 13b. BRD IMPACT MATRIX (Part 14) ────────────────────────────────────
--- Structured, queryable rows alongside brd_uploads.parsed_impact_json
--- (kept, unchanged, as the raw AI response) — this table is what
--- Part 15's patch-plan builder and Part 16's regression scan actually
--- query, rather than re-parsing a JSON blob every time.
-CREATE TABLE IF NOT EXISTS brd_impact_matrix (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    brd_pk              INTEGER     NOT NULL REFERENCES brd_uploads(id) ON DELETE CASCADE,
-    requirement         TEXT,
-    transaction_id      TEXT,
-    screen              TEXT,
-    element_key         TEXT,
-    workflow            TEXT,
-    current_behavior    TEXT,
-    expected_behavior   TEXT,
-    change_type         TEXT,
-        -- new_transaction|workflow_change|field_change|validation_change|
-        -- locator_change|no_change
-    confidence          NUMERIC(4,3),
-    risk                TEXT,           -- low|medium|high
-    created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_impact_brd ON brd_impact_matrix (brd_pk);
-CREATE INDEX IF NOT EXISTS idx_impact_txn ON brd_impact_matrix (transaction_id);
-CREATE INDEX IF NOT EXISTS idx_impact_elkey ON brd_impact_matrix (element_key);
-
--- ── 14. FRAMEWORK INDEX (Section 8) ────────────────────────────────────
-CREATE TABLE IF NOT EXISTS framework_artifacts (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    artifact_type   TEXT        NOT NULL,
-        -- feature|page_object|step_definition|runner|utility|hook|property|test_data
-    name            TEXT        NOT NULL,
-    package         TEXT,
-    file_path       TEXT        NOT NULL,
-    content_hash    TEXT,
-    transaction_id  TEXT,
-    tags            TEXT        NOT NULL DEFAULT '[]',
-    summary         TEXT,
-    meta            TEXT       NOT NULL DEFAULT '{}',
-    indexed_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (file_path)
-);
-CREATE INDEX IF NOT EXISTS idx_fw_type ON framework_artifacts (artifact_type);
-CREATE INDEX IF NOT EXISTS idx_fw_txn  ON framework_artifacts (transaction_id);
-
-CREATE TABLE IF NOT EXISTS framework_methods (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    artifact_pk     BIGINT      NOT NULL REFERENCES framework_artifacts(id) ON DELETE CASCADE,
-    class_name      TEXT        NOT NULL,
-    method_name     TEXT        NOT NULL,
-    signature       TEXT,
-    return_type     TEXT,
-    annotations     TEXT        NOT NULL DEFAULT '[]',
-    gherkin_pattern TEXT,                          -- for step definitions
-    line_start      INT,
-    line_end        INT,
-    body_summary    TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_fwm_artifact ON framework_methods (artifact_pk);
-CREATE INDEX IF NOT EXISTS idx_fwm_gherkin  ON framework_methods (gherkin_pattern);
-
-CREATE TABLE IF NOT EXISTS framework_relations (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    from_class      TEXT        NOT NULL,
-    to_class        TEXT        NOT NULL,
-    relation        TEXT        NOT NULL,          -- imports|extends|implements|calls|uses
-    detail          TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_fwr_from ON framework_relations (from_class);
-
--- ── 15. AI DECISIONS (continuous learning) ─────────────────────────────
-CREATE TABLE IF NOT EXISTS ai_decisions (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent           TEXT        NOT NULL,
-    context_type    TEXT,                          -- recording|codegen|execution|heal|brd
-    transaction_id  TEXT,
-    prompt_summary  TEXT,
-    decision        TEXT,
-    rationale       TEXT,
-    confidence      NUMERIC(4,3),
-    outcome         TEXT,                          -- success|failure|unknown
-    meta            TEXT       NOT NULL DEFAULT '{}',
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_ai_txn   ON ai_decisions (transaction_id);
-CREATE INDEX IF NOT EXISTS idx_ai_agent ON ai_decisions (agent);
-
--- ── 16. HUMAN APPROVALS (Section 17) ───────────────────────────────────
-CREATE TABLE IF NOT EXISTS approvals (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    thread_id       TEXT        NOT NULL,
-    approval_type   TEXT        NOT NULL,   -- recording_keep|codegen|self_heal
-    subject_ref     TEXT,
-    payload         TEXT       NOT NULL DEFAULT '{}',
-    decision        TEXT,                   -- pending|approved|rejected|discarded
-    decided_by      TEXT,
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    decided_at      TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_appr_thread ON approvals (thread_id);
-
--- ── 17. VECTOR STORE (RAG, Section 9) ──────────────────────────────────
--- NOTE: dimension must match AZURE_OPENAI_EMBEDDING_DEPLOYMENT.
---       text-embedding-3-large = 3072, text-embedding-3-small = 1536.
-CREATE TABLE IF NOT EXISTS knowledge_embeddings (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    namespace       TEXT        NOT NULL,
-        -- element|dom|workflow|brd|framework|decision|report
-    ref_type        TEXT,
-    ref_id          TEXT,
-    transaction_id  TEXT,
-    content         TEXT        NOT NULL,
-    meta            TEXT       NOT NULL DEFAULT '{}',
-    embedding       TEXT,
-    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_emb_ns  ON knowledge_embeddings (namespace);
-CREATE INDEX IF NOT EXISTS idx_emb_txn ON knowledge_embeddings (transaction_id);
--- CREATE INDEX idx_emb_vec ON knowledge_embeddings
-
--- ── 18. RECORDING SESSIONS ─────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS recording_sessions (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_uid     TEXT        NOT NULL UNIQUE,
-    transaction_id  TEXT        NOT NULL,
-    transaction_name TEXT,
-    environment     TEXT,
-    status          TEXT        NOT NULL DEFAULT 'recording',
-        -- recording|stopped|kept|discarded|converted
-    start_url       TEXT,
-    capture_dir     TEXT,
-    stats           TEXT       NOT NULL DEFAULT '{}',
-    started_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    stopped_at      TEXT
-);
-
--- ── trigger: keep updated_at fresh (native SQLite triggers) ────────────
-DROP TRIGGER IF EXISTS trg_txn_touch;
-CREATE TRIGGER trg_txn_touch AFTER UPDATE ON transactions
-BEGIN
-    UPDATE transactions SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-END;
-
-DROP TRIGGER IF EXISTS trg_profile_touch;
-CREATE TRIGGER trg_profile_touch AFTER UPDATE ON test_data_profiles
-BEGIN
-    UPDATE test_data_profiles SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-END;
-
-DROP TRIGGER IF EXISTS trg_secrets_touch;
-CREATE TRIGGER trg_secrets_touch AFTER UPDATE ON secrets
-BEGIN
-    UPDATE secrets SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-END;
+def ai_may_generate(meta: dict[str, Any]) -> bool:
+    """Section 7.1 — AI generates only cosmetic, non-validated fields."""
+    return bool((meta.get("source_config") or {}).get("ai_generatable")) and not meta.get(
+        "sensitive"
+    )
