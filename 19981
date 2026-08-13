@@ -1,829 +1,656 @@
-"""Automatic Code Generation (Section 6).
+"""Base class for every generated Page Object.
 
-Turns an accepted recording into real artefacts inside the Python +
-Selenium + `behave` execution framework (`python-framework/`):
-
-    features/transactions/Transaction_<id>/Transaction<id>.feature
-    features/steps/transaction_<id>_steps.py
-    pages/transaction_<id>_page.py
-    test-data/<ENV>/transaction_<id>.json
-
-(No separate per-transaction runner file is generated — python-framework/run.py
-is fully generic and drives any transaction id straight from its feature
-file path.)
-
-Rules:
-  • The Framework Indexing Engine is queried FIRST — reuse beats duplication.
-  • Existing files are updated, never blindly replaced; hand-written code
-    between the CUSTOM markers is preserved.
-  • The AI never regenerates the framework itself, only extends it.
+The key method is ``_find(element_key)``
+— it walks the ranked locator list produced by the recorder (via
+``core.element_resolver``), so a UI tweak does not fail the run and the
+platform can self-heal instead of demanding a re-recording.
 """
 from __future__ import annotations
 
-import re
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Optional
-from jinja2 import Environment, FileSystemLoader, StrictUndefined
+import os
+import time
 
-from ..core.config import settings
-from ..core.logging_conf import get_logger
-from ..framework_index import indexer
-from ..recorder import locator_builder
-from ..tdm import templates as tdm_templates
-from . import naming
-
-log = get_logger(__name__)
-
-TEMPLATE_DIR = Path(__file__).parent / "templates"
-_env = Environment(
-    loader=FileSystemLoader(str(TEMPLATE_DIR)),
-    undefined=StrictUndefined,
-    trim_blocks=False,
-    lstrip_blocks=False,
-    keep_trailing_newline=True,
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    ElementNotInteractableException,
+    StaleElementReferenceException,
+    TimeoutException,
 )
+from selenium.webdriver.remote.webdriver import WebDriver
+from selenium.webdriver.remote.webelement import WebElement
+from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support import expected_conditions as EC
 
-CUSTOM_START = "# === CUSTOM CODE START"
-CUSTOM_END = "# === CUSTOM CODE END ==="
+from core import element_resolver
+from utils import execution_context as ctx
 
-
-def _py_string(value: str) -> str:
-    """Escape a value for embedding inside a Python double-quoted string
-    literal.
-
-    Gherkin patterns contain double quotes around field labels; unescaped
-    they terminate the string and produce a SyntaxError in the generated
-    step definition. Recorded element/validation text can also contain
-    literal backslashes or embedded newlines — either would just as
-    surely break the string literal open, so those are escaped too.
-    Backslashes are escaped FIRST so a later replacement's own backslash
-    doesn't get re-escaped.
-    """
-    return (
-        (value or "")
-        .replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\t", "\\t")
-    )
-
-
-ACTION_VERBS = {
-    "click": "clicks",
-    "type": "enters",
-    "select": "selects",
-    "check": "checks",
-    "uncheck": "unchecks",
-    "upload": "uploads",
-    "submit": "submits",
-    "navigate": "navigates to",
-    "drag_drop": "drags",
-}
-
-# Files whose step definitions are INTENTIONALLY shared across every
-# transaction — the same physical element genuinely is the same one
-# every time (the global login form, the top-menu "Home" button, the
-# generic negative-scenario helper). A step found in ANY OTHER file
-# (i.e. another transaction's own transaction<id>_steps.py) is never
-# safe to silently reuse — see the reuse-vs-disambiguate decision in
-# _step_models() for the real bug this specifically fixes.
-_SHARED_STEP_FILES = frozenset({
-    "common_steps.py", "transaction_9750_steps.py", "negative_steps.py",
-})
-
-_STEP_DECORATOR_RE = re.compile(
-    r'@(?:given|when|then|step)\s*\(\s*"((?:[^"\\]|\\.)*)"\s*\)'
+# Exceptions that mean "the element was found, but something about page
+# timing (very often network slowness — a slow AJAX response re-rendering
+# the DOM right as Selenium tries to act) made the interaction itself
+# fail" — worth a fresh look-up and another try, unlike a genuine
+# "this element doesn't exist" failure.
+_TRANSIENT_INTERACTION_ERRORS = (
+    StaleElementReferenceException,
+    ElementClickInterceptedException,
+    ElementNotInteractableException,
+    TimeoutException,
 )
 
 
-def _scan_existing_step_patterns(exclude_files: set[Path] | None = None) -> dict[str, str]:
-    """Direct, deterministic scan of every step file already on disk for
-    `@given/@when/@then/@step("...")` patterns.
+class BasePage:
+    def __init__(self, driver: WebDriver):
+        self.driver = driver
+        # Wait durations are configurable via environment variables
+        # rather than hard-coded, so a congested/slow network doesn't
+        # need a code change — just SBI_WAIT_SECONDS /
+        # SBI_SHORT_WAIT_SECONDS set higher for that run/profile.
+        long_wait_s = float(os.environ.get("SBI_WAIT_SECONDS", "30"))
+        short_wait_s = float(os.environ.get("SBI_SHORT_WAIT_SECONDS", "3"))
+        self.wait = WebDriverWait(driver, long_wait_s)
+        self.short_wait = WebDriverWait(driver, short_wait_s)
+        # How many times an interaction re-finds the element and tries
+        # again after a transient failure, before giving up for real.
+        self._interact_retries = max(1, int(os.environ.get("SBI_INTERACT_RETRIES", "3")))
 
-    The Framework Index (Section 8) is only refreshed by an explicit
-    `python scripts/reindex.py` — relying on it ALONE to prevent behave's
-    `AmbiguousStep` at generation time is unsafe: a transaction generated
-    since the last reindex is invisible to `indexer.find_step_definition()`,
-    so an identical step (e.g. a generic "user clicks \"Home\"") generated
-    independently for two different transactions slips through undetected
-    at generation time and only surfaces the moment `behave` tries to load
-    BOTH files together at execution — aborting the whole run before a
-    single scenario runs. This scan is cheap (a handful of files, done
-    once per generation call) and always current.
-    """
-    exclude_files = {p.resolve() for p in (exclude_files or set())}
-    steps_dir = settings.framework_src_path / "features" / "steps"
-    found: dict[str, str] = {}
-    if not steps_dir.exists():
-        return found
-    for path in steps_dir.glob("*.py"):
-        if path.resolve() in exclude_files:
-            continue
+    # ── element resolution ──────────────────────────────────────────────
+    def _find(self, element_key: str, silent: bool = False) -> WebElement:
+        return element_resolver.resolve(self.driver, self.wait, self.short_wait,
+                                         element_key, silent)
+
+    def _with_retry(self, element_key: str, action, silent: bool = False):
+        """Runs `action(element)` against a FRESHLY re-resolved element,
+        retrying on a transient failure instead of the same possibly-stale
+        WebElement reference.
+
+        The most common "the locator found the element, but the
+        interaction still failed" case on a slow/laggy connection isn't a
+        bad locator at all — it's that the page kept re-rendering (a late
+        AJAX response, a re-painted overlay) in the gap between resolving
+        the element and Selenium actually clicking/typing into it. A
+        WebElement handle from a moment ago can go stale or become
+        covered by then. Re-finding on every attempt picks up whatever
+        the DOM looks like right now rather than replaying against a
+        snapshot, and a short backoff between attempts gives a slow
+        network/animation time to actually settle instead of hammering
+        the same not-yet-ready state repeatedly.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(1, self._interact_retries + 1):
+            try:
+                element = self._find(element_key, silent=silent)
+                result = action(element)
+                # Generic "switch back after interaction" — if `_find()`
+                # resolved this element inside an iframe (a popup dialog,
+                # a lookup/picker, ...), it deliberately leaves the driver
+                # POSITIONED there for the interaction that just ran. Once
+                # that interaction is done, resetting to the top-level
+                # document here means the NEXT interaction — on this same
+                # element, a sibling inside the popup, or something
+                # entirely outside it once the popup closes — always
+                # starts its own resolve() from a clean, known state
+                # rather than silently staying stuck inside a frame that
+                # may no longer even exist. Harmless (a cheap no-op) when
+                # the element was never inside a frame to begin with.
+                try:
+                    self.driver.switch_to.default_content()
+                except Exception:
+                    pass
+                return result
+            except _TRANSIENT_INTERACTION_ERRORS as exc:
+                last_exc = exc
+                if attempt < self._interact_retries:
+                    ctx.record_step(
+                        "transaction",
+                        f"Retrying interaction on {element_key} "
+                        f"(attempt {attempt + 1}/{self._interact_retries}) "
+                        f"after {type(exc).__name__}",
+                        "healed", 0, "",
+                        "Likely transient — network/page timing, not a missing element",
+                    )
+                    time.sleep(0.4 * attempt)  # small linear backoff
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        raise RuntimeError(f"Unreachable: no attempts made for {element_key}")
+
+    # ── interactions ─────────────────────────────────────────────────────
+    def _ensure_visible(self, element: WebElement) -> None:
+        """Waits for an element to actually be VISIBLE — not just
+        present in the DOM — before any interaction touches it.
+
+        `_find()`/`element_resolver.resolve()` only waits for
+        `presence_of_element_located`, which is satisfied the instant an
+        element exists in the DOM tree, whether or not it has actually
+        finished rendering, is still behind a loading overlay, or is
+        mid-CSS-transition. Interacting immediately after "presence" —
+        especially typing, which was previously not waited on AT ALL
+        here — was the direct cause of a real, observed failure: a
+        field that visually wasn't ready yet accepted a `.clear()` +
+        `.send_keys()) call that silently didn't register any text,
+        producing an empty value even though the step "succeeded"
+        procedurally. `EC.visibility_of` re-checks `is_displayed()`
+        until it's actually true (or the wait times out), which is
+        Selenium's own definition of "this is now something a real user
+        could actually see and act on" — not a replacement for
+        `element_to_be_clickable()` (still used in click() below, which
+        additionally checks enabled-state), just the same category of
+        guard applied consistently to every kind of interaction, not
+        only clicks.
+        """
         try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        for match in _STEP_DECORATOR_RE.finditer(text):
-            raw_pattern = match.group(1).replace('\\"', '"')
-            found.setdefault(raw_pattern, str(path))
-    return found
-
-
-class GenerationResult(dict):
-    """{artifact_type: file_path} plus a reuse report."""
-
-
-# ── preserved custom blocks ─────────────────────────────────────────────
-def _extract_custom(path: Path) -> str:
-    if not path.exists():
-        return ""
-    text = path.read_text(encoding="utf-8", errors="ignore")
-    start = text.find(CUSTOM_START)
-    end = text.find(CUSTOM_END)
-    if start == -1 or end == -1 or end < start:
-        return ""
-    block = text[text.find("\n", start) + 1 : end]
-    return block.rstrip()
-
-
-def _reinject_custom(rendered: str, custom: str) -> str:
-    if not custom.strip():
-        return rendered
-    start = rendered.find(CUSTOM_START)
-    end = rendered.find(CUSTOM_END)
-    if start == -1 or end == -1:
-        return rendered
-    head = rendered[: rendered.find("\n", start) + 1]
-    tail = rendered[end:]
-    return head + custom + "\n" + tail
-
-
-def _write(path: Path, content: str) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    custom = _extract_custom(path)
-    path.write_text(_reinject_custom(content, custom), encoding="utf-8")
-    log.info("Generated %s", path)
-    return str(path)
-
-
-# ── model building ──────────────────────────────────────────────────────
-def _clean_label(value: Any) -> str:
-    """Collapse whatever whitespace a recorded label/text came with —
-    including embedded newlines/tabs — into single spaces.
-
-    A recorded element's visible text can genuinely span multiple
-    physical lines in the real UI (a wrapped button caption, a two-line
-    field label) and that gets captured verbatim, newline and all. Left
-    as-is, that newline lands directly inside a generated `.feature`
-    file's step line — Gherkin is a LINE-based grammar, so the second
-    half of the label then appears as its own line with no Given/When/
-    Then/And keyword in front of it, and behave's parser rejects the
-    whole file with a ParserError pointing at that orphaned continuation
-    line rather than at the real cause.
-    """
-    return " ".join(str(value or "").split())
-
-
-def _element_models(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    models, used = [], set()
-    for element in elements:
-        key = element["element_key"]
-        const = naming.constant(key.split("::")[-1])
-        while const in used:
-            const += "_X"
-        used.add(const)
-        locators = element.get("locators", [])
-        if isinstance(locators, list) and locators and isinstance(locators[0], dict):
-            python_locators = [
-                {"python": locator_builder.to_python_by(loc)} for loc in locators[:5]
-            ]
-        else:
-            python_locators = [{"python": '(By.XPATH, "//*")'}]
-        models.append({
-            "element_key": key,
-            "constant": const,
-            "getter": naming.method_for_action("get", key),
-            "element_type": element.get("element_type"),
-            "label": _clean_label(element.get("label")),
-            "page_key": element.get("page_key"),
-            "locators": python_locators,
-        })
-    return models
-
-
-# The platform's OWN shared app-search box (owned by
-# python-framework/pages/transaction_search_page.py under its own
-# `search::transaction_box` element key) — a transaction's own
-# RECORDING can end up capturing a SECOND, generic "type"/"click"
-# action on this exact same physical element (its id/name is
-# `appSearch`), alongside the platform's dedicated, already-correct
-# "user searches for transaction ..." step. Left in, that duplicate
-# action re-types into (and can reset/break) the very search that
-# already navigated to the transaction — using a value that has no
-# real test-data behind it, since it was never a genuine business
-# field, producing an empty string that clears the search box and
-# leaves the browser back on the app dashboard. Real, observed
-# real-world symptom this exact filter fixes: a 40+ second
-# "Could not resolve ...::accntname" failure immediately after a
-# `user enters "" in "Enter screen number or part of screen name"`
-# step that should never have been generated at all.
-_RESERVED_ELEMENT_SIGNATURES: tuple[dict[str, str], ...] = (
-    {"id": "appSearch"}, {"name": "appSearch"},
-)
-
-
-def _is_reserved_element(element: dict[str, Any]) -> bool:
-    attrs = (element.get("meta") or {}).get("attributes") or element.get("attributes") or {}
-    for sig in _RESERVED_ELEMENT_SIGNATURES:
-        if all(attrs.get(k) == v for k, v in sig.items()):
-            return True
-    if "appSearchText" in (attrs.get("class") or ""):
-        return True
-    return False
-
-
-def _strip_reserved_elements(
-    elements: list[dict[str, Any]], field_metadata: list[dict[str, Any]] | None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
-    """Removes the reserved search-box element from both the element
-    list (so no action referencing it generates a step — see
-    `_step_models()`'s `if not element: continue`) and from
-    field_metadata (so it never becomes an auto-generated negative
-    scenario either)."""
-    kept_elements = [e for e in elements if not _is_reserved_element(e)]
-    dropped_keys = {e["element_key"] for e in elements if _is_reserved_element(e)}
-    kept_fields = (
-        [f for f in field_metadata if f.get("element_key") not in dropped_keys]
-        if field_metadata else field_metadata
-    )
-    return kept_elements, kept_fields
-
-
-def _action_models(
-    actions: list[dict[str, Any]], element_models: list[dict[str, Any]]
-) -> list[Optional[dict[str, Any]]]:
-    """One entry per action, SAME LENGTH AND ORDER as `actions`.
-
-    `_step_models()` below indexes into this list with the *same* index it
-    uses for `actions` (`action_models[index]`), so this must never drop or
-    reorder entries — an action with no matching element becomes `None`
-    here rather than being skipped, otherwise every action after the first
-    skip would line up with the wrong page-object method and the generated
-    step definition would call a method that doesn't exist on the page
-    object (`AttributeError` at run time).
-    """
-    by_key = {e["element_key"]: e for e in element_models}
-    models: list[Optional[dict[str, Any]]] = []
-    used = set()
-    for action in actions:
-        key = action.get("element_key") or ""
-        element = by_key.get(key)
-        if not element:
-            models.append(None)
-            continue
-        verb = action.get("action", "click")
-        if verb == "scroll":
-            # A recorded scroll is real, useful EVIDENCE (kept in the
-            # manifest/knowledge package as-is) — but it doesn't need
-            # its OWN generated step: `_ensure_visible()`
-            # (python-framework/core/base_page.py) already scrolls
-            # every element into view automatically before every
-            # interaction, so a step here would be redundant at best.
-            # Worse than redundant if left to fall through to the
-            # generic "unknown verb" branch below, which defaults to
-            # `self.click(...)` — silently generating a CLICK on the
-            # scrolled container instead, which is a real, wrong action.
-            models.append(None)
-            continue
-        method = naming.method_for_action(verb, key)
-        while method in used:
-            method += "X"
-        used.add(method)
-        if verb == "type":
-            params = ", value: str"
-            body = f'self.type({element["constant"]}, value)'
-        elif verb == "select":
-            params = ", value: str"
-            body = f'self.select_by_visible_text({element["constant"]}, value)'
-        elif verb in ("check", "uncheck"):
-            params = ""
-            body = f'self.set_checkbox({element["constant"]}, {str(verb == "check")})'
-        elif verb == "upload":
-            params = ", file_path: str"
-            body = f'self.upload_file({element["constant"]}, file_path)'
-        elif verb == "drag_drop":
-            target_key = action.get("target_element_key")
-            target = by_key.get(target_key) if target_key else None
-            params = ""
-            if target:
-                body = f'self.drag_and_drop({element["constant"]}, {target["constant"]})'
-            else:
-                # Recorded without a resolvable drop target (e.g. the
-                # target element didn't survive dedup/filtering) — fall
-                # back to a plain click on the source rather than
-                # generating a call to drag_and_drop() with a target
-                # constant that doesn't exist.
-                body = f'self.click({element["constant"]})'
-        else:
-            params = ""
-            body = f'self.click({element["constant"]})'
-        models.append({
-            "method": method,
-            "params": params,
-            "body": body,
-            "comment": f"{verb} on {element.get('label') or key}",
-        })
-    return models
-
-
-def _step_models(
-    actions: list[dict[str, Any]],
-    element_models: list[dict[str, Any]],
-    action_models: list[Optional[dict[str, Any]]],
-    transaction_id: str,
-    existing_patterns: dict[str, str],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
-    """Return (gherkin steps, python step functions, reuse notes)."""
-    by_key = {e["element_key"]: e for e in element_models}
-    gherkin: list[dict[str, str]] = []
-    py_steps: list[dict[str, Any]] = []
-    reuse_notes: list[str] = []
-    used_methods: set[str] = set()
-    used_patterns: set[str] = set()
-
-    for index, action in enumerate(actions):
-        key = action.get("element_key") or ""
-        element = by_key.get(key)
-        if not element:
-            continue
-        verb = action.get("action", "click")
-        label = _clean_label(element.get("label")) or key.split("::")[-1]
-        page_key = element.get("page_key") or ""
-        action_model = action_models[index] if index < len(action_models) else None
-        page_method = action_model["method"] if action_model else None
-        if page_method is None:
-            continue
-
-        # Two elements can legitimately share the same label on different
-        # screens (e.g. "Submit", "Remarks", "Account Number" repeated
-        # across pages in a banking UI). Since the Gherkin PATTERN is built
-        # from the label alone, that produces two step definitions with the
-        # identical @when/@given text — behave raises an AmbiguousStep
-        # error at runtime, not at generation time, so it only surfaces
-        # during execution. Disambiguate with page context, and an index
-        # as a last-resort tiebreaker for a genuine same-label-same-page
-        # duplicate.
-        display_label = label
-
-        def _pattern_for(lbl: str) -> str:
-            if verb in ("type", "select", "upload"):
-                # MUST match the placeholder text actually written into
-                # the generated file byte-for-byte (see the `gherkin_
-                # quoted_pattern` block below) — this `pattern` value is
-                # also used as the reuse/dedup lookup key against
-                # `existing_patterns` a few lines down. It used to build
-                # a literal "{}" here and only convert it to "{value}"
-                # later (for the file), so the dedup lookup was
-                # comparing "...{}..." against disk-scanned "...{value}
-                # ..." entries and never matched — every parameterised
-                # step (type/select/upload) silently skipped dedup no
-                # matter how many transactions already defined the exact
-                # same field, while plain clicks (no placeholder, no
-                # mismatch) deduped correctly. That's why "Home" (a
-                # click) deduped fine but "Account Number" (a type action)
-                # didn't.
-                return f'user {ACTION_VERBS.get(verb, verb)} "{{value}}" in "{lbl}"'
-            return f'user {ACTION_VERBS.get(verb, verb)} "{lbl}"'
-
-        pattern = _pattern_for(display_label)
-        # A collision with a step from ANOTHER transaction's own
-        # generated file is only safe to silently REUSE if that file is
-        # one of the intentionally-shared ones (common_steps.py, the
-        # 9750 pre-step, negative_steps.py) — genuinely the same
-        # physical element every time (the global "Home" nav button,
-        # the shared login form, ...). A collision with a step in
-        # ANOTHER transaction's own transaction<id>_steps.py is NOT
-        # safe to reuse: two different screens legitimately share an
-        # English label like "Account Number" or "Submit" while being
-        # completely different physical elements with different
-        # locators — reusing that step silently makes the NEW
-        # transaction call the OLD transaction's page-object method
-        # against the wrong element (real-world symptom this caused:
-        # transaction 1010's "Account Number" click/type silently
-        # reused transaction 400's, producing a ~30-60s hang while it
-        # tried to resolve a locator that isn't on this screen, then
-        # entered an empty value into whatever it eventually found).
-        # Such a collision must be DISAMBIGUATED instead — same
-        # page_key-suffix mechanism already used for a same-transaction
-        # collision below, just also triggered by a cross-transaction one.
-        def _unsafe_cross_txn_collision(p: str) -> bool:
-            source = existing_patterns.get(p)
-            return bool(source) and Path(source).name not in _SHARED_STEP_FILES
-
-        if (pattern in used_patterns or _unsafe_cross_txn_collision(pattern)) and page_key:
-            display_label = f"{label} ({page_key})"
-            pattern = _pattern_for(display_label)
-        if pattern in used_patterns or _unsafe_cross_txn_collision(pattern):
-            display_label = f"{label} ({page_key or 'step'} #{index})"
-            pattern = _pattern_for(display_label)
-        used_patterns.add(pattern)
-
-        if verb in ("type", "select", "upload"):
-            variable = action.get("value_ref") or naming.variable(
-                action.get("field_name") or label
-            )
-            text = f'user {ACTION_VERBS.get(verb, verb)} "<{variable}>" in "{display_label}"'
-            params = ", value"
-            body = f"page.{page_method}(data.resolve(value))"
-        else:
-            text = f'user {ACTION_VERBS.get(verb, verb)} "{display_label}"'
-            params = ""
-            body = f"page.{page_method}()"
-
-        keyword = "when" if index == 0 else "step"
-        gherkin.append({"keyword": "When" if index == 0 else "And", "text": text})
-
-        # ── reuse check: disk scan (authoritative, always current) first,
-        # then the Framework Index (Section 8) for anything the exact-text
-        # scan didn't catch. See _scan_existing_step_patterns()'s docstring
-        # for why the disk scan has to be the primary check.
-        existing_file = existing_patterns.get(pattern)
-        if existing_file and Path(existing_file).name in _SHARED_STEP_FILES:
-            reuse_notes.append(
-                f"Reused existing step definition in {Path(existing_file).name} "
-                f"for: {pattern}"
-            )
-            continue
-        try:
-            existing = indexer.find_step_definition(pattern)
+            self.wait.until(EC.visibility_of(element))
         except Exception:
-            existing = []
-        if existing:
-            reuse_notes.append(
-                f"Reused existing step definition "
-                f"{existing[0].get('class_name') or existing[0].get('module')}"
-                f".{existing[0]['method_name']} for: {pattern}"
+            # Same philosophy as click()'s clickability wait below: some
+            # real pages never cleanly satisfy this (an element that's
+            # genuinely usable despite a CSS quirk Selenium doesn't
+            # recognise as "visible") — don't fail the step on the wait
+            # itself, still attempt the interaction.
+            pass
+        self._scroll_into_view(element)
+        self._wait_until_stable(element)
+        self._wait_for_overlay_transition()
+
+    def _scroll_into_view(self, element: WebElement) -> None:
+        """Explicit `scrollIntoView()` — Selenium's native click DOES
+        auto-scroll an element into view as part of its own W3C
+        WebDriver-spec behaviour, but only reliably for the MAIN page
+        scroll. A field inside a CUSTOM scrollable container (a
+        scrollable data table, a scrollable modal body, a scrollable
+        dropdown list — all common in this kind of enterprise banking
+        UI) can still be technically "in the DOM" and even pass
+        `is_displayed()` while sitting outside its OWN container's
+        visible scroll area, which the browser's built-in click-time
+        auto-scroll doesn't always handle correctly. JS's own
+        `scrollIntoView()` walks EVERY scrollable ancestor, not just the
+        window, which is what actually makes "the field needs a scroll
+        to be shown" reliable across every interaction, not only clicks.
+        `{block: 'center'}` centers it rather than just barely-visible-
+        at-the-edge, giving `_wait_until_stable()` right after this a
+        real settled position to compare against instead of one that's
+        still right at a container's scroll boundary.
+        """
+        try:
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
+                element,
             )
-            continue
+        except Exception:
+            # Never worth failing the whole interaction over — the
+            # element might already be fully in view (a no-op scroll is
+            # harmless), or genuinely non-scrollable-to for some reason;
+            # the interaction attempt right after this is still the
+            # real, authoritative one.
+            pass
 
-        method = naming.camel(f"step_{verb}_{label}_{index}")
-        while method in used_methods:
-            method += "X"
-        used_methods.add(method)
+    def _wait_until_stable(self, element: WebElement, timeout: float = 0.3) -> None:
+        """A genuine fluent wait — Selenium's own term for a polling
+        wait with a bounded timeout — for the element's position/size to
+        stop CHANGING, not just for it to be visible. `EC.visibility_of`
+        only checks `is_displayed()`, which can already be True while a
+        field is still SETTLING — sliding into place as part of a layout
+        reflow, resizing as a sibling element finishes loading, or
+        simply not yet interactive because the app hasn't finished
+        wiring up its event handlers. Typing into a field that's still
+        moving/settling is exactly the class of "script is putting
+        input even before the field is loaded" symptom this addresses:
+        comparing its bounding rect across two checks a beat apart, and
+        only proceeding once it's identical (i.e. genuinely at rest).
 
-        # `pattern` (computed above by `_pattern_for`) already has the
-        # real "{value}" placeholder text for a type/select/upload verb —
-        # it's the exact same string that goes into the generated file
-        # below, which is what makes the dedup lookup above actually work.
-        if verb in ("type", "select", "upload"):
-            gherkin_quoted_pattern = pattern
-            fn_params = ", value"
-        else:
-            gherkin_quoted_pattern = pattern
-            fn_params = ""
+        Deliberately fast-pathed for the OVERWHELMINGLY common case — a
+        field that's already stable, which is nearly every field, nearly
+        every time: the first comparison uses a tiny 30ms gap rather
+        than an unconditional longer sleep, so a genuinely settled field
+        costs barely anything extra. Only a field that's ACTUALLY still
+        changing pays for further, slightly longer-spaced checks, capped
+        at a low 0.3s total rather than left open-ended — this exists to
+        catch real settling, not to become a second source of the exact
+        "everything feels slow" complaint that made the overlay-wait's
+        own budget get cut down at the same time as this was added.
+        """
+        try:
+            previous = element.rect
+        except Exception:
+            return  # can't read geometry — nothing more this check can do
+        deadline = time.time() + timeout
+        poll = 0.03
+        while time.time() < deadline:
+            time.sleep(poll)
+            try:
+                current = element.rect
+            except Exception:
+                return  # went stale mid-check — the caller's own
+                         # retry-on-stale-element handles this, not here
+            if current == previous:
+                return
+            previous = current
+            poll = 0.08  # subsequent checks space out a bit more once
+                         # we know it's genuinely still moving
+        # Never seen it settle within the budget — proceed anyway rather
+        # than blocking indefinitely; the interaction that follows still
+        # has its own retry-on-transient-failure safety net.
 
-        py_steps.append({
-            "annotation": "when" if index == 0 else "step",
-            "pattern": _py_string(gherkin_quoted_pattern),
-            "method": method,
-            "params": fn_params,
-            "body": body,
-        })
+    # There's no single reliable selector for "a modal/popup that's
+    # currently opening" across every screen either (same situation as
+    # the spinner/validation-message pattern lists elsewhere in this
+    # class) — check the common shapes a transitioning overlay actually
+    # takes. This exists because of a real, repeating failure pattern:
+    # a NEW popup (a Bootstrap-style dialog, a dropdown/suggestion list)
+    # appears as the direct result of the action just before it, and
+    # code immediately tried to interact with something INSIDE that
+    # popup before its own open/fade transition had actually finished —
+    # `_find()` can return an element that's technically present but
+    # still moving/fading, which the plain `EC.visibility_of` check
+    # above doesn't catch (a Bootstrap-modal-in-transition can already
+    # report `is_displayed() == True` while its CSS opacity/transform
+    # transition is still running). Waiting for the known "still
+    # transitioning" classes to clear first is what actually prevents
+    # clicking/typing into an overlay before it's settled into place.
+    _TRANSITIONING_OVERLAY_SELECTORS = (
+        ".modal.fade.showing, .modal.fade.in.showing",
+        ".bootstrap-dialog.type-loading",
+        ".modal-backdrop.fade:not(.show)",
+        "[aria-busy='true']",
+    )
 
-    return gherkin, py_steps, reuse_notes
+    def _wait_for_overlay_transition(self, timeout: float = 0.5) -> None:
+        """Reduced from an earlier 2.0s default — a genuine CSS fade/
+        transition on this kind of overlay settles in 150-350ms in
+        practice; a MUCH longer budget only ever mattered for the
+        (rare) worst case, while taxing the overwhelmingly common case
+        just as heavily. A REAL, confirmed cost of the longer timeout:
+        if any element on a given screen happens to persistently match
+        one of the selectors above WITHOUT ever actually clearing (e.g.
+        a permanently-present, always-`aria-busy` loading-indicator
+        container that isn't a genuine per-interaction overlay at all —
+        a real anti-pattern some Bootstrap-based apps have), this loop
+        used to burn its FULL timeout on every single interaction across
+        the ENTIRE screen, not just once — which is exactly the "every
+        field feels slow" symptom this was found from. Halving the
+        budget halves that worst case; a genuinely transitioning overlay
+        still gets several poll cycles to clear within it.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            still_transitioning = False
+            for selector in self._TRANSITIONING_OVERLAY_SELECTORS:
+                try:
+                    if self.driver.find_elements("css selector", selector):
+                        still_transitioning = True
+                        break
+                except Exception:
+                    continue
+            if not still_transitioning:
+                return
+            time.sleep(0.1)
 
+    def click(self, element_key: str) -> None:
+        def _do(element: WebElement) -> None:
+            self._ensure_visible(element)
+            try:
+                self.wait.until(EC.element_to_be_clickable(element))
+            except Exception:
+                # Some real pages never satisfy Selenium's strict "clickable"
+                # check (a fading overlay, a border-case visibility quirk) even
+                # though the element is genuinely usable — don't fail the step
+                # here; still attempt the click below.
+                pass
+            try:
+                element.click()
+            except (ElementClickInterceptedException, ElementNotInteractableException):
+                self.driver.execute_script("arguments[0].click();", element)
 
-def _validation_models(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    models, used = [], set()
-    for rule in rules:
-        text = rule.get("message_text") or rule.get("expression") or ""
-        if not text:
-            continue
-        method = naming.camel("is_" + (rule.get("severity") or "info") + "_" + text[:30])
-        while method in used:
-            method += "X"
-        used.add(method)
-        models.append({"method": method, "message_text": _py_string(text)})
-    return models
+        self._with_retry(element_key, _do)
 
+    def type(self, element_key: str, value: str | None) -> None:
+        def _do(element: WebElement) -> None:
+            self._ensure_visible(element)
+            element.clear()
+            element.send_keys(value or "")
+            # A slow-rendering/JS-validated field can silently drop or
+            # reformat what was just typed (a masking script re-writing
+            # the value on its own `input`/`change` handler, for
+            # instance) — verifying what's actually IN the field now
+            # catches that immediately, as a `StaleElementReferenceException`-
+            # style transient (caught and retried by `_with_retry`,
+            # which re-finds a FRESH element and tries again) rather
+            # than silently reporting success with an empty/wrong value.
+            actual = element.get_attribute("value") or ""
+            if value and not actual:
+                raise StaleElementReferenceException(
+                    f"Typed value did not register (field reads back empty) for {element_key}"
+                )
 
-def _synthesize_invalid_value(pattern: str | None) -> str:
-    """A deliberately-wrong sample value for a field's pattern, used to
-    drive a negative ("invalid format") scenario."""
-    if not pattern:
-        return "@@INVALID@@"
-    has_digit_class = any(tok in pattern for tok in ("\\d", "0-9"))
-    has_alpha_class = any(tok in pattern for tok in ("A-Za-z", "a-zA-Z", "A-Z", "a-z"))
-    if has_digit_class and not has_alpha_class:
-        return "ABCDEF"          # expects digits -> feed letters
-    if has_alpha_class and not has_digit_class:
-        return "123456"          # expects letters -> feed digits
-    return "@@INVALID@@"
+        self._with_retry(element_key, _do)
 
+    def select_by_visible_text(self, element_key: str, text: str) -> None:
+        def _do(element: WebElement) -> None:
+            self._ensure_visible(element)
+            Select(element).select_by_visible_text(text)
+            # Same "did it actually register" concern as type() above —
+            # a custom/JS-driven dropdown widget (very common on an
+            # enterprise banking screen; not every "dropdown" is a plain
+            # native <select>) can silently fail to update its
+            # underlying value even though the click/select call itself
+            # didn't raise. Reading back the currently-selected option's
+            # text and comparing catches that as a transient (retried
+            # via a freshly re-found element) rather than reporting
+            # success with the wrong option still selected.
+            selected = Select(element).first_selected_option.text.strip()
+            if selected != text.strip():
+                raise StaleElementReferenceException(
+                    f"Selection did not register for {element_key} "
+                    f"(expected {text!r}, still shows {selected!r})"
+                )
 
-def _negative_scenarios(
-    field_metadata: list[dict[str, Any]] | None,
-    actions: list[dict[str, Any]],
-    transaction_id: str,
-) -> list[dict[str, Any]]:
-    """Auto-derive negative-path scenarios from what's already known about
-    each recorded field (required / pattern).
+        self._with_retry(element_key, _do)
 
-    Recording only ever captures the happy path a user walked through — it
-    never sees what happens on a wrong input, because nobody deliberately
-    breaks their own transaction while recording it. But every recorded
-    field already carries a `required` flag and (often) a `pattern` from
-    field_meta — enough to derive real negative coverage without asking
-    anyone to record failure paths by hand. These reuse the generic,
-    shared python-framework/features/steps/negative_steps.py rather than
-    generating new per-transaction code, since the pattern is always
-    identical: clear/corrupt a field, submit, confirm the app pushes back.
-    """
-    if not field_metadata:
-        return []
-    submit_key = None
-    for action in reversed(actions):
-        if action.get("action") == "click":
-            submit_key = action.get("element_key")
-            break
-    if not submit_key:
-        return []  # no known submit button -> nothing safe to generate
+    def set_checkbox(self, element_key: str, checked: bool) -> None:
+        def _do(element: WebElement) -> None:
+            self._ensure_visible(element)
+            if element.is_selected() != checked:
+                element.click()
+            # Verify the click actually flipped the state — a checkbox/
+            # radio driven by a JS widget (rather than a plain native
+            # input) can visually toggle without the underlying
+            # `is_selected()` state actually changing, same class of
+            # "looked like it worked but didn't" issue as typing/select.
+            if element.is_selected() != checked:
+                raise StaleElementReferenceException(
+                    f"Checkbox/radio state did not register for {element_key} "
+                    f"(wanted checked={checked})"
+                )
 
-    # The search box (search::transaction_box) is a SHARED, platform-level
-    # element — the persistent "search for a screen" control every
-    # transaction starts from (TransactionSearchPage/common_steps.py), not
-    # a field that belongs to THIS transaction's own form. If it shows up
-    # in field_metadata (it can, once it's properly recorded), generating
-    # a negative scenario for it produces an incoherent test: "search for
-    # 400 successfully, then type garbage into that SAME search box and
-    # click 400's unrelated Submit button" doesn't exercise anything real.
-    PLATFORM_ELEMENT_PREFIXES = ("search::",)
+        self._with_retry(element_key, _do)
 
-    scenarios: list[dict[str, Any]] = []
-    for meta in field_metadata:
-        element_key = meta.get("element_key")
-        field = meta.get("field") or ""
-        if not element_key or element_key == submit_key:
-            continue
-        if any(element_key.startswith(p) for p in PLATFORM_ELEMENT_PREFIXES):
-            continue
-        if meta.get("required"):
-            scenarios.append({
-                "name": f"{field} is required",
-                "steps": [
-                    {"keyword": "Given",
-                     "text": f'user searches for transaction "{transaction_id}"'},
-                    {"keyword": "When",
-                     "text": f'user clears "{element_key}" and submits via "{submit_key}"'},
-                    {"keyword": "Then", "text": "a validation message is shown"},
-                ],
-            })
-        pattern = meta.get("pattern")
-        if pattern:
-            bad_value = _synthesize_invalid_value(pattern)
-            scenarios.append({
-                "name": f"{field} rejects an invalid value",
-                "steps": [
-                    {"keyword": "Given",
-                     "text": f'user searches for transaction "{transaction_id}"'},
-                    {"keyword": "When",
-                     "text": f'user enters an invalid value "{bad_value}" '
-                             f'in "{element_key}" and submits via "{submit_key}"'},
-                    {"keyword": "Then", "text": "a validation message is shown"},
-                ],
-            })
-    return scenarios
+    def upload_file(self, element_key: str, absolute_path: str) -> None:
+        # Deliberately NO visibility wait here, unlike every other
+        # interaction in this class — a file input is very commonly
+        # hidden-by-design (`opacity:0`/`display:none`, styled via a
+        # custom "Choose file" button overlay that triggers it) and
+        # that's the NORMAL case for this element type, not a loading-
+        # timing problem to wait out. Waiting for visibility here would
+        # just burn the full wait budget on every single upload for no
+        # benefit.
+        self._with_retry(element_key, lambda element: element.send_keys(absolute_path))
 
+    def drag_and_drop(self, source_key: str, target_key: str) -> None:
+        from selenium.webdriver.common.action_chains import ActionChains
 
-def _python_module_name(class_name: str) -> str:
-    """TransactionPage -> transaction_page (snake_case module file name)."""
-    s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", class_name)
-    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
+        source = self._find(source_key)
+        self._ensure_visible(source)
+        target = self._find(target_key)
+        self._ensure_visible(target)
+        ActionChains(self.driver).drag_and_drop(source, target).perform()
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
 
+    def text_of(self, element_key: str) -> str:
+        return self._with_retry(element_key, lambda element: element.text)
 
-# ── public API ──────────────────────────────────────────────────────────
-def regenerate_feature_only(transaction_id: str) -> dict[str, Any]:
-    """Part 15's targeted patch for a validation_change — re-renders
-    ONLY the `.feature` file (Gherkin + auto-derived negative scenarios)
-    from whatever is currently stored (elements/actions/field_metadata,
-    including a `set_field_requirement()` patch already applied),
-    leaving the page object and step definitions file completely
-    untouched — a narrower, safer change than `generate_all()`'s full
-    regeneration of every artefact type for a change that only ever
-    affects validation/Gherkin text, not locators or Python code.
-    """
-    if transaction_id == settings.password_change_transaction:
-        raise ValueError(
-            f"Transaction {transaction_id} is reserved for the mandatory "
-            "password-change pre-step and is not patched through this path."
+    # ── waits & assertions ──────────────────────────────────────────────
+    def wait_for_page(self) -> None:
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+        self.wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+
+    def recover_from_security_breach_if_present(self) -> bool:
+        """Explicit, PROACTIVE check — as distinct from
+        element_resolver.py's REACTIVE version, which only ever fires as
+        a side-effect of some LATER element lookup failing. That's a real
+        gap for an action like logout: it's typically the LAST step in a
+        scenario, so there's often no subsequent element resolution to
+        ever trigger the reactive check at all — the real,
+        confirmed-in-production trigger ("BCF0070: Security breached,
+        user session invalidated", seen specifically on an automated
+        logout, never a manual one) would otherwise go completely
+        undetected and unrecorded, which is exactly what happened before
+        this existed: the page WAS being silently refreshed by the
+        reactive path on whatever NEXT resolve() call happened to run
+        (which is why it "goes away on refresh" but never showed up in
+        the report), with nothing to show it had occurred at all.
+
+        Call this explicitly right after any action that's known to be
+        a common trigger point (logout here; any other page is free to
+        call this too — it's on BasePage, not logout-specific).
+        Returns True if a breach message was found (and a refresh was
+        attempted), False otherwise.
+        """
+        from core import element_resolver
+        try:
+            page_text = self.driver.page_source
+        except Exception:
+            return False
+        evidence = element_resolver._looks_like_security_breach(page_text)
+        if not evidence:
+            return False
+        ctx.record_step(
+            "transaction",
+            "Security/session anomaly detected after logout — refreshing to recover",
+            "healed", 0, "", f"evidence={evidence!r}",
         )
-    from ..knowledge import repository as repo
-    from ..tdm import templates as tdm_templates
-
-    txn = repo.get_transaction(transaction_id)
-    if not txn:
-        raise ValueError(f"Transaction {transaction_id} is not in the knowledge repository")
-    transaction_pk = int(txn["id"])
-    elements = repo.get_elements(transaction_pk)
-    actions = repo.get_actions(transaction_pk)
-    field_metadata = tdm_templates.get_field_metadata(transaction_id)
-    elements, field_metadata = _strip_reserved_elements(elements, field_metadata)
-
-    element_models = _element_models(elements)
-    gherkin, _py_steps, _reuse = _step_models(
-        actions, element_models,
-        _action_models(actions, element_models), transaction_id,
-        _scan_existing_step_patterns(),
-    )
-    negative_scenarios = _negative_scenarios(field_metadata, actions, transaction_id)
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    txn_dir = settings.framework_src_path / "features" / "transactions" / f"Transaction_{transaction_id}"
-    feature_text = _env.get_template("feature.j2").render(
-        transaction_id=transaction_id,
-        feature_name=f"Transaction {transaction_id} — {txn['name']}",
-        scenario_name=f"Execute {txn['name']}",
-        description=txn.get("description"),
-        version=txn["version"],
-        tags=[],
-        steps=gherkin,
-        negative_scenarios=negative_scenarios,
-    )
-    path = _write(txn_dir / naming.feature_file_name(transaction_id), feature_text)
-    log.info("Targeted patch: regenerated ONLY the feature file for %s (%s)",
-             transaction_id, path)
-    return {"transaction_id": transaction_id, "feature": path,
-            "negative_scenarios": len(negative_scenarios), "patched_at": now}
-
-
-def generate_all(
-    transaction_id: str,
-    transaction_name: str,
-    version: str,
-    elements: list[dict[str, Any]],
-    actions: list[dict[str, Any]],
-    validations: list[dict[str, Any]] | None = None,
-    environment: str = "PREPROD",
-    field_metadata: list[dict[str, Any]] | None = None,
-    description: str | None = None,
-) -> GenerationResult:
-    """Generate feature + page object + step definitions + test data."""
-    if transaction_id == settings.password_change_transaction:
-        # 9750 is the reserved forced-password-change pre-step (Section
-        # 11.1) — its feature/page/steps are hand-written framework files
-        # (python-framework/pages/transaction_9750_page.py,
-        # features/steps/transaction_9750_steps.py,
-        # features/transactions/Transaction_9750/Transaction9750.feature),
-        # loaded by run.py for EVERY execution, not generated per-recording.
-        # Running the normal codegen path against this id would overwrite
-        # that seeded feature file (same Transaction_9750/ folder) and spin
-        # up a second, independently-generated steps file whose step text
-        # (e.g. a generic "user clicks \"Home\"") collides with whatever
-        # else already defines it — behave's step registry is global across
-        # every file in features/steps/, so that collision doesn't surface
-        # as a generation error, it surfaces as `AmbiguousStep` the next
-        # time ANY transaction executes, aborting the run before a single
-        # scenario starts. If 9750's recorded locators genuinely need
-        # updating (a real UI change on the password-change screen), patch
-        # utils/locator_repository.py's registration in
-        # pages/transaction_9750_page.py directly, or let self-healing
-        # apply it — the same path already used for every other locator
-        # drift — rather than regenerating the file wholesale.
-        raise ValueError(
-            f"Transaction {transaction_id} is reserved for the mandatory "
-            "password-change pre-step and is not generated through the "
-            "normal code-generation path. Update "
-            "python-framework/pages/transaction_9750_page.py directly, or "
-            "let self-healing apply a locator fix, instead of recording "
-            "9750 as a regular transaction."
-        )
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    elements, field_metadata = _strip_reserved_elements(elements, field_metadata)
-    element_models = _element_models(elements)
-    action_models = _action_models(actions, element_models)
-
-    page_class = naming.transaction_class(transaction_id, "Page")
-    steps_class = naming.transaction_class(transaction_id, "Steps")
-    page_module = _python_module_name(page_class)
-    steps_module = _python_module_name(steps_class)
-    steps_file = settings.framework_src_path / "features" / "steps" / f"{steps_module}.py"
-
-    # Excludes THIS transaction's own (about-to-be-overwritten) steps file
-    # from the duplicate scan — regenerating a transaction must never see
-    # its own prior version as "already defined elsewhere" and silently
-    # drop its own step functions.
-    existing_patterns = _scan_existing_step_patterns(exclude_files={steps_file})
-
-    gherkin, py_steps, reuse_notes = _step_models(
-        actions, element_models, action_models, transaction_id, existing_patterns
-    )
-    validation_models = _validation_models(validations or [])
-    negative_scenarios = _negative_scenarios(field_metadata, actions, transaction_id)
-
-    feature_name = f"Transaction {transaction_id} — {transaction_name}"
-
-    txn_dir = settings.framework_src_path / "features" / "transactions" / f"Transaction_{transaction_id}"
-
-    result = GenerationResult()
-
-    # ── feature ─────────────────────────────────────────────────────────
-    feature_text = _env.get_template("feature.j2").render(
-        transaction_id=transaction_id,
-        feature_name=feature_name,
-        scenario_name=f"Execute {transaction_name}",
-        description=description,
-        version=version,
-        tags=[],
-        steps=gherkin,
-        negative_scenarios=negative_scenarios,
-    )
-    result["feature"] = _write(
-        txn_dir / naming.feature_file_name(transaction_id), feature_text
-    )
-
-    # ── page object ─────────────────────────────────────────────────────
-    page_text = _env.get_template("page.py.j2").render(
-        class_name=page_class,
-        transaction_id=transaction_id,
-        transaction_name=transaction_name,
-        version=version,
-        generated_at=now,
-        elements=element_models,
-        actions=[m for m in action_models if m is not None],
-        validations=validation_models,
-    )
-    result["page_object"] = _write(
-        settings.framework_src_path / "pages" / f"{page_module}.py",
-        page_text,
-    )
-
-    # ── step definitions ────────────────────────────────────────────────
-    steps_text = _env.get_template("steps.py.j2").render(
-        class_name=steps_class,
-        page_class=page_class,
-        page_module=page_module,
-        transaction_id=transaction_id,
-        transaction_name=transaction_name,
-        version=version,
-        generated_at=now,
-        steps=py_steps,
-    )
-    result["step_definition"] = _write(
-        steps_file,
-        steps_text,
-    )
-
-    # No per-transaction runner file any more — python-framework/run.py is
-    # fully generic (`python run.py --transaction=<id> ...`).
-
-    # ── test data template ──────────────────────────────────────────────
-    if field_metadata:
-        for env_name in (environment, "UAT", "PROD"):
-            path = tdm_templates.scaffold_from_fields(
-                transaction_id, env_name, field_metadata
+        try:
+            self.driver.refresh()
+            self.wait.until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
             )
-            if env_name == environment:
-                result["test_data"] = path
+        except Exception:
+            pass
+        return True
 
-    result["reuse_notes"] = reuse_notes
-    result["metadata"] = {
-        "transaction_id": transaction_id,
-        "version": version,
-        "generated_at": now,
-        "elements": len(element_models),
-        "page_actions": len(action_models),
-        "gherkin_steps": len(gherkin),
-        "negative_scenarios": len(negative_scenarios),
-        "new_step_definitions": len(py_steps),
-        "reused_step_definitions": len(reuse_notes),
-    }
-    log.info("Code generation complete for %s: %s", transaction_id, result["metadata"])
-    return result
+    def is_text_present(self, text: str) -> bool:
+        try:
+            return text in self.driver.page_source
+        except Exception:
+            return False
 
+    def exists(self, element_key: str) -> bool:
+        try:
+            self._find(element_key, silent=True)
+            return True
+        except Exception:
+            return False
 
-def repair_file(path: str, new_content: str) -> str:
-    """Used by the Self-Healing / BRD flow to patch a single file."""
-    return _write(Path(path), new_content)
+    def find_all(self, by: str, value: str) -> list[WebElement]:
+        return self.driver.find_elements(by, value)
 
+    # ── NBC-framework compatibility layer ─────────────────────────────────
+    # The following mirror the vocabulary of the original Java BasePage
+    # (com.nbc.base.BasePage) that TopMenu/HomePage/PasswordChangePage/
+    # SupOverridePage/ElectronicJournalPage/etc. were written against, so
+    # those page objects port over with (nearly) unchanged call sites —
+    # just element_key strings instead of raw `By` locator fields, so they
+    # still go through _find()/element_resolver and keep self-healing.
+    def send_keys(self, element_key: str, value: str | None) -> None:
+        self.type(element_key, value)
 
-def patch_locator(page_object_path: str, element_constant: str,
-                  new_python_by: str) -> bool:
-    """Swap one locator inside a generated page object (self-healing)."""
-    path = Path(page_object_path)
-    if not path.exists():
-        return False
-    text = path.read_text(encoding="utf-8")
-    pattern = re.compile(
-        r"(locator_repo\.register\(\s*" + re.escape(element_constant)
-        + r"\s*,\s*\[)",
-    )
-    match = pattern.search(text)
-    if not match:
-        return False
-    insert_at = match.end()
-    patched = text[:insert_at] + f"\n            {new_python_by}," + text[insert_at:]
-    path.write_text(patched, encoding="utf-8")
-    log.info("Self-heal: promoted %s for %s", new_python_by, element_constant)
-    return True
+    def send_keys_enter(self, element_key: str, value: str | None) -> None:
+        from selenium.webdriver.common.keys import Keys
+
+        def _do(element: WebElement) -> None:
+            self._ensure_visible(element)
+            element.clear()
+            element.send_keys((value or "") + Keys.ENTER)
+
+        self._with_retry(element_key, _do)
+
+    def press_tab(self) -> None:
+        from selenium.webdriver.common.keys import Keys
+        try:
+            self.driver.switch_to.active_element.send_keys(Keys.TAB)
+        except Exception:
+            pass
+
+    def get_element_text(self, element_key: str) -> str:
+        return self.text_of(element_key)
+
+    def get_element_value(self, element_key: str) -> str:
+        try:
+            return self._with_retry(
+                element_key, lambda element: element.get_attribute("value") or "", silent=True
+            )
+        except Exception:
+            return ""
+
+    def is_element_displayed(self, element_key: str) -> bool:
+        try:
+            return self._find(element_key, silent=True).is_displayed()
+        except Exception:
+            return False
+
+    def hover(self, element_key: str) -> None:
+        from selenium.webdriver.common.action_chains import ActionChains
+
+        def _do(element: WebElement) -> None:
+            self._ensure_visible(element)
+            ActionChains(self.driver).move_to_element(element).perform()
+
+        try:
+            self._with_retry(element_key, _do)
+        except Exception:
+            pass
+
+    def select_by_value(self, element_key: str, value: str) -> None:
+        def _do(element: WebElement) -> None:
+            self._ensure_visible(element)
+            Select(element).select_by_value(str(value))
+
+        self._with_retry(element_key, _do)
+
+    def wait_for_clickable(self, element_key: str) -> None:
+        try:
+            element = self._find(element_key)
+            self.wait.until(EC.element_to_be_clickable(element))
+        except Exception:
+            pass  # click() itself falls back to a JS click regardless
+
+    def wait_for_visible(self, element_key: str) -> None:
+        try:
+            self.wait.until(lambda d: self._find(element_key).is_displayed())
+        except Exception:
+            pass
+
+    def wait_for_invisibility(self, element_key: str) -> None:
+        try:
+            self.wait.until(lambda d: not self.is_element_displayed(element_key))
+        except Exception:
+            pass
+
+    def wait_specific_time(self, seconds: float) -> None:
+        import time
+        time.sleep(seconds)
+
+    # There's no single reliable id/class for "the" spinner across every
+    # NBC screen, so this checks the common patterns used across the app
+    # and simply returns once none of them are visible any more (or after
+    # a bounded timeout) — same "check the known patterns, don't hard-fail
+    # on a miss" approach as negative_steps.py's validation-message check.
+    _SPINNER_LOCATORS = [
+        ("css selector", ".spinner, .loading, .loader, [class*='spinner']"),
+        ("css selector", "[class*='loading' i]"),
+        ("id", "loadingDiv"),
+    ]
+
+    def wait_for_spinner_to_disappear(self, timeout: float = 20.0) -> None:
+        import time
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            any_visible = False
+            for by, value in self._SPINNER_LOCATORS:
+                try:
+                    for el in self.driver.find_elements(by, value):
+                        if el.is_displayed():
+                            any_visible = True
+                            break
+                except Exception:
+                    continue
+                if any_visible:
+                    break
+            if not any_visible:
+                return
+            time.sleep(0.2)
+
+    def close_x(self, element_key: str) -> None:
+        """Click a popup's "X" close control — same as click(), kept as a
+        separate name for 1:1 call-site parity with the original Java."""
+        self.click(element_key)
+
+    # There's no single reliable id/class for "the" page header/title
+    # across every NBC screen either (same situation as the spinner check
+    # above) — check the common patterns and confirm the expected text
+    # appears in whichever one is actually on this screen.
+    _HEADER_LOCATORS = [
+        ("css selector", "h1, h2, .page-title, .panel-title, [class*='header-title']"),
+        ("xpath", "//*[contains(@class,'bootstrap-dialog-title')]"),
+    ]
+
+    def validate_page_header(self, expected_title: str) -> bool:
+        expected = (expected_title or "").strip()
+        for by, value in self._HEADER_LOCATORS:
+            try:
+                for el in self.driver.find_elements(by, value):
+                    if el.is_displayed() and expected.lower() in (el.text or "").strip().lower():
+                        ctx.record_step("assertion", f"Page header matches: {expected}",
+                                         "passed", 0, "", None)
+                        return True
+            except Exception:
+                continue
+        ctx.record_step("assertion", f"Page header matches: {expected}", "failed", 0, "",
+                         "No visible header element contained the expected title")
+        raise AssertionError(f"Page header did not match expected title: {expected}")
+
+    def assert_element(self, element_key: str, message: str = "") -> None:
+        if not self.is_element_displayed(element_key):
+            ctx.record_step("assertion", message or f"Element present: {element_key}",
+                             "failed", 0, "", f"Not present/visible: {element_key}")
+            raise AssertionError(message or f"Expected element not present: {element_key}")
+        ctx.record_step("assertion", message or f"Element present: {element_key}", "passed", 0, "", None)
+
+    def assert_element_text(self, element_key: str, expected: str, mode: str = "equals",
+                             message: str = "") -> None:
+        actual = ""
+        mode = (mode or "equals").lower()
+        try:
+            if mode == "value":
+                actual = self.get_element_value(element_key)
+            else:
+                actual = self.get_element_text(element_key)
+        except Exception:
+            pass
+        expected = expected or ""
+        if mode == "contains":
+            ok = expected in actual
+        elif mode == "startswith":
+            ok = actual.strip().startswith(expected)
+        elif mode == "amount":
+            # Loose numeric-string comparison — the app renders amounts
+            # with commas/decimals inconsistently across screens.
+            norm = lambda s: (s or "").replace(",", "").replace(".00", "").strip()
+            ok = norm(actual) == norm(expected)
+        elif mode == "dropdownvalue":
+            ok = expected in actual
+        else:  # equals / value
+            ok = actual.strip() == expected.strip()
+        detail = f"expected='{expected}' actual='{actual}' mode={mode}"
+        if not ok:
+            ctx.record_step("assertion", message or "Text assertion", "failed", 0, "", detail)
+            raise AssertionError(f"{message or 'Text assertion failed'}: {detail}")
+        ctx.record_step("assertion", message or "Text assertion", "passed", 0, "", None)
+
+    # ── evidence ─────────────────────────────────────────────────────────
+    def screenshot(self, name: str) -> str:
+        try:
+            png = self.driver.get_screenshot_as_png()
+            return ctx.save_screenshot(name, png)
+        except Exception:
+            return ""
+
+    def dump_dom(self) -> str:
+        try:
+            return self.driver.page_source
+        except Exception:
+            return ""
