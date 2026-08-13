@@ -1,8 +1,16 @@
-"""Transaction Data Templates (Section 7.4).
+"""AI Data Resolver (Section 7.7).
 
-test-data/<ENV>/transaction_<id>.json — one file per transaction per
-environment.  Feature files reference variables; only these files change
-when a value changes (Section 7.5).
+At execution time each required field is resolved to its best source, in
+the priority order of Section 7.3:
+
+  1. existing framework data (*.properties)
+  2. user-provided static / profile data
+  3. runtime user input
+  4. database query
+  5. API data
+  6. AI-generated data — cosmetic, non-validated fields ONLY
+
+python-framework never needs to know where a value came from.
 """
 from __future__ import annotations
 
@@ -13,306 +21,241 @@ from typing import Any, Optional
 from ..core import db
 from ..core.config import settings
 from ..core.logging_conf import get_logger
-from ..core.security import get_secret_box, mask_value
-from ..knowledge import repository as repo
+from ..framework_index import text_formats
+from . import field_meta, profiles, templates
 
 log = get_logger(__name__)
 
-ENVIRONMENTS = ("PREPROD", "UAT", "PROD")
+SOURCE_ORDER = ("framework", "profile", "runtime", "database", "api", "ai")
 
 
-def template_path(transaction_id: str, environment: str) -> Path:
-    directory = settings.framework_testdata_path / environment.upper()
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"transaction_{transaction_id}.json"
+class UnresolvedFieldError(RuntimeError):
+    def __init__(self, fields: list[str]) -> None:
+        super().__init__(
+            "The following fields must be supplied by the user before this "
+            "transaction can run: " + ", ".join(fields)
+        )
+        self.fields = fields
 
 
-def read(transaction_id: str, environment: str) -> dict[str, Any]:
-    path = template_path(transaction_id, environment)
-    if not path.exists():
-        return {"transaction": transaction_id, "environment": environment.upper(),
-                "data": {}}
+# ── source 1: framework property files ──────────────────────────────────
+def _framework_properties() -> dict[str, str]:
+    merged: dict[str, str] = {}
+    root = settings.framework_root_path
+    for path in root.rglob("*.properties"):
+        try:
+            merged.update(text_formats.parse_properties_file(path))
+        except Exception:
+            continue
+    return merged
+
+
+# ── source 4: database query ────────────────────────────────────────────
+def _from_database(config: dict[str, Any]) -> Optional[str]:
+    """config = {"sql": "SELECT cif FROM ... LIMIT 1", "column": "cif"}"""
+    sql = config.get("sql")
+    if not sql:
+        return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        log.error("Corrupt test-data file %s: %s", path, exc)
-        return {"transaction": transaction_id, "environment": environment.upper(),
-                "data": {}}
+        row = db.query_one(sql)
+    except Exception as exc:
+        log.warning("Test-data SQL failed: %s", exc)
+        return None
+    if not row:
+        return None
+    column = config.get("column")
+    return str(row.get(column) if column else list(row.values())[0])
 
 
-def write(transaction_id: str, environment: str, data: dict[str, Any]) -> str:
-    """Persist the template.  Sensitive values are NOT written in plaintext —
-    the file carries a placeholder and the real value lives encrypted in
-    Postgres (`test_data_values`)."""
-    path = template_path(transaction_id, environment)
-    payload = {
-        "transaction": transaction_id,
-        "environment": environment.upper(),
-        "data": data,
-    }
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    log.info("Test-data template written: %s", path)
-    return str(path)
+# ── source 5: API ───────────────────────────────────────────────────────
+def _from_api(config: dict[str, Any]) -> Optional[str]:
+    url = config.get("url")
+    if not url:
+        return None
+    try:
+        import httpx
+        response = httpx.request(
+            config.get("method", "GET"), url,
+            headers=config.get("headers") or {},
+            json=config.get("body"),
+            timeout=config.get("timeout", 20),
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        log.warning("Test-data API call failed for %s: %s", url, exc)
+        return None
+    pointer = config.get("json_path")
+    if not pointer:
+        return str(payload)
+    current: Any = payload
+    for part in str(pointer).split("."):
+        if isinstance(current, list):
+            try:
+                current = current[int(part)]
+            except Exception:
+                return None
+        elif isinstance(current, dict):
+            current = current.get(part)
+        else:
+            return None
+    return None if current is None else str(current)
 
 
-def scaffold_from_fields(
-    transaction_id: str, environment: str, fields: list[dict[str, Any]]
-) -> str:
-    """Create the template right after a recording is kept."""
-    existing = read(transaction_id, environment).get("data", {})
-    data: dict[str, Any] = {}
-    for meta in fields:
-        name = meta["field"]
-        previous = existing.get(name, {})
-        data[name] = {
-            "value": previous.get("value", ""),
-            "sensitive": bool(meta.get("sensitive")),
-            "datatype": meta.get("datatype"),
-            "required": bool(meta.get("required")),
-            "pattern": meta.get("pattern"),
-            "source": meta.get("source", "user"),
-        }
-    return write(transaction_id, environment, data)
+# ── source 6: AI (cosmetic fields only) ─────────────────────────────────
+def _from_ai(meta: dict[str, Any]) -> Optional[str]:
+    if not field_meta.ai_may_generate(meta):
+        return None
+    if not settings.llm_configured:
+        return None
+    from ..core.llm import complete
+    try:
+        value = complete(
+            "You generate a single cosmetic test value for a banking UI field. "
+            "Never invent identifiers that must validate against a core banking "
+            "system. Return the value only, no quotes, no explanation.",
+            f"Field: {meta['field']}\nMeaning: {meta.get('business_meaning')}\n"
+            f"Datatype: {meta.get('datatype')}\n"
+            f"Pattern: {meta.get('pattern')}",
+        ).strip().splitlines()[0][:120]
+        return value
+    except Exception as exc:
+        log.warning("AI data generation failed for %s: %s", meta["field"], exc)
+        return None
 
 
-# ── DB-backed values (sensitive ones encrypted) ─────────────────────────
-def save_values(
+# ── main resolver ───────────────────────────────────────────────────────
+def resolve(
     transaction_id: str,
     environment: str,
-    values: list[dict[str, Any]],
-    profile_pk: Optional[int] = None,
+    profile_name: str,
+    runtime_values: dict[str, str] | None = None,
+    strict: bool = True,
 ) -> dict[str, Any]:
-    box = get_secret_box()
-    file_data = read(transaction_id, environment).get("data", {})
-    saved = 0
-    for item in values:
-        field = item["field"]
-        raw = item.get("value", "")
-        sensitive = bool(item.get("sensitive"))
-        db.execute(
-            """
-            INSERT INTO test_data_values
-              (profile_pk, transaction_id, environment, field, value_plain,
-               value_encrypted, sensitive, source)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (profile_pk, transaction_id, environment, field)
-            DO UPDATE SET value_plain=EXCLUDED.value_plain,
-                          value_encrypted=EXCLUDED.value_encrypted,
-                          sensitive=EXCLUDED.sensitive,
-                          source=EXCLUDED.source,
-                          updated_at=now()
-            """,
-            (profile_pk, transaction_id, environment.upper(), field,
-             None if sensitive else raw,
-             box.encrypt(raw) if sensitive else None,
-             sensitive, item.get("source", "user")),
-        )
-        entry = file_data.get(field, {})
-        entry.update({
-            "value": "__ENCRYPTED__" if sensitive else raw,
-            "sensitive": sensitive,
-            "source": item.get("source", "user"),
-        })
-        file_data[field] = entry
-        saved += 1
-    path = write(transaction_id, environment, file_data)
-    return {"saved": saved, "file": path}
+    """Resolve every field of a transaction to a concrete value."""
+    runtime_values = runtime_values or {}
+    metas = templates.get_field_metadata(transaction_id)
+    profile = profiles.get_profile(profile_name)
+    profile_pk = int(profile["id"]) if profile else None
+    profile_vals = {k.lower(): v for k, v in (profiles.profile_values(profile_name)).items()}
+    saved = templates.resolve_values(transaction_id, environment, profile_pk)
+    framework_props = {k.lower(): v for k, v in _framework_properties().items()}
 
+    resolved: dict[str, str] = {}
+    provenance: dict[str, str] = {}
+    unresolved: list[str] = []
+    validation_errors: list[str] = []
 
-def resolve_values(
-    transaction_id: str, environment: str, profile_pk: Optional[int] = None
-) -> dict[str, str]:
-    """Return decrypted, ready-to-inject values."""
-    box = get_secret_box()
-    rows = db.query(
-        """
-        SELECT field, value_plain, value_encrypted, sensitive
-        FROM test_data_values
-        WHERE transaction_id=%s AND environment=%s
-          AND (profile_pk = %s OR profile_pk IS NULL)
-        ORDER BY (profile_pk IS NULL)
-        """,
-        (transaction_id, environment.upper(), profile_pk),
-    )
-    out: dict[str, str] = {}
-    for row in rows:
-        if row["field"] in out:
-            continue
-        out[row["field"]] = (
-            box.decrypt(row["value_encrypted"]) if row["sensitive"]
-            else (row["value_plain"] or "")
-        )
-    # fall back to plaintext entries in the JSON file
-    for field, entry in read(transaction_id, environment).get("data", {}).items():
-        if field not in out and entry.get("value") not in (None, "", "__ENCRYPTED__"):
-            out[field] = str(entry["value"])
-    return out
-
-
-def editor_view(
-    transaction_id: str, environment: str, profile_pk: Optional[int] = None
-) -> dict[str, Any]:
-    """What the frontend Test Data Editor renders (Section 7.8).
-
-    Scoped to the CURRENT version of the transaction only (same "active,
-    else most recently recorded" resolution used everywhere else via
-    repository.get_transaction()) — joining on transaction_id alone would
-    pull in one row per historical version (v1.0, v2.0, v3.0, ...) for any
-    field whose name/pattern hasn't changed across versions, which is
-    exactly why the editor was showing 2-3 identical-looking rows for what
-    is really a single field.
-    """
-    txn = repo.get_transaction(transaction_id)
-    if not txn:
-        return {
-            "transaction_id": transaction_id, "environment": environment.upper(),
-            "file": str(template_path(transaction_id, environment)), "fields": [],
-        }
-    metas = db.query(
-        "SELECT * FROM test_data_fields WHERE transaction_pk=%s ORDER BY id",
-        (txn["id"],),
-    )
-    values = resolve_values(transaction_id, environment, profile_pk)
-    fields = []
     for meta in metas:
-        raw = values.get(meta["field"], "")
-        fields.append({
-            "field": meta["field"],
-            "datatype": meta["datatype"],
-            "required": meta["required"],
-            "pattern": meta["pattern"],
-            "business_meaning": meta["business_meaning"],
-            "sensitive": meta["sensitive"],
-            "editable": meta["editable"],
-            "source": meta["source"],
-            "options": (meta.get("source_config") or {}).get("options"),
-            "value": mask_value(raw) if meta["sensitive"] else raw,
-            "has_value": bool(raw),
-        })
+        field = meta["field"]
+        key = field.lower()
+        value: Optional[str] = None
+        source: str = ""
+
+        # 3. runtime input wins when explicitly provided for this run
+        if field in runtime_values or key in runtime_values:
+            value = runtime_values.get(field) or runtime_values.get(key)
+            source = "runtime"
+
+        # 2. saved test-data / profile values
+        if value in (None, "") and saved.get(field):
+            value, source = saved[field], "profile"
+        if value in (None, "") and profile_vals.get(key):
+            value, source = profile_vals[key], "profile"
+
+        # 1. existing framework property files
+        if value in (None, "") and framework_props.get(key):
+            value, source = framework_props[key], "framework"
+
+        # Manual-recording value reuse — the value a human actually typed
+        # while recording this transaction (opt-in, non-sensitive fields
+        # only — see backend/recorder/injector.js's captureValues flag).
+        # Trusted MORE than a database/api lookup or AI-generation (a
+        # human really used this value successfully, once), but LESS
+        # than an explicit profile/runtime override — someone who went
+        # to the trouble of setting up a profile value clearly wants
+        # THAT one used, not whatever happened to be typed at record time.
+        if value in (None, "") and meta.get("recorded_value"):
+            value, source = meta["recorded_value"], "recorded"
+
+        config = meta.get("source_config") or {}
+        # 4. database
+        if value in (None, "") and meta.get("source") == "database":
+            value = _from_database(config.get("database") or config)
+            source = "database"
+        # 5. api
+        if value in (None, "") and meta.get("source") == "api":
+            value = _from_api(config.get("api") or config)
+            source = "api"
+        # 6. ai — cosmetic only
+        if value in (None, ""):
+            generated = _from_ai(meta)
+            if generated:
+                value, source = generated, "ai"
+
+        if value in (None, ""):
+            if meta.get("required"):
+                unresolved.append(field)
+            continue
+
+        ok, message = field_meta.validate(value, meta)
+        if not ok:
+            validation_errors.append(message)
+        resolved[field] = value
+        provenance[field] = source
+
+    if strict and unresolved:
+        raise UnresolvedFieldError(unresolved)
+
     return {
         "transaction_id": transaction_id,
         "environment": environment.upper(),
-        "file": str(template_path(transaction_id, environment)),
-        "fields": fields,
+        "profile": profile_name,
+        "values": resolved,
+        "provenance": provenance,
+        "unresolved": unresolved,
+        "validation_errors": validation_errors,
+        "sensitive_fields": [m["field"] for m in metas if m.get("sensitive")],
     }
 
 
-def save_field_metadata(transaction_pk: int, fields: list[dict[str, Any]]) -> int:
-    for meta in fields:
-        db.execute(
-            """
-            INSERT INTO test_data_fields
-              (transaction_pk, field, datatype, required, pattern,
-               business_meaning, sensitive, editable, source, source_config,
-               element_key, recorded_value)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s)
-            ON CONFLICT (transaction_pk, field) DO UPDATE SET
-              datatype=EXCLUDED.datatype, required=EXCLUDED.required,
-              pattern=EXCLUDED.pattern,
-              business_meaning=EXCLUDED.business_meaning,
-              sensitive=EXCLUDED.sensitive, editable=EXCLUDED.editable,
-              source=EXCLUDED.source, source_config=EXCLUDED.source_config,
-              element_key=EXCLUDED.element_key,
-              -- A NULL recorded_value here (this recording pass didn't
-              -- capture one — opted out, or the field is sensitive)
-              -- deliberately does NOT wipe out a PREVIOUSLY recorded
-              -- value from an earlier Keep of this same transaction —
-              -- COALESCE keeps whichever is non-null, preferring the
-              -- new one when this pass genuinely has one.
-              recorded_value=COALESCE(EXCLUDED.recorded_value, test_data_fields.recorded_value)
-            """,
-            (transaction_pk, meta["field"], meta.get("datatype"),
-             meta.get("required", False), meta.get("pattern"),
-             meta.get("business_meaning"), meta.get("sensitive", False),
-             meta.get("editable", True), meta.get("source", "user"),
-             db.jsonb(meta.get("source_config", {})), meta.get("element_key"),
-             meta.get("recorded_value")),
-        )
-    return len(fields)
+def write_runtime_file(resolution: dict[str, Any], target: Path | None = None) -> str:
+    """Write the resolved values to the file python-framework/utils/
+    test_data_reader.py reads.
 
-
-def set_field_requirement(
-    transaction_id: str, field: str, required: bool | None = None,
-    pattern: str | None = None,
-) -> dict[str, Any]:
-    """Part 15's "validation_change" patch — a BRD saying e.g. "PAN is
-    now mandatory" maps to exactly this: flip one field's `required` (or
-    tighten its `pattern`), surgically, via the SAME upsert
-    `save_field_metadata` already uses — not a full field-metadata
-    recompute (that would re-derive datatype/pattern from scratch from
-    the recorded element, discarding this deliberate, human-approved
-    override) and not a full re-recording.
+    It just reads `transaction_<id>.json` from the runtime directory — it
+    never learns where a value came from.
     """
-    txn = repo.get_transaction(transaction_id)
-    if not txn:
-        raise ValueError(f"Transaction {transaction_id} is not in the knowledge repository")
-    existing = {m["field"]: m for m in get_field_metadata(transaction_id)}
-    current = existing.get(field)
-    if not current:
-        raise ValueError(f"Field '{field}' is not known for transaction {transaction_id} "
-                          f"— it must already exist from a recording before it can be patched")
-    updated = dict(current)
-    if required is not None:
-        updated["required"] = required
-    if pattern is not None:
-        updated["pattern"] = pattern
-    save_field_metadata(int(txn["id"]), [updated])
-    log.info("Patched field requirement for %s.%s: required=%s pattern=%s",
-             transaction_id, field, required, pattern)
-    return {"transaction_id": transaction_id, "field": field, "updated": updated}
+    directory = target or (settings.framework_testdata_path / "_runtime")
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"transaction_{resolution['transaction_id']}.json"
+    payload = {
+        "transaction": resolution["transaction_id"],
+        "environment": resolution["environment"],
+        "data": {
+            field: {"value": value} for field, value in resolution["values"].items()
+        },
+    }
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return str(path)
 
 
-def get_field_metadata(transaction_id: str) -> list[dict[str, Any]]:
-    txn = repo.get_transaction(transaction_id)
-    if not txn:
+def required_runtime_prompts(transaction_id: str, environment: str,
+                             profile_name: str) -> list[dict[str, Any]]:
+    """Fields the UI must prompt for right before execution (Section 7.3.3)."""
+    try:
+        resolution = resolve(transaction_id, environment, profile_name, strict=False)
+    except Exception as exc:
+        log.warning("Resolution preview failed: %s", exc)
         return []
-    return db.query(
-        "SELECT * FROM test_data_fields WHERE transaction_pk=%s ORDER BY id",
-        (txn["id"],),
-    )
-
-
-def recompute_field_metadata(transaction_id: str) -> dict[str, Any]:
-    """Re-derive every field's datatype/pattern/business_meaning from the
-    ALREADY-RECORDED elements+actions, using the CURRENT field_meta.py
-    classification logic, and re-save it — without re-recording.
-
-    Field metadata is computed once, at recording time
-    (backend/agents/recorder_agent.py), and stored — so a later
-    improvement to field_meta.py's classification rules (e.g. teaching it
-    that "PasswordLocalOverrideOnly" is a config flag, not a real
-    password) has NO EFFECT on a transaction that was recorded before
-    that fix landed; execution keeps reading the old, stored
-    classification and keeps failing the same way. This re-runs that same
-    classification step against the transaction's existing recorded data
-    — the elements/actions are already sitting in the knowledge
-    repository — so applying a field_meta.py fix to it is a "recompute
-    and re-save", never a full re-recording.
-    """
-    from . import field_meta  # local import: avoids a set of import cycles
-
-    txn = repo.get_transaction(transaction_id)
-    if not txn:
-        raise ValueError(f"Transaction {transaction_id} is not in the knowledge repository")
-    transaction_pk = int(txn["id"])
-
-    elements_by_key = {e["element_key"]: e for e in repo.get_elements(transaction_pk)}
-    actions = repo.get_actions(transaction_pk)
-
-    fields: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for action in actions:
-        if action.get("action") not in ("type", "select", "upload"):
-            continue
-        name = action.get("value_ref") or action.get("field_name")
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        element = elements_by_key.get(action.get("element_key") or "", {})
-        fields.append(field_meta.build(
-            name, element.get("element_meta"), element_key=action.get("element_key")
-        ))
-
-    updated = save_field_metadata(transaction_pk, fields)
-    log.info("Recomputed field metadata for %s: %d field(s) updated", transaction_id, updated)
-    return {"transaction_id": transaction_id, "fields_updated": updated, "fields": fields}
+    metas = {m["field"]: m for m in templates.get_field_metadata(transaction_id)}
+    return [
+        {
+            "field": field,
+            "datatype": metas.get(field, {}).get("datatype"),
+            "pattern": metas.get(field, {}).get("pattern"),
+            "sensitive": metas.get(field, {}).get("sensitive", False),
+            "business_meaning": metas.get(field, {}).get("business_meaning"),
+        }
+        for field in resolution["unresolved"]
+    ]
