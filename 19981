@@ -1,185 +1,318 @@
-"""Field metadata inference (Section 7.2).
+"""Transaction Data Templates (Section 7.4).
 
-The recorder stores metadata about every input, never the raw value.
-Banking data is ALWAYS supplied by the SBI user — this module classifies
-fields so the platform knows what to ask for and how to validate it.
+test-data/<ENV>/transaction_<id>.json — one file per transaction per
+environment.  Feature files reference variables; only these files change
+when a value changes (Section 7.5).
 """
 from __future__ import annotations
 
-import re
+import json
+from pathlib import Path
 from typing import Any, Optional
 
-from ..core.security import is_sensitive
+from ..core import db
+from ..core.config import settings
+from ..core.logging_conf import get_logger
+from ..core.security import get_secret_box, mask_value
+from ..knowledge import repository as repo
 
-# datatype → (regex pattern, business meaning, sensitive, ai_generatable)
-DATATYPES: dict[str, tuple[str, str, bool, bool]] = {
-    "PAN":        (r"[A-Z]{5}[0-9]{4}[A-Z]", "Permanent Account Number", False, False),
-    "CIF":        (r"\d{11}", "Customer Information File number", True, False),
-    "ACCOUNT":    (r"\d{9,18}", "Bank account number", True, False),
-    "IFSC":       (r"[A-Z]{4}0[A-Z0-9]{6}", "IFSC code", False, False),
-    "AADHAAR":    (r"\d{12}", "Aadhaar number", True, False),
-    "MOBILE":     (r"[6-9]\d{9}", "Indian mobile number", False, False),
-    "EMAIL":      (r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}", "Email address", False, True),
-    "AMOUNT":     (r"\d+(\.\d{1,2})?", "Monetary amount", False, False),
-    "BRANCHCODE": (r"\d{4,5}", "Branch code", False, False),
-    "TELLERID":   (r"[A-Za-z0-9]{4,12}", "Teller / maker user id", True, False),
-    "CHECKERID":  (r"[A-Za-z0-9]{4,12}", "Checker user id", True, False),
-    "PASSWORD":   (r".{6,}", "Login password", True, False),
-    "DATE":       (r"\d{2}[-/]\d{2}[-/]\d{4}", "Date value", False, False),
-    "CURRENCY":   (r"[A-Z]{3}", "Currency code", False, False),
-    "NAME":       (r"[A-Za-z .'-]{2,}", "Customer / person name", False, False),
-    "TEXT":       (r".*", "Free text", False, False),
-    "REMARKS":    (r".*", "Cosmetic remarks / narration", False, True),
-}
+log = get_logger(__name__)
 
-_HINTS: list[tuple[re.Pattern[str], str]] = [
-    # Must come before every specific-datatype hint below — a field name
-    # ENDING in "Only"/"Flag"/"Indicator" is almost always a configuration
-    # toggle (e.g. "PasswordLocalOverrideOnly" is a Y/N setting about WHEN
-    # a password override applies, not a password value itself; likewise
-    # "AccountLockFlag", "AmountCapIndicator"), even though it may contain
-    # an unrelated datatype keyword like "password"/"account"/"amount" as
-    # a substring earlier in the name. Force these through the permissive
-    # TEXT pattern instead of whatever specific, over-strict pattern the
-    # embedded keyword would otherwise trigger — a real toggle value
-    # ("Y"/"N", "true"/"false", "1"/"0") would fail almost any of the
-    # specific datatype patterns (e.g. PASSWORD's `.{6,}` minimum length).
-    (re.compile(r"(only|flag|indicator)\s*$", re.I), "TEXT"),
-    (re.compile(r"\bpan\b", re.I), "PAN"),
-    (re.compile(r"\bcif\b|customer\s*info", re.I), "CIF"),
-    (re.compile(r"account\s*(no|num|number)|\bacct\b", re.I), "ACCOUNT"),
-    (re.compile(r"\bifsc\b", re.I), "IFSC"),
-    (re.compile(r"aadha?ar|uid", re.I), "AADHAAR"),
-    (re.compile(r"mobile|phone|contact\s*no", re.I), "MOBILE"),
-    (re.compile(r"e-?mail", re.I), "EMAIL"),
-    (re.compile(r"amount|amt|deposit|withdraw|balance|principal", re.I), "AMOUNT"),
-    (re.compile(r"branch\s*code|\bsol\b", re.I), "BRANCHCODE"),
-    (re.compile(r"teller|maker", re.I), "TELLERID"),
-    # Must come before the generic "name" hint below — a login/user-ID
-    # field's HTML `name`/`id` attribute very commonly looks like
-    # "userName"/"userId"/"loginId" (a routine naming convention, not a
-    # person's name), and that attribute value feeds straight into the
-    # haystack infer_datatype() searches. Without this, such a field gets
-    # misclassified as NAME (letters/spaces/dots/hyphens only), and any
-    # real alphanumeric SBI user id then fails validation against that
-    # letters-only pattern before it ever reaches the browser.
-    (re.compile(r"user\s*-?\s*(id|name)|login\s*-?\s*(id|name)", re.I), "TELLERID"),
-    (re.compile(r"checker|approver|supervisor", re.I), "CHECKERID"),
-    (re.compile(r"pass\s*word|\bpwd\b|\bpin\b", re.I), "PASSWORD"),
-    (re.compile(r"date|dob|\bdt\b", re.I), "DATE"),
-    (re.compile(r"currency|\bccy\b", re.I), "CURRENCY"),
-    (re.compile(r"remark|narration|comment|description", re.I), "REMARKS"),
-    # Must come before the generic "name" hint below — navigation/search
-    # fields like "Enter screen number or part of screen name" contain the
-    # substring "name" but hold a transaction number or partial screen
-    # title, not a person's name, and must not be forced through the
-    # letters-only NAME pattern.
-    (re.compile(r"screen\s*(no|number|name)|search\s*(box|field|transaction)",
-                re.I), "TEXT"),
-    (re.compile(r"name", re.I), "NAME"),
-]
-
-# Which sources are allowed to supply which datatype (Section 7.1)
-USER_ONLY = {
-    "PAN", "CIF", "ACCOUNT", "IFSC", "AADHAAR", "BRANCHCODE",
-    "TELLERID", "CHECKERID", "PASSWORD", "AMOUNT", "MOBILE",
-    "NAME", "DATE", "CURRENCY", "TEXT", "EMAIL",
-}
-# Section 7.1: AI may generate ONLY cosmetic, non-validated filler.
-AI_ALLOWED = {"REMARKS"}
+ENVIRONMENTS = ("PREPROD", "UAT", "PROD")
 
 
-def infer_datatype(field_name: str, element_meta: dict[str, Any] | None = None) -> str:
-    haystack = " ".join(
-        str(x) for x in [
-            field_name,
-            (element_meta or {}).get("label"),
-            ((element_meta or {}).get("attributes") or {}).get("name"),
-            ((element_meta or {}).get("attributes") or {}).get("id"),
-            ((element_meta or {}).get("attributes") or {}).get("placeholder"),
-        ] if x
-    )
-    for pattern, datatype in _HINTS:
-        if pattern.search(haystack):
-            return datatype
-    element_type = (element_meta or {}).get("element_type") or ""
-    if element_type == "password":
-        return "PASSWORD"
-    if element_type == "calendar":
-        return "DATE"
-    return "TEXT"
+def template_path(transaction_id: str, environment: str) -> Path:
+    directory = settings.framework_testdata_path / environment.upper()
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"transaction_{transaction_id}.json"
 
 
-def build(
-    field_name: str,
-    element_meta: dict[str, Any] | None = None,
-    required: Optional[bool] = None,
-    element_key: str | None = None,
-    recorded_value: str | None = None,
-    allow_sensitive_recorded_value: bool = False,
+def read(transaction_id: str, environment: str) -> dict[str, Any]:
+    path = template_path(transaction_id, environment)
+    if not path.exists():
+        return {"transaction": transaction_id, "environment": environment.upper(),
+                "data": {}}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        log.error("Corrupt test-data file %s: %s", path, exc)
+        return {"transaction": transaction_id, "environment": environment.upper(),
+                "data": {}}
+
+
+def write(transaction_id: str, environment: str, data: dict[str, Any]) -> str:
+    """Persist the template.  Sensitive values are NOT written in plaintext —
+    the file carries a placeholder and the real value lives encrypted in
+    Postgres (`test_data_values`)."""
+    path = template_path(transaction_id, environment)
+    payload = {
+        "transaction": transaction_id,
+        "environment": environment.upper(),
+        "data": data,
+    }
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    log.info("Test-data template written: %s", path)
+    return str(path)
+
+
+def scaffold_from_fields(
+    transaction_id: str, environment: str, fields: list[dict[str, Any]]
+) -> str:
+    """Create the template right after a recording is kept."""
+    existing = read(transaction_id, environment).get("data", {})
+    data: dict[str, Any] = {}
+    for meta in fields:
+        name = meta["field"]
+        previous = existing.get(name, {})
+        data[name] = {
+            "value": previous.get("value", ""),
+            "sensitive": bool(meta.get("sensitive")),
+            "datatype": meta.get("datatype"),
+            "required": bool(meta.get("required")),
+            "pattern": meta.get("pattern"),
+            "source": meta.get("source", "user"),
+        }
+    return write(transaction_id, environment, data)
+
+
+# ── DB-backed values (sensitive ones encrypted) ─────────────────────────
+def save_values(
+    transaction_id: str,
+    environment: str,
+    values: list[dict[str, Any]],
+    profile_pk: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Produce the Section 7.2 metadata block for one field."""
-    meta = element_meta or {}
-    datatype = infer_datatype(field_name, meta)
-    pattern, meaning, sensitive_default, ai_ok = DATATYPES.get(
-        datatype, DATATYPES["TEXT"]
+    box = get_secret_box()
+    file_data = read(transaction_id, environment).get("data", {})
+    saved = 0
+    for item in values:
+        field = item["field"]
+        raw = item.get("value", "")
+        sensitive = bool(item.get("sensitive"))
+        db.execute(
+            """
+            INSERT INTO test_data_values
+              (profile_pk, transaction_id, environment, field, value_plain,
+               value_encrypted, sensitive, source)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (profile_pk, transaction_id, environment, field)
+            DO UPDATE SET value_plain=EXCLUDED.value_plain,
+                          value_encrypted=EXCLUDED.value_encrypted,
+                          sensitive=EXCLUDED.sensitive,
+                          source=EXCLUDED.source,
+                          updated_at=now()
+            """,
+            (profile_pk, transaction_id, environment.upper(), field,
+             None if sensitive else raw,
+             box.encrypt(raw) if sensitive else None,
+             sensitive, item.get("source", "user")),
+        )
+        entry = file_data.get(field, {})
+        entry.update({
+            "value": "__ENCRYPTED__" if sensitive else raw,
+            "sensitive": sensitive,
+            "source": item.get("source", "user"),
+        })
+        file_data[field] = entry
+        saved += 1
+    path = write(transaction_id, environment, file_data)
+    return {"saved": saved, "file": path}
+
+
+def resolve_values(
+    transaction_id: str, environment: str, profile_pk: Optional[int] = None
+) -> dict[str, str]:
+    """Return decrypted, ready-to-inject values."""
+    box = get_secret_box()
+    rows = db.query(
+        """
+        SELECT field, value_plain, value_encrypted, sensitive
+        FROM test_data_values
+        WHERE transaction_id=%s AND environment=%s
+          AND (profile_pk = %s OR profile_pk IS NULL)
+        ORDER BY (profile_pk IS NULL)
+        """,
+        (transaction_id, environment.upper(), profile_pk),
     )
-    element_pattern = meta.get("pattern") or (meta.get("attributes") or {}).get("pattern")
-    sensitive = sensitive_default or is_sensitive(field_name)
+    out: dict[str, str] = {}
+    for row in rows:
+        if row["field"] in out:
+            continue
+        out[row["field"]] = (
+            box.decrypt(row["value_encrypted"]) if row["sensitive"]
+            else (row["value_plain"] or "")
+        )
+    # fall back to plaintext entries in the JSON file
+    for field, entry in read(transaction_id, environment).get("data", {}).items():
+        if field not in out and entry.get("value") not in (None, "", "__ENCRYPTED__"):
+            out[field] = str(entry["value"])
+    return out
+
+
+def editor_view(
+    transaction_id: str, environment: str, profile_pk: Optional[int] = None
+) -> dict[str, Any]:
+    """What the frontend Test Data Editor renders (Section 7.8).
+
+    Scoped to the CURRENT version of the transaction only (same "active,
+    else most recently recorded" resolution used everywhere else via
+    repository.get_transaction()) — joining on transaction_id alone would
+    pull in one row per historical version (v1.0, v2.0, v3.0, ...) for any
+    field whose name/pattern hasn't changed across versions, which is
+    exactly why the editor was showing 2-3 identical-looking rows for what
+    is really a single field.
+    """
+    txn = repo.get_transaction(transaction_id)
+    if not txn:
+        return {
+            "transaction_id": transaction_id, "environment": environment.upper(),
+            "file": str(template_path(transaction_id, environment)), "fields": [],
+        }
+    metas = db.query(
+        "SELECT * FROM test_data_fields WHERE transaction_pk=%s ORDER BY id",
+        (txn["id"],),
+    )
+    values = resolve_values(transaction_id, environment, profile_pk)
+    fields = []
+    for meta in metas:
+        raw = values.get(meta["field"], "")
+        fields.append({
+            "field": meta["field"],
+            "datatype": meta["datatype"],
+            "required": meta["required"],
+            "pattern": meta["pattern"],
+            "business_meaning": meta["business_meaning"],
+            "sensitive": meta["sensitive"],
+            "editable": meta["editable"],
+            "source": meta["source"],
+            "options": (meta.get("source_config") or {}).get("options"),
+            "value": mask_value(raw) if meta["sensitive"] else raw,
+            "has_value": bool(raw),
+        })
     return {
-        "field": field_name,
-        "datatype": datatype,
-        "required": bool(
-            required if required is not None
-            else meta.get("required") or (meta.get("attributes") or {}).get("required")
-        ),
-        "pattern": element_pattern or pattern,
-        "business_meaning": meaning,
-        "sensitive": bool(sensitive),
-        "editable": not bool(meta.get("readonly")),
-        "source": "ai" if datatype in AI_ALLOWED else "user",
-        "source_config": {
-            "ai_generatable": datatype in AI_ALLOWED,
-            "user_only": datatype in USER_ONLY,
-            "max_length": meta.get("maxlength"),
-            "options": (meta.get("options") or None),
-        },
-        "element_key": element_key,
-        # A sensitive field only ever gets its recorded_value stored when
-        # the recording session ITSELF explicitly opted into
-        # `capture_sensitive_values` — a deliberate, informed, per-
-        # session choice (e.g. a UAT environment that only ever uses
-        # dummy/test credentials, never real ones), never the default.
-        "recorded_value": (
-            recorded_value if (not sensitive or allow_sensitive_recorded_value) else None
-        ),
+        "transaction_id": transaction_id,
+        "environment": environment.upper(),
+        "file": str(template_path(transaction_id, environment)),
+        "fields": fields,
     }
 
 
-def validate(value: str, meta: dict[str, Any]) -> tuple[bool, str]:
-    """Check a user-supplied value against the field's pattern."""
-    if meta.get("required") and not (value or "").strip():
-        return False, f"{meta['field']} is mandatory"
-    if not value:
-        return True, ""
-    pattern = meta.get("pattern")
-    if pattern:
-        try:
-            if not re.fullmatch(pattern, value):
-                return False, (
-                    f"{meta['field']} does not match expected format for "
-                    f"{meta.get('datatype')} ({pattern})"
-                )
-        except re.error:
-            return True, ""
-    max_length = (meta.get("source_config") or {}).get("max_length")
-    if max_length and len(value) > int(max_length):
-        return False, f"{meta['field']} exceeds max length {max_length}"
-    return True, ""
+def save_field_metadata(transaction_pk: int, fields: list[dict[str, Any]]) -> int:
+    for meta in fields:
+        db.execute(
+            """
+            INSERT INTO test_data_fields
+              (transaction_pk, field, datatype, required, pattern,
+               business_meaning, sensitive, editable, source, source_config,
+               element_key, recorded_value)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s)
+            ON CONFLICT (transaction_pk, field) DO UPDATE SET
+              datatype=EXCLUDED.datatype, required=EXCLUDED.required,
+              pattern=EXCLUDED.pattern,
+              business_meaning=EXCLUDED.business_meaning,
+              sensitive=EXCLUDED.sensitive, editable=EXCLUDED.editable,
+              source=EXCLUDED.source, source_config=EXCLUDED.source_config,
+              element_key=EXCLUDED.element_key,
+              -- A NULL recorded_value here (this recording pass didn't
+              -- capture one — opted out, or the field is sensitive)
+              -- deliberately does NOT wipe out a PREVIOUSLY recorded
+              -- value from an earlier Keep of this same transaction —
+              -- COALESCE keeps whichever is non-null, preferring the
+              -- new one when this pass genuinely has one.
+              recorded_value=COALESCE(EXCLUDED.recorded_value, test_data_fields.recorded_value)
+            """,
+            (transaction_pk, meta["field"], meta.get("datatype"),
+             meta.get("required", False), meta.get("pattern"),
+             meta.get("business_meaning"), meta.get("sensitive", False),
+             meta.get("editable", True), meta.get("source", "user"),
+             db.jsonb(meta.get("source_config", {})), meta.get("element_key"),
+             meta.get("recorded_value")),
+        )
+    return len(fields)
 
 
-def ai_may_generate(meta: dict[str, Any]) -> bool:
-    """Section 7.1 — AI generates only cosmetic, non-validated fields."""
-    return bool((meta.get("source_config") or {}).get("ai_generatable")) and not meta.get(
-        "sensitive"
+def set_field_requirement(
+    transaction_id: str, field: str, required: bool | None = None,
+    pattern: str | None = None,
+) -> dict[str, Any]:
+    """Part 15's "validation_change" patch — a BRD saying e.g. "PAN is
+    now mandatory" maps to exactly this: flip one field's `required` (or
+    tighten its `pattern`), surgically, via the SAME upsert
+    `save_field_metadata` already uses — not a full field-metadata
+    recompute (that would re-derive datatype/pattern from scratch from
+    the recorded element, discarding this deliberate, human-approved
+    override) and not a full re-recording.
+    """
+    txn = repo.get_transaction(transaction_id)
+    if not txn:
+        raise ValueError(f"Transaction {transaction_id} is not in the knowledge repository")
+    existing = {m["field"]: m for m in get_field_metadata(transaction_id)}
+    current = existing.get(field)
+    if not current:
+        raise ValueError(f"Field '{field}' is not known for transaction {transaction_id} "
+                          f"— it must already exist from a recording before it can be patched")
+    updated = dict(current)
+    if required is not None:
+        updated["required"] = required
+    if pattern is not None:
+        updated["pattern"] = pattern
+    save_field_metadata(int(txn["id"]), [updated])
+    log.info("Patched field requirement for %s.%s: required=%s pattern=%s",
+             transaction_id, field, required, pattern)
+    return {"transaction_id": transaction_id, "field": field, "updated": updated}
+
+
+def get_field_metadata(transaction_id: str) -> list[dict[str, Any]]:
+    txn = repo.get_transaction(transaction_id)
+    if not txn:
+        return []
+    return db.query(
+        "SELECT * FROM test_data_fields WHERE transaction_pk=%s ORDER BY id",
+        (txn["id"],),
     )
+
+
+def recompute_field_metadata(transaction_id: str) -> dict[str, Any]:
+    """Re-derive every field's datatype/pattern/business_meaning from the
+    ALREADY-RECORDED elements+actions, using the CURRENT field_meta.py
+    classification logic, and re-save it — without re-recording.
+
+    Field metadata is computed once, at recording time
+    (backend/agents/recorder_agent.py), and stored — so a later
+    improvement to field_meta.py's classification rules (e.g. teaching it
+    that "PasswordLocalOverrideOnly" is a config flag, not a real
+    password) has NO EFFECT on a transaction that was recorded before
+    that fix landed; execution keeps reading the old, stored
+    classification and keeps failing the same way. This re-runs that same
+    classification step against the transaction's existing recorded data
+    — the elements/actions are already sitting in the knowledge
+    repository — so applying a field_meta.py fix to it is a "recompute
+    and re-save", never a full re-recording.
+    """
+    from . import field_meta  # local import: avoids a set of import cycles
+
+    txn = repo.get_transaction(transaction_id)
+    if not txn:
+        raise ValueError(f"Transaction {transaction_id} is not in the knowledge repository")
+    transaction_pk = int(txn["id"])
+
+    elements_by_key = {e["element_key"]: e for e in repo.get_elements(transaction_pk)}
+    actions = repo.get_actions(transaction_pk)
+
+    fields: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for action in actions:
+        if action.get("action") not in ("type", "select", "upload"):
+            continue
+        name = action.get("value_ref") or action.get("field_name")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        element = elements_by_key.get(action.get("element_key") or "", {})
+        fields.append(field_meta.build(
+            name, element.get("element_meta"), element_key=action.get("element_key")
+        ))
+
+    updated = save_field_metadata(transaction_pk, fields)
+    log.info("Recomputed field metadata for %s: %d field(s) updated", transaction_id, updated)
+    return {"transaction_id": transaction_id, "fields_updated": updated, "fields": fields}
