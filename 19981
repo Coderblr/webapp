@@ -1,261 +1,256 @@
-"""AI Data Resolver (Section 7.7).
-
-At execution time each required field is resolved to its best source, in
-the priority order of Section 7.3:
-
-  1. existing framework data (*.properties)
-  2. user-provided static / profile data
-  3. runtime user input
-  4. database query
-  5. API data
-  6. AI-generated data — cosmetic, non-validated fields ONLY
-
-python-framework never needs to know where a value came from.
-"""
+"""Pydantic contracts shared by the API layer and the agents."""
 from __future__ import annotations
 
-import json
-from pathlib import Path
-from typing import Any, Optional
+from datetime import datetime
+from typing import Any, Literal, Optional
 
-from ..core import db
-from ..core.config import settings
-from ..core.logging_conf import get_logger
-from ..framework_index import text_formats
-from . import field_meta, profiles, templates
+from pydantic import BaseModel, Field
 
-log = get_logger(__name__)
-
-SOURCE_ORDER = ("framework", "profile", "runtime", "database", "api", "ai")
+Environment = Literal["PREPROD", "UAT", "PROD"]
+TransactionType = Literal["business", "system_prerequisite", "system_cleanup"]
+DataSource = Literal["framework", "profile", "runtime", "database", "api", "ai", "user"]
 
 
-class UnresolvedFieldError(RuntimeError):
-    def __init__(self, fields: list[str]) -> None:
-        super().__init__(
-            "The following fields must be supplied by the user before this "
-            "transaction can run: " + ", ".join(fields)
-        )
-        self.fields = fields
+# ── recorder ────────────────────────────────────────────────────────────
+class RecordingStartRequest(BaseModel):
+    transaction_id: str = Field(..., examples=["1045"])
+    transaction_name: str = Field(..., examples=["CIF Creation"])
+    environment: Environment = "PREPROD"
+    start_url: str
+    transaction_type: TransactionType = "business"
+    description: Optional[str] = None
+    fullpage_crawl: bool = True
+    capture_network: bool = True
+    capture_recorded_values: bool = False
+    capture_sensitive_values: bool = False
 
 
-# ── source 1: framework property files ──────────────────────────────────
-def _framework_properties() -> dict[str, str]:
-    merged: dict[str, str] = {}
-    root = settings.framework_root_path
-    for path in root.rglob("*.properties"):
-        try:
-            merged.update(text_formats.parse_properties_file(path))
-        except Exception:
-            continue
-    return merged
+class RecordingSession(BaseModel):
+    session_uid: str
+    transaction_id: str
+    transaction_name: Optional[str] = None
+    environment: Optional[str] = None
+    status: str
+    start_url: Optional[str] = None
+    capture_dir: Optional[str] = None
+    stats: dict[str, Any] = {}
+    started_at: Optional[datetime] = None
+    stopped_at: Optional[datetime] = None
 
 
-# ── source 4: database query ────────────────────────────────────────────
-def _from_database(config: dict[str, Any]) -> Optional[str]:
-    """config = {"sql": "SELECT cif FROM ... LIMIT 1", "column": "cif"}"""
-    sql = config.get("sql")
-    if not sql:
-        return None
-    try:
-        row = db.query_one(sql)
-    except Exception as exc:
-        log.warning("Test-data SQL failed: %s", exc)
-        return None
-    if not row:
-        return None
-    column = config.get("column")
-    return str(row.get(column) if column else list(row.values())[0])
+class RecordedActionOut(BaseModel):
+    sequence: int
+    action: str
+    element_key: Optional[str] = None
+    field_name: Optional[str] = None
+    value_ref: Optional[str] = None
+    page_key: Optional[str] = None
+    screenshot_after: Optional[str] = None
 
 
-# ── source 5: API ───────────────────────────────────────────────────────
-def _from_api(config: dict[str, Any]) -> Optional[str]:
-    url = config.get("url")
-    if not url:
-        return None
-    try:
-        import httpx
-        response = httpx.request(
-            config.get("method", "GET"), url,
-            headers=config.get("headers") or {},
-            json=config.get("body"),
-            timeout=config.get("timeout", 20),
-        )
-        response.raise_for_status()
-        payload = response.json()
-    except Exception as exc:
-        log.warning("Test-data API call failed for %s: %s", url, exc)
-        return None
-    pointer = config.get("json_path")
-    if not pointer:
-        return str(payload)
-    current: Any = payload
-    for part in str(pointer).split("."):
-        if isinstance(current, list):
-            try:
-                current = current[int(part)]
-            except Exception:
-                return None
-        elif isinstance(current, dict):
-            current = current.get(part)
-        else:
-            return None
-    return None if current is None else str(current)
+class KeepDiscardRequest(BaseModel):
+    session_uid: str
+    decision: Literal["keep", "discard"]
+    reason: Optional[str] = None
+    generate_code: bool = True
 
 
-# ── source 6: AI (cosmetic fields only) ─────────────────────────────────
-def _from_ai(meta: dict[str, Any]) -> Optional[str]:
-    if not field_meta.ai_may_generate(meta):
-        return None
-    if not settings.llm_configured:
-        return None
-    from ..core.llm import complete
-    try:
-        value = complete(
-            "You generate a single cosmetic test value for a banking UI field. "
-            "Never invent identifiers that must validate against a core banking "
-            "system. Return the value only, no quotes, no explanation.",
-            f"Field: {meta['field']}\nMeaning: {meta.get('business_meaning')}\n"
-            f"Datatype: {meta.get('datatype')}\n"
-            f"Pattern: {meta.get('pattern')}",
-        ).strip().splitlines()[0][:120]
-        return value
-    except Exception as exc:
-        log.warning("AI data generation failed for %s: %s", meta["field"], exc)
-        return None
+# ── transactions / knowledge ────────────────────────────────────────────
+class TransactionOut(BaseModel):
+    id: int
+    transaction_id: str
+    name: str
+    description: Optional[str] = None
+    version: str
+    type: str
+    status: str
+    confidence: float = 1.0
+    tags: list[str] = []
+    workflow_path: list[Any] = []
+    generated_files: dict[str, Any] = {}
+    recorded_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
 
 
-# ── main resolver ───────────────────────────────────────────────────────
-def resolve(
-    transaction_id: str,
-    environment: str,
-    profile_name: str,
-    runtime_values: dict[str, str] | None = None,
-    strict: bool = True,
-) -> dict[str, Any]:
-    """Resolve every field of a transaction to a concrete value."""
-    runtime_values = runtime_values or {}
-    metas = templates.get_field_metadata(transaction_id)
-    profile = profiles.get_profile(profile_name)
-    profile_pk = int(profile["id"]) if profile else None
-    profile_vals = {k.lower(): v for k, v in (profiles.profile_values(profile_name)).items()}
-    saved = templates.resolve_values(transaction_id, environment, profile_pk)
-    framework_props = {k.lower(): v for k, v in _framework_properties().items()}
-
-    resolved: dict[str, str] = {}
-    provenance: dict[str, str] = {}
-    unresolved: list[str] = []
-    validation_errors: list[str] = []
-
-    for meta in metas:
-        field = meta["field"]
-        key = field.lower()
-        value: Optional[str] = None
-        source: str = ""
-
-        # 3. runtime input wins when explicitly provided for this run
-        if field in runtime_values or key in runtime_values:
-            value = runtime_values.get(field) or runtime_values.get(key)
-            source = "runtime"
-
-        # 2. saved test-data / profile values
-        if value in (None, "") and saved.get(field):
-            value, source = saved[field], "profile"
-        if value in (None, "") and profile_vals.get(key):
-            value, source = profile_vals[key], "profile"
-
-        # 1. existing framework property files
-        if value in (None, "") and framework_props.get(key):
-            value, source = framework_props[key], "framework"
-
-        # Manual-recording value reuse — the value a human actually typed
-        # while recording this transaction (opt-in, non-sensitive fields
-        # only — see backend/recorder/injector.js's captureValues flag).
-        # Trusted MORE than a database/api lookup or AI-generation (a
-        # human really used this value successfully, once), but LESS
-        # than an explicit profile/runtime override — someone who went
-        # to the trouble of setting up a profile value clearly wants
-        # THAT one used, not whatever happened to be typed at record time.
-        if value in (None, "") and meta.get("recorded_value"):
-            value, source = meta["recorded_value"], "recorded"
-
-        config = meta.get("source_config") or {}
-        # 4. database
-        if value in (None, "") and meta.get("source") == "database":
-            value = _from_database(config.get("database") or config)
-            source = "database"
-        # 5. api
-        if value in (None, "") and meta.get("source") == "api":
-            value = _from_api(config.get("api") or config)
-            source = "api"
-        # 6. ai — cosmetic only
-        if value in (None, ""):
-            generated = _from_ai(meta)
-            if generated:
-                value, source = generated, "ai"
-
-        if value in (None, ""):
-            if meta.get("required"):
-                unresolved.append(field)
-            continue
-
-        ok, message = field_meta.validate(value, meta)
-        if not ok:
-            validation_errors.append(message)
-        resolved[field] = value
-        provenance[field] = source
-
-    if strict and unresolved:
-        raise UnresolvedFieldError(unresolved)
-
-    return {
-        "transaction_id": transaction_id,
-        "environment": environment.upper(),
-        "profile": profile_name,
-        "values": resolved,
-        "provenance": provenance,
-        "unresolved": unresolved,
-        "validation_errors": validation_errors,
-        "sensitive_fields": [m["field"] for m in metas if m.get("sensitive")],
-    }
+class ElementOut(BaseModel):
+    element_key: str
+    tag: Optional[str] = None
+    element_type: Optional[str] = None
+    label: Optional[str] = None
+    visible: bool = True
+    enabled: bool = True
+    interacted: bool = False
+    locators: list[dict[str, Any]] = []
 
 
-def write_runtime_file(resolution: dict[str, Any], target: Path | None = None) -> str:
-    """Write the resolved values to the file python-framework/utils/
-    test_data_reader.py reads.
-
-    It just reads `transaction_<id>.json` from the runtime directory — it
-    never learns where a value came from.
-    """
-    directory = target or (settings.framework_testdata_path / "_runtime")
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"transaction_{resolution['transaction_id']}.json"
-    payload = {
-        "transaction": resolution["transaction_id"],
-        "environment": resolution["environment"],
-        "data": {
-            field: {"value": value} for field, value in resolution["values"].items()
-        },
-    }
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    return str(path)
+# ── test data ───────────────────────────────────────────────────────────
+class TestDataFieldMeta(BaseModel):
+    field: str
+    datatype: Optional[str] = None
+    required: bool = False
+    pattern: Optional[str] = None
+    business_meaning: Optional[str] = None
+    sensitive: bool = False
+    editable: bool = True
+    source: DataSource = "user"
+    source_config: dict[str, Any] = {}
+    element_key: Optional[str] = None
 
 
-def required_runtime_prompts(transaction_id: str, environment: str,
-                             profile_name: str) -> list[dict[str, Any]]:
-    """Fields the UI must prompt for right before execution (Section 7.3.3)."""
-    try:
-        resolution = resolve(transaction_id, environment, profile_name, strict=False)
-    except Exception as exc:
-        log.warning("Resolution preview failed: %s", exc)
-        return []
-    metas = {m["field"]: m for m in templates.get_field_metadata(transaction_id)}
-    return [
-        {
-            "field": field,
-            "datatype": metas.get(field, {}).get("datatype"),
-            "pattern": metas.get(field, {}).get("pattern"),
-            "sensitive": metas.get(field, {}).get("sensitive", False),
-            "business_meaning": metas.get(field, {}).get("business_meaning"),
-        }
-        for field in resolution["unresolved"]
+class TestDataValueIn(BaseModel):
+    field: str
+    value: str
+    sensitive: bool = False
+    source: DataSource = "user"
+
+
+class TestDataSaveRequest(BaseModel):
+    transaction_id: str
+    environment: Environment
+    profile: Optional[str] = None
+    values: list[TestDataValueIn]
+
+
+class TestDataTemplateOut(BaseModel):
+    transaction: str
+    environment: str
+    data: dict[str, dict[str, Any]]
+    file_path: Optional[str] = None
+
+
+class ManualLocatorRequest(BaseModel):
+    strategy: str            # id | name | css | xpath | data | aria | text ...
+    value: str
+    priority: int = 1        # 1 = tried first, ahead of the recorder's own locators
+    # Only used if the element doesn't exist yet (recorder never captured it):
+    tag: str = "input"
+    element_type: str = "textbox"
+    label: str | None = None
+    page_key: str | None = None
+    action: str | None = None   # click | type | select ... defaults from element_type
+    insert_after_index: int | None = None  # splice into the sequence instead of appending
+
+
+class ProfileIn(BaseModel):
+    name: str
+    environment: Environment
+    description: Optional[str] = None
+    values: dict[str, str] = {}
+    secrets: dict[str, str] = {}   # teller_id, teller_password, checker_id, ...
+
+
+class ProfileOut(BaseModel):
+    id: int
+    name: str
+    environment: str
+    description: Optional[str] = None
+    values: dict[str, Any] = {}
+    secret_keys: list[str] = []    # names only, never values
+
+
+# ── execution ───────────────────────────────────────────────────────────
+class ExecutionRequest(BaseModel):
+    transaction_id: str
+    environment: Environment = "PREPROD"
+    profile: str
+    target_url: Optional[str] = None
+    runtime_values: dict[str, str] = {}
+    skip_password_change: bool = False    # audit-logged override
+    skip_teller_reset: bool = False       # audit-logged override
+    headless: bool = False
+
+
+class ExecutionStepOut(BaseModel):
+    sequence: int
+    phase: str
+    step_name: str
+    status: str
+    duration_ms: Optional[int] = None
+    screenshot_ref: Optional[str] = None
+    error_msg: Optional[str] = None
+    detail: dict[str, Any] = {}
+
+
+class ExecutionOut(BaseModel):
+    execution_uid: str
+    transaction_id: str
+    environment: str
+    status: str
+    password_change_status: Optional[str] = None
+    teller_reset_status: Optional[str] = None
+    teller_reset_response: Optional[str] = None
+    report_path: Optional[str] = None
+    error_summary: Optional[str] = None
+    metrics: dict[str, Any] = {}
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    steps: list[ExecutionStepOut] = []
+
+
+# ── BRD ─────────────────────────────────────────────────────────────────
+class BRDImpact(BaseModel):
+    transaction_id: str
+    transaction_name: Optional[str] = None
+    change_type: Literal[
+        "new_transaction", "workflow_change", "field_change",
+        "validation_change", "locator_change", "no_change"
     ]
+    affected_screens: list[str] = []
+    affected_fields: list[str] = []
+    requires_recording: bool = False
+    risk: Literal["low", "medium", "high"] = "medium"
+    rationale: str = ""
+    proposed_changes: list[str] = []
+
+
+class BRDAnalysisOut(BaseModel):
+    brd_id: int
+    filename: str
+    status: str
+    summary: str = ""
+    impacts: list[BRDImpact] = []
+
+
+# ── approvals / self-heal ───────────────────────────────────────────────
+class ApprovalDecision(BaseModel):
+    thread_id: str
+    approval_type: Literal["recording_keep", "codegen", "self_heal"]
+    decision: Literal["approved", "rejected", "discarded"]
+    decided_by: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class SelfHealEntry(BaseModel):
+    element_key: str
+    old_locator: str
+    new_locator: str
+    strategy: str
+    confidence: float
+    reason: str
+    applied: bool = False
+
+
+# ── secrets ─────────────────────────────────────────────────────────────
+class SecretIn(BaseModel):
+    scope: Literal["global", "profile", "environment"] = "profile"
+    scope_ref: Optional[str] = None
+    key: Literal[
+        "teller_id", "teller_password", "teller_new_password",
+        "checker_id", "checker_password", "cbs_reset_string",
+    ]
+    value: str
+
+
+class SecretOut(BaseModel):
+    scope: str
+    scope_ref: Optional[str] = None
+    key: str
+    hint: str
+    updated_at: Optional[datetime] = None
+
+
+# ── generic ─────────────────────────────────────────────────────────────
+class Ack(BaseModel):
+    ok: bool = True
+    message: str = ""
+    data: dict[str, Any] = {}
