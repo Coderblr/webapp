@@ -18,6 +18,20 @@
   const REC = {
     version: '1.0',
     enabled: true,
+    // Off by default (Section 7's original rule) — set to true by
+    // Python right after injection ONLY when the person recording
+    // explicitly opted in to "use typed values as default test data"
+    // for this session (see cdp_recorder.py's `capture_recorded_values`).
+    captureValues: false,
+    // A SEPARATE, second opt-in — deliberately not folded into
+    // captureValues above. Someone can want "reuse my typed values" for
+    // ordinary business fields WITHOUT also wanting password/PIN/OTP
+    // values captured — bundling them into one checkbox would mean
+    // whichever person just wants the common case ends up silently
+    // capturing credentials too, without a distinct, informed decision
+    // about that specific, higher-risk category. Only meaningful when
+    // captureValues is ALSO true — this alone changes nothing.
+    captureSensitiveValues: false,
     events: [],
     crawls: [],
     messages: [],
@@ -292,6 +306,33 @@
     return out;
   }
 
+  function accessibilityInfo(el) {
+    // A proper, unified accessibility snapshot — role/name/description/
+    // state — rather than the same handful of aria-* attributes
+    // scattered individually across other parts of this file. This is
+    // what gives an AI self-healing agent (Part 10) real semantic
+    // grounding to re-identify an element by MEANING when its locator
+    // breaks, not just by whatever CSS/XPath happened to work before.
+    let describedBy = null;
+    const describedById = el.getAttribute && el.getAttribute('aria-describedby');
+    if (describedById) {
+      const describer = document.getElementById(describedById);
+      if (describer) describedBy = visibleText(describer);
+    }
+    return {
+      role: (el.getAttribute && el.getAttribute('role')) || null,
+      name: labelFor(el),
+      description: describedBy,
+      checked: el.checked !== undefined ? !!el.checked
+        : (el.getAttribute && el.getAttribute('aria-checked')) || null,
+      selected: el.selected !== undefined ? !!el.selected
+        : (el.getAttribute && el.getAttribute('aria-selected')) || null,
+      expanded: (el.getAttribute && el.getAttribute('aria-expanded')) || null,
+      disabled: !!el.disabled || (el.getAttribute && el.getAttribute('aria-disabled') === 'true'),
+      hidden: !!el.hidden || (el.getAttribute && el.getAttribute('aria-hidden') === 'true'),
+    };
+  }
+
   function describe(el, interacted) {
     if (!el || el.nodeType !== 1) return null;
     const rect = (el.getBoundingClientRect && el.getBoundingClientRect()) || {};
@@ -322,6 +363,7 @@
       page_key: pageKey(),
       frame_url: location.href,
       attributes: attrs,
+      accessibility: accessibilityInfo(el),
       options: (el.tagName === 'SELECT')
         ? Array.from(el.options || []).slice(0, 100)
             .map(function (o) { return { value: o.value, text: o.text }; })
@@ -383,10 +425,25 @@
   ].join(',');
 
   function collectRoots() {
-    const roots = [document];
-    document.querySelectorAll('*').forEach(function (el) {
-      if (el.shadowRoot) roots.push(el.shadowRoot);
-    });
+    // Recursively pierces NESTED shadow DOM, not just one level — a
+    // shadow root's own contents can themselves contain further shadow
+    // roots (a component library built from nested custom elements is
+    // a common real-world shape for this), and the original single-pass
+    // version only ever found shadow roots attached directly to the
+    // top-level light DOM, silently missing anything nested inside one.
+    const roots = [];
+    const seen = new Set();
+    function visit(root) {
+      if (seen.has(root)) return;
+      seen.add(root);
+      roots.push(root);
+      let nodes = [];
+      try { nodes = root.querySelectorAll('*'); } catch (e) { return; }
+      nodes.forEach(function (el) {
+        if (el.shadowRoot) visit(el.shadowRoot);
+      });
+    }
+    visit(document);
     return roots;
   }
 
@@ -547,33 +604,54 @@
         // A detached/disabled element by the time this fires — nothing
         // more to do; the recorded event itself is already safe.
       }
-    }, 300);
+    }, 600);
   }, true);
 
   document.addEventListener('change', function (e) {
     const el = e.target;
     const t = elementType(el);
     if (t === 'dropdown') {
-      pushAction('select', el, {
+      const extra = {
         selected_text: el.options && el.options[el.selectedIndex]
           ? el.options[el.selectedIndex].text : null,
         value_length: (el.value || '').length
-      });
+      };
+      if (REC.captureValues) {
+        extra.recorded_value = el.value || '';
+      }
+      pushAction('select', el, extra);
     } else if (t === 'checkbox' || t === 'radio') {
       pushAction(el.checked ? 'check' : 'uncheck', el, {});
     } else if (t === 'upload') {
       pushAction('upload', el, { file_count: (el.files || []).length });
     } else {
-      /* NEVER store the raw value — only metadata (Section 7.1) */
+      /* Raw value is ONLY ever captured when BOTH: (a) the field isn't
+       * sensitive, and (b) the recording session opted in
+       * (REC.captureValues, off by default — set explicitly by Python
+       * right after injection, only when the person recording chose
+       * "use typed values as default test data" for this session).
+       * Section 7's original rule (never store the raw value) stays the
+       * DEFAULT behaviour; this is an explicit, informed opt-in on top
+       * of it, not a replacement for it — value_length is ALWAYS sent
+       * either way, recorded_value only when both conditions hold. */
       const now = Date.now();
       if (el.__aiRecLastCapture && now - el.__aiRecLastCapture < 400) return;
       el.__aiRecLastCapture = now;
-      pushAction('type', el, {
+      const isSensitive = SENSITIVE_HINT.test(el.name || '') ||
+                          SENSITIVE_HINT.test(el.id || '') ||
+                          (el.type || '') === 'password';
+      const extra = {
         value_length: (el.value || '').length,
-        sensitive: SENSITIVE_HINT.test(el.name || '') ||
-                   SENSITIVE_HINT.test(el.id || '') ||
-                   (el.type || '') === 'password'
-      });
+        sensitive: isSensitive
+      };
+      // The element is STILL correctly labelled sensitive:true above
+      // either way (screenshots/masking/display elsewhere all still
+      // treat it as sensitive) — only the VALUE-capture decision itself
+      // changes based on the second, explicit opt-in.
+      if (REC.captureValues && (!isSensitive || REC.captureSensitiveValues)) {
+        extra.recorded_value = el.value || '';
+      }
+      pushAction('type', el, extra);
     }
     setTimeout(captureMessages, 350);
   }, true);
@@ -593,7 +671,57 @@
     setTimeout(function () {
       captureMessages();
       try { form.submit(); } catch (err) { /* form already gone — nothing to do */ }
-    }, 300);
+    }, 600);
+  }, true);
+
+  /* Drag & drop — recorded as ONE logical action (drag target -> drop
+   * target), not as the several low-level dragstart/dragover/drop
+   * events the browser actually fires; a business-meaning "moved X onto
+   * Y" is what's replayable and readable, the intermediate dragover
+   * noise is not. Native, unprevented — this only OBSERVES, it doesn't
+   * intercept or hold anything back the way click/submit/Enter do,
+   * since drag&drop very rarely triggers an immediate page navigation
+   * the way those do. */
+  let __aiRecDragSource = null;
+  document.addEventListener('dragstart', function (e) {
+    __aiRecDragSource = e.target;
+  }, true);
+  document.addEventListener('drop', function (e) {
+    if (!__aiRecDragSource) return;
+    const dropTarget = e.target;
+    pushAction('drag_drop', __aiRecDragSource, {
+      drop_target: describe(dropTarget, false),
+    });
+    __aiRecDragSource = null;
+    setTimeout(function () { crawlPage('post_drop'); captureMessages(); }, 350);
+  }, true);
+
+  /* Meaningful scroll only — "sometimes you need to scroll to reveal a
+   * field before interacting with it" (a scrollable table/modal body/
+   * dropdown list hiding what's needed next) is worth a record of WHERE
+   * scrolling happened and how far; continuous scroll-wheel ticks are
+   * not (Section 5's own "usually ignore: insignificant scroll events").
+   * Debounced — only fires once scrolling has actually STOPPED for a
+   * beat, one entry per scroll gesture rather than dozens of
+   * intermediate positions, and only when the total distance is large
+   * enough to plausibly have revealed something that wasn't visible
+   * before (a few pixels of jiggle is not that).
+   */
+  let __aiRecScrollTimer = null;
+  let __aiRecScrollStart = null;
+  document.addEventListener('scroll', function (e) {
+    const target = e.target === document ? document.documentElement : e.target;
+    if (!target || typeof target.scrollTop !== 'number') return;
+    if (__aiRecScrollStart === null) __aiRecScrollStart = target.scrollTop;
+    if (__aiRecScrollTimer) clearTimeout(__aiRecScrollTimer);
+    __aiRecScrollTimer = setTimeout(function () {
+      const distance = Math.abs(target.scrollTop - __aiRecScrollStart);
+      __aiRecScrollStart = null;
+      if (distance < 80) return;  // too small to plausibly matter
+      pushAction('scroll', target === document.documentElement ? document.body : target, {
+        distance_px: Math.round(distance),
+      });
+    }, 400);
   }, true);
 
   /* Search/query boxes overwhelmingly submit on Enter, with the page's
@@ -655,12 +783,38 @@
           bubbles: true, cancelable: true,
         }));
       } catch (err) { /* nothing more to do */ }
-    }, 300);
+    }, 600);
   }, true);
 
 
   window.addEventListener('load', function () {
     setTimeout(function () { crawlPage('load'); captureMessages(); }, 400);
+  });
+
+  /* Best-effort final safety net — a page teardown (logout, a session-
+   * timeout auto-redirect, anything genuinely instant enough to outrun
+   * even the 600ms hold-back above) leaves NO time for async work; a
+   * beforeunload/unload handler can't reliably wait for anything. This
+   * doesn't attempt to. It just marks that the page is going away RIGHT
+   * NOW, on the (real, common) chance Python's poll happens to land in
+   * the brief window between this firing and the page actually being
+   * destroyed — logout being the very last thing recorded, rather than
+   * silently missing, depends on catching that window when it can.
+   */
+  window.addEventListener('beforeunload', function () {
+    try {
+      // Deliberately NOT type: 'action' — this has none of the fields
+      // (`action`, `element`) _ingest_action() expects, and would
+      // otherwise route into it and produce a garbage/empty action
+      // entry. This type doesn't match any of _ingest()'s structured
+      // branches, so it's safely appended to the raw event log only —
+      // evidence that a teardown was IMMINENT at this exact page/URL,
+      // without pretending to be a structured recorded action itself.
+      REC.events.push({
+        type: 'page_unloading', ts: Date.now(),
+        page: { page_key: pageKey(), url: location.href, title: document.title },
+      });
+    } catch (e) { /* nothing more can be done at this point */ }
   });
 
   /* SPA / dynamic DOM: re-crawl when the page materially changes.
