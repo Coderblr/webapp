@@ -1,214 +1,261 @@
+"""AI Data Resolver (Section 7.7).
+
+At execution time each required field is resolved to its best source, in
+the priority order of Section 7.3:
+
+  1. existing framework data (*.properties)
+  2. user-provided static / profile data
+  3. runtime user input
+  4. database query
+  5. API data
+  6. AI-generated data — cosmetic, non-validated fields ONLY
+
+python-framework never needs to know where a value came from.
 """
-FastAPI orchestrator for the Java Cucumber framework.
+from __future__ import annotations
 
-Flow 1 (manager's primary flow):
-    POST /execute/txn/{txn_no}      -> looks up the feature in the index, runs it on Edge
+import json
+from pathlib import Path
+from typing import Any, Optional
 
-Flow 2 (alternate flow):
-    POST /execute/upload            -> user uploads a .feature file; we detect its module,
-                                       dry-run to verify glue code exists, then execute it
+from ..core import db
+from ..core.config import settings
+from ..core.logging_conf import get_logger
+from ..framework_index import text_formats
+from . import field_meta, profiles, templates
 
-Common:
-    GET  /jobs/{job_id}             -> status + pass/fail summary
-    GET  /jobs/{job_id}/logs        -> live console log (poll with ?offset=)
-    GET  /txns?q=0104               -> search the index (for an autocomplete box in Next.js)
-    POST /index/rebuild             -> rescan the framework after new features are added
+log = get_logger(__name__)
 
-Run with:  uvicorn app.main:app --reload --port 8000
-"""
-import re
-
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-
-from . import config, executor, indexer
+SOURCE_ORDER = ("framework", "profile", "runtime", "database", "api", "ai")
 
 
-class RunParams(BaseModel):
-    """Target environment + credentials for one execution.
-    All optional — omit any value to keep whatever the properties file already has."""
-    url: str | None = None
-    maker_id: str | None = None
-    maker_password: str | None = None
-    checker_id: str | None = None
-    checker_password: str | None = None
-
-app = FastAPI(title="Java Framework Orchestrator")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # your Next.js dev server
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+class UnresolvedFieldError(RuntimeError):
+    def __init__(self, fields: list[str]) -> None:
+        super().__init__(
+            "The following fields must be supplied by the user before this "
+            "transaction can run: " + ", ".join(fields)
+        )
+        self.fields = fields
 
 
-@app.on_event("startup")
-def _startup():
-    if config.FRAMEWORK_ROOT.exists():
-        indexer.build_index()
-
-
-# ─────────────────────────── index endpoints ────────────────────────────────
-@app.post("/index/rebuild")
-def rebuild_index():
-    idx = indexer.build_index()
-    return {"indexed_txns": len(idx)}
-
-
-@app.get("/txns")
-def search_txns(q: str = "", all: bool = False):
-    """Returns [{txn, module, file}] — the full list when all=1 so the UI can
-    offer a scrollable, searchable dropdown of every feature."""
-    idx = indexer.get_index()
-    q = q.lower()
-    items = []
-    from pathlib import Path as _P
-    for k, v in idx.items():
-        if not v.get("feature"):
-            continue  # java-only entries can't be executed — keep them out of the picker
-        name = v.get("txn") or k
-        if q and q not in name.lower() and q not in (v.get("feature") or "").lower():
+# ── source 1: framework property files ──────────────────────────────────
+def _framework_properties() -> dict[str, str]:
+    merged: dict[str, str] = {}
+    root = settings.framework_root_path
+    for path in root.rglob("*.properties"):
+        try:
+            merged.update(text_formats.parse_properties_file(path))
+        except Exception:
             continue
-        items.append({"txn": name, "module": v.get("module") or "",
-                      "file": _P(v["feature"]).name})
-    items.sort(key=lambda x: int(re.sub(r"\D", "", x["txn"]) or 0))
-    if not all:
-        items = items[:50]
-    return {"count": len(items), "txns": items}
+    return merged
 
 
-# ───────────────────────── flow 1: run by txn number ────────────────────────
-@app.post("/execute/txn/{txn_no}")
-def execute_txn(txn_no: str, params: RunParams | None = None):
-    """txn_no arrives as e.g. 'Txn36048' or 'txn69069' (prefix chosen in the UI).
-    We locate the feature via the index, VERIFY the matching @tag exists inside
-    the feature file, then run with cucumber.filter.tags=<that exact tag> —
-    same effect as replacing the number in TestRunner's tags, but with no
-    Java edit and no recompile."""
-    hit = indexer.lookup(txn_no)
-    if not hit:
-        raise HTTPException(404, f"Txn '{txn_no}' not found in index. Try POST /index/rebuild.")
-    if not hit.get("feature"):
-        raise HTTPException(409,
-            f"{hit['txn']} has step-definition/page Java files but NO .feature file was found "
-            f"for this number anywhere under {config.FEATURES_DIR.name}. This transaction is "
-            f"not automatable until its feature file exists (check the filename's Txn number).")
-
-    # find the matching tag inside the feature file. Frameworks tag in several
-    # styles, so we accept (in priority order):
-    #   1. @Txn012000                              (exact, any casing)
-    #   2. @Txn012000_LoansCreateLoanDetails       (starts with the txn id)
-    #   3. @12000                                  (bare number, zero-padding ignored)
-    from pathlib import Path as _P
-    text = _P(hit["feature"]).read_text(encoding="utf-8", errors="ignore")
-    tags_in_file = re.findall(r"@[\w]+", text)
-    digits = re.sub(r"\D", "", txn_no)
-
-    def _match_rank(t: str) -> int:
-        low = t.lower().lstrip("@")
-        if low == f"txn{digits}".lower():
-            return 1
-        if low.startswith(f"txn{digits}".lower()) and not low[len(f"txn{digits}"):][:1].isdigit():
-            return 2
-        if low.isdigit() and low.lstrip("0") == digits.lstrip("0"):
-            return 3
-        return 99
-
-    tag = min(tags_in_file, key=_match_rank, default=None)
-    if tag is not None and _match_rank(tag) == 99:
-        tag = None
-    if not tag:
-        raise HTTPException(409,
-            f"Feature found ({_P(hit['feature']).name}) but it has no @{txn_no} tag. "
-            f"Tags present in the file: {sorted(set(tags_in_file)) or 'none'}. "
-            f"Add the tag above the Scenario/Feature line, or run without tag matching.")
-
-    job = executor.start_job(hit["feature"],
-                             run_params=params.model_dump() if params else None,
-                             tag_filter=tag)
-    return {"txn": hit["txn"], "module": hit["module"], "tag": tag, **job.public()}
+# ── source 4: database query ────────────────────────────────────────────
+def _from_database(config: dict[str, Any]) -> Optional[str]:
+    """config = {"sql": "SELECT cif FROM ... LIMIT 1", "column": "cif"}"""
+    sql = config.get("sql")
+    if not sql:
+        return None
+    try:
+        row = db.query_one(sql)
+    except Exception as exc:
+        log.warning("Test-data SQL failed: %s", exc)
+        return None
+    if not row:
+        return None
+    column = config.get("column")
+    return str(row.get(column) if column else list(row.values())[0])
 
 
-# ───────────────────── flow 2: run an uploaded feature ──────────────────────
-@app.post("/execute/upload")
-async def execute_upload(
-    file: UploadFile = File(...),
-    dry_run: bool = False,
-    url: str | None = Form(None),
-    maker_id: str | None = Form(None),
-    maker_password: str | None = Form(None),
-    checker_id: str | None = Form(None),
-    checker_password: str | None = Form(None),
-):
-    if not file.filename.endswith(".feature"):
-        raise HTTPException(400, "Please upload a .feature file.")
-    text = (await file.read()).decode("utf-8", errors="ignore")
-    if "Scenario" not in text and "Scenario Outline" not in text:
-        raise HTTPException(400, "File does not look like a valid Gherkin feature.")
+# ── source 5: API ───────────────────────────────────────────────────────
+def _from_api(config: dict[str, Any]) -> Optional[str]:
+    url = config.get("url")
+    if not url:
+        return None
+    try:
+        import httpx
+        response = httpx.request(
+            config.get("method", "GET"), url,
+            headers=config.get("headers") or {},
+            json=config.get("body"),
+            timeout=config.get("timeout", 20),
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        log.warning("Test-data API call failed for %s: %s", url, exc)
+        return None
+    pointer = config.get("json_path")
+    if not pointer:
+        return str(payload)
+    current: Any = payload
+    for part in str(pointer).split("."):
+        if isinstance(current, list):
+            try:
+                current = current[int(part)]
+            except Exception:
+                return None
+        elif isinstance(current, dict):
+            current = current.get(part)
+        else:
+            return None
+    return None if current is None else str(current)
 
-    module = indexer.detect_module(text)
-    dest = config.UPLOADS_DIR / file.filename
-    dest.write_text(text, encoding="utf-8")
 
-    run_params = {
-        "url": url,
-        "maker_id": maker_id,
-        "maker_password": maker_password,
-        "checker_id": checker_id,
-        "checker_password": checker_password,
-    }
-    # NOTE: we execute the feature straight from our uploads folder via the
-    # cucumber features override. The framework's source is never modified;
-    # only the properties file is patched for the run and restored afterwards.
-    job = executor.start_job(str(dest), dry_run=dry_run, run_params=run_params)
-    closest = indexer.closest_feature(text, module)
+# ── source 6: AI (cosmetic fields only) ─────────────────────────────────
+def _from_ai(meta: dict[str, Any]) -> Optional[str]:
+    if not field_meta.ai_may_generate(meta):
+        return None
+    if not settings.llm_configured:
+        return None
+    from ..core.llm import complete
+    try:
+        value = complete(
+            "You generate a single cosmetic test value for a banking UI field. "
+            "Never invent identifiers that must validate against a core banking "
+            "system. Return the value only, no quotes, no explanation.",
+            f"Field: {meta['field']}\nMeaning: {meta.get('business_meaning')}\n"
+            f"Datatype: {meta.get('datatype')}\n"
+            f"Pattern: {meta.get('pattern')}",
+        ).strip().splitlines()[0][:120]
+        return value
+    except Exception as exc:
+        log.warning("AI data generation failed for %s: %s", meta["field"], exc)
+        return None
+
+
+# ── main resolver ───────────────────────────────────────────────────────
+def resolve(
+    transaction_id: str,
+    environment: str,
+    profile_name: str,
+    runtime_values: dict[str, str] | None = None,
+    strict: bool = True,
+) -> dict[str, Any]:
+    """Resolve every field of a transaction to a concrete value."""
+    runtime_values = runtime_values or {}
+    metas = templates.get_field_metadata(transaction_id)
+    profile = profiles.get_profile(profile_name)
+    profile_pk = int(profile["id"]) if profile else None
+    profile_vals = {k.lower(): v for k, v in (profiles.profile_values(profile_name)).items()}
+    saved = templates.resolve_values(transaction_id, environment, profile_pk)
+    framework_props = {k.lower(): v for k, v in _framework_properties().items()}
+
+    resolved: dict[str, str] = {}
+    provenance: dict[str, str] = {}
+    unresolved: list[str] = []
+    validation_errors: list[str] = []
+
+    for meta in metas:
+        field = meta["field"]
+        key = field.lower()
+        value: Optional[str] = None
+        source: str = ""
+
+        # 3. runtime input wins when explicitly provided for this run
+        if field in runtime_values or key in runtime_values:
+            value = runtime_values.get(field) or runtime_values.get(key)
+            source = "runtime"
+
+        # 2. saved test-data / profile values
+        if value in (None, "") and saved.get(field):
+            value, source = saved[field], "profile"
+        if value in (None, "") and profile_vals.get(key):
+            value, source = profile_vals[key], "profile"
+
+        # 1. existing framework property files
+        if value in (None, "") and framework_props.get(key):
+            value, source = framework_props[key], "framework"
+
+        # Manual-recording value reuse — the value a human actually typed
+        # while recording this transaction (opt-in, non-sensitive fields
+        # only — see backend/recorder/injector.js's captureValues flag).
+        # Trusted MORE than a database/api lookup or AI-generation (a
+        # human really used this value successfully, once), but LESS
+        # than an explicit profile/runtime override — someone who went
+        # to the trouble of setting up a profile value clearly wants
+        # THAT one used, not whatever happened to be typed at record time.
+        if value in (None, "") and meta.get("recorded_value"):
+            value, source = meta["recorded_value"], "recorded"
+
+        config = meta.get("source_config") or {}
+        # 4. database
+        if value in (None, "") and meta.get("source") == "database":
+            value = _from_database(config.get("database") or config)
+            source = "database"
+        # 5. api
+        if value in (None, "") and meta.get("source") == "api":
+            value = _from_api(config.get("api") or config)
+            source = "api"
+        # 6. ai — cosmetic only
+        if value in (None, ""):
+            generated = _from_ai(meta)
+            if generated:
+                value, source = generated, "ai"
+
+        if value in (None, ""):
+            if meta.get("required"):
+                unresolved.append(field)
+            continue
+
+        ok, message = field_meta.validate(value, meta)
+        if not ok:
+            validation_errors.append(message)
+        resolved[field] = value
+        provenance[field] = source
+
+    if strict and unresolved:
+        raise UnresolvedFieldError(unresolved)
+
     return {
-        "module_detected": module,
-        "closest_existing_feature": closest,
-        "hint": "If the run reports undefined_steps, the framework has no Java glue "
-                "for those lines — reuse the closest_existing_feature's wording, "
-                "or generate new step definitions (phase 2).",
-        **job.public(),
+        "transaction_id": transaction_id,
+        "environment": environment.upper(),
+        "profile": profile_name,
+        "values": resolved,
+        "provenance": provenance,
+        "unresolved": unresolved,
+        "validation_errors": validation_errors,
+        "sensitive_fields": [m["field"] for m in metas if m.get("sensitive")],
     }
 
 
-# ─────────────────────────── job status / logs ──────────────────────────────
-@app.post("/jobs/{job_id}/stop")
-def stop_job(job_id: str):
-    ok = executor.stop_job(job_id)
-    if not ok:
-        raise HTTPException(409, "Job is not running (or unknown id).")
-    return {"job_id": job_id, "status": "stopping"}
+def write_runtime_file(resolution: dict[str, Any], target: Path | None = None) -> str:
+    """Write the resolved values to the file python-framework/utils/
+    test_data_reader.py reads.
 
-
-@app.get("/jobs/{job_id}")
-def job_status(job_id: str):
-    job = executor.JOBS.get(job_id)
-    if not job:
-        raise HTTPException(404, "Unknown job id.")
-    return job.public()
-
-
-@app.get("/jobs/{job_id}/logs")
-def job_logs(job_id: str, offset: int = 0):
-    chunk, new_offset = executor.read_log(job_id, offset)
-    job = executor.JOBS.get(job_id)
-    return {
-        "log": chunk,
-        "next_offset": new_offset,
-        "status": job.status if job else "unknown",
+    It just reads `transaction_<id>.json` from the runtime directory — it
+    never learns where a value came from.
+    """
+    directory = target or (settings.framework_testdata_path / "_runtime")
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"transaction_{resolution['transaction_id']}.json"
+    payload = {
+        "transaction": resolution["transaction_id"],
+        "environment": resolution["environment"],
+        "data": {
+            field: {"value": value} for field, value in resolution["values"].items()
+        },
     }
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return str(path)
 
 
-# ───────────────────────── serve the frontend ───────────────────────────────
-# Must be mounted LAST so it doesn't shadow the API routes above.
-# Open http://localhost:8000 in a browser after starting uvicorn.
-from pathlib import Path as _Path
-from fastapi.staticfiles import StaticFiles
-
-_FRONTEND_DIR = _Path(__file__).resolve().parent.parent / "frontend"
-if _FRONTEND_DIR.exists():
-    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIR), html=True), name="frontend")
+def required_runtime_prompts(transaction_id: str, environment: str,
+                             profile_name: str) -> list[dict[str, Any]]:
+    """Fields the UI must prompt for right before execution (Section 7.3.3)."""
+    try:
+        resolution = resolve(transaction_id, environment, profile_name, strict=False)
+    except Exception as exc:
+        log.warning("Resolution preview failed: %s", exc)
+        return []
+    metas = {m["field"]: m for m in templates.get_field_metadata(transaction_id)}
+    return [
+        {
+            "field": field,
+            "datatype": metas.get(field, {}).get("datatype"),
+            "pattern": metas.get(field, {}).get("pattern"),
+            "sensitive": metas.get(field, {}).get("sensitive", False),
+            "business_meaning": metas.get(field, {}).get("business_meaning"),
+        }
+        for field in resolution["unresolved"]
+    ]
