@@ -1,19 +1,2216 @@
-crawler:
-  type: playwright       # playwright or selenium
-  headless: true
-  timeout: 30000
-  max_pages: 6           # max child pages to follow from home
-  viewport:
-    width: 1920
-    height: 1080
+injector.js
 
-llm:
-  model: gpt-4o             # your Azure deployment name (gpt-4o, gpt-4, gpt-35-turbo, etc.)
-  max_tokens: 8192
 
-output:
-  base_dir: output
-  save_intermediate: true
 
-logging:
-  level: INFO
+
+
+
+
+
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Application Knowledge Collector — in-page agent  (Section 5)
+
+   Injected on every document (via CDP Page.addScriptToEvaluateOnNewDocument)
+   so it survives navigation.  It:
+     • records every user interaction (click / type / select / check / submit)
+     • crawls the WHOLE page for interactable elements — not just the ones
+       the user touched — so future BRDs already know about them
+     • builds a multi-strategy locator repository per element
+     • captures validation / error / success messages
+     • traverses iframes and open shadow roots
+
+   It buffers events on window.__AIREC__ ; the Python side drains the buffer.
+   ═══════════════════════════════════════════════════════════════════════ */
+(function () {
+  if (window.__AIREC__) { return; }
+
+  // Pre-execution Shadow DOM Unlocking Patch (Forces closed shadow roots to open)
+  if (!window.__shadowPatchApplied) {
+    window.__shadowPatchApplied = true;
+    try {
+      const origAttach = Element.prototype.attachShadow;
+      Element.prototype.attachShadow = function (init) {
+        const shadow = origAttach.call(this, Object.assign({}, init, { mode: 'open' }));
+        window.__shadowRoots = window.__shadowRoots || [];
+        window.__shadowRoots.push(shadow);
+        return shadow;
+      };
+    } catch (e) {}
+  }
+
+  const REC = {
+    version: '1.0',
+    enabled: true,
+    captureValues: false,
+    captureSensitiveValues: false,
+    events: [],
+    crawls: [],
+    messages: [],
+    seq: 0,
+    pageKey: null
+  };
+  window.__AIREC__ = REC;
+
+  /* ── helpers ───────────────────────────────────────────────────────── */
+  const SENSITIVE_HINT = /pass|pwd|pin|otp|cvv|secret|token/i;
+
+  function cssCount(sel) {
+    try { return document.querySelectorAll(sel).length; } catch (e) { return -1; }
+  }
+  function cssResolvesToElement(sel, el) {
+    try {
+      const nodes = document.querySelectorAll(sel);
+      return nodes.length === 1 && nodes[0] === el;
+    } catch (e) { return false; }
+  }
+  function xpathResolvesToElement(xp, el) {
+    try {
+      const result = document.evaluate(
+        xp, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null
+      );
+      return result.snapshotLength === 1 && result.snapshotItem(0) === el;
+    } catch (e) { return false; }
+  }
+
+  /* ── native CDP binding helper ───────────────────────────────────── */
+  function sendNativeCDP(kind, payload) {
+    if (window.sendToPythonRecorder) {
+      try {
+        window.sendToPythonRecorder(JSON.stringify({ kind: kind, payload: payload }));
+      } catch (e) {}
+    }
+  }
+
+  function relayToTop(kind, payload) {
+    sendNativeCDP(kind, payload);
+    if (window === window.top) return;
+    try {
+      window.top.postMessage({ __airec_relay__: true, kind: kind, payload: payload }, '*');
+    } catch (e) {
+      // cross-origin postMessage failures handled via CDP auto-attach & binding
+    }
+  }
+  if (window === window.top) {
+    window.addEventListener('message', function (e) {
+      const data = e && e.data;
+      if (!data || !data.__airec_relay__ || !REC.enabled) return;
+      if (data.kind === 'action') { REC.events.push(data.payload); }
+      else if (data.kind === 'crawl') { REC.crawls.push(data.payload); REC.events.push(data.payload); }
+      else if (data.kind === 'messages') { REC.messages.push(data.payload); REC.events.push(data.payload); }
+    });
+  }
+
+  function slug(text) {
+    return (text || '')
+      .toString().trim().toLowerCase()
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 60);
+  }
+
+  /* Section 8 fix: the previous version computed this ONCE and cached
+   * it forever (`if (!REC.pageKey)`), which was correct only for a
+   * classic full-page-reload navigation (this script re-injects fresh
+   * via Page.addScriptToEvaluateOnNewDocument on every real navigation
+   * anyway, so a fresh REC object naturally gets a fresh pageKey then).
+   * It silently broke for a client-side-routed SPA screen change —
+   * title/pathname change WITHOUT a full reload, this script is NOT
+   * re-injected, and every element/action after that point kept
+   * getting attributed to the FIRST screen's stale page_key forever.
+   * Now recomputes whenever title/pathname has actually changed since
+   * the last check, and flags the transition so Python can treat it as
+   * an action-grouping boundary (Section 7) the same way a real
+   * navigation already is. */
+  function pageKey() {
+    const currentSignature = document.title + '|' + location.pathname;
+    if (!REC.pageKey || REC._pageSignature !== currentSignature) {
+      REC._pageSignature = currentSignature;
+      REC.pageKey = slug(document.title) || slug(location.pathname) || 'page';
+      REC._pageTransitioned = true;
+    }
+    return REC.pageKey;
+  }
+
+  function visibleText(el) {
+    if (!el) return '';
+    const t = (el.innerText || el.textContent || '').trim();
+    return t.length > 120 ? t.slice(0, 120) : t;
+  }
+
+  // Structural container tags — almost NEVER a meaningful individual
+  // "label" for a specific click target, even when they genuinely are
+  // what got clicked (event delegation on a wide container, a click that
+  // bubbled up past the actual intended cell/input). Falling back to
+  // visibleText() on one of these dumps its ENTIRE aggregate text — a
+  // real, confirmed bug: a whole denomination TABLE's header+data text
+  // ("Denomination Current Quantity Current Balance Denom In Amount In
+  // Denom Out Amount Out 500.00 10874") became the "label" for SEVERAL
+  // DIFFERENT clicks inside that same table, producing repeated,
+  // garbled, disambiguation-suffixed labels for what should have been
+  // distinct, specific cells.
+  const _CONTAINER_TAGS = new Set(['TABLE', 'TBODY', 'THEAD', 'TFOOT', 'TR', 'FORM', 'UL', 'OL']);
+
+  function labelFor(el) {
+    if (!el) return '';
+    if (el.getAttribute && el.getAttribute('aria-label')) return el.getAttribute('aria-label');
+    if (el.id) {
+      const lab = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+      if (lab) return visibleText(lab);
+    }
+    let p = el.parentElement;
+    for (let i = 0; i < 3 && p; i++, p = p.parentElement) {
+      if (p.tagName === 'LABEL') return visibleText(p);
+      const lab = p.querySelector && p.querySelector('label');
+      if (lab && lab.contains && !lab.contains(el)) return visibleText(lab);
+    }
+    if (el.placeholder) return el.placeholder;
+    if (el.title) return el.title;
+    if (el.name) return el.name;
+    if (_CONTAINER_TAGS.has(el.tagName)) {
+      // A container's own DIRECT text (not counting its many descendant
+      // elements) is often still meaningful and short (a caption, a
+      // heading directly inside it) — but its FULL aggregate text is
+      // not. `childNodes` filtered to direct text nodes only, never
+      // recursing into children, is what actually avoids the dump.
+      const directText = Array.from(el.childNodes || [])
+        .filter(function (n) { return n.nodeType === 3; })
+        .map(function (n) { return (n.textContent || '').trim(); })
+        .filter(Boolean)
+        .join(' ');
+      return directText.length > 0 && directText.length <= 60 ? directText : '';
+    }
+    return visibleText(el);
+  }
+
+  function elementType(el) {
+    const tag = (el.tagName || '').toLowerCase();
+    const type = (el.getAttribute && (el.getAttribute('type') || '')).toLowerCase();
+    if (tag === 'select') return 'dropdown';
+    if (tag === 'textarea') return 'textarea';
+    if (tag === 'a') return 'link';
+    if (tag === 'table') return 'table';
+    if (tag === 'input') {
+      if (type === 'checkbox') return 'checkbox';
+      if (type === 'radio') return 'radio';
+      if (type === 'file') return 'upload';
+      if (type === 'submit' || type === 'button') return 'button';
+      if (type === 'date' || type === 'datetime-local') return 'calendar';
+      if (type === 'password') return 'password';
+      return 'textbox';
+    }
+    if (tag === 'button') return 'button';
+    const role = el.getAttribute && el.getAttribute('role');
+    if (role) return role;
+    if (el.onclick || (el.className && /btn|button|clickable/i.test(el.className))) {
+      return 'button';
+    }
+    return tag || 'element';
+  }
+
+  function absoluteXPath(el) {
+    if (!el || el.nodeType !== 1) return '';
+    if (el.id) return '//*[@id="' + el.id + '"]';
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === 1 && node !== document.documentElement) {
+      let index = 1;
+      let sib = node.previousElementSibling;
+      while (sib) {
+        if (sib.tagName === node.tagName) index++;
+        sib = sib.previousElementSibling;
+      }
+      parts.unshift(node.tagName.toLowerCase() + '[' + index + ']');
+      node = node.parentElement;
+    }
+    return '/html/' + parts.join('/');
+  }
+
+  function cssPath(el) {
+    if (!el || el.nodeType !== 1) return '';
+    if (el.id) {
+      const idSel = '#' + CSS.escape(el.id);
+      // An id that ISN'T actually unique on this page (duplicate ids do
+      // happen on messy enterprise markup) is worse than useless as a
+      // locator — verify before trusting it.
+      if (cssResolvesToElement(idSel, el)) return idSel;
+    }
+    const segments = [];
+    let node = el;
+    while (node && node.nodeType === 1 && segments.length < 8) {
+      let seg = node.tagName.toLowerCase();
+      if (node.classList && node.classList.length) {
+        const cls = Array.from(node.classList)
+          .filter(c => !/^(ng-|is-|active|selected|hover|focus)/.test(c))
+          .slice(0, 2);
+        if (cls.length) seg += '.' + cls.map(c => CSS.escape(c)).join('.');
+      }
+      const parent = node.parentElement;
+      let indexedSeg = seg;
+      if (parent) {
+        const same = Array.from(parent.children).filter(c => c.tagName === node.tagName);
+        if (same.length > 1) indexedSeg = seg + ':nth-of-type(' + (same.indexOf(node) + 1) + ')';
+      }
+      if (node.id) { indexedSeg = '#' + CSS.escape(node.id); }
+
+      // Try the class/tag-only segment FIRST (survives DOM reordering /
+      // row insertion) — only fall back to the position-based
+      // :nth-of-type segment if the plain one isn't unique enough yet.
+      segments.unshift(seg);
+      let candidate = segments.join(' > ');
+      if (cssResolvesToElement(candidate, el)) return candidate;
+
+      if (indexedSeg !== seg) {
+        segments[0] = indexedSeg;
+        candidate = segments.join(' > ');
+        if (cssResolvesToElement(candidate, el)) return candidate;
+        segments[0] = seg; // keep the non-positional form for the next ancestor level
+      }
+
+      if (node.id) { segments[0] = '#' + CSS.escape(node.id); break; }
+      node = parent;
+    }
+    // Nothing became unique within 8 ancestor levels (rare) — return the
+    // best-effort deepest path; locator_builder.py penalises anything
+    // that wasn't marked verified, below.
+    return segments.join(' > ');
+  }
+
+  function relativeXPaths(el) {
+    const out = [];
+    const tag = (el.tagName || '').toLowerCase();
+    const type = (el.getAttribute && (el.getAttribute('type') || '')).toLowerCase();
+    // 'value' is deliberately EXCLUDED for free-text inputs — for a
+    // textbox/textarea it's whatever the user just TYPED during
+    // recording (an account number, a name, ...), which is both
+    // guaranteed to differ on every future run and a way for recorded
+    // data to leak into a "locator". It's kept only for elements whose
+    // value IS the static, unchanging label (a <input type="submit"
+    // value="Save">-style button), where it behaves like button text.
+    const attrs = ['name', 'placeholder', 'aria-label', 'title'];
+    if (tag !== 'input' || type === 'submit' || type === 'button' || type === 'reset') {
+      attrs.push('value');
+    }
+    attrs.push('type');
+    const candidates = [];
+    attrs.forEach(function (a) {
+      const v = el.getAttribute && el.getAttribute(a);
+      if (v) candidates.push('//' + tag + '[@' + a + '="' + v + '"]');
+    });
+    Array.from(el.attributes || []).forEach(function (a) {
+      if (a.name.indexOf('data-') === 0 && a.value) {
+        candidates.push('//' + tag + '[@' + a.name + '="' + a.value + '"]');
+      }
+    });
+    const txt = visibleText(el);
+    if (txt && txt.length < 40) {
+      candidates.push('//' + tag + '[normalize-space(text())="' + txt + '"]');
+      candidates.push('//' + tag + '[contains(normalize-space(.),"' + txt + '")]');
+    }
+    const lab = labelFor(el);
+    if (lab && lab.length < 40 && (tag === 'input' || tag === 'select' || tag === 'textarea')) {
+      candidates.push('//label[contains(normalize-space(.),"' + lab + '")]/following::'
+        + tag + '[1]');
+      candidates.push('//td[contains(normalize-space(.),"' + lab + '")]/following::'
+        + tag + '[1]');
+    }
+    // Keep only candidates VERIFIED, right now, to resolve to exactly
+    // this element — an xpath that also matches other elements on the
+    // page is a locator that can silently act on the wrong one, which is
+    // worse than not offering it as a fallback at all.
+    candidates.forEach(function (xp) {
+      if (xpathResolvesToElement(xp, el)) out.push(xp);
+    });
+    return out;
+  }
+
+  function accessibilityInfo(el) {
+    // A proper, unified accessibility snapshot — role/name/description/
+    // state — rather than the same handful of aria-* attributes
+    // scattered individually across other parts of this file. This is
+    // what gives an AI self-healing agent (Part 10) real semantic
+    // grounding to re-identify an element by MEANING when its locator
+    // breaks, not just by whatever CSS/XPath happened to work before.
+    let describedBy = null;
+    const describedById = el.getAttribute && el.getAttribute('aria-describedby');
+    if (describedById) {
+      const describer = document.getElementById(describedById);
+      if (describer) describedBy = visibleText(describer);
+    }
+    return {
+      role: (el.getAttribute && el.getAttribute('role')) || null,
+      name: labelFor(el),
+      description: describedBy,
+      checked: el.checked !== undefined ? !!el.checked
+        : (el.getAttribute && el.getAttribute('aria-checked')) || null,
+      selected: el.selected !== undefined ? !!el.selected
+        : (el.getAttribute && el.getAttribute('aria-selected')) || null,
+      expanded: (el.getAttribute && el.getAttribute('aria-expanded')) || null,
+      disabled: !!el.disabled || (el.getAttribute && el.getAttribute('aria-disabled') === 'true'),
+      hidden: !!el.hidden || (el.getAttribute && el.getAttribute('aria-hidden') === 'true'),
+    };
+  }
+
+  function describe(el, interacted) {
+    if (!el || el.nodeType !== 1) return null;
+    const rect = (el.getBoundingClientRect && el.getBoundingClientRect()) || {};
+    const style = window.getComputedStyle ? window.getComputedStyle(el) : {};
+    const attrs = {};
+    Array.from(el.attributes || []).forEach(function (a) {
+      if (!SENSITIVE_HINT.test(a.name)) attrs[a.name] = a.value;
+    });
+    const label = labelFor(el);
+    const key = slug(
+      el.id || el.getAttribute('name') || label || elementType(el) + '_' + (REC.seq)
+    ) || ('el_' + REC.seq);
+
+    return {
+      element_key: key,
+      tag: (el.tagName || '').toLowerCase(),
+      element_type: elementType(el),
+      label: label,
+      text: visibleText(el),
+      visible: !!(rect.width || rect.height) && style.visibility !== 'hidden'
+        && style.display !== 'none',
+      enabled: !el.disabled,
+      readonly: !!el.readOnly,
+      required: !!el.required,
+      maxlength: el.maxLength && el.maxLength > 0 ? el.maxLength : null,
+      pattern: el.pattern || null,
+      interacted: !!interacted,
+      page_key: pageKey(),
+      frame_url: location.href,
+      attributes: attrs,
+      accessibility: accessibilityInfo(el),
+      options: (el.tagName === 'SELECT')
+        ? Array.from(el.options || []).slice(0, 100)
+            .map(function (o) { return { value: o.value, text: o.text }; })
+        : null,
+      position: { x: Math.round(rect.left || 0), y: Math.round(rect.top || 0),
+                  w: Math.round(rect.width || 0), h: Math.round(rect.height || 0) },
+      parent: el.parentElement ? {
+        tag: el.parentElement.tagName.toLowerCase(),
+        id: el.parentElement.id || null,
+        cls: el.parentElement.className || null
+      } : null,
+      siblings: el.parentElement ? el.parentElement.children.length : 0,
+      locators: (function () {
+        const cssCandidate = cssPath(el);
+        const cssVerified = cssCandidate ? cssResolvesToElement(cssCandidate, el) : false;
+        // A duplicate id/name on the page (messy enterprise markup is
+        // full of these) is not a usable locator even though the
+        // attribute exists — verify before offering it, same as css/xpath
+        // above. An id/name that fails verification is dropped (set to
+        // null) rather than passed downstream with false confidence;
+        // the verified css/xpath/relative_xpath candidates still cover
+        // the element.
+        const rawId = el.id || null;
+        const idVerified = rawId ? cssResolvesToElement('#' + CSS.escape(rawId), el) : false;
+        const rawName = el.getAttribute ? el.getAttribute('name') : null;
+        const nameVerified = rawName
+          ? cssResolvesToElement(
+              (el.tagName || '').toLowerCase() + '[name="' + rawName + '"]', el
+            )
+          : false;
+        return {
+          id: idVerified ? rawId : null,
+          id_ambiguous: !!(rawId && !idVerified),
+          name: nameVerified ? rawName : null,
+          name_ambiguous: !!(rawName && !nameVerified),
+          css: cssCandidate,
+          css_verified: cssVerified,
+          xpath: absoluteXPath(el),
+          relative_xpath: relativeXPaths(el),
+          text: visibleText(el) || null,
+          class: el.className || null,
+          placeholder: el.placeholder || null,
+          aria: el.getAttribute ? el.getAttribute('aria-label') : null,
+          data: Object.keys(attrs)
+            .filter(function (k) { return k.indexOf('data-') === 0; })
+            .reduce(function (acc, k) { acc[k] = attrs[k]; return acc; }, {})
+        };
+      })()
+    };
+  }
+
+  /* ── whole-page crawl (Section 5.2) ────────────────────────────────── */
+  const CRAWL_SELECTOR = [
+    'input', 'textarea', 'select', 'button', 'a[href]', 'table',
+    '[role=button]', '[role=tab]', '[role=menuitem]', '[role=checkbox]',
+    '[role=radio]', '[role=combobox]', '[role=link]', '[onclick]',
+    '[contenteditable=true]', 'label', 'li[class*=menu]', 'div[class*=btn]',
+    'span[class*=btn]', 'img[onclick]', 'i[class*=icon][onclick]'
+  ].join(',');
+
+  function collectRoots() {
+    // Recursively pierces NESTED shadow DOM, not just one level — a
+    // shadow root's own contents can themselves contain further shadow
+    // roots (a component library built from nested custom elements is
+    // a common real-world shape for this), and the original single-pass
+    // version only ever found shadow roots attached directly to the
+    // top-level light DOM, silently missing anything nested inside one.
+    const roots = [];
+    const seen = new Set();
+    function visit(root) {
+      if (seen.has(root)) return;
+      seen.add(root);
+      roots.push(root);
+      let nodes = [];
+      try { nodes = root.querySelectorAll('*'); } catch (e) { return; }
+      nodes.forEach(function (el) {
+        if (el.shadowRoot) visit(el.shadowRoot);
+      });
+    }
+    visit(document);
+    return roots;
+  }
+
+  function crawlPage(reason) {
+    if (!REC.enabled) return null;
+    const elements = [];
+    const seen = new Set();
+    collectRoots().forEach(function (root) {
+      let nodes = [];
+      try { nodes = Array.from(root.querySelectorAll(CRAWL_SELECTOR)); } catch (e) { }
+      nodes.slice(0, 4000).forEach(function (el) {
+        if (seen.has(el)) return;
+        seen.add(el);
+        const d = describe(el, false);
+        if (d) elements.push(d);
+      });
+    });
+    const crawl = {
+      type: 'crawl',
+      reason: reason || 'page_change',
+      seq: REC.seq++,
+      ts: Date.now(),
+      page: {
+        page_key: pageKey(),
+        url: location.href,
+        title: document.title,
+        page_transitioned: !!REC._pageTransitioned,
+        frames: Array.from(document.querySelectorAll('iframe,frame')).map(function (f) {
+          return { src: f.getAttribute('src'), id: f.id || null, name: f.name || null };
+        }),
+        shadow_roots: collectRoots().length - 1
+      },
+      elements: elements,
+      element_count: elements.length
+    };
+    // Reported once per genuine transition — the NEXT crawl on this same
+    // page (no title/pathname change since) reports it as false again.
+    REC._pageTransitioned = false;
+    REC.crawls.push(crawl);
+    REC.events.push(crawl);
+    relayToTop('crawl', crawl);
+    return crawl;
+  }
+
+  /* ── validation / message capture (Section 5.8) ────────────────────── */
+  const MESSAGE_SELECTOR = [
+    '.error', '.errorMessage', '.error-message', '.alert', '.alert-danger',
+    '.alert-success', '.alert-warning', '.validation-message', '.help-block',
+    '[role=alert]', '.msg', '.message', '.success', '.warning', '.toast',
+    'span[class*=err]', 'div[class*=err]', 'label[class*=err]'
+  ].join(',');
+
+  function captureMessages() {
+    const found = [];
+    document.querySelectorAll(MESSAGE_SELECTOR).forEach(function (el) {
+      const txt = visibleText(el);
+      const rect = el.getBoundingClientRect();
+      if (!txt || !(rect.width || rect.height)) return;
+      let severity = 'info';
+      const cls = (el.className || '') + ' ' + (el.getAttribute('role') || '');
+      if (/err|danger|invalid|fail/i.test(cls)) severity = 'error';
+      else if (/succ|ok|valid/i.test(cls)) severity = 'success';
+      else if (/warn/i.test(cls)) severity = 'warning';
+      found.push({ text: txt, severity: severity, page_key: pageKey(),
+                   selector: cssPath(el) });
+    });
+    if (found.length) {
+      const evt = { type: 'messages', seq: REC.seq++, ts: Date.now(),
+                    page_key: pageKey(), messages: found };
+      REC.messages.push(evt);
+      REC.events.push(evt);
+      relayToTop('messages', evt);
+    }
+    return found;
+  }
+
+  /* ── interaction hooks (Section 5.1 / 5.4) ─────────────────────────── */
+  function pushAction(action, el, extra) {
+    if (!REC.enabled) return;
+    const d = describe(el, true);
+    if (!d) return;
+    const evt = Object.assign({
+      type: 'action',
+      action: action,
+      seq: REC.seq++,
+      ts: Date.now(),
+      page_key: pageKey(),
+      url: location.href,
+      element: d
+    }, extra || {});
+    REC.events.push(evt);
+    // Synchronous, same tick as the click/change/submit that produced
+    // this event — see relayToTop()'s comment for why this has to happen
+    // here and not on some later timer.
+    relayToTop('action', evt);
+  }
+
+  document.addEventListener('click', function (e) {
+    // composedPath()[0] is the TRUE originally-clicked element even when
+    // it's inside a Shadow DOM component (a common way modern frameworks
+    // render floaters/menus) — plain e.target can get "retargeted" to an
+    // outer wrapper in that case, describing the wrong thing.
+    const clicked = (e.composedPath && e.composedPath()[0]) || e.target;
+
+    // ANY click can turn out to trigger an immediate navigation/AJAX
+    // reload — not just a literal `type="submit"` element. A plain <a>
+    // link, a "Home"/menu item, or a JS onclick handler that does its
+    // own `location.href = ...` or triggers a client-side route change
+    // all look identical to an ordinary click until they fire — there's
+    // no reliable way to know in advance which ones will navigate and
+    // which won't. The click gets recorded into memory just fine
+    // either way (pushAction is synchronous), but Python only DRAINS
+    // that memory periodically (~400ms poll) — if the page navigates
+    // before the next poll, the whole in-memory event queue is
+    // destroyed with it, and the click is silently lost even though it
+    // was captured correctly. This used to only be guarded for
+    // type="submit" elements specifically; generalised to (almost)
+    // every click is what actually stops "some actions just don't get
+    // recorded" for the (very common, in a banking UI) case of a
+    // styled link or JS-driven nav button doing the same thing a
+    // submit button does.
+    //
+    // Deliberately EXCLUDED: checkbox/radio inputs. Those already work
+    // correctly via the separate 'change' listener below, which relies
+    // on the click's NATIVE toggle behaviour actually happening —
+    // preventDefault()-ing it here first, then re-dispatching 300ms
+    // later, risks breaking that toggle (and the resulting 'change'
+    // event) for no benefit, since a checkbox/radio click essentially
+    // never triggers an immediate navigation the way a link/button does.
+    const tag = (clicked.tagName || '').toLowerCase();
+    const inputType = (clicked.type || '').toLowerCase();
+    const isCheckboxLike = tag === 'input' && (inputType === 'checkbox' || inputType === 'radio');
+
+    if (isCheckboxLike) {
+      // Already recorded correctly by the 'change' listener elsewhere
+      // in this file — do NOT push here too (that would double-record
+      // every checkbox/radio toggle); just let the native click proceed
+      // untouched, same as before this whole fix existed.
+      return;
+    }
+
+    if (clicked.__aiRecReleased) {
+      // This is our own re-dispatched click going through for real —
+      // don't intercept it again, just let it proceed natively.
+      clicked.__aiRecReleased = false;
+      return;
+    }
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    pushAction('click', clicked, {via: 'delayed_for_safe_drain'});
+    setTimeout(function () {
+      captureMessages();
+      crawlPage('post_click');
+      clicked.__aiRecReleased = true;
+      try {
+        clicked.click(); // re-dispatch — the real click/navigation happens now
+      } catch (err) {
+        // A detached/disabled element by the time this fires — nothing
+        // more to do; the recorded event itself is already safe.
+      }
+    }, 600);
+  }, true);
+
+  document.addEventListener('change', function (e) {
+    const el = e.target;
+    const t = elementType(el);
+    if (t === 'dropdown') {
+      const extra = {
+        selected_text: el.options && el.options[el.selectedIndex]
+          ? el.options[el.selectedIndex].text : null,
+        value_length: (el.value || '').length
+      };
+      if (REC.captureValues) {
+        extra.recorded_value = el.value || '';
+      }
+      pushAction('select', el, extra);
+    } else if (t === 'checkbox' || t === 'radio') {
+      pushAction(el.checked ? 'check' : 'uncheck', el, {});
+    } else if (t === 'upload') {
+      pushAction('upload', el, { file_count: (el.files || []).length });
+    } else {
+      /* Raw value is ONLY ever captured when BOTH: (a) the field isn't
+       * sensitive, and (b) the recording session opted in
+       * (REC.captureValues, off by default — set explicitly by Python
+       * right after injection, only when the person recording chose
+       * "use typed values as default test data" for this session).
+       * Section 7's original rule (never store the raw value) stays the
+       * DEFAULT behaviour; this is an explicit, informed opt-in on top
+       * of it, not a replacement for it — value_length is ALWAYS sent
+       * either way, recorded_value only when both conditions hold. */
+      const now = Date.now();
+      if (el.__aiRecLastCapture && now - el.__aiRecLastCapture < 400) return;
+      el.__aiRecLastCapture = now;
+      const isSensitive = SENSITIVE_HINT.test(el.name || '') ||
+                          SENSITIVE_HINT.test(el.id || '') ||
+                          (el.type || '') === 'password';
+      const extra = {
+        value_length: (el.value || '').length,
+        sensitive: isSensitive
+      };
+      // The element is STILL correctly labelled sensitive:true above
+      // either way (screenshots/masking/display elsewhere all still
+      // treat it as sensitive) — only the VALUE-capture decision itself
+      // changes based on the second, explicit opt-in.
+      if (REC.captureValues && (!isSensitive || REC.captureSensitiveValues)) {
+        extra.recorded_value = el.value || '';
+      }
+      pushAction('type', el, extra);
+    }
+    setTimeout(captureMessages, 350);
+  }, true);
+
+  document.addEventListener('submit', function (e) {
+    // Same "hold back until safely drained" reasoning as the click
+    // handler above — a form submit is the SINGLE MOST LIKELY trigger
+    // for an immediate navigation (that's the entire point of submit),
+    // so this had NO protection at all before this fix, unlike clicks.
+    // `HTMLFormElement.submit()` (used to release it below) bypasses the
+    // 'submit' event entirely per spec — no re-entry guard needed the
+    // way clicked.click() needed one, this genuinely just submits.
+    const form = e.target;
+    if (form.__aiRecReleased) { form.__aiRecReleased = false; return; }
+    e.preventDefault();
+    pushAction('submit', form, {});
+    setTimeout(function () {
+      captureMessages();
+      try { form.submit(); } catch (err) { /* form already gone — nothing to do */ }
+    }, 600);
+  }, true);
+
+  /* Drag & drop — recorded as ONE logical action (drag target -> drop
+   * target), not as the several low-level dragstart/dragover/drop
+   * events the browser actually fires; a business-meaning "moved X onto
+   * Y" is what's replayable and readable, the intermediate dragover
+   * noise is not. Native, unprevented — this only OBSERVES, it doesn't
+   * intercept or hold anything back the way click/submit/Enter do,
+   * since drag&drop very rarely triggers an immediate page navigation
+   * the way those do. */
+  let __aiRecDragSource = null;
+  document.addEventListener('dragstart', function (e) {
+    __aiRecDragSource = e.target;
+  }, true);
+  document.addEventListener('drop', function (e) {
+    if (!__aiRecDragSource) return;
+    const dropTarget = e.target;
+    pushAction('drag_drop', __aiRecDragSource, {
+      drop_target: describe(dropTarget, false),
+    });
+    __aiRecDragSource = null;
+    setTimeout(function () { crawlPage('post_drop'); captureMessages(); }, 350);
+  }, true);
+
+  /* Meaningful scroll only — "sometimes you need to scroll to reveal a
+   * field before interacting with it" (a scrollable table/modal body/
+   * dropdown list hiding what's needed next) is worth a record of WHERE
+   * scrolling happened and how far; continuous scroll-wheel ticks are
+   * not (Section 5's own "usually ignore: insignificant scroll events").
+   * Debounced — only fires once scrolling has actually STOPPED for a
+   * beat, one entry per scroll gesture rather than dozens of
+   * intermediate positions, and only when the total distance is large
+   * enough to plausibly have revealed something that wasn't visible
+   * before (a few pixels of jiggle is not that).
+   */
+  let __aiRecScrollTimer = null;
+  let __aiRecScrollStart = null;
+  document.addEventListener('scroll', function (e) {
+    const target = e.target === document ? document.documentElement : e.target;
+    if (!target || typeof target.scrollTop !== 'number') return;
+    if (__aiRecScrollStart === null) __aiRecScrollStart = target.scrollTop;
+    if (__aiRecScrollTimer) clearTimeout(__aiRecScrollTimer);
+    __aiRecScrollTimer = setTimeout(function () {
+      const distance = Math.abs(target.scrollTop - __aiRecScrollStart);
+      __aiRecScrollStart = null;
+      if (distance < 80) return;  // too small to plausibly matter
+      pushAction('scroll', target === document.documentElement ? document.body : target, {
+        distance_px: Math.round(distance),
+      });
+    }, 400);
+  }, true);
+
+  /* Search/query boxes overwhelmingly submit on Enter, with the page's
+   * own JS intercepting the keydown (often via preventDefault()) to fire
+   * an AJAX search or navigate immediately — the field never blurs in the
+   * way needed for a native 'change' event to fire, so the standard
+   * change-listener above never captures it. This was the actual cause of
+   * a search box that's auto-focused after login (never clicked, typed
+   * into immediately, Enter pressed) going completely unrecorded. Capture
+   * on Enter BEFORE that navigation/AJAX can happen. */
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter' && e.keyCode !== 13) return;
+    const el = e.target;
+    const tag = (el.tagName || '').toLowerCase();
+    if (tag !== 'input' && tag !== 'textarea') return;
+    const t = elementType(el);
+    if (t === 'dropdown' || t === 'checkbox' || t === 'radio' || t === 'upload') return;
+    // Dedup: if a native 'change' already captured this exact field very
+    // recently, don't double-record the same keystroke as two steps.
+    const now = Date.now();
+    if (el.__aiRecLastCapture && now - el.__aiRecLastCapture < 400) return;
+    el.__aiRecLastCapture = now;
+
+    // Same "hold back until safely drained" reasoning as click/submit
+    // above. Pressing Enter in a search box (this platform's own
+    // confirmed real-world case: type a transaction number, press
+    // Enter, the transaction screen opens immediately) is exactly the
+    // shape of action most likely to have been silently lost before
+    // this fix — no protection existed here at all previously.
+    if (el.__aiRecEnterReleased) { el.__aiRecEnterReleased = false; return; }
+    e.preventDefault();
+    pushAction('type', el, {
+      value_length: (el.value || '').length,
+      sensitive: SENSITIVE_HINT.test(el.name || '') ||
+                 SENSITIVE_HINT.test(el.id || '') ||
+                 (el.type || '') === 'password',
+      via: 'enter_key'
+    });
+    setTimeout(function () {
+      captureMessages();
+      el.__aiRecEnterReleased = true;
+      const form = el.form || (el.closest ? el.closest('form') : null);
+      if (form) {
+        // A standard HTML form's native auto-submit-on-Enter — bypass
+        // the trusted-event restriction entirely by submitting directly,
+        // the same way the 'submit' handler above releases itself.
+        try { form.submit(); return; } catch (err) { /* fall through */ }
+      }
+      // No enclosing form (a JS-driven search box handling its own
+      // keydown listener and doing its own navigation/AJAX call, which
+      // this app's search box is — confirmed) — re-dispatch a synthetic
+      // Enter keydown. The page's OWN JS listener still fires for a
+      // synthetic event (only the BROWSER's native default action, e.g.
+      // auto-submitting a real <form>, requires a trusted one — and
+      // that case is already handled above).
+      try {
+        el.dispatchEvent(new KeyboardEvent('keydown', {
+          key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+          bubbles: true, cancelable: true,
+        }));
+      } catch (err) { /* nothing more to do */ }
+    }, 600);
+  }, true);
+
+
+  window.addEventListener('load', function () {
+    setTimeout(function () { crawlPage('load'); captureMessages(); }, 400);
+  });
+
+  /* Best-effort final safety net — a page teardown (logout, a session-
+   * timeout auto-redirect, anything genuinely instant enough to outrun
+   * even the 600ms hold-back above) leaves NO time for async work; a
+   * beforeunload/unload handler can't reliably wait for anything. This
+   * doesn't attempt to. It just marks that the page is going away RIGHT
+   * NOW, on the (real, common) chance Python's poll happens to land in
+   * the brief window between this firing and the page actually being
+   * destroyed — logout being the very last thing recorded, rather than
+   * silently missing, depends on catching that window when it can.
+   */
+  window.addEventListener('beforeunload', function () {
+    try {
+      // Deliberately NOT type: 'action' — this has none of the fields
+      // (`action`, `element`) _ingest_action() expects, and would
+      // otherwise route into it and produce a garbage/empty action
+      // entry. This type doesn't match any of _ingest()'s structured
+      // branches, so it's safely appended to the raw event log only —
+      // evidence that a teardown was IMMINENT at this exact page/URL,
+      // without pretending to be a structured recorded action itself.
+      REC.events.push({
+        type: 'page_unloading', ts: Date.now(),
+        page: { page_key: pageKey(), url: location.href, title: document.title },
+      });
+    } catch (e) { /* nothing more can be done at this point */ }
+  });
+
+  /* SPA / dynamic DOM: re-crawl when the page materially changes.
+   * Used to require >=3 new interactive elements before bothering to
+   * re-crawl — small floaters/popups (a 2-button "Update Later / Update
+   * Now" panel, a short dropdown) never crossed that threshold and were
+   * silently never captured. Any change now triggers a re-crawl. */
+  let mutationTimer = null;
+  let lastCount = 0;
+  const observer = new MutationObserver(function () {
+    if (!REC.enabled) return;
+    clearTimeout(mutationTimer);
+    mutationTimer = setTimeout(function () {
+      const count = document.querySelectorAll(CRAWL_SELECTOR).length;
+      if (count !== lastCount) {
+        lastCount = count;
+        REC.pageKey = null;           // title may have changed
+        crawlPage('dom_mutation');
+      }
+      captureMessages();
+    }, 500);
+  });
+  try {
+    observer.observe(document.documentElement || document.body,
+      { childList: true, subtree: true, attributes: false });
+  } catch (e) { }
+
+  /* ── drain API used by the Python recorder ─────────────────────────── */
+  REC.drain = function () {
+    const batch = REC.events.splice(0, REC.events.length);
+    return batch;
+  };
+  REC.snapshotDom = function () {
+    return {
+      url: location.href,
+      title: document.title,
+      html: document.documentElement ? document.documentElement.outerHTML : '',
+      page_key: pageKey()
+    };
+  };
+  REC.forceCrawl = function () { return crawlPage('manual'); };
+  REC.stop = function () { REC.enabled = false; try { observer.disconnect(); } catch (e) { } };
+  /* Pause/Resume (Section 25) — unlike stop(), does NOT disconnect the
+   * MutationObserver permanently; click/change/submit/keydown listeners
+   * already all check `REC.enabled` first thing, so toggling it back to
+   * true picks capture back up exactly where it left off, in the same
+   * browser session, without a fresh injection. */
+  REC.pause = function () { REC.enabled = false; };
+  REC.resume = function () { REC.enabled = true; };
+
+  /* Progressive re-crawl, not a single fixed-delay snapshot. A slow-
+   * rendering SPA (this platform's own hash-routed UAT login screen is
+   * exactly this shape) can easily still be rendering its login form —
+   * including the password/id fields — well past a single 600ms window.
+   * A crawl that only ever fires once at a fixed delay silently misses
+   * whatever hadn't rendered yet at that exact moment, with no second
+   * chance to catch it later — which is the direct, confirmed cause of
+   * "the recorder doesn't reliably capture the password/id field in
+   * UAT". cdp_recorder.py's `_merge_element()` already de-dupes and
+   * merges elements across repeated crawl events by their unique key
+   * (locators accumulate, nothing gets overwritten) — so simply
+   * crawling AGAIN at increasing intervals, rather than replacing the
+   * single crawl with a longer fixed delay, is what actually closes
+   * this gap: an early crawl still catches whatever's already there
+   * fast, and each later one has another chance at anything that took
+   * longer to render, all merging into the same knowledge instead of
+   * requiring a guess at "the one right delay" for every screen.
+   */
+  [600, 1500, 3000, 6000].forEach(function (delay) {
+    setTimeout(function () { crawlPage('init'); }, delay);
+  });
+})();
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+cdp recorder.py
+
+
+
+
+
+
+
+
+"""Recorder Engine — drives Microsoft Edge via Selenium + CDP (Section 5).
+
+A recording session captures a full digital twin of one transaction:
+pages, every interactable element on every page (whole-page crawl),
+a multi-strategy locator repository, DOM before/after each action,
+screenshots, workflow path, validation rules and (optionally) network
+activity.
+
+Recording is the ONLY manual step in the platform, and it happens once
+per unique transaction.
+"""
+from __future__ import annotations
+
+import json
+import re
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+from ..core import db
+from ..core.config import settings
+from ..core.logging_conf import get_logger
+from ..core.security import is_sensitive
+from . import action_grouping, checkpoint_detector, component_detector, locator_builder
+from . import dom_diff as recorder_dom_diff
+from . import network_capture, quality_score
+from .action_normalizer import ActionNormalizer
+from .snapshot_store import SnapshotStore, dom_diff
+
+log = get_logger(__name__)
+
+INJECTOR_JS = (Path(__file__).parent / "injector.js").read_text(encoding="utf-8")
+
+POLL_INTERVAL = 0.4  # Reduced from 1.0s — per-action processing used to
+                      # include a full-page DOM parse+diff synchronously
+                      # in the hot path (moved to a deferred pass at
+                      # stop() instead), which was slow enough that a
+                      # 1-second poll interval on top of it meant capture
+                      # routinely fell behind normal-speed clicking/
+                      # typing. With that heavy work out of the loop, a
+                      # tighter poll keeps up much more reliably.
+DRIVER_CALL_TIMEOUT = 8.0  # seconds — a hung Edge/CDP call must never hang the caller
+
+
+class RecorderError(RuntimeError):
+    pass
+
+
+def _bypass_proxy_for_local_webdriver() -> None:
+    """Exclude localhost/127.0.0.1 from the corporate HTTP proxy.
+
+    On a machine where a corporate proxy (visible in browser and CLI
+    traffic — SBI's helpdesk.proxy@sbi.co.in gateway shows up here) is
+    configured system-wide via HTTP_PROXY/HTTPS_PROXY, Selenium's
+    internal HTTP client (talking to msedgedriver's local server at
+    http://localhost:<port>, purely on this machine) inherits that proxy
+    setting too unless localhost is explicitly excluded. The proxy then
+    intercepts what should be a purely local WebDriver-protocol call,
+    can't authenticate it (no corporate credentials attached to an
+    internal loopback request), and returns an "Access Denied
+    (authentication_failed)" HTML page — which Selenium can't parse as
+    the JSON response it expected, and raises WebDriverException.
+    Merges into any existing NO_PROXY/no_proxy value rather than
+    overwriting it, in case other exclusions are already configured.
+    """
+    import os
+    for var in ("NO_PROXY", "no_proxy"):
+        current = os.environ.get(var, "")
+        entries = {e.strip() for e in current.split(",") if e.strip()}
+        entries.update({"localhost", "127.0.0.1", "::1"})
+        os.environ[var] = ",".join(sorted(entries))
+
+
+def _call_with_timeout(fn: Callable[[], Any], timeout: float = DRIVER_CALL_TIMEOUT) -> Any:
+    """Run fn() with a hard wall-clock timeout.
+
+    Selenium's WebDriver HTTP client has no reliable per-call timeout of its
+    own, so a stuck browser (e.g. a native JS confirm()/alert() blocking the
+    page, or a wedged msedgedriver) can hang a call forever. We can't kill a
+    Python thread, so on timeout we abandon the worker and raise immediately,
+    letting the caller move on. The worker MUST be a daemon thread — a
+    plain (non-daemon) thread left running would block the whole process
+    from exiting later, trading one hang for another.
+    """
+    result: dict[str, Any] = {}
+    error: dict[str, BaseException] = {}
+
+    def runner() -> None:
+        try:
+            result["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            error["value"] = exc
+
+    worker = threading.Thread(target=runner, daemon=True, name="driver-call")
+    worker.start()
+    worker.join(timeout=timeout)
+    if worker.is_alive():
+        raise TimeoutError(f"driver call exceeded {timeout}s")
+    if "value" in error:
+        raise error["value"]
+    return result.get("value")
+
+
+class RecordingSession:
+    """One recording of one transaction."""
+
+    def __init__(
+        self,
+        transaction_id: str,
+        transaction_name: str,
+        start_url: str,
+        environment: str = "PREPROD",
+        transaction_type: str = "business",
+        description: str | None = None,
+        fullpage_crawl: bool = True,
+        capture_network: bool = True,
+        capture_recorded_values: bool = False,
+        capture_sensitive_values: bool = False,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        self.session_uid = f"rec_{transaction_id}_{uuid.uuid4().hex[:8]}"
+        self.transaction_id = transaction_id
+        self.transaction_name = transaction_name
+        self.environment = environment
+        self.transaction_type = transaction_type
+        self.description = description
+        self.start_url = start_url
+        self.fullpage_crawl = fullpage_crawl
+        self.capture_network = capture_network and settings.recorder_capture_network
+        # Opt-in, per session — "use the value I actually type during
+        # this recording as the default test-data value" — never forced
+        # on. `capture_sensitive_values` is a SEPARATE, second opt-in on
+        # top of it — extends value-capture to password/PIN/OTP fields
+        # too, meant for environments (like a UAT env using dummy test
+        # credentials, never real ones) where that's a deliberate,
+        # informed choice — never bundled into the first flag alone.
+        self.capture_recorded_values = capture_recorded_values
+        self.capture_sensitive_values = capture_sensitive_values
+        self.on_event = on_event
+
+        self.store = SnapshotStore(self.session_uid)
+        self.driver = None
+        self.status = "created"
+        self._poll_thread: Optional[threading.Thread] = None
+        self._stop_flag = threading.Event()
+        self._last_dom: str = ""
+        self._events: list[dict[str, Any]] = []
+        self._pages: dict[str, dict[str, Any]] = {}
+        self._elements: dict[str, dict[str, Any]] = {}
+        self._messages: list[dict[str, Any]] = []
+        self._network: list[dict[str, Any]] = []
+        self._workflow: list[str] = []
+        self._actions: list[dict[str, Any]] = []
+        self._last_dom_ref: str = ""
+        self._action_seq = 0
+        # Multiple windows/tabs — the banking app can open a genuinely
+        # NEW browser window (a supervisor-override popup, a report
+        # viewer, ...) via window.open()/target="_blank", which a
+        # script injected via Page.addScriptToEvaluateOnNewDocument on
+        # the ORIGINAL window does NOT automatically also apply to —
+        # each window/tab needs its own injection. `_window_stack`
+        # tracks the PARENT handle each new window was opened FROM, so
+        # closing a child window can return to the correct parent
+        # (not just "whichever handle happens to be first"), the same
+        # way a person naturally alt-tabs back to where they came from.
+        self._known_window_handles: set[str] = set()
+        self._window_stack: list[str] = []
+        self._windows_meta: dict[str, dict[str, Any]] = {}
+        self._last_alert_text: str | None = None
+        self._console_events: list[dict[str, Any]] = []
+        self._known_downloads: set[str] = set()
+        self._downloads: list[dict[str, Any]] = []
+        self.download_dir: Path | None = None
+        # Recorder-enhancement Sections 5/6/7 — normalization/dedup runs
+        # per-event as actions are ingested; grouping runs once, on
+        # demand, over the full action list (it needs to see the whole
+        # sequence to find step boundaries).
+        self._normalizer = ActionNormalizer()
+        self._page_boundary_sequences: set[int] = set()
+        # Section 15/16 — checkpoints and business-validation records are
+        # stored SEPARATELY from `_actions`, never mixed in — this is
+        # what makes "ACTION vs EXPECTED OUTCOME" a structural distinction
+        # rather than just a label on the same list.
+        self._checkpoints: list[dict[str, Any]] = []
+        self._validations: list[dict[str, Any]] = []
+        self._last_url: str = ""
+
+    # ── browser lifecycle ───────────────────────────────────────────────
+    def _build_driver(self):
+        from selenium import webdriver
+        from selenium.webdriver.edge.options import Options
+        from selenium.webdriver.edge.service import Service
+
+        _bypass_proxy_for_local_webdriver()
+
+        options = Options()
+        options.add_argument("--start-maximized")
+        options.add_argument("--disable-popup-blocking")
+        options.add_argument("--disable-notifications")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        # Same rationale as python-framework/core/driver_factory.py's
+        # execution-side driver — kept in sync deliberately. See that
+        # file's docstring for the full explanation, INCLUDING why
+        # --disable-web-security and --allow-running-insecure-content are
+        # deliberately NOT here (removed after a confirmed real incident:
+        # they caused a "BCF0070: Security breached, user session
+        # invalidated" error on logout, specifically because they disable
+        # the browser's own CORS/same-origin enforcement that this app's
+        # server-side session-security layer relies on to consider a
+        # request legitimate).
+        options.add_argument("--ignore-certificate-errors")
+        options.add_argument("--allow-insecure-localhost")
+        options.add_argument("--disable-blink-features=BlockCredentialedSubresources")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+        options.set_capability("ms:loggingPrefs", {"performance": "ALL", "browser": "ALL"})
+        if settings.edge_binary_path:
+            options.binary_location = settings.edge_binary_path
+        if self.capture_network:
+            # NOT options.set_capability("ms:edgeOptions", {...}) — that
+            # was a real, pre-existing bug found while wiring in the
+            # options above: Selenium's own `to_capabilities()` REBUILDS
+            # the `ms:edgeOptions` capability from its internal
+            # args/extensions/experimental_options state, discarding
+            # anything set directly via `set_capability("ms:edgeOptions",
+            # ...)` — so `perfLoggingPrefs` was silently never actually
+            # reaching the browser at all, regardless of
+            # `capture_network`. `add_experimental_option()` is the
+            # mechanism that actually survives into the final
+            # capabilities (confirmed directly: excludeSwitches/
+            # useAutomationExtension/prefs above all do, via this exact
+            # path) — using it here for perfLoggingPrefs too.
+            options.add_experimental_option("perfLoggingPrefs", {"enableNetwork": True})
+        service = (
+            Service(executable_path=settings.edge_driver_path)
+            if settings.edge_driver_path else Service()
+        )
+        driver = webdriver.Edge(service=service, options=options)
+        driver.implicitly_wait(settings.browser_implicit_wait)
+        # A native OS "Save As" dialog for a download would otherwise
+        # BLOCK the browser the same way a native alert does (see the
+        # alert-detection above) — Selenium/CDP can't interact with an
+        # OS-level dialog at all. Setting an explicit download directory
+        # + "allow" behavior via CDP makes every download save silently
+        # and automatically, so it can be detected by watching that
+        # directory (see `_drain_downloads()`) instead.
+        self.download_dir = self.store.root / "downloads"
+        self.download_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            driver.execute_cdp_cmd("Page.setDownloadBehavior", {
+                "behavior": "allow", "downloadPath": str(self.download_dir),
+            })
+        except Exception as exc:
+            log.debug("Could not configure download behaviour: %s", exc)
+        return driver
+
+    def start(self) -> dict[str, Any]:
+        log.info("Starting recording %s for transaction %s",
+                 self.session_uid, self.transaction_id)
+        self.driver = self._build_driver()
+        # Inject on every document so the collector survives navigation.
+        try:
+            # Enable CDP domains for deep auto-attachment & accessibility
+            for domain in ("Page", "DOM", "Runtime"):
+                try:
+                    self.driver.execute_cdp_cmd(f"{domain}.enable", {})
+                except Exception:
+                    pass
+            try:
+                self.driver.execute_cdp_cmd("Accessibility.enable", {})
+            except Exception:
+                pass
+
+            # 1. CDP Multi-Target Auto-Attach (penetrates all sandboxed & cross-origin iframes natively)
+            try:
+                self.driver.execute_cdp_cmd("Target.setAutoAttach", {
+                    "autoAttach": True,
+                    "waitForDebuggerOnStart": False,
+                    "flatten": True
+                })
+            except Exception as exc:
+                log.debug("Target.setAutoAttach not supported: %s", exc)
+
+            # 2. Register native CDP binding for instant event streaming to Python
+            try:
+                self.driver.execute_cdp_cmd("Runtime.addBinding", {"name": "sendToPythonRecorder"})
+            except Exception as exc:
+                log.debug("Runtime.addBinding failed: %s", exc)
+
+            # 3. Inject pre-execution Shadow DOM patch & collector on every document
+            self.driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument", {"source": INJECTOR_JS}
+            )
+            if self.capture_network:
+                self.driver.execute_cdp_cmd("Network.enable", {})
+        except Exception as exc:
+            log.warning("CDP injection unavailable, falling back: %s", exc)
+
+        self.driver.get(self.start_url)
+        self._ensure_injected()
+        self._apply_session_config()
+        self.status = "recording"
+
+        db.execute(
+            """
+            INSERT INTO recording_sessions
+              (session_uid, transaction_id, transaction_name, environment,
+               status, start_url, capture_dir)
+            VALUES (%s,%s,%s,%s,'recording',%s,%s)
+            ON CONFLICT (session_uid) DO NOTHING
+            """,
+            (self.session_uid, self.transaction_id, self.transaction_name,
+             self.environment, self.start_url, str(self.store.root)),
+        )
+
+        self._stop_flag.clear()
+        self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._poll_thread.start()
+        return self.info()
+
+    def _ensure_injected(self) -> None:
+        """Re-inject after navigations that bypassed the CDP hook."""
+        try:
+            present = self.driver.execute_script("return !!window.__AIREC__;")
+            if not present:
+                self.driver.execute_script(INJECTOR_JS)
+                self._apply_session_config()
+        except Exception as exc:
+            log.debug("Injection check failed: %s", exc)
+
+    def _apply_session_config(self) -> None:
+        """`Page.addScriptToEvaluateOnNewDocument` re-runs the SAME
+        static injector script on every new document (every real
+        navigation creates a fresh `window.__AIREC__` object) —
+        `captureValues`/`captureSensitiveValues` reset to their
+        script-level defaults (both false) each time, so this needs to
+        be explicitly re-applied after every (re-)injection, not just
+        once at session start."""
+        if not self.capture_recorded_values:
+            return
+        try:
+            flags = "true" if self.capture_sensitive_values else "false"
+            self.driver.execute_script(
+                "if (window.__AIREC__) { "
+                "window.__AIREC__.captureValues = true; "
+                f"window.__AIREC__.captureSensitiveValues = {flags}; "
+                "}"
+            )
+        except Exception as exc:
+            log.debug("Could not apply session config: %s", exc)
+
+    def _sync_window_handles(self) -> None:
+        """Detects a newly-opened window/tab (switches to it, injects the
+        recorder script there too, and remembers which window it was
+        opened FROM) or a closed one (returns to that parent), on every
+        poll tick — a supervisor-override popup, a report viewer, or any
+        other window.open()/target="_blank" window the banking app opens
+        is otherwise invisible to this recorder entirely, since each
+        window/tab needs its own script injection.
+        """
+        try:
+            current_handles = set(self.driver.window_handles)
+        except Exception:
+            return  # driver/browser gone — nothing to sync
+
+        new_handles = current_handles - self._known_window_handles
+        closed_handles = self._known_window_handles - current_handles
+
+        for handle in new_handles:
+            try:
+                parent_handle = self.driver.current_window_handle
+            except Exception:
+                parent_handle = None
+            try:
+                self.driver.switch_to.window(handle)
+                self.driver.execute_script(INJECTOR_JS)
+                url = self.driver.current_url
+                title = self.driver.title
+            except Exception as exc:
+                log.debug("Could not switch to/inject new window %s: %s", handle, exc)
+                url, title = "", ""
+            self._windows_meta[handle] = {"opened_from": parent_handle, "url": url, "title": title}
+            if parent_handle and parent_handle != handle:
+                self._window_stack.append(parent_handle)
+            self._messages.append({
+                "type": "window_opened", "handle": handle, "url": url,
+                "title": title, "ts": time.time(),
+                "text": f"Window opened: {title or url}",
+            })
+            log.info("New window/tab detected during recording: %s (%s)", title, url)
+
+        for handle in closed_handles:
+            self._windows_meta.pop(handle, None)
+            self._messages.append({
+                "type": "window_closed", "handle": handle, "ts": time.time(),
+                "text": "Window closed",
+            })
+            # Return to whichever window this one was opened from, same
+            # as a person naturally alt-tabbing back — not just
+            # whichever handle happens to be first in the remaining set.
+            parent = self._window_stack.pop() if self._window_stack else None
+            try:
+                remaining = self.driver.window_handles
+            except Exception:
+                remaining = []
+            target = parent if parent in remaining else (remaining[0] if remaining else None)
+            if target:
+                try:
+                    self.driver.switch_to.window(target)
+                except Exception as exc:
+                    log.debug("Could not switch back to %s after child window closed: %s",
+                              target, exc)
+
+        self._known_window_handles = current_handles
+
+    # ── polling loop ────────────────────────────────────────────────────
+    def _poll_loop(self) -> None:
+        while not self._stop_flag.is_set():
+            try:
+                self._drain_once()
+            except Exception as exc:
+                log.debug("Poll iteration failed: %s", exc)
+            self._stop_flag.wait(POLL_INTERVAL)
+
+    def _drain_once(self) -> None:
+        if self.driver is None:
+            return
+        if self.status == "paused":
+            # Nothing to drain while paused — skip the CDP round-trips
+            # entirely rather than polling a browser that was told not
+            # to be capturing anything (Section 27: don't do unnecessary
+            # work on every tick).
+            return
+
+        # ── native browser dialogs (alert/confirm/prompt) ───────────────
+        # A native dialog BLOCKS every subsequent WebDriver command
+        # (including the execute_script() drain call below) until it's
+        # dismissed — without this check, every poll tick would just
+        # silently fail (caught by _poll_loop's broad except) for as
+        # long as the dialog stays open, capturing NOTHING and recording
+        # no evidence the dialog ever appeared. This does NOT auto-
+        # dismiss it — during RECORDING, a human is present and will
+        # resolve it as part of their own natural workflow (that IS the
+        # action being recorded); this only makes sure its appearance
+        # and text get captured as evidence before that happens.
+        try:
+            alert = self.driver.switch_to.alert
+            alert_text = alert.text
+        except Exception:
+            alert_text = None
+        if alert_text is not None:
+            if alert_text != self._last_alert_text:
+                self._last_alert_text = alert_text
+                # Best-effort — some drivers allow a screenshot while a
+                # native dialog is open (it's read-only, same category
+                # as reading alert.text above, which already succeeded);
+                # _screenshot() already swallows its own failures, so a
+                # driver that DOESN'T allow this just gets an empty ref
+                # rather than breaking dialog detection itself.
+                shot = self._screenshot(f"dialog_{int(time.time() * 1000)}")
+                self._messages.append({
+                    "type": "native_dialog", "text": alert_text,
+                    "ts": time.time(), "page_key": self._last_page_key(),
+                    "screenshot_ref": shot,
+                })
+                log.info("Native dialog detected during recording: %r", alert_text)
+            return  # nothing else is safe to do while a dialog is open
+
+        self._last_alert_text = None
+        self._sync_window_handles()
+        self._ensure_injected()
+        raw: list[dict[str, Any]] = []
+        try:
+            top = _call_with_timeout(
+                lambda: self.driver.execute_script(
+                    "return window.__AIREC__ && window.__AIREC__.drain();"
+                )
+            )
+            if top:
+                raw.extend(top)
+        except Exception as exc:
+            log.debug("Top-level drain failed: %s", exc)
+        try:
+            raw.extend(self._drain_frames(depth=0))
+        finally:
+            # _drain_frames always restores context on its own way out, but
+            # a raised exception partway through a switch_to chain must
+            # never leave the driver stuck inside a stale/detached iframe
+            # for every subsequent poll tick.
+            try:
+                self.driver.switch_to.default_content()
+            except Exception:
+                pass
+        if not raw:
+            return
+        # Section 27 / correctness: EACH event gets its own isolated
+        # try/except. Before this fix, a single exception from ANY event
+        # in the batch (a screenshot call failing during a page
+        # transition, a DOM-diff parse hiccup, ...) propagated straight
+        # out of this whole function — which meant every event AFTER
+        # the one that failed was silently never ingested, AND never
+        # even reached the raw-events append below, so there was no way
+        # to recover them afterward either. This was the direct,
+        # confirmed cause of actions going missing during a real
+        # recording — one bad event could take out the rest of an
+        # entire poll batch with it.
+        for event in raw:
+            try:
+                self._ingest(event)
+            except Exception as exc:
+                log.warning("Failed to ingest one recorder event (sequence "
+                           "continues with the rest of this batch): %s", exc)
+        # Persisted regardless of whether every individual ingest above
+        # succeeded — the raw capture is never lost even if enrichment
+        # failed for some of it.
+        self.store.append_events(raw)
+        if self.capture_network:
+            self._drain_network()
+        self._drain_console()
+        self._drain_downloads()
+
+    MAX_FRAME_DEPTH = 3
+
+    def _drain_frames(self, depth: int) -> list[dict[str, Any]]:
+        """Inject into AND drain every iframe, including iframes nested
+        inside iframes (a "popped-up" modal dialog is very often
+        implemented as an iframe injected into the DOM), up to
+        `MAX_FRAME_DEPTH` levels deep.
+
+        injector.js's click/change/submit listeners are attached to
+        `document` inside whichever window they're injected into — an
+        iframe has its OWN separate `window`, so a click recorded inside
+        one lands in THAT iframe's own `window.__AIREC__.events` buffer,
+        never in the top-level document's. Only injecting into iframes
+        (the old behaviour) without ALSO switching into each one to call
+        its own `.drain()` meant every interaction inside an iframe was
+        captured correctly by the in-page script but never actually read
+        back into Python — it just sat in the iframe's buffer, invisible
+        to the recorder, until the next navigation cleared it.
+        """
+        collected: list[dict[str, Any]] = []
+        if depth >= self.MAX_FRAME_DEPTH:
+            return collected
+        try:
+            frames = self.driver.find_elements("tag name", "iframe")
+        except Exception:
+            return collected
+
+        for index in range(len(frames)):
+            try:
+                # Re-fetch on every iteration: switching frames can detach
+                # earlier WebElement references, and a popped-up iframe
+                # can itself appear/disappear between poll ticks.
+                frames = self.driver.find_elements("tag name", "iframe")
+                if index >= len(frames):
+                    break
+                frame_el = frames[index]
+                frame_tag = (
+                    frame_el.get_attribute("name")
+                    or frame_el.get_attribute("id")
+                    or frame_el.get_attribute("src")
+                    or f"frame_{index}"
+                )
+                self.driver.switch_to.frame(frame_el)
+            except Exception as exc:
+                log.debug("Could not switch into frame %s at depth %s: %s",
+                          index, depth, exc)
+                try:
+                    self.driver.switch_to.default_content()
+                    for _ in range(depth):
+                        pass  # already at top; nothing more to unwind
+                except Exception:
+                    pass
+                continue
+
+            try:
+                if not self.driver.execute_script("return !!window.__AIREC__;"):
+                    self.driver.execute_script(INJECTOR_JS)
+                frame_events = _call_with_timeout(
+                    lambda: self.driver.execute_script(
+                        "return window.__AIREC__ && window.__AIREC__.drain();"
+                    )
+                )
+                if frame_events:
+                    for event in frame_events:
+                        event["frame_path"] = f"{depth}:{index}:{frame_tag}"
+                    collected.extend(frame_events)
+                # Recurse into any iframe nested inside this one BEFORE
+                # leaving its context.
+                collected.extend(self._drain_frames(depth + 1))
+            except Exception as exc:
+                log.debug("Frame drain failed at depth %s index %s: %s",
+                          depth, index, exc)
+            finally:
+                try:
+                    self.driver.switch_to.parent_frame()
+                except Exception:
+                    try:
+                        self.driver.switch_to.default_content()
+                    except Exception:
+                        pass
+        return collected
+
+    def _drain_network(self) -> None:
+        try:
+            logs = self.driver.get_log("performance")
+        except Exception:
+            return
+        for entry in logs[-200:]:
+            try:
+                message = json.loads(entry["message"])["message"]
+            except Exception:
+                continue
+            # Section 17 — masked URL, HTTP method, status, timing, and a
+            # correlation id (requestId), via network_capture.py rather
+            # than the previous method/url/status-only capture. Never a
+            # request/response BODY — see that module's docstring for why.
+            #
+            # Selenium's performance-log `timestamp` is milliseconds
+            # since epoch (CDP/JS convention); every action's own `ts`
+            # (cdp_recorder.py's `_ingest_action`) is `time.time()` —
+            # SECONDS since epoch. Comparing them directly in
+            # network_capture.correlate() without normalising first
+            # would be off by a factor of 1000 and never match anything
+            # — converted to seconds here, once, at the source.
+            raw_ts = entry.get("timestamp")
+            ts_seconds = raw_ts / 1000.0 if isinstance(raw_ts, (int, float)) else raw_ts
+            normalized = network_capture.normalize_event(message, ts_seconds)
+            if normalized:
+                self._network.append(normalized)
+
+    def _drain_console(self) -> None:
+        """Console errors/warnings/unhandled exceptions — needs
+        `ms:loggingPrefs: {"browser": "ALL"}` on the driver options
+        (backend/recorder/cdp_recorder.py's own `_build_driver()`) to
+        have anything to read here at all. A JS error at the exact
+        moment of a recorded action is often the real explanation for
+        why that action's outcome looked wrong (a field that silently
+        didn't update, a submit that silently did nothing) — evidence
+        worth keeping even though this never blocks or alters the
+        recording itself.
+        """
+        try:
+            logs = self.driver.get_log("browser")
+        except Exception:
+            return
+        for entry in logs[-100:]:
+            level = (entry.get("level") or "").upper()
+            if level not in ("SEVERE", "WARNING"):
+                continue  # INFO/DEBUG-level browser log noise, not useful evidence
+            raw_ts = entry.get("timestamp")
+            ts_seconds = raw_ts / 1000.0 if isinstance(raw_ts, (int, float)) else time.time()
+            self._console_events.append({
+                "level": "error" if level == "SEVERE" else "warning",
+                "message": (entry.get("message") or "")[:2000],
+                "ts": ts_seconds,
+                "page_key": self._last_page_key(),
+            })
+
+    def _drain_downloads(self) -> None:
+        """Watches the configured download directory (see
+        `_build_driver()`'s `Page.setDownloadBehavior`) for newly-
+        appeared files — a genuinely-completed download shows up here
+        as an ordinary file, no CDP event subscription needed, fitting
+        the same polling model everything else in this class already
+        uses. A file that's still `.crdownload`/`.tmp` (Chromium's own
+        in-progress marker extensions) is deliberately NOT reported yet
+        — only once it's actually finished and renamed to its real name.
+        """
+        if not self.download_dir or not self.download_dir.exists():
+            return
+        try:
+            current_files = {
+                f.name for f in self.download_dir.iterdir()
+                if f.is_file() and not f.name.endswith((".crdownload", ".tmp"))
+            }
+        except Exception:
+            return
+        for filename in current_files - self._known_downloads:
+            full_path = self.download_dir / filename
+            try:
+                size_bytes = full_path.stat().st_size
+            except Exception:
+                size_bytes = None
+            self._downloads.append({
+                "filename": filename,
+                "extension": full_path.suffix.lstrip("."),
+                "size_bytes": size_bytes,
+                "ts": time.time(),
+                "page_key": self._last_page_key(),
+            })
+            log.info("Download detected during recording: %s", filename)
+        self._known_downloads = current_files
+
+    # ── event ingestion ─────────────────────────────────────────────────
+    def _ingest(self, event: dict[str, Any]) -> None:
+        etype = event.get("type")
+        if etype == "crawl":
+            self._ingest_crawl(event)
+        elif etype == "action":
+            self._ingest_action(event)
+        elif etype == "messages":
+            self._messages.extend(event.get("messages", []))
+        self._events.append(event)
+        if self.on_event:
+            try:
+                self.on_event(self._public_event(event))
+            except Exception:
+                pass
+
+    def _ingest_crawl(self, event: dict[str, Any]) -> None:
+        page = event.get("page", {})
+        page_key = page.get("page_key") or "page"
+        if page_key not in self._pages:
+            dom = self._snapshot_dom(f"page_{len(self._pages):02d}_{page_key}")
+            self._pages[page_key] = {
+                "page_key": page_key,
+                "title": page.get("title"),
+                "url": page.get("url"),
+                "sequence": len(self._pages),
+                "dom_ref": dom.get("ref"),
+                "screenshot_ref": self._screenshot(f"page_{page_key}"),
+                "frames": page.get("frames", []),
+                "shadow_roots": [{"count": page.get("shadow_roots", 0)}],
+                "page_type": self._classify_page_type(page, event.get("elements", [])),
+                "meta": {"element_count": event.get("element_count", 0)},
+            }
+            self._workflow.append(page.get("title") or page_key)
+            # Section 7: a page/URL transition is an unconditional action-
+            # grouping boundary — the NEXT action recorded belongs to a
+            # new logical step no matter how quickly it follows the last
+            # one on the previous page.
+            self._page_boundary_sequences.add(self._action_seq)
+        for raw_element in event.get("elements", []):
+            self._merge_element(raw_element, page_key, interacted=False)
+
+    _MFA_PAGE_HINTS = re.compile(
+        r"\b(otp|one[\s_-]?time[\s_-]?password|verification[\s_-]?code|"
+        r"authenticat(or|ion)|two[\s_-]?factor|2fa|mfa)\b", re.I
+    )
+
+    def _classify_page_type(self, page: dict[str, Any], elements: list[dict[str, Any]]) -> str | None:
+        """A PAGE-level label, not just the existing FIELD-level
+        `sensitive: true` flag — an OTP/MFA verification screen is
+        structurally special (a security-critical checkpoint the
+        workflow has to pass through, not an ordinary business form),
+        worth knowing about at the SCREEN level for the same reason
+        Part 6's error classifier treats AUTHENTICATION failures as
+        never-heal-worthy: an AI or human reviewing this recording
+        should immediately understand "this step exists to verify
+        identity", not have to infer it from one field's name alone.
+        """
+        title = (page.get("title") or "")
+        url = (page.get("url") or "")
+        if self._MFA_PAGE_HINTS.search(title) or self._MFA_PAGE_HINTS.search(url):
+            return "otp_verification"
+        otp_field_count = sum(
+            1 for el in elements
+            if self._MFA_PAGE_HINTS.search(
+                f"{el.get('label', '')} {(el.get('locators') or {}).get('name', '')} "
+                f"{(el.get('locators') or {}).get('id', '')}"
+            )
+        )
+        # A single OTP-ish field on an otherwise-ordinary form (a
+        # "reference OTP" display column in a data table, say) doesn't
+        # make the whole SCREEN an OTP-verification step — only when
+        # OTP-related fields are clearly the page's main content.
+        if elements and otp_field_count >= 1 and otp_field_count / max(len(elements), 1) > 0.3:
+            return "otp_verification"
+        return None
+
+    def _ingest_action(self, event: dict[str, Any]) -> None:
+        normalized = self._normalizer.process(event)
+        if normalized is None:
+            # A duplicate of the immediately-preceding action on the same
+            # element (Section 6) — never reaches the knowledge package.
+            log.debug("Dropped duplicate action: %s", self._normalizer._identity(event))
+            return
+        event = normalized
+
+        raw_element = event.get("element") or {}
+        page_key = event.get("page_key") or "page"
+        element_key = self._merge_element(raw_element, page_key, interacted=True)
+
+        # drag_drop's drop target is a SEPARATE element from the one
+        # being dragged (`raw_element`) — needs its own locator profile
+        # merged in the same way, so codegen can reference both by key
+        # rather than only ever knowing about the drag SOURCE.
+        target_element_key = None
+        raw_target = event.get("drop_target")
+        if raw_target:
+            target_element_key = self._merge_element(raw_target, page_key, interacted=True)
+
+        name = f"action_{self._action_seq:03d}_{event.get('action')}"
+        before_ref = self._last_dom_ref or ""
+        shot_before = self._screenshot(name + "_before")
+        dom_after = self._snapshot_dom(name + "_after")
+        shot_after = self._screenshot(name + "_after")
+
+        field_name = (
+            raw_element.get("label")
+            or raw_element.get("locators", {}).get("name")
+            or element_key
+        )
+        variable = _variable_name(field_name)
+        current_url = event.get("url") or self._last_url
+        action_record = {
+            "sequence": self._action_seq,
+            "ts": time.time(),
+            "action": event.get("action"),
+            "element": {"element_key": element_key, "label": raw_element.get("label")},
+            "element_key": element_key,
+            "target_element_key": target_element_key,
+            "field_name": field_name,
+            # NEVER the raw value — only the variable reference (Section 7)
+            "value_ref": variable if event.get("action") in
+                         ("type", "select", "upload") else None,
+            "page_key": page_key,
+            "dom_before_ref": before_ref,
+            "dom_after_ref": dom_after.get("ref"),
+            "screenshot_before": shot_before,
+            "screenshot_after": shot_after,
+            "meta": {
+                "url": event.get("url"),
+                "value_length": event.get("value_length"),
+                "selected_text": event.get("selected_text"),
+                "sensitive": bool(event.get("sensitive"))
+                             or is_sensitive(field_name or ""),
+                "element_type": raw_element.get("element_type"),
+                "dom_diff": dom_diff(self._last_dom, dom_after.get("html", "")),
+                # Blocked for a sensitive field UNLESS this session
+                # explicitly opted into BOTH capture_recorded_values AND
+                # capture_sensitive_values — the same two-flag rule
+                # enforced independently at three layers now (injector.js,
+                # here, and field_meta.build() next) rather than relying
+                # on any single one of them alone.
+                "recorded_value": (
+                    event.get("recorded_value")
+                    if (
+                        not (bool(event.get("sensitive")) or is_sensitive(field_name or ""))
+                        or (self.capture_recorded_values and self.capture_sensitive_values)
+                    )
+                    else None
+                ),
+            },
+        }
+        self._events_action(action_record)
+        self._last_dom = dom_after.get("html", "")
+        self._last_url = current_url
+        self._action_seq += 1
+
+    def _run_checkpoint_detection_pass(self) -> None:
+        """Section 15/16's checkpoint + business-validation detection —
+        moved OUT of the per-action synchronous capture path (where it
+        used to run on every single click/type) and into a single pass
+        over the whole action list, run once at stop(). This is the
+        actual fix for "recorder is lagging": `whole_page_diff()` parses
+        the FULL before/after page HTML with `html.parser` and diffs the
+        resulting trees — a genuinely non-trivial cost that, per-action,
+        stacked with 2 screenshots and a DOM snapshot, meant Python's
+        capture loop routinely fell behind a person clicking/typing at
+        completely normal speed. None of that analysis needs to happen
+        WHILE someone is still actively recording — Section 24's own
+        principle ("AI/heavier processing happens after recording, not
+        per-event") applies here even though this specific step isn't
+        AI at all, just expensive.
+        """
+        by_seq = {a["sequence"]: a for a in self._actions}
+        for action in self._actions:
+            dom_before_ref = action.get("dom_before_ref") or ""
+            dom_after_ref = action.get("dom_after_ref") or ""
+            html_before = self.store.load_dom(dom_before_ref) if dom_before_ref else ""
+            html_after = self.store.load_dom(dom_after_ref) if dom_after_ref else ""
+            if not html_after:
+                continue
+            try:
+                rich_diff = recorder_dom_diff.whole_page_diff(html_before, html_after)
+                new_checkpoints = checkpoint_detector.detect(
+                    action, rich_diff,
+                    url_before=(action.get("meta") or {}).get("url"),
+                    url_after=(action.get("meta") or {}).get("url"),
+                )
+                self._checkpoints.extend(new_checkpoints)
+                validation = checkpoint_detector.detect_business_validation(
+                    action, new_checkpoints
+                )
+                if validation:
+                    self._validations.append(validation)
+            except Exception as exc:
+                log.debug("Checkpoint detection failed for action %s: %s",
+                         action.get("sequence"), exc)
+
+    def _events_action(self, action: dict[str, Any]) -> None:
+        self._actions.append(action)
+
+    def _merge_element(
+        self, raw: dict[str, Any], page_key: str, interacted: bool
+    ) -> str:
+        key = raw.get("element_key") or "element"
+        unique = f"{page_key}::{key}"
+        existing = self._elements.get(unique)
+        locators = locator_builder.build(
+            raw.get("locators", {}), raw.get("element_type", "")
+        )
+        if existing:
+            existing["interacted"] = existing["interacted"] or interacted
+            known = {(l["strategy"], l["value"]) for l in existing["locators"]}
+            existing["locators"].extend(
+                l for l in locators if (l["strategy"], l["value"]) not in known
+            )
+            return unique
+        # Section 12 — a "locator profile" alongside the existing flat
+        # `locators` list (kept exactly as-is, unchanged shape, for every
+        # existing consumer — generator.py, self_healing.py, etc.).
+        # `locator_profile` is purely additive: a named, SCORED candidate
+        # list using Part 9's multi-factor ranker (stability +
+        # historical_success + uniqueness + semantic_match against the
+        # recorded label), computed at record time instead of only ever
+        # at self-healing time.
+        profile = locator_builder.build_profile(
+            unique, raw.get("locators", {}), raw.get("element_type", ""),
+            label=raw.get("label"),
+        )
+        self._elements[unique] = {
+            "element_key": unique,
+            "tag": raw.get("tag"),
+            "element_type": raw.get("element_type"),
+            "label": raw.get("label"),
+            "visible": raw.get("visible", True),
+            "enabled": raw.get("enabled", True),
+            "interacted": interacted,
+            "page_key": page_key,
+            "locators": locators,
+            "locator_profile": profile,
+            "meta": {
+                "text": raw.get("text"),
+                "attributes": raw.get("attributes", {}),
+                "accessibility": raw.get("accessibility", {}),
+                "options": raw.get("options"),
+                "required": raw.get("required"),
+                "pattern": raw.get("pattern"),
+                "maxlength": raw.get("maxlength"),
+                "readonly": raw.get("readonly"),
+                "position": raw.get("position"),
+                "parent": raw.get("parent"),
+                "frame_url": raw.get("frame_url"),
+            },
+        }
+        return unique
+
+    # ── capture helpers ─────────────────────────────────────────────────
+    def _snapshot_dom(self, name: str) -> dict[str, Any]:
+        try:
+            payload = self.driver.execute_script(
+                "return window.__AIREC__ ? window.__AIREC__.snapshotDom() : null;"
+            ) or {}
+        except Exception:
+            payload = {}
+        html = payload.get("html") or (self.driver.page_source if self.driver else "")
+        ref = self.store.save_dom(name, html, {"url": payload.get("url"),
+                                               "title": payload.get("title")})
+        self._last_dom_ref = ref
+        return {"ref": ref, "html": html}
+
+    def _screenshot(self, name: str) -> str:
+        try:
+            data = self.driver.get_screenshot_as_png()
+            return self.store.save_screenshot_bytes(name, data)
+        except Exception as exc:
+            log.debug("Screenshot %s failed: %s", name, exc)
+            return ""
+
+    @staticmethod
+    def _public_event(event: dict[str, Any]) -> dict[str, Any]:
+        """Trimmed event for the live UI feed."""
+        if event.get("type") == "crawl":
+            return {
+                "type": "crawl",
+                "page": (event.get("page") or {}).get("title"),
+                "elements": event.get("element_count"),
+            }
+        if event.get("type") == "action":
+            element = event.get("element") or {}
+            return {
+                "type": "action",
+                "action": event.get("action"),
+                "element": element.get("label") or element.get("element_key"),
+                "element_type": element.get("element_type"),
+                "page": event.get("page_key"),
+            }
+        return {"type": event.get("type")}
+
+    # ── control ─────────────────────────────────────────────────────────
+    def force_crawl(self) -> dict[str, Any]:
+        try:
+            _call_with_timeout(
+                lambda: self.driver.execute_script(
+                    "window.__AIREC__ && window.__AIREC__.forceCrawl();"
+                )
+            )
+            time.sleep(0.5)
+            self._drain_once()
+        except Exception as exc:
+            log.warning("Manual crawl failed: %s", exc)
+        return {"elements": len(self._elements), "pages": len(self._pages)}
+
+    # ── pause / resume (Section 25) ─────────────────────────────────────
+    # Distinct from stop(): the browser stays open, the poll thread keeps
+    # running (so a resume doesn't need to re-establish anything), but
+    # the in-page collector stops capturing new events and the drain
+    # loop stops ingesting — a person can click around to get to the
+    # right screen without every one of THOSE clicks becoming part of
+    # the recorded transaction.
+    def pause(self) -> dict[str, Any]:
+        if self.status != "recording":
+            raise RecorderError(f"Cannot pause a session in status '{self.status}'")
+        try:
+            _call_with_timeout(
+                lambda: self.driver.execute_script(
+                    "window.__AIREC__ && window.__AIREC__.pause();"
+                )
+            )
+        except Exception as exc:
+            log.warning("Pause signal to browser failed (continuing): %s", exc)
+        self.status = "paused"
+        db.execute("UPDATE recording_sessions SET status='paused' WHERE session_uid=%s",
+                   (self.session_uid,))
+        log.info("Paused recording %s", self.session_uid)
+        return self.info()
+
+    def resume(self) -> dict[str, Any]:
+        if self.status != "paused":
+            raise RecorderError(f"Cannot resume a session in status '{self.status}'")
+        try:
+            _call_with_timeout(
+                lambda: self.driver.execute_script(
+                    "window.__AIREC__ && window.__AIREC__.resume();"
+                )
+            )
+        except Exception as exc:
+            log.warning("Resume signal to browser failed (continuing): %s", exc)
+        self.status = "recording"
+        db.execute("UPDATE recording_sessions SET status='recording' WHERE session_uid=%s",
+                   (self.session_uid,))
+        log.info("Resumed recording %s", self.session_uid)
+        return self.info()
+
+    def stop(self) -> dict[str, Any]:
+        log.info("Stopping recording %s", self.session_uid)
+        self._stop_flag.set()
+        poll_thread_done = True
+        if self._poll_thread:
+            self._poll_thread.join(timeout=DRIVER_CALL_TIMEOUT + 2)
+            poll_thread_done = not self._poll_thread.is_alive()
+        if poll_thread_done:
+            # Safe to touch self.driver from this thread — the poll thread
+            # has fully exited, so there's no concurrent WebDriver access.
+            try:
+                self._drain_once()
+                _call_with_timeout(
+                    lambda: self.driver.execute_script(
+                        "window.__AIREC__ && window.__AIREC__.stop();"
+                    )
+                )
+            except Exception as exc:
+                log.warning("Final drain before stop failed (continuing): %s", exc)
+        else:
+            # The poll thread is still busy against the driver (a stuck page,
+            # a wedged msedgedriver, ...). Do NOT call driver.* from here too
+            # — concurrent WebDriver calls from two threads can hang forever
+            # with no exception raised. Skip straight to closing out the
+            # session with whatever was captured so far.
+            log.warning(
+                "Recorder poll thread for %s did not stop in time — "
+                "skipping final drain and browser close to avoid a hang. "
+                "The browser window may need to be closed manually.",
+                self.session_uid,
+            )
+        network_ref = ""
+        if self._network:
+            network_ref = self.store.save_network("network", self._network)
+        # Deferred checkpoint/business-validation detection (see
+        # _run_checkpoint_detection_pass's own docstring) — runs ONCE
+        # here, after recording has actually finished, never while
+        # someone is still live-clicking through the transaction.
+        try:
+            self._run_checkpoint_detection_pass()
+        except Exception as exc:
+            log.warning("Checkpoint detection pass failed (continuing "
+                       "without it): %s", exc)
+        if poll_thread_done and self.driver:
+            try:
+                _call_with_timeout(self.driver.quit)
+            except Exception as exc:
+                log.warning("driver.quit() for %s failed/timed out: %s",
+                            self.session_uid, exc)
+        self.status = "stopped"
+        manifest = self.build_manifest(network_ref)
+        self.store.write_manifest(manifest)
+        self.store.write_knowledge_package(manifest)
+        db.execute(
+            "UPDATE recording_sessions SET status='stopped', stopped_at=now(),"
+            " stats=%s::jsonb WHERE session_uid=%s",
+            (db.jsonb(manifest["stats"]), self.session_uid),
+        )
+        return manifest
+
+    # ── the knowledge package ───────────────────────────────────────────
+    def build_manifest(self, network_ref: str = "") -> dict[str, Any]:
+        elements = list(self._elements.values())
+        # Section 7 — grouped into logical steps, computed once here
+        # (needs the whole final action list to find boundaries, unlike
+        # normalization/dedup which happen per-event as actions arrive).
+        steps = action_grouping.group_actions(
+            self._actions, page_boundaries=self._page_boundary_sequences
+        )
+        # Section 18 — computed once here (needs the whole action list +
+        # whole network-event list, unlike per-event processing above).
+        network_correlations = network_capture.correlate(self._actions, self._network)
+        # Section 19 — component candidates found WITHIN this one
+        # recording (cross-transaction detection needs a transaction_id
+        # already saved in the knowledge repository — that only exists
+        # after Keep, so it happens as part of the Keep flow instead,
+        # not here at raw manifest-build time).
+        component_candidates = component_detector.detect_within_recording(
+            list(self._pages.values()), elements
+        )
+        manifest = {
+            "schema_version": "2",
+            "session_uid": self.session_uid,
+            "transaction_id": self.transaction_id,
+            "transaction_name": self.transaction_name,
+            "transaction_type": self.transaction_type,
+            "description": self.description,
+            "environment": self.environment,
+            "start_url": self.start_url,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "capture_recorded_values": self.capture_recorded_values,
+            "capture_sensitive_values": self.capture_sensitive_values,
+            "workflow_path": self._workflow,
+            "pages": list(self._pages.values()),
+            "elements": elements,
+            "actions": self._actions,
+            "steps": steps,
+            "checkpoints": self._checkpoints,
+            "validations": self._validations,
+            "network_events": self._network,
+            "console_events": self._console_events,
+            "downloads": self._downloads,
+            "network_correlations": network_correlations,
+            "messages": self._messages,
+            "network_ref": network_ref,
+            "capture_dir": str(self.store.root),
+            "stats": {
+                "pages": len(self._pages),
+                "elements": len(elements),
+                "elements_interacted": sum(1 for e in elements if e["interacted"]),
+                "actions": len(self._actions),
+                "steps": len(steps),
+                "checkpoints": len(self._checkpoints),
+                "validations": len(self._validations),
+                "messages": len(self._messages),
+                "network_events": len(self._network),
+                "console_events": len(self._console_events),
+                "capture_bytes": self.store.size_bytes(),
+                "normalization": self._normalizer.stats,
+            },
+            "components": component_candidates,
+        }
+        # Section 21 — computed from the manifest just built above; added
+        # to it last since it needs the finished stats/checkpoints/etc.
+        manifest["quality"] = quality_score.score(manifest)
+        return manifest
+
+    def info(self) -> dict[str, Any]:
+        return {
+            "session_uid": self.session_uid,
+            "transaction_id": self.transaction_id,
+            "transaction_name": self.transaction_name,
+            "environment": self.environment,
+            "status": self.status,
+            "start_url": self.start_url,
+            "capture_dir": str(self.store.root),
+            "current_page": self._last_page_key(),
+            "stats": {
+                "pages": len(self._pages),
+                "elements": len(self._elements),
+                "actions": len(self._actions),
+                "checkpoints": len(self._checkpoints),
+                "validations": len(self._validations),
+                "network_events": len(self._network),
+                "console_events": len(self._console_events),
+                "duplicates_filtered": self._normalizer.stats.get("deduplicated", 0),
+            },
+        }
+
+    def _last_page_key(self) -> str | None:
+        return list(self._pages.keys())[-1] if self._pages else None
+
+
+def _variable_name(field_name: str) -> str:
+    """CustomerName → <CustomerName>  (Section 7.5)."""
+    cleaned = "".join(
+        part.capitalize()
+        for part in "".join(
+            ch if ch.isalnum() else " " for ch in (field_name or "field")
+        ).split()
+    )
+    return cleaned or "Field"
+
+
+# ── session registry (one active recording at a time per transaction) ───
+_sessions: dict[str, RecordingSession] = {}
+_lock = threading.Lock()
+
+
+def start_session(**kwargs: Any) -> dict[str, Any]:
+    session = RecordingSession(**kwargs)
+    with _lock:
+        _sessions[session.session_uid] = session
+    return session.start()
+
+
+def get_session(session_uid: str) -> Optional[RecordingSession]:
+    return _sessions.get(session_uid)
+
+
+def stop_session(session_uid: str) -> dict[str, Any]:
+    session = _sessions.get(session_uid)
+    if not session:
+        raise RecorderError(f"No such recording session: {session_uid}")
+    return session.stop()
+
+
+def list_sessions() -> list[dict[str, Any]]:
+    return [s.info() for s in _sessions.values()]
+
+
+def drop_session(session_uid: str) -> None:
+    _sessions.pop(session_uid, None)
