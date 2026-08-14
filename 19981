@@ -1,369 +1,121 @@
-"""Generic, stage-agnostic popup/modal detector and handler.
+"""Example integration of `core.popup_handler` into a generic Selenium
+action wrapper.
 
-The application under test can surface a `.modal-backdrop` element at
-*any* point in the flow — before a click, after a click, after a
-navigation, mid-AJAX, while another wait is already in progress, or
-completely unprompted (a session-timeout warning, a background-job
-notification, etc). Every other wait/interaction helper in this
-framework (see `core/base_page.py`) assumes the DOM it's looking at is
-"normal"; none of them know how to recognise or clear an unexpected
-modal sitting on top of it.
-
-This module is the single, reusable place that answers exactly one
-question — "is a popup blocking the page right now, and if so what is
-it / what should be done about it?" — so that question can be asked
-from anywhere (a page object, a step definition, a generic action
-wrapper, a polling loop) without duplicating detection logic or ever
-propagating a Selenium wait-timeout exception up to the caller.
-
-Design notes
-------------
-* No `time.sleep()` anywhere — every wait is a bounded, polling
-  `WebDriverWait` using Selenium's own Expected Conditions.
-* Every public function is exception-safe: a missing popup is a
-  normal, expected outcome (`False` / `{}` / `False`), never a raised
-  `TimeoutException`/`NoSuchElementException`. Only genuinely
-  unexpected driver failures propagate, and even those are narrowed to
-  the handful of `WebDriverException` subclasses Selenium itself
-  raises for "the browser/session went away", which no popup-handling
-  logic could meaningfully recover from anyway.
-* `handle_popup()` deliberately does NOT hard-code what a specific
-  popup means (dismiss it, accept it, escalate it) — different popups
-  on this application need different responses (a confirmation dialog
-  vs. a session-timeout warning vs. a validation error), and that
-  policy belongs to whoever is closest to the flow, not to a generic
-  detector. It calls out to a small, explicitly pluggable registry of
-  handlers keyed on the popup's own metadata (title/message keywords),
-  with a safe, generic fallback for anything unrecognised.
+This is deliberately kept separate from `BasePage` (rather than editing
+its interaction methods directly) so it can be reviewed/adopted
+independently — wire it in by having page objects call
+`popup_aware_actions.click(...)` etc. instead of the raw `self.click`,
+or by wrapping `BasePage._with_retry` itself once the approach is
+confirmed on a couple of screens. Either integration point works
+because both funnel every interaction through one place.
 """
 from __future__ import annotations
 
+import functools
 import logging
-from typing import Callable, Optional, TypedDict
+from typing import Callable, TypeVar
 
-from selenium.common.exceptions import (
-    NoSuchElementException,
-    StaleElementReferenceException,
-    TimeoutException,
-    WebDriverException,
-)
-from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webdriver import WebDriver
-from selenium.webdriver.remote.webelement import WebElement
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+
+from core import popup_handler
 
 logger = logging.getLogger(__name__)
 
-# ── locators ──────────────────────────────────────────────────────────
-# The backdrop is the reliable signal that *a* popup is active — it is
-# always present regardless of which specific dialog markup sits above
-# it. The dialog-body candidates below are best-effort: several
-# different popup implementations exist across this application (a
-# Bootstrap modal, a bootstrap-dialog, a plain custom div), so a short
-# ranked list is checked rather than one fixed selector, same pattern
-# BasePage already uses for spinners/headers.
-POPUP_BACKDROP_SELECTOR = ".modal-backdrop"
+T = TypeVar("T")
 
-_POPUP_CONTAINER_SELECTORS = (
-    ".modal.show",
-    ".modal.in",
-    ".modal[style*='display: block']",
-    ".bootstrap-dialog",
-    ".modal",
-)
-_TITLE_SELECTORS = (
-    ".modal-title",
-    ".bootstrap-dialog-title",
-    "[class*='title']",
-)
-_MESSAGE_SELECTORS = (
-    ".modal-body",
-    ".bootstrap-dialog-message",
-    "[class*='message']",
-    "[class*='body']",
-)
-_BUTTON_SELECTOR = "button, [role='button'], input[type='button'], input[type='submit'], a.btn"
-
-# Narrow, deliberate exception surface: these are the only failures
-# that mean "the browser session itself is gone" (crashed, closed,
-# navigated away mid-read) — nothing a popup handler can recover from,
-# so they are the one thing allowed to propagate. Everything else
-# (timeout, not found, gone stale while reading) is treated as a
-# normal "no popup / popup changed under us" outcome.
-_FATAL_DRIVER_ERRORS = (WebDriverException,)
+# Short by design: this check runs around EVERY interaction, so it must
+# stay cheap for the overwhelmingly common case (no popup at all).
+# `popup_handler.is_popup_present` still polls up to this timeout when a
+# popup genuinely is mid-render, so a real popup is never missed — this
+# just bounds how long a *normal, popup-free* interaction pays before
+# proceeding.
+_DEFAULT_PRE_ACTION_TIMEOUT = 1.0
+_DEFAULT_POST_ACTION_TIMEOUT = 1.0
 
 
-class PopupDetails(TypedDict, total=False):
-    present: bool
-    title: str
-    message: str
-    buttons: list[str]
-    backdrop_count: int
-    container_selector: Optional[str]
-    raw_html: str
+def popup_guard(pre_timeout: float = _DEFAULT_PRE_ACTION_TIMEOUT,
+                 post_timeout: float = _DEFAULT_POST_ACTION_TIMEOUT):
+    """Decorator for any bound BasePage-style method whose first
+    positional/keyword-free argument set includes `self.driver`.
+
+    Wraps the call so that, transparently to every caller:
+      1. Before the action runs, checks for (and handles) a popup that
+         may already be blocking the page — e.g. a session-timeout
+         warning that appeared while the previous step was still
+         being read by a human/report, or a popup left over from a
+         prior action that nothing yet cleared.
+      2. Runs the wrapped action as normal.
+      3. After the action runs, checks again — this is the common case
+         a plain "check once before clicking Submit" approach misses:
+         a popup that the action *itself* triggered (e.g. clicking
+         Submit is exactly what opens a confirmation dialog).
+
+    Popup checks never raise and never replace the action's own
+    result/exception — if the wrapped action fails for a genuine
+    reason, that failure still propagates normally.
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs) -> T:
+            driver: WebDriver = self.driver
+            _safe_check(driver, pre_timeout, stage=f"before {func.__name__}")
+            result = func(self, *args, **kwargs)
+            _safe_check(driver, post_timeout, stage=f"after {func.__name__}")
+            return result
+        return wrapper
+    return decorator
 
 
-# ── detection ─────────────────────────────────────────────────────────
-def is_popup_present(driver: WebDriver, timeout: float = 3) -> bool:
-    """Waits up to `timeout` seconds for `.modal-backdrop` to appear.
-
-    Returns True the moment a backdrop element is present in the DOM,
-    False if none appears within the timeout. Never raises — this is
-    meant to be called defensively from anywhere in the flow (before
-    an action, after an action, inside a loop, ...) without the caller
-    having to wrap it in its own try/except.
+def _safe_check(driver: WebDriver, timeout: float, stage: str) -> None:
+    """Runs check_and_handle_popup and swallows anything unexpected —
+    a popup-guard check must never be the reason a real interaction
+    fails. Any genuine driver/session failure will surface again
+    immediately on the real action right after this anyway.
     """
     try:
-        WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, POPUP_BACKDROP_SELECTOR))
-        )
-        return True
-    except TimeoutException:
-        return False
-    except (NoSuchElementException, StaleElementReferenceException):
-        # The backdrop existed for an instant and was then removed (a
-        # popup that opened and immediately auto-closed) — not a
-        # detection failure, just a race we lost; treat as "not
-        # present" rather than bubbling a low-level DOM error.
-        return False
-    except _FATAL_DRIVER_ERRORS:
-        logger.warning("is_popup_present(): driver/session error while polling for popup",
-                        exc_info=True)
-        return False
+        detected = popup_handler.check_and_handle_popup(driver, timeout=timeout)
+        if detected:
+            logger.info("popup_guard: popup detected and processed (%s)", stage)
+    except Exception:  # noqa: BLE001 - guard must never break the real flow
+        logger.debug("popup_guard: check failed (%s)", stage, exc_info=True)
 
 
-def _first_matching(container: WebElement, selectors: tuple[str, ...]) -> Optional[WebElement]:
-    """Returns the first visible element matching any selector in the
-    ranked list, or None. Isolated here so every metadata field is read
-    through the same "try each known shape, skip anything that errors"
-    logic rather than duplicating it per field.
-    """
-    for selector in selectors:
-        try:
-            candidates = container.find_elements(By.CSS_SELECTOR, selector)
-        except (NoSuchElementException, StaleElementReferenceException):
-            continue
-        for candidate in candidates:
-            try:
-                if candidate.is_displayed():
-                    return candidate
-            except StaleElementReferenceException:
-                continue
-    return None
-
-
-def _locate_popup_container(driver: WebDriver) -> Optional[tuple[WebElement, str]]:
-    """Finds the visible popup container that goes with the active
-    backdrop, trying each known markup shape in turn. Returns
-    (element, selector_used) or None if no container matches even
-    though a backdrop is present (e.g. a bare backdrop with no dialog
-    markup yet — still mid-render).
-    """
-    for selector in _POPUP_CONTAINER_SELECTORS:
-        try:
-            elements = driver.find_elements(By.CSS_SELECTOR, selector)
-        except (NoSuchElementException, StaleElementReferenceException):
-            continue
-        for element in elements:
-            try:
-                if element.is_displayed():
-                    return element, selector
-            except StaleElementReferenceException:
-                continue
-    return None
-
-
-def get_popup_details(driver: WebDriver) -> PopupDetails:
-    """Extracts whatever metadata is available for the currently active
-    popup: title, message body, visible/enabled button labels, how many
-    backdrop elements are stacked (more than one can mean a popup was
-    opened from within another popup), and which container selector
-    matched (useful for `handle_popup()`'s routing and for diagnostics).
-
-    Always returns a dict — `{"present": False}` if no popup is active,
-    never raises. Safe to call speculatively; callers should generally
-    check `is_popup_present()` first, but this degrades gracefully even
-    if called cold.
-    """
-    details: PopupDetails = {"present": False}
-    try:
-        backdrops = driver.find_elements(By.CSS_SELECTOR, POPUP_BACKDROP_SELECTOR)
-    except _FATAL_DRIVER_ERRORS:
-        logger.warning("get_popup_details(): driver/session error reading backdrop",
-                        exc_info=True)
-        return details
-
-    if not backdrops:
-        return details
-
-    details["present"] = True
-    details["backdrop_count"] = len(backdrops)
-
-    located = _locate_popup_container(driver)
-    if located is None:
-        # Backdrop is up but no known dialog markup matched yet (very
-        # early in the popup's own open transition) — report presence
-        # honestly without pretending to have content that isn't
-        # readable yet.
-        details["title"] = ""
-        details["message"] = ""
-        details["buttons"] = []
-        details["container_selector"] = None
-        return details
-
-    container, selector_used = located
-    details["container_selector"] = selector_used
-
-    title_el = _first_matching(container, _TITLE_SELECTORS)
-    details["title"] = _safe_text(title_el)
-
-    message_el = _first_matching(container, _MESSAGE_SELECTORS)
-    details["message"] = _safe_text(message_el)
-
-    buttons: list[str] = []
-    try:
-        for btn in container.find_elements(By.CSS_SELECTOR, _BUTTON_SELECTOR):
-            label = _safe_text(btn)
-            if label:
-                buttons.append(label)
-    except (NoSuchElementException, StaleElementReferenceException):
-        pass
-    details["buttons"] = buttons
-
-    try:
-        details["raw_html"] = container.get_attribute("outerHTML") or ""
-    except (StaleElementReferenceException,) + _FATAL_DRIVER_ERRORS:
-        details["raw_html"] = ""
-
-    return details
-
-
-def _safe_text(element: Optional[WebElement]) -> str:
-    if element is None:
-        return ""
-    try:
-        return (element.text or "").strip()
-    except StaleElementReferenceException:
-        return ""
-
-
-# ── handling ──────────────────────────────────────────────────────────
-# Pluggable, keyword-routed handlers: each entry maps a lowercase
-# substring expected in the popup's title/message to the callable that
-# should run when it matches. This is intentionally a plain dict rather
-# than a class/registry object — page objects or step files can extend
-# it at import time (`popup_handler.POPUP_HANDLERS["session expired"] =
-# my_reauth_fn`) without needing to subclass anything, which matches
-# how the rest of this framework favours simple functions/dicts
-# (see utils/locator_repository.py) over deeper class hierarchies.
-PopupHandlerFn = Callable[[WebDriver, PopupDetails], bool]
-
-
-def _default_dismiss(driver: WebDriver, details: PopupDetails) -> bool:
-    """Placeholder fallback handler for any popup that doesn't match a
-    more specific entry in POPUP_HANDLERS. Real per-popup-type behaviour
-    (confirm a supervisor override, acknowledge a session-timeout
-    warning, capture a validation error for the report, etc.) should be
-    registered as its own handler — this only exists so `handle_popup()`
-    always has *something* safe to fall back to, and logs what it saw so
-    an unrecognised popup is at least visible in the run's evidence
-    rather than silently swallowed.
-    """
-    logger.info(
-        "popup_handler: no specific handler matched — title=%r message=%r buttons=%r",
-        details.get("title"), details.get("message"), details.get("buttons"),
-    )
-    # Deliberately a no-op beyond logging: guessing which button to
-    # press on an unrecognised popup is more likely to corrupt the
-    # transaction under test than leaving it for the caller/report to
-    # deal with. Register a specific handler in POPUP_HANDLERS for any
-    # popup type that should actually be dismissed automatically.
-    return False
-
-
-POPUP_HANDLERS: dict[str, PopupHandlerFn] = {
-    # Example entries a real integration would add, e.g.:
-    # "session will expire": _extend_session,
-    # "supervisor override": _acknowledge_sup_override,
-}
-
-
-def handle_popup(driver: WebDriver, details: Optional[PopupDetails] = None) -> bool:
-    """Runs the appropriate handler for the currently active popup.
-
-    Looks up `details` (captured fresh via `get_popup_details()` if not
-    supplied) against `POPUP_HANDLERS` by keyword match on title/message,
-    falling back to `_default_dismiss()` for anything unrecognised.
-
-    Returns True if a registered (non-default) handler actually
-    processed the popup, False otherwise — including when there was no
-    popup to handle at all. This return value is deliberately *not*
-    "was the popup closed" (that depends entirely on what the specific
-    handler does); it signals whether specific handling logic ran, so
-    callers can decide whether to keep polling/retrying.
-    """
-    if details is None:
-        details = get_popup_details(driver)
-
-    if not details.get("present"):
-        return False
-
-    haystack = f"{details.get('title', '')} {details.get('message', '')}".lower()
-    for keyword, handler in POPUP_HANDLERS.items():
-        if keyword.lower() in haystack:
-            try:
-                return bool(handler(driver, details))
-            except _FATAL_DRIVER_ERRORS:
-                logger.warning("handle_popup(): registered handler for %r raised", keyword,
-                                exc_info=True)
-                return False
-
-    _default_dismiss(driver, details)
-    return False
-
-
-def wait_until_popup_cleared(driver: WebDriver, timeout: float = 10) -> bool:
-    """Waits for the `.modal-backdrop` to be removed from the DOM —
-    i.e. for a previously-detected popup to have actually gone away
-    (closed by `handle_popup()`, by the user flow itself, or by the
-    application on its own). Returns True once cleared, False if it is
-    still present after `timeout`. Never raises.
-
-    Useful after `handle_popup()` when the handler is expected to close
-    the dialog, to confirm the page is genuinely clear before the
-    normal action wrapper proceeds.
-    """
-    try:
-        WebDriverWait(driver, timeout).until_not(
-            EC.presence_of_element_located((By.CSS_SELECTOR, POPUP_BACKDROP_SELECTOR))
-        )
-        return True
-    except TimeoutException:
-        return False
-    except _FATAL_DRIVER_ERRORS:
-        return False
-
-
-def check_and_handle_popup(driver: WebDriver, timeout: float = 3,
-                            wait_for_clear: bool = True,
-                            clear_timeout: float = 10) -> bool:
-    """Convenience one-call wrapper combining detect -> capture -> handle
-    -> (optionally) confirm cleared. This is the single function most
-    call sites (action wrappers, step definitions, polling loops) need;
-    the individual functions above stay available for anywhere finer
-    control is needed.
-
-    Returns True if a popup was detected (regardless of whether a
-    specific handler matched it), False if no popup ever appeared.
-    """
-    if not is_popup_present(driver, timeout=timeout):
-        return False
-
-    details = get_popup_details(driver)
-    handle_popup(driver, details)
-
-    if wait_for_clear:
-        wait_until_popup_cleared(driver, timeout=clear_timeout)
-
-    return True
+# ── example usage against this framework's own BasePage ────────────────
+#
+#   from core.base_page import BasePage
+#   from core.popup_aware_actions import popup_guard
+#
+#   class MyPage(BasePage):
+#       @popup_guard()
+#       def click(self, element_key: str) -> None:
+#           return super().click(element_key)
+#
+#       @popup_guard()
+#       def type(self, element_key: str, value: str | None) -> None:
+#           return super().type(element_key, value)
+#
+# Every call site that already does `self.click("some::key")` or
+# `self.type("some::key", value)` needs no change at all — the guard is
+# transparent. The same pattern applies to `wait_for_visible`,
+# `select_by_visible_text`, navigation helpers, or any other method on
+# BasePage/a page object.
+#
+# For call sites that are NOT a page-object method (e.g. inside a
+# `behave` step definition, or a plain polling loop watching for some
+# condition), call the lower-level functions directly instead of going
+# through the decorator:
+#
+#   from core import popup_handler
+#
+#   def step_wait_for_confirmation(context):
+#       driver = context.driver
+#       while not condition_met(driver):
+#           if popup_handler.is_popup_present(driver, timeout=1):
+#               popup_handler.handle_popup(driver)
+#               continue
+#           # ... normal polling logic ...
+#
+# Both integration points end up calling the same underlying
+# `core.popup_handler` functions, so detection/handling behaviour is
+# identical whether it fires from a decorated page-object method or a
+# manual check inside a loop.
