@@ -1,19 +1,190 @@
-# run_platform()
--process_env = {**os.environ, **(env or {})}
-+process_env = {
-+    **os.environ,
-+    "PYTHONIOENCODING": "utf-8:replace",
-+    "PYTHONUTF8": "1",
-+    **(env or {}),      # caller's env still wins on conflict
-+}
+"""A genuine CDP WebSocket connection — completes what `Runtime.addBinding`
+and `Target.setAutoAttach` (both already set up in cdp_recorder.py /
+injector.js) were BUILT for but couldn't use on their own: those calls
+make the BROWSER emit `Runtime.bindingCalled` / `Target.attachedToTarget`
+CDP *events*, but Selenium's `driver.execute_cdp_cmd()` is a one-shot
+request/response call — it has no way to LISTEN for an async event
+stream. Without something actually consuming those events, both
+features were fully configured but functionally inert.
 
- process = subprocess.Popen(
-     command, cwd=str(settings.framework_root_path), env=process_env,
-     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-+    encoding="utf-8", errors="replace",
-     **popen_kwargs,
- )
+This module opens a SECOND, independent WebSocket directly to the
+browser's own CDP endpoint (bypassing Selenium's Python wrapper
+entirely — talking to the exact same debugger protocol Selenium itself
+uses internally, just with a persistent, listening connection instead
+of Selenium's one-shot style) and runs a background thread that reacts
+to events as they arrive — instant, not on the next ~400ms poll tick.
 
-# runtime_available() — both probe subprocesses
--capture_output=True, text=True, timeout=20
-+capture_output=True, text=True, timeout=20, encoding="utf-8", errors="replace"
+Deliberately NOT a replacement for the existing polling-based capture
+in cdp_recorder.py — this runs ALONSIDE it, as a supplementary, best-
+effort fast path. If establishing this connection fails for any reason
+(a driver-capabilities shape this wasn't written against, a firewall,
+whatever), every method here degrades to doing nothing, and the
+existing, already-proven polling capture is completely unaffected —
+recording correctness never depends on this module succeeding.
+
+Honest limitation: the exact way a debugger WebSocket URL surfaces in
+`driver.capabilities` has genuinely varied across Selenium/Edge
+versions historically. This has NOT been validated against a live
+Edge instance (no real browser exists in the environment this was
+written in) — treat this as a starting point to iterate on with real
+runs, not a finished, proven mechanism the way the rest of the recorder
+is.
+"""
+from __future__ import annotations
+
+import json
+import threading
+from typing import Any, Callable, Optional
+
+from ..core.logging_conf import get_logger
+
+log = get_logger(__name__)
+
+try:
+    import websocket  # websocket-client
+except ImportError:  # pragma: no cover
+    websocket = None  # type: ignore[assignment]
+
+
+def find_debugger_ws_url(driver) -> Optional[str]:
+    """Best-effort extraction of the browser's own CDP WebSocket URL from
+    Selenium's driver capabilities. Tries every shape that's been seen
+    across Selenium/Chromium-driver versions; returns None (never
+    raises) if none of them match — the caller treats that as "this
+    supplementary path isn't available right now", not an error.
+    """
+    try:
+        caps = driver.capabilities or {}
+    except Exception:
+        return None
+
+    # Selenium 4.x, Chromium-based drivers commonly expose this directly.
+    for key in ("se:cdp", "goog:chromeOptions", "ms:edgeOptions"):
+        value = caps.get(key)
+        if isinstance(value, str) and value.startswith("ws"):
+            return value
+        if isinstance(value, dict):
+            debugger_address = value.get("debuggerAddress")
+            if debugger_address:
+                url = _resolve_ws_url_from_http(debugger_address)
+                if url:
+                    return url
+    # Some versions put it at the top level.
+    direct = caps.get("se:cdpVersion") and caps.get("webSocketUrl")
+    if isinstance(direct, str) and direct.startswith("ws"):
+        return direct
+    return None
+
+
+def _resolve_ws_url_from_http(debugger_address: str) -> Optional[str]:
+    """`debuggerAddress` is a host:port for the browser's own DevTools
+    HTTP endpoint — /json/version there returns the actual page-level
+    webSocketDebuggerUrl to connect a raw client to."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen(
+            f"http://{debugger_address}/json/version", timeout=3
+        ) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        url = data.get("webSocketDebuggerUrl")
+        return url if isinstance(url, str) else None
+    except Exception as exc:
+        log.debug("Could not resolve CDP ws url from %s: %s", debugger_address, exc)
+        return None
+
+
+class CDPEventBridge:
+    """Owns the persistent WebSocket connection and a background thread
+    reading frames off it. `on_binding_called(payload)` fires for every
+    `sendToPythonRecorder(...)` call from injector.js — the exact data
+    `relayToTop()` already sends, just delivered instantly instead of
+    waiting for the next poll tick.
+    """
+
+    def __init__(
+        self,
+        ws_url: str,
+        on_binding_called: Optional[Callable[[dict[str, Any]], None]] = None,
+        on_target_attached: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> None:
+        self.ws_url = ws_url
+        self.on_binding_called = on_binding_called
+        self.on_target_attached = on_target_attached
+        self._ws: Optional[Any] = None
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._msg_id = 0
+        self._lock = threading.Lock()
+
+    def start(self) -> bool:
+        if websocket is None:
+            log.info("websocket-client not installed — CDP event bridge "
+                     "unavailable, falling back to polling only.")
+            return False
+        try:
+            self._ws = websocket.create_connection(self.ws_url, timeout=5)
+        except Exception as exc:
+            log.info("CDP event bridge: could not connect to %s (%s) — "
+                     "falling back to polling only, nothing else is affected.",
+                     self.ws_url, exc)
+            return False
+        try:
+            self._send("Runtime.enable", {})
+            self._send("Target.setAutoAttach", {
+                "autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True,
+            })
+        except Exception as exc:
+            log.debug("CDP event bridge: initial enable calls failed: %s", exc)
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._read_loop, daemon=True,
+                                         name="cdp-event-bridge")
+        self._thread.start()
+        log.info("CDP event bridge connected and listening.")
+        return True
+
+    def _send(self, method: str, params: dict[str, Any]) -> None:
+        with self._lock:
+            self._msg_id += 1
+            msg_id = self._msg_id
+        if self._ws:
+            self._ws.send(json.dumps({"id": msg_id, "method": method, "params": params}))
+
+    def _read_loop(self) -> None:
+        while not self._stop.is_set() and self._ws:
+            try:
+                self._ws.settimeout(1.0)
+                raw = self._ws.recv()
+            except Exception:
+                if self._stop.is_set():
+                    return
+                continue  # timeout or transient read issue — keep listening
+            if not raw:
+                continue
+            try:
+                message = json.loads(raw)
+            except Exception:
+                continue
+            method = message.get("method")
+            params = message.get("params") or {}
+            try:
+                if method == "Runtime.bindingCalled" and self.on_binding_called:
+                    payload_raw = params.get("payload")
+                    try:
+                        payload = json.loads(payload_raw) if payload_raw else {}
+                    except Exception:
+                        payload = {"raw": payload_raw}
+                    self.on_binding_called(payload)
+                elif method == "Target.attachedToTarget" and self.on_target_attached:
+                    self.on_target_attached(params)
+            except Exception as exc:
+                log.debug("CDP event bridge: handler raised for %s: %s", method, exc)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+        if self._thread:
+            self._thread.join(timeout=3)
