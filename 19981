@@ -1,317 +1,667 @@
-##################################
-#Excel
-################################
 """
-ALL-IN-ONE DOM Interaction Recorder (No Playwright — uses Selenium)
----------------------------------------------------------------------
-What it does, in ONE script:
-  1. Opens a browser using Selenium.
-  2. Injects JS that listens for clicks, typing, and dropdown changes.
-  3. Records every interaction with its locator (CSS + XPath) and value.
-  4. When you stop it (Ctrl+C):
-       a. Saves the raw events      -> recorded_steps.json
-       b. Cleans them up            -> clean_steps.json
-          (collapses keystrokes into final values, removes duplicate
-          consecutive clicks)
-       c. Generates a ready-to-run  -> generated_test.py
-          Selenium script from the cleaned steps.
+recorder.py
 
-     d. Builds a pandas DataFrame from the cleaned steps and saves it
-        as an Excel file -> recorded_steps.xlsx
+The recording orchestrator. Ties together dom_crawler, mutation_observer,
+event_listener, modal_detector, iframe_handler, shadow_dom, and
+locator_engine into the end-to-end manual-recording workflow described in
+the spec (section 4 / section 38):
 
-Install requirement:
-    pip install selenium webdriver-manager pandas openpyxl
+  launch browser -> discover page -> crawl DOM -> store locators ->
+  start event capture -> [user interacts] -> record action -> capture
+  element/locator/test-data -> detect dynamic DOM -> detect modal/iframe ->
+  update locator repository -> update BDD artifacts -> ... -> stop ->
+  build Excel -> finalize artifacts -> save recording.
 
-Run:
-    python dom_recorder_all_in_one.py
+Everything here is generic: the only application-specific input is the
+`target_url` supplied by the user at Start Recording time.
 """
+from __future__ import annotations
 
-import json
-import os
+import logging
+import queue
+import threading
 import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
-import pandas as pd
-from openpyxl.styles import Font, Alignment, PatternFill
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
+from selenium.common.exceptions import WebDriverException
+
+from backend.generator.artifact_manager import ArtifactManager
+from backend.recorder import (
+    browser_factory,
+    dom_crawler,
+    event_listener,
+    iframe_handler,
+    js_bridge,
+    modal_detector,
+    mutation_observer,
+    shadow_dom,
+)
+from backend.storage.excel_store import ExcelStore
+from backend.storage.locator_store import LocatorRepository
+from backend.storage.metadata_store import MetadataStore
+from backend.storage.models import (
+    ActionRecord,
+    ActionType,
+    FramePath,
+    FrameRecord,
+    ModalRecord,
+    PageRecord,
+    RecordingMetadata,
+)
+from backend.storage.recording_store import RecordingPaths, RecordingStore
+
+logger = logging.getLogger("universal_automation.recorder")
+
+POLL_INTERVAL_SECONDS = 0.5
+MODAL_CHECK_EVERY_N_TICKS = 2
+
+# A <form> firing its native "submit" event immediately after a button
+# inside it was clicked is the browser's own side-effect of that click, not
+# a second deliberate user action - without this guard, every Continue/
+# Login-style click on a real <form> got recorded TWICE (once as CLICK,
+# once as SUBMIT on the form a moment later), which both inflates the step
+# count and - worse - replays as two submissions of the same form during
+# execution (the second one hitting whatever the first submission already
+# navigated to, which is exactly the "duplicate SUBMIT after CLICK login"
+# failure pattern). 1000ms comfortably covers one recorder poll tick
+# (500ms) even if the click and its resulting submit land in two separate
+# drain() batches.
+SUBMIT_AFTER_CLICK_DEDUP_MS = 1000
 
 
-# ---------- JavaScript injected into the page to capture events ----------
-JS_LISTENER = r"""
-if (!window.__recordedSteps) {
-    window.__recordedSteps = [];
+@dataclass
+class LiveEvent:
+    event_type: str
+    message: str
+    data: Dict[str, Any] = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
 
-    function getXPath(el) {
-        if (el.id) return `//*[@id="${el.id}"]`;
-        const parts = [];
-        while (el && el.nodeType === 1) {
-            let index = 1;
-            let sibling = el.previousElementSibling;
-            while (sibling) {
-                if (sibling.nodeName === el.nodeName) index++;
-                sibling = sibling.previousElementSibling;
-            }
-            parts.unshift(`${el.nodeName.toLowerCase()}[${index}]`);
-            el = el.parentElement;
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "event_type": self.event_type,
+            "message": self.message,
+            "data": self.data,
+            "timestamp": self.timestamp,
         }
-        return "/" + parts.join("/");
-    }
-
-    function getCssSelector(el) {
-        if (el.id) return `#${el.id}`;
-        if (el.className && typeof el.className === "string") {
-            const cls = el.className.trim().split(/\s+/).join(".");
-            if (cls) return `${el.tagName.toLowerCase()}.${cls}`;
-        }
-        return el.tagName.toLowerCase();
-    }
-
-    function record(e, actionType) {
-        const el = e.target;
-        window.__recordedSteps.push({
-            action: actionType,
-            tag: el.tagName,
-            id: el.id || null,
-            name: el.getAttribute("name") || null,
-            class_name: el.className || null,
-            css_selector: getCssSelector(el),
-            xpath: getXPath(el),
-            text: (el.innerText || "").trim().slice(0, 100),
-            value: el.value !== undefined ? el.value : null,
-            timestamp: new Date().toISOString()
-        });
-    }
-
-    document.addEventListener("click", (e) => record(e, "click"), true);
-    document.addEventListener("change", (e) => record(e, "input_change"), true);
-    document.addEventListener("input", (e) => record(e, "typing"), true);
-}
-"""
 
 
-RAW_FILE = "recorded_steps.json"
+class RecorderSession:
+    """One active manual-recording session for one recording_id."""
 
+    def __init__(self, recording_id: str, name: str, target_url: str, browser: str = "chrome", remote_node_url: Optional[str] = None):
+        self.recording_id = recording_id
+        self.name = name
+        self.target_url = target_url
+        self.browser = browser
+        # Optional: record using a browser on someone else's PC (a
+        # WebDriver node they're running locally) instead of launching one
+        # on this machine - see browser_factory._create_remote(). None
+        # preserves the existing local-launch behavior exactly.
+        self.remote_node_url = remote_node_url
 
-def save_json(path, data):
-    """Write JSON to disk immediately and confirm it landed on disk."""
-    abs_path = os.path.abspath(path)
-    with open(abs_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    print(f"  -> wrote {len(data) if isinstance(data, list) else ''} "
-          f"items to {abs_path}")
-    return abs_path
+        self.store = RecordingStore()
+        self.paths: RecordingPaths = self.store.paths(recording_id)
+        self.locator_repo = LocatorRepository(recording_id, self.paths)
+        self.artifact_manager = ArtifactManager(recording_id, self.name, self.paths)
 
+        self.driver = None
+        self._thread: Optional[threading.Thread] = None
+        self._stop_flag = threading.Event()
+        self._paused = threading.Event()
 
-# ---------- Step 1: Record ----------
-def record_steps(start_url="https://www.saucedemo.com/"):
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()))
-    driver.get(start_url)
+        self.actions: List[ActionRecord] = []
+        self.events: "queue.Queue[LiveEvent]" = queue.Queue()
 
-    all_events = []
-    seen_count = 0
+        self._known_pages: Dict[str, PageRecord] = {}   # normalized_key -> PageRecord
+        self._known_frame_paths: List[FramePath] = [FramePath(path=[], nested_depth=0)]
+        self._seen_modal_sigs: set = set()
+        self._url_history: List[str] = []
+        self._known_window_handles: List[str] = []
+        self._current_page: Optional[PageRecord] = None
+        self._tick = 0
+        self.status = "starting"
 
-    print("Recording started. Interact with the page in the opened browser.")
-    print("Press Ctrl+C here in the terminal when you're done.\n")
-    print(f"Working directory (where files will be saved): {os.getcwd()}\n")
+        # Dedup state for the CLICK-triggers-native-SUBMIT pattern (see
+        # SUBMIT_AFTER_CLICK_DEDUP_MS above).
+        self._last_click_ts_ms: Optional[float] = None
 
-    try:
-        while True:
-            driver.execute_script(JS_LISTENER)  # re-inject in case of navigation
-            events = driver.execute_script("return window.__recordedSteps || [];")
+        # Guarantees every element_name/test_data_key used across THIS
+        # recording is unique, even when the target app gives two (or
+        # three) genuinely different fields identical structural hints -
+        # e.g. a multi-step "enter ID -> Continue -> enter password ->
+        # Continue -> enter OTP" wizard where the username, password, and
+        # OTP inputs are all rendered by the same generic, unlabeled
+        # <input> component (no id/name/aria-label/placeholder for
+        # generate_element_name() to key off of), so every one of them
+        # would otherwise be named e.g. "input_input" and share the exact
+        # same test_data_key "{{INPUT_INPUT}}". Without this, a Test Data
+        # override meant only for the OTP step (e.g. a fixed/hardcoded UAT
+        # OTP the user always needs to type) would ALSO silently overwrite
+        # the username and password steps, since all three collide on one
+        # key - which is exactly the "hardcoded OTP value not applying
+        # correctly" failure mode. Keyed by (base_name, element_id) so the
+        # SAME physical field being interacted with again later (e.g.
+        # retyping a password after a validation error) keeps resolving to
+        # the same name instead of getting a new suffix every time.
+        self._name_assignments: Dict[tuple, str] = {}
+        self._claimed_names: set = set()
 
-            if len(events) > seen_count:
-                new_events = events[seen_count:]
-                for ev in new_events:
-                    print(f"[{ev['action']}] <{ev['tag']}> "
-                          f"locator(css)={ev['css_selector']} "
-                          f"value={ev['value']!r}")
-                all_events.extend(new_events)
-                seen_count = len(events)
-                # Save after every batch of new events, so nothing is
-                # lost even if the second Ctrl+C or a crash happens later.
-                save_json(RAW_FILE, all_events)
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    def start(self) -> None:
+        self.driver = browser_factory.create_driver(self.browser, remote_node_url=self.remote_node_url)
+        self.driver.get(self.target_url)
+        self._known_window_handles = list(self.driver.window_handles)
+        self._emit("status", f"Browser launched, navigating to {self.target_url}")
 
-            time.sleep(1)
+        self._register_current_page(initial=True)
+        self._discover_all_frames_and_shadow()
 
-    except KeyboardInterrupt:
-        print("\nStopping recorder...")
+        event_listener.start(self.driver)
+        mutation_observer.start(self.driver)
 
-    except Exception as e:
-        print(f"\nRecorder stopped due to an error: {e}")
+        self._record_open_url_action()
 
-    finally:
+        self.status = "recording"
+        self._stop_flag.clear()
+        self._paused.clear()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def pause(self) -> None:
+        self._paused.set()
+        self.status = "paused"
+        self._emit("status", "Recording paused")
+
+    def resume(self) -> None:
+        self._paused.clear()
+        self.status = "recording"
+        self._emit("status", "Recording resumed")
+
+    def delete_action(self, step_number: int) -> bool:
+        """Removes one already-recorded action from this in-progress
+        recording (e.g. a transaction that failed and shouldn't be part of
+        the replayable test/Excel dataset) and immediately regenerates the
+        BDD artifacts so they never reflect the deleted step either.
+        Remaining steps are renumbered to stay contiguous (1..N), since any
+        action recorded from this point on is numbered off of
+        len(self.actions)+1 - without renumbering, deleting a step out of
+        the middle would produce a duplicate step number the next time the
+        user records something."""
+        idx = next((i for i, a in enumerate(self.actions) if a.step_number == step_number), None)
+        if idx is None:
+            return False
+        removed = self.actions.pop(idx)
+        for i, a in enumerate(self.actions, start=1):
+            a.step_number = i
+        self.artifact_manager.set_actions(self.actions)
+        label = f"{removed.action} on '{removed.element_name}'" if removed.element_name else str(removed.action)
+        self._emit(
+            "action_deleted",
+            f"Deleted step {step_number} ({label}). {len(self.actions)} step(s) remain.",
+            {"deleted_step_number": step_number, "remaining_steps": len(self.actions)},
+        )
+        return True
+
+    def stop(self) -> Dict[str, Any]:
+        self._stop_flag.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+        self.status = "stopped"
+        self._finalize()
+        self._emit("status", "Recording stopped and saved")
         try:
-            driver.quit()
-        except Exception:
+            if self.driver:
+                self.driver.quit()
+        except WebDriverException:
+            pass
+        return self._summary()
+
+    # ------------------------------------------------------------------
+    # Main polling loop
+    # ------------------------------------------------------------------
+    def _run_loop(self) -> None:
+        while not self._stop_flag.is_set():
+            if self._paused.is_set():
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
+            try:
+                self._tick += 1
+                self._check_page_and_window_changes()
+                self._poll_context(FramePath(path=[], nested_depth=0))
+                for fp in list(self._known_frame_paths):
+                    if fp.path:
+                        self._poll_context(fp)
+                if self._tick % MODAL_CHECK_EVERY_N_TICKS == 0:
+                    self._check_modals(trigger_step=None, relative="before")
+            except WebDriverException:
+                # transient navigation-related errors are expected; keep polling
+                pass
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.exception("Recorder loop error: %s", exc)
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+    def _poll_context(self, frame_path: FramePath) -> None:
+        if not iframe_handler.navigate_to_frame(self.driver, frame_path):
+            return
+        try:
+            js_bridge.inject(self.driver)
+            event_listener.start(self.driver)
+            mutation_observer.start(self.driver)
+
+            for raw_mutation in mutation_observer.drain(self.driver):
+                self._handle_mutation(raw_mutation, frame_path)
+
+            for raw_event in event_listener.drain(self.driver):
+                self._handle_raw_event(raw_event, frame_path)
+        finally:
+            self.driver.switch_to.default_content()
+
+    # ------------------------------------------------------------------
+    # Page / window change detection
+    # ------------------------------------------------------------------
+    def _check_page_and_window_changes(self) -> None:
+        handles = list(self.driver.window_handles)
+        if len(handles) > len(self._known_window_handles):
+            new_handles = [h for h in handles if h not in self._known_window_handles]
+            for h in new_handles:
+                self._record_generic_action(ActionType.NEW_TAB, window_context=h)
+                self._emit("action", "New tab/window detected", {"handle": h})
+            self._known_window_handles = handles
+            # Follow the new window. Without this, Selenium's "current
+            # window" stays on whichever one was focused *before* this new
+            # one opened (e.g. a login page that spawns an SSO popup on
+            # submit) - so every event/mutation-poll call right after this
+            # method returns keeps reading from the old window, and nothing
+            # the user does in the new one (finishing the login there, for
+            # instance) is ever captured. A plain switch_to.window() alone
+            # sometimes leaves the new window without real OS/browser focus
+            # too (a known Selenium quirk), hence the follow-up JS focus().
+            newest = new_handles[-1]
+            try:
+                self.driver.switch_to.window(newest)
+                self.driver.execute_script("window.focus();")
+            except WebDriverException:
+                pass
+            self._current_page = None  # force the page-registration path below to run for this new window
+        elif len(handles) < len(self._known_window_handles):
+            closed = [h for h in self._known_window_handles if h not in handles]
+            for h in closed:
+                self._record_generic_action(ActionType.CLOSE_TAB, window_context=h)
+                self._emit("action", "Tab/window closed", {"handle": h})
+            self._known_window_handles = handles
+            # If the window we were actively following was the one that
+            # just closed, our "current window" is now gone - follow
+            # whatever window is left instead of silently losing focus
+            # (every driver call would otherwise start raising
+            # NoSuchWindowException until something re-establishes focus).
+            still_focused = True
+            try:
+                self.driver.current_window_handle
+            except WebDriverException:
+                still_focused = False
+            if not still_focused and handles:
+                try:
+                    self.driver.switch_to.window(handles[-1])
+                    self._current_page = None
+                except WebDriverException:
+                    pass
+
+        try:
+            current_url = self.driver.current_url
+        except WebDriverException:
+            return
+
+        if self._current_page and current_url == self._current_page.url:
+            return
+
+        # URL changed -> could be a fresh navigation or back/forward
+        if current_url in self._url_history[:-1]:
+            self._record_generic_action(ActionType.NAVIGATE_BACK, page_url=current_url)
+            self._emit("action", "Navigate back detected", {"url": current_url})
+        elif self._url_history and current_url not in self._url_history:
+            pass  # regular forward navigation, will be logged as new page below
+
+        self._url_history.append(current_url)
+        self._register_current_page()
+        self._discover_all_frames_and_shadow()
+
+    def _register_current_page(self, initial: bool = False) -> None:
+        try:
+            url = self.driver.current_url
+            title = self.driver.title
+        except WebDriverException:
+            return
+        page = dom_crawler.make_page_record(url, title)
+        if page.normalized_key not in self._known_pages:
+            self._known_pages[page.normalized_key] = page
+            self.locator_repo.upsert_page(page)
+            self._emit("page_discovered", f"Page discovered: {title or url}", {"url": url, "title": title})
+        else:
+            page = self._known_pages[page.normalized_key]
+            page.last_seen_at = time.time()
+        self._current_page = page
+        if not self._url_history:
+            self._url_history.append(url)
+
+        elements = dom_crawler.crawl_current_context(self.driver, page.page_id)
+        for el in elements:
+            self.locator_repo.upsert_element(el)
+        self._emit("crawl_complete", f"Crawled {len(elements)} elements on top document", {"count": len(elements)})
+        self.locator_repo.flush()
+
+    def _discover_all_frames_and_shadow(self) -> None:
+        if not self._current_page:
+            return
+        page = self._current_page
+
+        def on_frame(frame: FrameRecord) -> None:
+            self.locator_repo.upsert_frame(frame)
+            self._emit("frame_detected", f"Iframe detected (depth {frame.nested_depth})", frame.to_dict())
+            # track the frame path for later event polling
+            # (reconstructed fully in on_elements callback closure below)
+
+        collected_paths: List[FramePath] = []
+
+        def on_elements(elements) -> None:
+            for el in elements:
+                self.locator_repo.upsert_element(el)
+                if el.frame_path and el.frame_path.path and el.frame_path not in collected_paths:
+                    collected_paths.append(el.frame_path)
+            if elements:
+                self._emit("crawl_complete", f"Crawled {len(elements)} elements in nested context", {"count": len(elements)})
+
+        try:
+            iframe_handler.discover_frames(self.driver, page, on_frame, on_elements)
+        except WebDriverException:
             pass
 
-    return all_events
+        for fp in collected_paths:
+            if fp not in self._known_frame_paths:
+                self._known_frame_paths.append(fp)
 
+        try:
+            n = shadow_dom.discover(self.driver, page, lambda els: [self.locator_repo.upsert_element(e) for e in els])
+            if n:
+                self._emit("shadow_dom_detected", f"Shadow DOM elements discovered: {n}", {"count": n})
+        except WebDriverException:
+            pass
 
-# ---------- Step 2: Clean ----------
-def clean_steps(raw_steps):
-    cleaned = []
+        self.locator_repo.flush()
 
-    for step in raw_steps:
-        action = step["action"]
-        locator = step["css_selector"]
-
-        if action in ("typing", "input_change"):
-            if cleaned and cleaned[-1]["action"] == "input" and cleaned[-1]["css_selector"] == locator:
-                cleaned[-1]["value"] = step["value"]
-                cleaned[-1]["timestamp"] = step["timestamp"]
-            else:
-                cleaned.append({
-                    "action": "input",
-                    "tag": step["tag"],
-                    "id": step["id"],
-                    "name": step["name"],
-                    "css_selector": step["css_selector"],
-                    "xpath": step["xpath"],
-                    "value": step["value"],
-                    "timestamp": step["timestamp"],
-                })
-
-        elif action == "click":
-            if cleaned and cleaned[-1]["action"] == "click" and cleaned[-1]["css_selector"] == locator:
-                continue
-            cleaned.append({
-                "action": "click",
-                "tag": step["tag"],
-                "id": step["id"],
-                "name": step["name"],
-                "css_selector": step["css_selector"],
-                "xpath": step["xpath"],
-                "text": step.get("text", ""),
-                "timestamp": step["timestamp"],
-            })
-
-    return cleaned
-
-
-# ---------- Step 3: Generate a runnable Selenium test script ----------
-def generate_selenium_script(cleaned_steps, start_url="https://www.saucedemo.com/"):
-    lines = [
-        "from selenium import webdriver",
-        "from selenium.webdriver.common.by import By",
-        "from selenium.webdriver.chrome.service import Service",
-        "from webdriver_manager.chrome import ChromeDriverManager",
-        "import time",
-        "",
-        "driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()))",
-        f'driver.get("{start_url}")',
-        "",
-    ]
-
-    for step in cleaned_steps:
-        selector = step["css_selector"].replace('"', '\\"')
-        if step["action"] == "click":
-            lines.append(f'driver.find_element(By.CSS_SELECTOR, "{selector}").click()')
-            lines.append("time.sleep(0.5)")
-        elif step["action"] == "input":
-            value = (step["value"] or "").replace('"', '\\"')
-            lines.append(f'el = driver.find_element(By.CSS_SELECTOR, "{selector}")')
-            lines.append("el.clear()")
-            lines.append(f'el.send_keys("{value}")')
-            lines.append("time.sleep(0.3)")
-        lines.append("")
-
-    lines.append("# driver.quit()  # uncomment to close browser at the end")
-    return "\n".join(lines)
-
-
-# ---------- Step 4: Build Excel report from cleaned steps ----------
-def save_excel_report(cleaned_steps, path="recorded_steps.xlsx"):
-    rows = []
-    for i, step in enumerate(cleaned_steps, start=1):
-        rows.append({
-            "Step": i,
-            "Action": step["action"],
-            "Tag": step["tag"],
-            "Id": step.get("id") or "",
-            "Name": step.get("name") or "",
-            "CSS Selector": step.get("css_selector") or "",
-            "XPath": step.get("xpath") or "",
-            "Value": step.get("value") or "",
-            "Text": step.get("text") or "",
-            "Timestamp": step.get("timestamp") or "",
+    # ------------------------------------------------------------------
+    # Mutation handling (dynamic DOM)
+    # ------------------------------------------------------------------
+    def _handle_mutation(self, raw: Dict[str, Any], frame_path: FramePath) -> None:
+        info = raw.get("element")
+        if not info or not self._current_page:
+            return
+        event_page = self._resolve_page_for_event(raw)
+        if not event_page:
+            return
+        record = dom_crawler.to_element_record(info, event_page.page_id, frame_path=frame_path, dynamic=True)
+        self.locator_repo.upsert_element(record)
+        self._emit("element_discovered", f"Dynamic element discovered: <{record.tag}> {record.attributes.get('element_name','')}", {
+            "tag": record.tag, "component_type": record.component_type,
         })
 
-    df = pd.DataFrame(rows, columns=[
-        "Step", "Action", "Tag", "Id", "Name",
-        "CSS Selector", "XPath", "Value", "Text", "Timestamp",
-    ])
+    # ------------------------------------------------------------------
+    # Event -> Action handling
+    # ------------------------------------------------------------------
+    def _resolve_page_for_event(self, raw: Dict[str, Any]) -> Optional[PageRecord]:
+        """Events can be drained a poll tick (up to ~0.5s) after they
+        actually fired - worst case, after the browser has already
+        navigated to the next page (e.g. a password field's committed
+        "change" event, immediately followed by a form submit). If we
+        blindly attributed every drained event to whatever page is
+        "current" at drain time, that event's value would silently be
+        lost (never make it into an ActionRecord because it was queued
+        under the old, now-torn-down document) or - if bridge.js's
+        pending-event recovery already re-queued it on the new page -
+        get logged against the wrong page/step. Resolve the page the
+        event actually happened on from the URL it captured itself."""
+        raw_url = raw.get("url") or ""
+        if not raw_url:
+            return self._current_page
+        page = self._known_pages.get(dom_crawler.normalize_url(raw_url))
+        return page or self._current_page
 
-    abs_path = os.path.abspath(path)
-    with pd.ExcelWriter(abs_path, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Recorded Steps", index=False)
+    def _unique_element_name(self, base_name: str, element_id: Optional[str]) -> str:
+        """Returns a name guaranteed unique within this recording for a
+        genuinely different field, while still returning the SAME name for
+        a repeat visit to the same physical field. See the comment on
+        self._name_assignments above for why this matters (OTP/password/
+        username fields on generic multi-step login wizards frequently
+        generate identical base names)."""
+        key = (base_name, element_id or "")
+        if key in self._name_assignments:
+            return self._name_assignments[key]
+        if base_name not in self._claimed_names:
+            assigned = base_name
+        else:
+            n = 2
+            while f"{base_name}_{n}" in self._claimed_names:
+                n += 1
+            assigned = f"{base_name}_{n}"
+        self._claimed_names.add(assigned)
+        self._name_assignments[key] = assigned
+        return assigned
 
-        ws = writer.sheets["Recorded Steps"]
+    def _handle_raw_event(self, raw: Dict[str, Any], frame_path: FramePath) -> None:
+        raw_type = raw.get("type")
+        if raw_type == "popstate":
+            self._check_page_and_window_changes()
+            return
 
-        # Header formatting
-        header_font = Font(name="Arial", bold=True, color="FFFFFF")
-        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-        for cell in ws[1]:
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center", vertical="center")
+        action_type = event_listener.to_action_type(raw_type)
+        if not action_type or not self._current_page:
+            return
 
-        # Body font + column widths
-        body_font = Font(name="Arial", size=10)
-        for row in ws.iter_rows(min_row=2):
-            for cell in row:
-                cell.font = body_font
+        # A form's native "submit" firing right after a button inside it
+        # was clicked is the browser's own side-effect of that click, not a
+        # second deliberate action - see SUBMIT_AFTER_CLICK_DEDUP_MS above.
+        if action_type == ActionType.SUBMIT and self.actions and self._last_click_ts_ms is not None:
+            last = self.actions[-1]
+            raw_ts = raw.get("timestamp")
+            if last.action == ActionType.CLICK and raw_ts is not None and (raw_ts - self._last_click_ts_ms) <= SUBMIT_AFTER_CLICK_DEDUP_MS:
+                return
 
-        widths = {"A": 6, "B": 12, "C": 8, "D": 16, "E": 16,
-                  "F": 24, "G": 40, "H": 20, "I": 30, "J": 24}
-        for col, w in widths.items():
-            ws.column_dimensions[col].width = w
+        event_page = self._resolve_page_for_event(raw)
+        if not event_page:
+            return
 
-        ws.freeze_panes = "A2"
+        info = raw.get("element")
+        element_record = None
+        if info:
+            element_record = dom_crawler.to_element_record(info, event_page.page_id, frame_path=frame_path)
+            # Disambiguate BEFORE storing, so the locator repository (Layer
+            # A - Locator JSON download, self-healing lookups, reports) and
+            # this action's element_name/test_data_key (Layer B - Excel,
+            # Test Data overrides) always agree on the same name.
+            base_name = element_record.attributes.get("element_name", "field")
+            element_record.attributes["element_name"] = self._unique_element_name(base_name, element_record.element_id)
+            self.locator_repo.upsert_element(element_record)
 
-    print(f"  -> wrote {len(df)} rows to {abs_path}")
-    return abs_path
+        if action_type == ActionType.CLICK:
+            self._last_click_ts_ms = raw.get("timestamp")
+
+        step_number = len(self.actions) + 1
+        value = raw.get("value", "") or raw.get("selected_text", "")
+        test_data_key = None
+        display_value = value
+        if element_record and value:
+            elem_name = element_record.attributes.get("element_name", "field")
+            test_data_key = "{{" + elem_name.upper() + "}}"
+
+        best_locator = element_record.best_locator() if element_record else None
+        fallback_locators = []
+        if element_record:
+            others = [l for l in element_record.locators if l is not best_locator][:3]
+            fallback_locators = [{"type": l.strategy, "value": l.value} for l in others]
+
+        action = ActionRecord(
+            step_number=step_number,
+            action=action_type,
+            page_url=event_page.url,
+            page_title=event_page.title,
+            page_id=event_page.page_id,
+            element_id=element_record.element_id if element_record else None,
+            element_text=(element_record.text if element_record else "")[:120],
+            element_tag=element_record.tag if element_record else "",
+            element_name=element_record.attributes.get("element_name", "") if element_record else "",
+            primary_locator_type=best_locator.strategy if best_locator else "",
+            primary_locator=best_locator.value if best_locator else "",
+            fallback_locators=fallback_locators,
+            value=value,
+            test_data_key=test_data_key,
+            frame_path=frame_path if frame_path.path else None,
+            window_context=self.driver.current_window_handle if self.driver else "",
+        )
+
+        self.actions.append(action)
+        self._emit("action_recorded", self._describe_action(action, display_value), action.to_dict())
+
+        self._check_modals(trigger_step=step_number, relative="after", trigger_element_id=action.element_id)
+
+        self.artifact_manager.on_action(action, event_page)
+        self._emit("artifacts_updated", "Feature / Page Object / Step Definition updated", {"step": step_number})
+
+    def _record_open_url_action(self) -> None:
+        page = self._current_page
+        action = ActionRecord(
+            step_number=1,
+            action=ActionType.OPEN_URL,
+            page_url=self.target_url,
+            page_title=page.title if page else "",
+            page_id=page.page_id if page else "",
+            value=self.target_url,
+        )
+        self.actions.append(action)
+        self._emit("action_recorded", f"OPEN_URL {self.target_url}", action.to_dict())
+        self.artifact_manager.on_action(action, page)
+
+    def _record_generic_action(self, action_type: str, page_url: str = "", window_context: str = "") -> None:
+        step_number = len(self.actions) + 1
+        page = self._current_page
+        action = ActionRecord(
+            step_number=step_number,
+            action=action_type,
+            page_url=page_url or (page.url if page else ""),
+            page_title=page.title if page else "",
+            page_id=page.page_id if page else "",
+            window_context=window_context,
+        )
+        self.actions.append(action)
+        self.artifact_manager.on_action(action, page)
+
+    @staticmethod
+    def _describe_action(action: ActionRecord, display_value: str) -> str:
+        base = f"Step {action.step_number}: {action.action}"
+        if action.element_name:
+            base += f" on '{action.element_name}'"
+        if display_value:
+            base += f" = '{display_value}'"
+        return base
+
+    # ------------------------------------------------------------------
+    # Modal detection (before AND after actions)
+    # ------------------------------------------------------------------
+    def _check_modals(self, trigger_step: Optional[int], relative: str, trigger_element_id: Optional[str] = None) -> None:
+        if not self._current_page:
+            return
+        try:
+            raw_modals = modal_detector.detect(self.driver)
+        except WebDriverException:
+            return
+        if not raw_modals:
+            return
+        new_raw = []
+        for raw in raw_modals:
+            sig = (raw.get("container") or {}).get("dom_signature", "")
+            if sig and sig in self._seen_modal_sigs:
+                continue
+            if sig:
+                self._seen_modal_sigs.add(sig)
+            new_raw.append(raw)
+        if not new_raw:
+            return
+
+        modal_records = modal_detector.to_modal_records(
+            new_raw, self._current_page.page_id, trigger_element_id, trigger_step, relative,
+        )
+        for m in modal_records:
+            self.locator_repo.upsert_modal(m)
+            self._emit("modal_detected", f"{m.modal_type.replace('_', ' ').title()} detected ({relative} action)", m.to_dict())
+        self.locator_repo.flush()
+
+    # ------------------------------------------------------------------
+    # Finalization
+    # ------------------------------------------------------------------
+    def _finalize(self) -> None:
+        self.locator_repo.flush()
+        ExcelStore(self.paths.execution_excel).write(self.actions)
+        self.artifact_manager.finalize(self.actions, list(self._known_pages.values()))
+
+        meta = self.store.load_metadata(self.recording_id) or RecordingMetadata(
+            recording_id=self.recording_id, name=self.name, target_url=self.target_url,
+        )
+        meta.status = "stopped"
+        meta.total_steps = len(self.actions)
+        meta.total_pages = len(self._known_pages)
+        meta.test_data_keys = sorted({a.test_data_key for a in self.actions if a.test_data_key})
+        meta.updated_at = time.time()
+        self.store.save_metadata(meta)
+        self._emit("excel_generated", "execution.xlsx written", {"rows": len(self.actions)})
+        self._emit("feature_generated", "BDD artifacts finalized", {})
+
+    def _summary(self) -> Dict[str, Any]:
+        return {
+            "recording_id": self.recording_id,
+            "status": self.status,
+            "total_steps": len(self.actions),
+            "total_pages": len(self._known_pages),
+            "locator_repository_stats": self.locator_repo.stats(),
+        }
+
+    # ------------------------------------------------------------------
+    def _emit(self, event_type: str, message: str, data: Optional[Dict[str, Any]] = None) -> None:
+        evt = LiveEvent(event_type=event_type, message=message, data=data or {})
+        self.events.put(evt)
+        logger.info("[%s] %s", event_type, message)
 
 
-# ---------- Main ----------
-def main():
-    start_url = "https://www.saucedemo.com/"  # <-- change to your target URL
+class RecorderManager:
+    """Process-wide registry of active recording sessions."""
 
-    raw_steps = record_steps(start_url)
+    _sessions: Dict[str, RecorderSession] = {}
+    _lock = threading.Lock()
 
-    if not raw_steps:
-        print("\nNo events were recorded (raw_steps is empty) — "
-              "nothing to clean or generate. Did you interact with "
-              "the page before pressing Ctrl+C?")
-        return
+    @classmethod
+    def start_recording(cls, name: str, target_url: str, browser: str = "chrome", remote_node_url: Optional[str] = None) -> RecorderSession:
+        store = RecordingStore()
+        meta = store.create(name=name, target_url=target_url, browser=browser)
+        session = RecorderSession(meta.recording_id, name, target_url, browser, remote_node_url=remote_node_url)
+        with cls._lock:
+            cls._sessions[meta.recording_id] = session
+        session.start()
+        return session
 
-    print()
-    save_json(RAW_FILE, raw_steps)
+    @classmethod
+    def get(cls, recording_id: str) -> Optional[RecorderSession]:
+        return cls._sessions.get(recording_id)
 
-    cleaned = clean_steps(raw_steps)
-    save_json("clean_steps.json", cleaned)
+    @classmethod
+    def stop_recording(cls, recording_id: str) -> Optional[Dict[str, Any]]:
+        session = cls._sessions.get(recording_id)
+        if not session:
+            return None
+        summary = session.stop()
+        with cls._lock:
+            cls._sessions.pop(recording_id, None)
+        return summary
 
-    script = generate_selenium_script(cleaned, start_url)
-    abs_path = os.path.abspath("generated_test.py")
-    with open(abs_path, "w", encoding="utf-8") as f:
-        f.write(script)
-        f.flush()
-        os.fsync(f.fileno())
-    print(f"  -> wrote generated_test.py to {abs_path}")
-
-    excel_path = save_excel_report(cleaned, "recorded_steps.xlsx")
-
-    print("\nDone. Files saved:")
-    print(f"  {os.path.abspath(RAW_FILE)}")
-    print(f"  {os.path.abspath('clean_steps.json')}")
-    print(f"  {abs_path}")
-    print(f"  {excel_path}")
-
-
-if __name__ == "__main__":
-    main()
-dom_recorder.py
-Displaying dom_recorder.py.
+    @classmethod
+    def active_ids(cls) -> List[str]:
+        return list(cls._sessions.keys())
