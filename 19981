@@ -1,246 +1,177 @@
 """
-locator_engine.py
+selenium_executor.py
 
-Pure-Python logic that turns a raw element-info dict (as produced by
-bridge.js's `getElementInfo`) into a ranked list of LocatorCandidate
-objects, plus a `component_type` classification and a generated
-human-friendly element name.
-
-This module has zero Selenium/webdriver dependency by design - it is
-pure data transformation, which makes it trivially unit-testable and
-reusable by both the recorder (building the repository) and the
-self-healing engine (scoring candidate replacements).
+Low-level bridge between a single Excel step-row and Selenium. Given a
+resolved (locator_type, locator_value) pair, dispatches to the right
+ActionEngine method based on the row's Action column. Also implements
+Self-Healing Stages 1-2 (try primary locator, then each fallback locator)
+since those are cheap/deterministic and don't need the full healing
+pipeline in healing/self_healer.py.
 """
 from __future__ import annotations
 
-import re
-from typing import Any, Dict, List
+import logging
+import time
+from typing import Any, Dict, Optional, Tuple
 
-from backend.storage.models import LocatorCandidate, LocatorStrategy
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    NoSuchFrameException,
+    StaleElementReferenceException,
+    TimeoutException,
+    WebDriverException,
+)
+from selenium.webdriver.remote.webdriver import WebDriver
 
-# Attribute/id patterns that look auto-generated / volatile (react `:r1a:`
-# style ids, uuid-like ids, ember###, ids with many digits, etc). Locators
-# built from these get penalized since they are unlikely to survive a
-# rebuild.
-_VOLATILE_ID_PATTERNS = [
-    re.compile(r"^:[a-z0-9]+:$", re.I),           # react useId() -> ":r0:"
-    re.compile(r"^[a-f0-9-]{20,}$", re.I),          # uuid-ish
-    re.compile(r"^ember\d+$", re.I),
-    re.compile(r"\d{4,}"),                          # long digit runs
-    re.compile(r"^(ng|mat|mui|css)-[a-z0-9]+$", re.I),
-]
+from backend.config import settings
+from backend.execution.action_engine import ActionEngine, by_for
+from backend.recorder.iframe_handler import navigate_to_frame
+from backend.storage.models import ActionType
 
+logger = logging.getLogger("universal_automation.selenium_executor")
 
-def _looks_volatile(value: str) -> bool:
-    if not value:
-        return True
-    return any(p.search(value) for p in _VOLATILE_ID_PATTERNS)
-
-
-def _css_escape(value: str) -> str:
-    return re.sub(r"([ #.:\[\]()\"'])", r"\\\1", value)
+LOCATOR_EXCEPTIONS = (NoSuchElementException, TimeoutException, StaleElementReferenceException, NoSuchFrameException)
 
 
-def classify_component(info: Dict[str, Any]) -> str:
-    tag = (info.get("tag") or "").lower()
-    role = (info.get("role") or "").lower()
-    type_attr = (info.get("type") or "").lower()
-
-    if tag == "select" or role == "listbox":
-        return "dropdown"
-    if tag == "input":
-        if type_attr in ("checkbox",):
-            return "checkbox"
-        if type_attr in ("radio",):
-            return "radio"
-        if type_attr in ("file",):
-            return "file_upload"
-        if type_attr in ("submit", "button"):
-            return "button"
-        return "input"
-    if tag == "textarea":
-        return "input"
-    if tag in ("button",) or role == "button":
-        return "button"
-    if tag == "a" or role == "link":
-        return "link"
-    if tag == "table":
-        return "table"
-    if tag in ("tr", "td", "th"):
-        return "table_cell"
-    if tag in ("ul", "ol", "li") or role == "listitem":
-        return "list_item"
-    if role in ("tab",):
-        return "tab"
-    if role in ("menuitem",):
-        return "menu_item"
-    if tag == "iframe":
-        return "frame"
-    if role in ("dialog", "alertdialog") or tag == "dialog":
-        return "dialog"
-    if info.get("contenteditable"):
-        return "rich_text"
-    return "element"
+def resolve_frame(driver: WebDriver, step: Dict[str, Any]) -> bool:
+    frame_path = step.get("frame_path")
+    try:
+        return navigate_to_frame(driver, frame_path)
+    except WebDriverException:
+        return False
 
 
-def generate_element_name(info: Dict[str, Any], component_type: str) -> str:
-    """Human-friendly, generic name for use in Page Objects / reports -
-    never derived from business vocabulary, only from structural hints."""
-    candidates = [
-        info.get("data_attrs", {}).get("data-testid"),
-        info.get("id"),
-        info.get("name"),
-        info.get("aria_label"),
-        info.get("placeholder"),
-        info.get("text"),
-    ]
-    base = next((c for c in candidates if c and not _looks_volatile(c)), None)
-    if not base:
-        base = component_type
-    slug = re.sub(r"[^a-zA-Z0-9]+", "_", str(base)).strip("_").lower()
-    slug = slug[:40] if slug else component_type
-    return f"{slug or component_type}_{component_type}"
+def try_locator(engine: ActionEngine, driver: WebDriver, step: Dict[str, Any], locator_type: str, locator_value: str) -> Tuple[bool, str]:
+    """Attempts to perform the step's action using a specific locator.
+    Returns (success, error_message)."""
+    if not resolve_frame(driver, step):
+        return False, "Unable to navigate to the recorded frame hierarchy"
 
+    by = by_for(locator_type)
+    action = step.get("action", "")
+    value = step.get("value", "")
 
-def build_locators(info: Dict[str, Any]) -> List[LocatorCandidate]:
-    """Generate every viable locator strategy for an element, each scored."""
-    candidates: List[LocatorCandidate] = []
-    tag = info.get("tag", "*")
-    data_attrs = info.get("data_attrs", {}) or {}
-
-    # data-testid / data-test-id / data-qa -> highest reliability
-    for key in ("data-testid", "data-test-id", "data-qa"):
-        if data_attrs.get(key):
-            candidates.append(LocatorCandidate(
-                strategy=LocatorStrategy.DATA_TESTID,
-                value=f"[{key}='{data_attrs[key]}']",
-            ))
-
-    elem_id = info.get("id")
-    if elem_id:
-        if info.get("id_unique") is False:
-            # More than one element on the live page shared this exact id
-            # at capture time (invalid HTML, but real apps do this - e.g. a
-            # grid of "product" cards all wired to the same id instead of
-            # one per item). By.ID would silently resolve to whichever one
-            # happens to be first in the DOM, not the one actually
-            # recorded - so this is scored well below a genuinely
-            # distinguishing candidate (e.g. TEXT) rather than treated as
-            # the near-certain match a unique id would be.
-            candidates.append(LocatorCandidate(strategy=LocatorStrategy.ID, value=elem_id, reliability_score=0.2))
-        else:
-            score_adjust = -0.35 if _looks_volatile(elem_id) else 0.0
-            candidates.append(LocatorCandidate(
-                strategy=LocatorStrategy.ID,
-                value=elem_id,
-                reliability_score=max(0.1, 0.95 + score_adjust),
-            ))
-
-    name = info.get("name")
-    type_attr = (info.get("type") or "").lower()
-    if name:
-        if type_attr in ("radio", "checkbox") and info.get("value"):
-            # A <input type="radio">/<input type="checkbox">'s `name`
-            # attribute is shared by every option in its group by design
-            # (that's literally how the browser groups them for mutual
-            # exclusion) - a bare By.NAME locator can never tell two
-            # options apart, so Selenium silently resolves it to whichever
-            # option happens to come first in the DOM. That's exactly how
-            # a recorded click on a "No" radio replayed as "Yes": both
-            # options share one `name`, so the un-qualified NAME locator
-            # always landed on the first (Yes) option regardless of which
-            # one was actually recorded. Qualifying the locator with the
-            # option's own `value` attribute (required/meaningful on every
-            # standards-compliant radio/checkbox) makes it target that
-            # specific option, not just the group.
-            candidates.append(LocatorCandidate(
-                strategy=LocatorStrategy.CSS,
-                value=f"{tag}[name='{_css_escape(name)}'][value='{_css_escape(str(info['value']))}']",
-                reliability_score=0.8,
-            ))
-        else:
-            candidates.append(LocatorCandidate(strategy=LocatorStrategy.NAME, value=name))
-
-    # accessibility-based
-    aria_label = info.get("aria_label")
-    role = info.get("role")
-    if aria_label:
-        candidates.append(LocatorCandidate(
-            strategy=LocatorStrategy.ACCESSIBILITY,
-            value=f"[aria-label='{aria_label}']" + (f"[role='{role}']" if role else ""),
-        ))
-    elif role:
-        candidates.append(LocatorCandidate(strategy=LocatorStrategy.ACCESSIBILITY, value=f"[role='{role}']"))
-
-    # attribute-based (placeholder, title, alt, type+name combos)
-    for attr in ("placeholder", "title", "alt", "type"):
-        val = info.get(attr)
-        if val:
-            candidates.append(LocatorCandidate(
-                strategy=LocatorStrategy.ATTRIBUTE,
-                value=f"{tag}[{attr}='{val}']",
-            ))
-            break  # one attribute-based candidate is usually enough noise-wise
-
-    # text-based / link text
-    text = (info.get("text") or "").strip()
-    if text and len(text) <= 80:
-        if tag == "a":
-            candidates.append(LocatorCandidate(strategy=LocatorStrategy.LINK_TEXT, value=text))
-            candidates.append(LocatorCandidate(strategy=LocatorStrategy.PARTIAL_LINK_TEXT, value=text[:30]))
-        else:
-            # normalize-space(.) (the element's full aggregated string
-            # value, descendants included) rather than normalize-space
-            # (text()) (direct text-node children ONLY) - a container
-            # element whose visible label lives in a nested child (e.g. a
-            # <mat-card> wrapping a <mat-card-title>Personal Loan</...>)
-            # has no direct text node of its own, so text() would never
-            # match it at all even though the card's own visible text is
-            # exactly what makes it unique among its look-alike siblings.
-            candidates.append(LocatorCandidate(
-                strategy=LocatorStrategy.TEXT,
-                value=f"//{tag}[normalize-space(.)=\"{text}\"]",
-            ))
-
-    # stable-ish CSS via class names, filtering volatile-looking classes
-    class_name = (info.get("class_name") or "").strip()
-    if class_name:
-        classes = [c for c in class_name.split() if c and not _looks_volatile(c)]
-        if classes:
-            css = tag + "." + ".".join(_css_escape(c) for c in classes[:3])
-            if info.get("class_combo_unique") is False:
-                # This element's full tag+class combination matched more
-                # than one element on the live page (the same "repeated
-                # tile" situation as the id check above - e.g. every card
-                # in a product grid sharing identical styling classes).
-                # A selector built from any subset of these classes can't
-                # be trusted to pick out just this one instance either.
-                candidates.append(LocatorCandidate(strategy=LocatorStrategy.CSS, value=css, reliability_score=0.25))
+    try:
+        if action == ActionType.OPEN_URL:
+            driver.get(step.get("value") or step.get("page_url"))
+        elif action == ActionType.CLICK:
+            engine.click(by, locator_value)
+        elif action == ActionType.DOUBLE_CLICK:
+            engine.double_click(by, locator_value)
+        elif action == ActionType.RIGHT_CLICK:
+            engine.right_click(by, locator_value)
+        elif action == ActionType.TYPE:
+            engine.type(by, locator_value, value)
+        elif action == ActionType.CLEAR:
+            engine.clear(by, locator_value)
+        elif action == ActionType.SELECT:
+            engine.select(by, locator_value, option_text=value)
+        elif action == ActionType.CHECK:
+            engine.check(by, locator_value)
+        elif action == ActionType.UNCHECK:
+            engine.uncheck(by, locator_value)
+        elif action == ActionType.HOVER:
+            engine.hover(by, locator_value)
+        elif action == ActionType.SCROLL:
+            if locator_value:
+                engine.scroll_to(by, locator_value)
             else:
-                candidates.append(LocatorCandidate(strategy=LocatorStrategy.CSS, value=css))
+                driver.execute_script("window.scrollBy(0, 400);")
+        elif action == ActionType.PRESS_KEY:
+            engine.press_key(by, locator_value, value or "TAB")
+        elif action == ActionType.PRESS_ENTER:
+            engine.press_key(by, locator_value, "ENTER")
+        elif action == ActionType.PRESS_TAB:
+            engine.press_key(by, locator_value, "TAB")
+        elif action == ActionType.WAIT:
+            time.sleep(float(value) if value else 1.0)
+        elif action == ActionType.SUBMIT:
+            engine.submit(by, locator_value)
+        elif action == ActionType.UPLOAD:
+            engine.upload(by, locator_value, value)
+        elif action == ActionType.SWITCH_FRAME:
+            engine.switch_to_frame(by, locator_value)
+        elif action == ActionType.SWITCH_WINDOW:
+            engine.switch_window(step.get("window_context") or None)
+        elif action == ActionType.NEW_TAB:
+            # Recorded when the recorder observed the window count go up -
+            # almost always a side effect of the *previous* step (e.g.
+            # clicking a login/SSO button that opens a popup), not
+            # something the user deliberately did that we need to recreate.
+            # The old behavior unconditionally called window.open() here,
+            # which created a redundant *blank* window and then switched to
+            # THAT instead of the real popup, so replay silently ended up
+            # on the wrong window. Instead, wait briefly for the real popup
+            # (already triggered by the previous step, which already ran)
+            # to actually appear, and only open a blank tab ourselves as a
+            # last resort if one genuinely never shows up.
+            handles_before = len(driver.window_handles)
+            deadline = time.time() + engine.timeout
+            while len(driver.window_handles) <= handles_before and time.time() < deadline:
+                time.sleep(0.2)
+            if len(driver.window_handles) <= handles_before:
+                driver.execute_script("window.open();")
+            engine.switch_window()
+        elif action == ActionType.CLOSE_TAB:
+            driver.close()
+            handles = driver.window_handles
+            if handles:
+                driver.switch_to.window(handles[0])
+        elif action == ActionType.NAVIGATE_BACK:
+            engine.navigate_back()
+        elif action == ActionType.NAVIGATE_FORWARD:
+            engine.navigate_forward()
+        else:
+            return False, f"Unknown action type: {action}"
+        return True, ""
+    except LOCATOR_EXCEPTIONS as exc:
+        return False, f"{type(exc).__name__}: {str(exc)[:300]}"
+    except WebDriverException as exc:
+        return False, f"{type(exc).__name__}: {str(exc)[:300]}"
 
-    # css_path / xpath from the browser (always available fallback)
-    if info.get("css_path"):
-        candidates.append(LocatorCandidate(strategy=LocatorStrategy.CSS, value=info["css_path"], reliability_score=0.5))
-    if info.get("xpath"):
-        candidates.append(LocatorCandidate(strategy=LocatorStrategy.XPATH, value=info["xpath"]))
 
-    # relative xpath: tag + partial text/attr, more resilient than absolute xpath
-    if text and len(text) <= 80:
-        candidates.append(LocatorCandidate(
-            strategy=LocatorStrategy.RELATIVE_XPATH,
-            value=f"//{tag}[contains(normalize-space(.), \"{text[:40]}\")]",
-        ))
+def execute_with_fallbacks(engine: ActionEngine, driver: WebDriver, step: Dict[str, Any]) -> Dict[str, Any]:
+    """Self-healing Stage 1 + Stage 2: try the primary locator, then each
+    fallback locator in order. Returns a dict describing the outcome,
+    including which locator ultimately worked (if any) so the caller can
+    decide whether a "soft heal" (fallback promoted to primary) is
+    warranted."""
+    action = step.get("action", "")
+    if action in (ActionType.OPEN_URL, ActionType.SCROLL, ActionType.WAIT, ActionType.SWITCH_WINDOW,
+                  ActionType.NEW_TAB, ActionType.CLOSE_TAB, ActionType.NAVIGATE_BACK, ActionType.NAVIGATE_FORWARD):
+        # actions that don't require a locator
+        ok, err = try_locator(engine, driver, step, step.get("primary_locator_type", ""), step.get("primary_locator", ""))
+        return {"success": ok, "locator_type": step.get("primary_locator_type", ""), "locator_value": step.get("primary_locator", ""), "stage": "direct", "error": err}
 
-    # de-dup by (strategy, value)
-    seen = set()
-    unique: List[LocatorCandidate] = []
-    for c in candidates:
-        key = (c.strategy, c.value)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(c)
+    primary_type = step.get("primary_locator_type", "")
+    primary_value = step.get("primary_locator", "")
+    if primary_type and primary_value:
+        ok, err = try_locator(engine, driver, step, primary_type, primary_value)
+        if ok:
+            return {"success": True, "locator_type": primary_type, "locator_value": primary_value, "stage": "primary", "error": ""}
+        last_error = err
+    else:
+        last_error = "No primary locator recorded"
 
-    unique.sort(key=lambda c: c.reliability_score, reverse=True)
-    return unique
+    fallback_locators = step.get("fallback_locators", [])
+    if fallback_locators:
+        # See FALLBACK_WAIT_SECONDS in config.py: the primary attempt above
+        # already burned a full EXPLICIT_WAIT_SECONDS finding nothing, so
+        # each fallback gets a short, separate timeout instead of another
+        # full wait apiece - this is what actually made data-heavy screens
+        # (many radio buttons / a variable-length table) with several
+        # failing locators take minutes instead of seconds. Restored
+        # unconditionally afterward so nothing downstream (self-healing's
+        # own validation calls, later steps) is ever affected by this.
+        original_timeout = engine.timeout
+        engine.timeout = min(engine.timeout, settings.FALLBACK_WAIT_SECONDS)
+        try:
+            for fb in fallback_locators:
+                ok, err = try_locator(engine, driver, step, fb.get("type", ""), fb.get("value", ""))
+                if ok:
+                    return {"success": True, "locator_type": fb.get("type", ""), "locator_value": fb.get("value", ""), "stage": "fallback", "error": ""}
+                last_error = err
+        finally:
+            engine.timeout = original_timeout
+
+    return {"success": False, "locator_type": primary_type, "locator_value": primary_value, "stage": "exhausted", "error": last_error}
