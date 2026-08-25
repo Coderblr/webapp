@@ -1,177 +1,110 @@
 """
-selenium_executor.py
+Central configuration for the Universal AI-Powered Web Automation Platform.
 
-Low-level bridge between a single Excel step-row and Selenium. Given a
-resolved (locator_type, locator_value) pair, dispatches to the right
-ActionEngine method based on the row's Action column. Also implements
-Self-Healing Stages 1-2 (try primary locator, then each fallback locator)
-since those are cheap/deterministic and don't need the full healing
-pipeline in healing/self_healer.py.
+All configuration is environment-driven (see .env.example). Nothing
+application-specific (no business domain, no site names) lives here -
+this module only knows about infrastructure concerns: paths, browser
+defaults, and AI provider credentials.
+
+NOTE: this build has value masking disabled throughout (recorder,
+executor, logs) - it's configured for UAT use, where recorded/executed
+values are written to the Excel dataset, logs, and reports as-is. Do not
+point this configuration at a production environment.
 """
 from __future__ import annotations
 
-import logging
-import time
-from typing import Any, Dict, Optional, Tuple
+import os
+from pathlib import Path
 
-from selenium.common.exceptions import (
-    NoSuchElementException,
-    NoSuchFrameException,
-    StaleElementReferenceException,
-    TimeoutException,
-    WebDriverException,
-)
-from selenium.webdriver.remote.webdriver import WebDriver
+from dotenv import load_dotenv
 
-from backend.config import settings
-from backend.execution.action_engine import ActionEngine, by_for
-from backend.recorder.iframe_handler import navigate_to_frame
-from backend.storage.models import ActionType
-
-logger = logging.getLogger("universal_automation.selenium_executor")
-
-LOCATOR_EXCEPTIONS = (NoSuchElementException, TimeoutException, StaleElementReferenceException, NoSuchFrameException)
+# Load .env from the project root (one level above backend/) if present.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_PROJECT_ROOT / ".env")
 
 
-def resolve_frame(driver: WebDriver, step: Dict[str, Any]) -> bool:
-    frame_path = step.get("frame_path")
-    try:
-        return navigate_to_frame(driver, frame_path)
-    except WebDriverException:
-        return False
+def _bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
 
 
-def try_locator(engine: ActionEngine, driver: WebDriver, step: Dict[str, Any], locator_type: str, locator_value: str) -> Tuple[bool, str]:
-    """Attempts to perform the step's action using a specific locator.
-    Returns (success, error_message)."""
-    if not resolve_frame(driver, step):
-        return False, "Unable to navigate to the recorded frame hierarchy"
-
-    by = by_for(locator_type)
-    action = step.get("action", "")
-    value = step.get("value", "")
-
-    try:
-        if action == ActionType.OPEN_URL:
-            driver.get(step.get("value") or step.get("page_url"))
-        elif action == ActionType.CLICK:
-            engine.click(by, locator_value)
-        elif action == ActionType.DOUBLE_CLICK:
-            engine.double_click(by, locator_value)
-        elif action == ActionType.RIGHT_CLICK:
-            engine.right_click(by, locator_value)
-        elif action == ActionType.TYPE:
-            engine.type(by, locator_value, value)
-        elif action == ActionType.CLEAR:
-            engine.clear(by, locator_value)
-        elif action == ActionType.SELECT:
-            engine.select(by, locator_value, option_text=value)
-        elif action == ActionType.CHECK:
-            engine.check(by, locator_value)
-        elif action == ActionType.UNCHECK:
-            engine.uncheck(by, locator_value)
-        elif action == ActionType.HOVER:
-            engine.hover(by, locator_value)
-        elif action == ActionType.SCROLL:
-            if locator_value:
-                engine.scroll_to(by, locator_value)
-            else:
-                driver.execute_script("window.scrollBy(0, 400);")
-        elif action == ActionType.PRESS_KEY:
-            engine.press_key(by, locator_value, value or "TAB")
-        elif action == ActionType.PRESS_ENTER:
-            engine.press_key(by, locator_value, "ENTER")
-        elif action == ActionType.PRESS_TAB:
-            engine.press_key(by, locator_value, "TAB")
-        elif action == ActionType.WAIT:
-            time.sleep(float(value) if value else 1.0)
-        elif action == ActionType.SUBMIT:
-            engine.submit(by, locator_value)
-        elif action == ActionType.UPLOAD:
-            engine.upload(by, locator_value, value)
-        elif action == ActionType.SWITCH_FRAME:
-            engine.switch_to_frame(by, locator_value)
-        elif action == ActionType.SWITCH_WINDOW:
-            engine.switch_window(step.get("window_context") or None)
-        elif action == ActionType.NEW_TAB:
-            # Recorded when the recorder observed the window count go up -
-            # almost always a side effect of the *previous* step (e.g.
-            # clicking a login/SSO button that opens a popup), not
-            # something the user deliberately did that we need to recreate.
-            # The old behavior unconditionally called window.open() here,
-            # which created a redundant *blank* window and then switched to
-            # THAT instead of the real popup, so replay silently ended up
-            # on the wrong window. Instead, wait briefly for the real popup
-            # (already triggered by the previous step, which already ran)
-            # to actually appear, and only open a blank tab ourselves as a
-            # last resort if one genuinely never shows up.
-            handles_before = len(driver.window_handles)
-            deadline = time.time() + engine.timeout
-            while len(driver.window_handles) <= handles_before and time.time() < deadline:
-                time.sleep(0.2)
-            if len(driver.window_handles) <= handles_before:
-                driver.execute_script("window.open();")
-            engine.switch_window()
-        elif action == ActionType.CLOSE_TAB:
-            driver.close()
-            handles = driver.window_handles
-            if handles:
-                driver.switch_to.window(handles[0])
-        elif action == ActionType.NAVIGATE_BACK:
-            engine.navigate_back()
-        elif action == ActionType.NAVIGATE_FORWARD:
-            engine.navigate_forward()
-        else:
-            return False, f"Unknown action type: {action}"
-        return True, ""
-    except LOCATOR_EXCEPTIONS as exc:
-        return False, f"{type(exc).__name__}: {str(exc)[:300]}"
-    except WebDriverException as exc:
-        return False, f"{type(exc).__name__}: {str(exc)[:300]}"
+def _resolve(path_str: str) -> Path:
+    p = Path(path_str)
+    if not p.is_absolute():
+        p = (Path(__file__).resolve().parent / p).resolve()
+    return p
 
 
-def execute_with_fallbacks(engine: ActionEngine, driver: WebDriver, step: Dict[str, Any]) -> Dict[str, Any]:
-    """Self-healing Stage 1 + Stage 2: try the primary locator, then each
-    fallback locator in order. Returns a dict describing the outcome,
-    including which locator ultimately worked (if any) so the caller can
-    decide whether a "soft heal" (fallback promoted to primary) is
-    warranted."""
-    action = step.get("action", "")
-    if action in (ActionType.OPEN_URL, ActionType.SCROLL, ActionType.WAIT, ActionType.SWITCH_WINDOW,
-                  ActionType.NEW_TAB, ActionType.CLOSE_TAB, ActionType.NAVIGATE_BACK, ActionType.NAVIGATE_FORWARD):
-        # actions that don't require a locator
-        ok, err = try_locator(engine, driver, step, step.get("primary_locator_type", ""), step.get("primary_locator", ""))
-        return {"success": ok, "locator_type": step.get("primary_locator_type", ""), "locator_value": step.get("primary_locator", ""), "stage": "direct", "error": err}
+class Settings:
+    """Runtime settings, resolved once at import time."""
 
-    primary_type = step.get("primary_locator_type", "")
-    primary_value = step.get("primary_locator", "")
-    if primary_type and primary_value:
-        ok, err = try_locator(engine, driver, step, primary_type, primary_value)
-        if ok:
-            return {"success": True, "locator_type": primary_type, "locator_value": primary_value, "stage": "primary", "error": ""}
-        last_error = err
-    else:
-        last_error = "No primary locator recorded"
+    # --- General ---
+    APP_ENV: str = os.getenv("APP_ENV", "development")
+    APP_HOST: str = os.getenv("APP_HOST", "0.0.0.0")
+    APP_PORT: int = int(os.getenv("APP_PORT", "8000"))
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
-    fallback_locators = step.get("fallback_locators", [])
-    if fallback_locators:
-        # See FALLBACK_WAIT_SECONDS in config.py: the primary attempt above
-        # already burned a full EXPLICIT_WAIT_SECONDS finding nothing, so
-        # each fallback gets a short, separate timeout instead of another
-        # full wait apiece - this is what actually made data-heavy screens
-        # (many radio buttons / a variable-length table) with several
-        # failing locators take minutes instead of seconds. Restored
-        # unconditionally afterward so nothing downstream (self-healing's
-        # own validation calls, later steps) is ever affected by this.
-        original_timeout = engine.timeout
-        engine.timeout = min(engine.timeout, settings.FALLBACK_WAIT_SECONDS)
-        try:
-            for fb in fallback_locators:
-                ok, err = try_locator(engine, driver, step, fb.get("type", ""), fb.get("value", ""))
-                if ok:
-                    return {"success": True, "locator_type": fb.get("type", ""), "locator_value": fb.get("value", ""), "stage": "fallback", "error": ""}
-                last_error = err
-        finally:
-            engine.timeout = original_timeout
+    PROJECT_ROOT: Path = _PROJECT_ROOT
+    RECORDINGS_DIR: Path = _resolve(os.getenv("RECORDINGS_DIR", "../recordings"))
+    REPORTS_DIR: Path = _resolve(os.getenv("REPORTS_DIR", "../reports"))
+    LOGS_DIR: Path = _resolve(os.getenv("LOGS_DIR", "../logs"))
+    FRONTEND_DIR: Path = _PROJECT_ROOT / "frontend"
 
-    return {"success": False, "locator_type": primary_type, "locator_value": primary_value, "stage": "exhausted", "error": last_error}
+    # --- Browser ---
+    DEFAULT_BROWSER: str = os.getenv("DEFAULT_BROWSER", "chrome")
+    BROWSER_HEADLESS: bool = _bool("BROWSER_HEADLESS", False)
+    IMPLICIT_WAIT_SECONDS: float = float(os.getenv("IMPLICIT_WAIT_SECONDS", "2"))
+    EXPLICIT_WAIT_SECONDS: float = float(os.getenv("EXPLICIT_WAIT_SECONDS", "10"))
+    # Used only for fallback locator attempts (selenium_executor.py's
+    # execute_with_fallbacks), never for the primary locator. The primary
+    # attempt gets the full EXPLICIT_WAIT_SECONDS since a page may
+    # genuinely still be loading. By the time a fallback is tried, that
+    # full wait has already happened once for this step - waiting another
+    # complete EXPLICIT_WAIT_SECONDS for EACH of up to 3 fallback locators
+    # in turn (up to 30+ seconds on top of the primary's own 10s) is what
+    # made data-heavy screens with several failing/ambiguous locators (many
+    # radio buttons, a variable-length row table, ...) take minutes to
+    # execute - almost all of that time was spent waiting out timeouts,
+    # not doing anything. A short, separate timeout here keeps fallback
+    # attempts fast without shortening the one wait that actually matters
+    # (the primary locator's).
+    FALLBACK_WAIT_SECONDS: float = float(os.getenv("FALLBACK_WAIT_SECONDS", "3"))
+
+    # Manual driver binary paths. When set, browser_factory.py uses these
+    # directly instead of asking webdriver-manager to auto-download a
+    # matching driver - required on machines with no internet access or
+    # where outbound downloads are blocked (e.g. corporate/offline setups).
+    # Leave blank to keep the automatic download behavior.
+    CHROME_DRIVER_PATH: str = os.getenv("CHROME_DRIVER_PATH", "").strip()
+    EDGE_DRIVER_PATH: str = os.getenv("EDGE_DRIVER_PATH", "").strip()
+
+    # --- AI ---
+    DEFAULT_AI_PROVIDER: str = os.getenv("DEFAULT_AI_PROVIDER", "azure_openai")
+    AI_ENABLED: bool = _bool("AI_ENABLED", True)
+
+    AZURE_OPENAI_API_KEY: str = os.getenv("AZURE_OPENAI_API_KEY", "")
+    AZURE_OPENAI_ENDPOINT: str = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+    AZURE_OPENAI_DEPLOYMENT: str = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+    AZURE_OPENAI_API_VERSION: str = os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview")
+
+    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+    CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
+
+    DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
+    DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+
+    # --- Self-healing ---
+    HEALING_CONFIDENCE_THRESHOLD: float = float(os.getenv("HEALING_CONFIDENCE_THRESHOLD", "0.75"))
+    HEALING_MAX_CANDIDATES: int = int(os.getenv("HEALING_MAX_CANDIDATES", "15"))
+
+    @classmethod
+    def ensure_dirs(cls) -> None:
+        for d in (cls.RECORDINGS_DIR, cls.REPORTS_DIR, cls.LOGS_DIR):
+            d.mkdir(parents=True, exist_ok=True)
+
+
+settings = Settings()
+settings.ensure_dirs()
