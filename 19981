@@ -1,916 +1,516 @@
-"""
-action_engine.py
+/*
+ * bridge.js
+ * ---------------------------------------------------------------------
+ * Injected into every document (top-level page AND every iframe the
+ * recorder descends into) via Selenium's execute_script. Defines a
+ * single window.__UA__ namespace that the Python side polls.
+ *
+ * This file is 100% generic: no selector, class name, id, or business
+ * term from any specific application is hardcoded. Every heuristic
+ * below is based on structural/semantic DOM characteristics (role,
+ * aria-*, tag, generic class-name *patterns*, computed style) so the
+ * same script works against any Angular / React / Vue / plain-JS /
+ * Bootstrap / jQuery / enterprise UI site.
+ *
+ * Safe to inject multiple times (idempotent) because everything is
+ * guarded behind `if (!window.__UA__)`.
+ * ---------------------------------------------------------------------
+ */
+(function () {
+  if (window.__UA__) {
+    return; // already initialized in this document/frame
+  }
 
-Generic Selenium action executor.
+  const UA = {
+    eventQueue: [],
+    mutationQueue: [],
+    _observer: null,
+    _listenersAttached: false,
+    _seenSignatures: new Set(),
+  };
 
-Responsibilities:
-- Translate generic locator strategies into Selenium By strategies.
-- Resolve locators safely.
-- NEVER silently select the first element when a locator matches
-  multiple elements.
-- Perform common browser actions through one shared ActionEngine.
+  // ---- Cross-navigation event persistence ----------------------------
+  // A committed "change" event (e.g. a password field losing focus right
+  // before its form's Submit navigates the browser) can be queued here in
+  // JS memory and then never make it back to Python: the ~0.5s polling
+  // interval may not get a chance to drain the queue before the document
+  // is torn down by the navigation, silently losing that action's value
+  // (or, worse, letting a later action on the next page get logged in its
+  // place). To close that gap, stash any still-queued events into
+  // sessionStorage right before unload, and recover them into the fresh
+  // page's queue on injection - sessionStorage survives same-tab
+  // navigation (it does not survive a full external redirect to another
+  // origin, which is a page-storage limitation, not something JS can work
+  // around).
+  const PENDING_KEY = "__UA_pending_events__";
 
-Important:
-A locator used for an action must resolve to exactly ONE element.
+  (function recoverPendingEvents() {
+    try {
+      const raw = window.sessionStorage.getItem(PENDING_KEY);
+      if (raw) {
+        window.sessionStorage.removeItem(PENDING_KEY);
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr) && arr.length) {
+          // recovered (older, pre-navigation) events go first so they
+          // drain - and get recorded - ahead of anything new on this page
+          UA.eventQueue = arr.concat(UA.eventQueue);
+        }
+      }
+    } catch (e) { /* sessionStorage unavailable/blocked - nothing we can do */ }
+  })();
 
-This is especially important for applications such as RLMS where
-the DOM can contain duplicated IDs such as:
+  window.addEventListener("beforeunload", function () {
+    try {
+      if (UA.eventQueue.length) {
+        let existing = [];
+        const raw = window.sessionStorage.getItem(PENDING_KEY);
+        if (raw) {
+          try { existing = JSON.parse(raw) || []; } catch (e) { existing = []; }
+        }
+        window.sessionStorage.setItem(PENDING_KEY, JSON.stringify(existing.concat(UA.eventQueue)));
+      }
+    } catch (e) { /* ignore - best effort only */ }
+  }, true);
 
-    id="dashboardPersonalLoan"
-
-or repeated classes such as:
-
-    mat-card
-    dashboard-content
-    col-md-3
-    ng-star-inserted
-"""
-
-from __future__ import annotations
-
-import logging
-import time
-from typing import Optional, Tuple
-
-from selenium.common.exceptions import (
-    ElementClickInterceptedException,
-    ElementNotInteractableException,
-    NoSuchElementException,
-    StaleElementReferenceException,
-    TimeoutException,
-)
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.remote.webdriver import WebDriver
-from selenium.webdriver.remote.webelement import WebElement
-from selenium.webdriver.support.ui import Select, WebDriverWait
-
-from backend.config import settings
-from backend.storage.models import LocatorStrategy
-
-
-logger = logging.getLogger(
-    "universal_automation.action_engine"
-)
-
-
-# ============================================================================
-# Locator strategy -> Selenium By
-# ============================================================================
-
-STRATEGY_TO_BY = {
-    LocatorStrategy.ID: By.ID,
-    LocatorStrategy.NAME: By.NAME,
-    LocatorStrategy.CSS: By.CSS_SELECTOR,
-    LocatorStrategy.XPATH: By.XPATH,
-    LocatorStrategy.RELATIVE_XPATH: By.XPATH,
-    LocatorStrategy.LINK_TEXT: By.LINK_TEXT,
-    LocatorStrategy.PARTIAL_LINK_TEXT: By.PARTIAL_LINK_TEXT,
-
-    # locator_engine generates DATA_TESTID as CSS.
-    LocatorStrategy.DATA_TESTID: By.CSS_SELECTOR,
-
-    # locator_engine generates these as XPath.
-    LocatorStrategy.ACCESSIBILITY: By.XPATH,
-    LocatorStrategy.ATTRIBUTE: By.XPATH,
-    LocatorStrategy.TEXT: By.XPATH,
-}
-
-
-# ---------------------------------------------------------------------------
-# Backwards compatibility for string strategy names.
-# ---------------------------------------------------------------------------
-
-STRATEGY_TO_BY.update(
-    {
-        "ID": By.ID,
-        "NAME": By.NAME,
-        "CSS": By.CSS_SELECTOR,
-        "XPATH": By.XPATH,
-        "RELATIVE_XPATH": By.XPATH,
-        "LINK_TEXT": By.LINK_TEXT,
-        "PARTIAL_LINK_TEXT": By.PARTIAL_LINK_TEXT,
-        "DATA_TESTID": By.CSS_SELECTOR,
-        "ACCESSIBILITY": By.XPATH,
-        "ATTRIBUTE": By.XPATH,
-        "TEXT": By.XPATH,
+  // ---- helpers -----------------------------------------------------
+  function safeAttr(el, name) {
+    try {
+      const v = el.getAttribute(name);
+      return v === null ? "" : v;
+    } catch (e) {
+      return "";
     }
-)
-
-
-def by_for(strategy: str):
-    """
-    Convert a generic locator strategy into Selenium's By constant.
-    """
-
-    return STRATEGY_TO_BY.get(
-        strategy,
-        By.CSS_SELECTOR,
-    )
-
-
-# ============================================================================
-# Action Engine
-# ============================================================================
-
-class ActionEngine:
-    """
-    Generic Selenium action executor.
-
-    Every action takes a locator:
-
-        by
-        value
-
-    The engine deliberately refuses to act when the locator matches
-    multiple elements.
-
-    This prevents the classic Selenium problem:
-
-        find_element(...)
-            -> silently returns first match
-            -> wrong card gets clicked
-    """
-
-    def __init__(
-        self,
-        driver: WebDriver,
-        timeout: Optional[float] = None,
-    ):
-        self.driver = driver
-
-        self.timeout = (
-            timeout
-            or settings.EXPLICIT_WAIT_SECONDS
-        )
-
-    # ========================================================================
-    # LOW-LEVEL LOCATOR RESOLUTION
-    # ========================================================================
-
-    def _find_elements(
-        self,
-        by,
-        value: str,
-    ) -> list[WebElement]:
-        """
-        Return ALL matching elements.
-
-        This is intentionally different from Selenium's find_element().
-
-        We need the complete result set so that we can detect:
-
-            0 matches
-            1 match
-            2+ matches
-
-        before performing an action.
-        """
-
-        try:
-            return self.driver.find_elements(
-                by,
-                value,
-            )
-
-        except (
-            NoSuchElementException,
-            StaleElementReferenceException,
-        ):
-            return []
-
-    def _find_unique_now(
-        self,
-        by,
-        value: str,
-    ) -> Optional[WebElement]:
-        """
-        Return an element only when the locator matches exactly one element.
-
-        Returns:
-            WebElement -> exactly one match
-            None       -> zero or multiple matches
-
-        IMPORTANT:
-        Multiple matches are intentionally treated as unusable.
-        """
-
-        elements = self._find_elements(
-            by,
-            value,
-        )
-
-        if len(elements) == 0:
-            return None
-
-        if len(elements) > 1:
-
-            logger.warning(
-                "Ambiguous locator rejected: "
-                "%s=%r matched %d elements",
-                by,
-                value,
-                len(elements),
-            )
-
-            return None
-
-        return elements[0]
-
-    def _find_any_now(
-        self,
-        by,
-        value: str,
-    ) -> Optional[WebElement]:
-        """
-        Return the first matching element.
-
-        This method is ONLY intended for non-action inspection
-        where uniqueness is not required.
-
-        Do NOT use this for clicks/types/selections.
-        """
-
-        elements = self._find_elements(
-            by,
-            value,
-        )
-
-        if not elements:
-            return None
-
-        return elements[0]
-
-    # ========================================================================
-    # WAIT
-    # ========================================================================
-
-    def wait_for(
-        self,
-        by,
-        value: str,
-        condition: str = "visible",
-    ) -> WebElement:
-        """
-        Wait until a locator resolves to exactly one usable element.
-
-        Conditions:
-
-            clickable
-            visible
-            present
-
-        IMPORTANT:
-        If the locator matches multiple elements, it is considered
-        ambiguous and the wait continues.
-
-        This is the main protection against the RLMS duplicated-ID
-        problem.
-        """
-
-        def resolve(_driver):
-
-            element = self._find_unique_now(
-                by,
-                value,
-            )
-
-            if element is None:
-                return False
-
-            try:
-
-                if condition == "present":
-                    return element
-
-                if condition == "clickable":
-
-                    if not element.is_displayed():
-                        return False
-
-                    if not element.is_enabled():
-                        return False
-
-                    return element
-
-                # Default = visible.
-                if not element.is_displayed():
-                    return False
-
-                return element
-
-            except (
-                StaleElementReferenceException,
-                ElementNotInteractableException,
-            ):
-                return False
-
-        try:
-
-            return WebDriverWait(
-                self.driver,
-                self.timeout,
-                poll_frequency=0.2,
-            ).until(resolve)
-
-        except TimeoutException as exc:
-
-            # Give a useful diagnostic.
-            try:
-                count = len(
-                    self._find_elements(
-                        by,
-                        value,
-                    )
-                )
-            except Exception:
-                count = -1
-
-            if count > 1:
-
-                raise TimeoutException(
-                    f"Ambiguous locator: "
-                    f"{by}={value!r} "
-                    f"matched {count} elements. "
-                    f"Refusing to choose the first element."
-                ) from exc
-
-            raise TimeoutException(
-                f"Element not found/usable: "
-                f"{by}={value!r}, "
-                f"condition={condition!r}"
-            ) from exc
-
-    # ========================================================================
-    # FIND
-    # ========================================================================
-
-    def find(
-        self,
-        by,
-        value: str,
-    ) -> WebElement:
-        """
-        Find exactly one element.
-
-        This replaces unsafe direct usage of:
-
-            driver.find_element(by, value)
-
-        for actions.
-        """
-
-        element = self._find_unique_now(
-            by,
-            value,
-        )
-
-        if element is None:
-
-            elements = self._find_elements(
-                by,
-                value,
-            )
-
-            if len(elements) > 1:
-
-                raise RuntimeError(
-                    f"Ambiguous locator: "
-                    f"{by}={value!r} "
-                    f"matched {len(elements)} elements. "
-                    f"Refusing to select the first element."
-                )
-
-            raise NoSuchElementException(
-                f"No element found for "
-                f"{by}={value!r}"
-            )
-
-        return element
-
-    # ========================================================================
-    # VIEW / SCROLL
-    # ========================================================================
-
-    def _ensure_in_view(
-        self,
-        element: WebElement,
-    ) -> None:
-        """
-        Scroll the element into the center of the viewport.
-        """
-
-        try:
-
-            self.driver.execute_script(
-                """
-                arguments[0].scrollIntoView({
-                    block: 'center',
-                    inline: 'center'
-                });
-                """,
-                element,
-            )
-
-            # Small delay helps Angular/material animations settle.
-            time.sleep(0.05)
-
-        except Exception:
-            logger.debug(
-                "Could not scroll element into view",
-                exc_info=True,
-            )
-
-    # ========================================================================
-    # CLICK
-    # ========================================================================
-
-    def click(
-        self,
-        by,
-        value: str,
-    ) -> None:
-        """
-        Click exactly one unique element.
-        """
-
-        el = self.wait_for(
-            by,
-            value,
-            condition="clickable",
-        )
-
-        self._ensure_in_view(el)
-
-        try:
-
-            el.click()
-
-        except (
-            ElementClickInterceptedException,
-            ElementNotInteractableException,
-        ):
-
-            logger.warning(
-                "Normal click failed; retrying with ActionChains: "
-                "%s=%r",
-                by,
-                value,
-            )
-
-            # Re-resolve after scrolling/DOM changes.
-            el = self.wait_for(
-                by,
-                value,
-                condition="clickable",
-            )
-
-            self._ensure_in_view(el)
-
-            ActionChains(
-                self.driver
-            ).move_to_element(el).click().perform()
-
-    # ========================================================================
-    # DOUBLE CLICK
-    # ========================================================================
-
-    def double_click(
-        self,
-        by,
-        value: str,
-    ) -> None:
-
-        el = self.wait_for(
-            by,
-            value,
-            condition="clickable",
-        )
-
-        self._ensure_in_view(el)
-
-        ActionChains(
-            self.driver
-        ).double_click(el).perform()
-
-    # ========================================================================
-    # RIGHT CLICK
-    # ========================================================================
-
-    def right_click(
-        self,
-        by,
-        value: str,
-    ) -> None:
-
-        el = self.wait_for(
-            by,
-            value,
-            condition="clickable",
-        )
-
-        self._ensure_in_view(el)
-
-        ActionChains(
-            self.driver
-        ).context_click(el).perform()
-
-    # ========================================================================
-    # TYPE
-    # ========================================================================
-
-    def type(
-        self,
-        by,
-        value: str,
-        text: str,
-        clear_first: bool = True,
-    ) -> None:
-
-        el = self.wait_for(
-            by,
-            value,
-            condition="visible",
-        )
-
-        self._ensure_in_view(el)
-
-        if clear_first:
-
-            try:
-                el.clear()
-
-            except (
-                ElementNotInteractableException,
-                StaleElementReferenceException,
-            ):
-
-                # Re-resolve once after DOM refresh.
-                el = self.wait_for(
-                    by,
-                    value,
-                    condition="visible",
-                )
-
-                try:
-                    el.clear()
-                except Exception:
-                    pass
-
-        el.send_keys(text)
-
-    # ========================================================================
-    # CLEAR
-    # ========================================================================
-
-    def clear(
-        self,
-        by,
-        value: str,
-    ) -> None:
-
-        el = self.wait_for(
-            by,
-            value,
-            condition="visible",
-        )
-
-        self._ensure_in_view(el)
-
-        el.clear()
-
-    # ========================================================================
-    # SELECT
-    # ========================================================================
-
-    def select(
-        self,
-        by,
-        value: str,
-        option_text: Optional[str] = None,
-        option_value: Optional[str] = None,
-    ) -> None:
-
-        el = self.wait_for(
-            by,
-            value,
-            condition="visible",
-        )
-
-        self._ensure_in_view(el)
-
-        select = Select(el)
-
-        if option_value is not None:
-
-            select.select_by_value(
-                option_value
-            )
-
-        elif option_text is not None:
-
-            select.select_by_visible_text(
-                option_text
-            )
-
-        else:
-
-            raise ValueError(
-                "select() requires either "
-                "option_text or option_value"
-            )
-
-    # ========================================================================
-    # CHECK
-    # ========================================================================
-
-    def check(
-        self,
-        by,
-        value: str,
-    ) -> None:
-
-        el = self.wait_for(
-            by,
-            value,
-            condition="clickable",
-        )
-
-        self._ensure_in_view(el)
-
-        if not el.is_selected():
-            el.click()
-
-    # ========================================================================
-    # UNCHECK
-    # ========================================================================
-
-    def uncheck(
-        self,
-        by,
-        value: str,
-    ) -> None:
-
-        el = self.wait_for(
-            by,
-            value,
-            condition="clickable",
-        )
-
-        self._ensure_in_view(el)
-
-        if el.is_selected():
-            el.click()
-
-    # ========================================================================
-    # HOVER
-    # ========================================================================
-
-    def hover(
-        self,
-        by,
-        value: str,
-    ) -> None:
-
-        el = self.wait_for(
-            by,
-            value,
-            condition="visible",
-        )
-
-        self._ensure_in_view(el)
-
-        ActionChains(
-            self.driver
-        ).move_to_element(el).perform()
-
-    # ========================================================================
-    # SCROLL TO
-    # ========================================================================
-
-    def scroll_to(
-        self,
-        by,
-        value: str,
-    ) -> None:
-
-        el = self.wait_for(
-            by,
-            value,
-            condition="present",
-        )
-
-        self.driver.execute_script(
-            """
-            arguments[0].scrollIntoView({
-                block: 'center',
-                inline: 'center'
+  }
+
+  function isVisible(el) {
+    try {
+      const style = window.getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function isEnabled(el) {
+    return !(el.disabled === true || safeAttr(el, "aria-disabled") === "true");
+  }
+
+  function cssPath(el) {
+    if (!(el instanceof Element)) return "";
+    const path = [];
+    let node = el;
+    while (node && node.nodeType === Node.ELEMENT_NODE && path.length < 8) {
+      let selector = node.nodeName.toLowerCase();
+      if (node.id) {
+        selector += "#" + CSS.escape(node.id);
+        path.unshift(selector);
+        break;
+      } else {
+        let sibling = node;
+        let nth = 1;
+        while ((sibling = sibling.previousElementSibling)) {
+          if (sibling.nodeName.toLowerCase() === selector) nth++;
+        }
+        selector += ":nth-of-type(" + nth + ")";
+      }
+      path.unshift(selector);
+      node = node.parentElement;
+    }
+    return path.join(" > ");
+  }
+
+  function xpath(el) {
+    if (!(el instanceof Element)) return "";
+    if (el.id) return '//*[@id="' + el.id + '"]';
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === Node.ELEMENT_NODE) {
+      let index = 1;
+      let sibling = node.previousSibling;
+      while (sibling) {
+        if (sibling.nodeType === Node.ELEMENT_NODE && sibling.nodeName === node.nodeName) index++;
+        sibling = sibling.previousSibling;
+      }
+      parts.unshift(node.nodeName.toLowerCase() + "[" + index + "]");
+      node = node.parentElement;
+    }
+    return "/" + parts.join("/");
+  }
+
+  function domSignature(el) {
+    // A best-effort stable-ish fingerprint: tag + id/name/testid + class + position among siblings.
+    const tag = el.nodeName.toLowerCase();
+    const id = safeAttr(el, "id");
+    const testId = safeAttr(el, "data-testid") || safeAttr(el, "data-test-id") || safeAttr(el, "data-qa");
+    const name = safeAttr(el, "name");
+    const cls = (el.className && typeof el.className === "string") ? el.className.trim().split(/\s+/).slice(0, 3).join(".") : "";
+    let idx = 0;
+    if (el.parentElement) {
+      idx = Array.prototype.indexOf.call(el.parentElement.children, el);
+    }
+    return [tag, id, testId, name, cls, idx].join("|");
+  }
+
+  function collectDataAttrs(el) {
+    const out = {};
+    for (const attr of el.attributes || []) {
+      if (attr.name.startsWith("data-") || attr.name.startsWith("aria-")) {
+        out[attr.name] = attr.value;
+      }
+    }
+    return out;
+  }
+
+  function textOf(el) {
+    try {
+      let t = (el.innerText || el.textContent || "").trim();
+      if (!t) t = safeAttr(el, "value") || safeAttr(el, "placeholder") || safeAttr(el, "aria-label") || safeAttr(el, "title") || safeAttr(el, "alt");
+      return t.substring(0, 200);
+    } catch (e) {
+      return "";
+    }
+  }
+
+  // Some apps (seen on a real banking dashboard: a grid of near-identical
+  // "product" cards, e.g. Gold Loan / Personal Loan / Home Loan) reuse the
+  // exact same id and class list across every visually-repeated tile -
+  // invalid HTML (ids must be unique), but it happens in the wild, and a
+  // locator built from that id/class combo silently resolves to whichever
+  // tile happens to come first in the DOM rather than the one actually
+  // recorded. build_locators() (Python side) has no live DOM access to
+  // detect this itself, so we check it here, at capture time, while we
+  // still have the real page in front of us, and hand the verdict along
+  // so the locator scoring can react to it.
+  function isUniqueSelectorOnPage(selector) {
+    if (!selector) return true;
+    try {
+      return document.querySelectorAll(selector).length <= 1;
+    } catch (e) {
+      return true; // malformed selector (unusual attribute chars, etc.) - don't penalize speculatively
+    }
+  }
+
+  UA.getElementInfo = function (el) {
+    if (!el || !(el instanceof Element)) return null;
+    const rect = el.getBoundingClientRect();
+    const id = safeAttr(el, "id");
+    const classNameStr = (el.className && typeof el.className === "string") ? el.className : "";
+    const classList = classNameStr.trim().split(/\s+/).filter(Boolean);
+    const tagName = el.nodeName.toLowerCase();
+    return {
+      tag: tagName,
+      id: id,
+      id_unique: id ? isUniqueSelectorOnPage("#" + CSS.escape(id)) : true,
+      name: safeAttr(el, "name"),
+      class_name: classNameStr,
+      class_combo_unique: classList.length
+        ? isUniqueSelectorOnPage(tagName + "." + classList.map(function (c) { return CSS.escape(c); }).join("."))
+        : true,
+      type: safeAttr(el, "type"),
+      value: (el.value !== undefined ? String(el.value).substring(0, 200) : ""),
+      text: textOf(el),
+      placeholder: safeAttr(el, "placeholder"),
+      title: safeAttr(el, "title"),
+      role: safeAttr(el, "role"),
+      aria_label: safeAttr(el, "aria-label"),
+      aria_labelledby: safeAttr(el, "aria-labelledby"),
+      aria_describedby: safeAttr(el, "aria-describedby"),
+      data_attrs: collectDataAttrs(el),
+      href: safeAttr(el, "href"),
+      src: safeAttr(el, "src"),
+      alt: safeAttr(el, "alt"),
+      for_attr: safeAttr(el, "for"),
+      autocomplete: safeAttr(el, "autocomplete"),
+      disabled: el.disabled === true || safeAttr(el, "aria-disabled") === "true",
+      readonly: el.readOnly === true,
+      checked: el.checked === true,
+      selected: el.selected === true,
+      visible: isVisible(el),
+      enabled: isEnabled(el),
+      bounding_box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+      parent_signature: el.parentElement ? domSignature(el.parentElement) : "",
+      dom_signature: domSignature(el),
+      css_path: cssPath(el),
+      xpath: xpath(el),
+      link_text: el.nodeName.toLowerCase() === "a" ? textOf(el) : "",
+    };
+  };
+
+  // ---- DOM crawling --------------------------------------------------
+  const INTERESTING_SELECTOR = [
+    "a", "button", "input", "select", "textarea", "option", "label",
+    "[role='button']", "[role='link']", "[role='checkbox']", "[role='radio']",
+    "[role='tab']", "[role='menuitem']", "[role='option']", "[role='switch']",
+    "[onclick]", "[data-testid]", "[data-test-id]", "[data-qa]",
+    "table", "tr", "td", "th", "ul", "li", "nav", "form",
+    "[contenteditable='true']", "iframe", "[role='dialog']", "dialog"
+  ].join(",");
+
+  UA.crawlDom = function (root) {
+    root = root || document;
+    const els = root.querySelectorAll(INTERESTING_SELECTOR);
+    const out = [];
+    els.forEach(function (el) {
+      const info = UA.getElementInfo(el);
+      if (info) out.push(info);
+    });
+    return out;
+  };
+
+  // ---- Event listening -------------------------------------------------
+  function pushEvent(type, el, extra) {
+    const info = UA.getElementInfo(el);
+    if (!info) return;
+    UA.eventQueue.push(Object.assign({
+      type: type,
+      element: info,
+      timestamp: Date.now(),
+      url: window.location.href,
+      title: document.title,
+    }, extra || {}));
+  }
+
+  UA.startEventListeners = function () {
+    if (UA._listenersAttached) return;
+    UA._listenersAttached = true;
+
+    document.addEventListener("click", function (e) {
+      pushEvent(e.detail === 2 ? "dblclick" : "click", e.target);
+    }, true);
+
+    document.addEventListener("dblclick", function (e) {
+      pushEvent("dblclick", e.target);
+    }, true);
+
+    document.addEventListener("contextmenu", function (e) {
+      pushEvent("contextmenu", e.target);
+    }, true);
+
+    document.addEventListener("change", function (e) {
+      const el = e.target;
+      if (el && (el.tagName === "SELECT")) {
+        pushEvent("select", el, { value: el.value, selected_text: el.options[el.selectedIndex] ? el.options[el.selectedIndex].text : "" });
+      } else if (el && el.type === "checkbox") {
+        pushEvent(el.checked ? "check" : "uncheck", el);
+      } else if (el && el.type === "radio") {
+        pushEvent("check", el);
+      } else if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) {
+        pushEvent("type", el, { value: el.value });
+      }
+    }, true);
+
+    document.addEventListener("input", function (e) {
+      const el = e.target;
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) {
+        pushEvent("typing", el, { value: el.value !== undefined ? el.value : el.innerText });
+      }
+    }, true);
+
+    document.addEventListener("submit", function (e) {
+      pushEvent("submit", e.target);
+    }, true);
+
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") {
+        pushEvent("press_enter", e.target, { key: "Enter" });
+      } else if (e.key === "Tab") {
+        pushEvent("press_tab", e.target, { key: "Tab" });
+      } else if (["Escape", "ArrowDown", "ArrowUp"].indexOf(e.key) === -1) {
+        // avoid noise from purely navigational keys; still track generic keypress
+        pushEvent("keydown", e.target, { key: e.key });
+      }
+    }, true);
+
+    // NOTE: hover ("mouseover") capture is intentionally disabled. It was
+    // recording incidental mouse movement (the pointer passing over a
+    // background/overlay element on its way to the real target) as if it
+    // were a deliberate action, and even genuine hovers rarely replay
+    // reliably via Selenium (no real pointer movement, so hover-triggered
+    // CSS/JS states often never engage) - so hover steps were a frequent
+    // source of failures/timeouts that didn't reflect an actual problem
+    // with the recording or the target application. Click/type/select/etc.
+    // are unaffected; this only turns off the previous fully-generic
+    // mouseover -> "hover" action capture.
+
+    let scrollTimer = null;
+    window.addEventListener("scroll", function () {
+      clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(function () {
+        UA.eventQueue.push({
+          type: "scroll",
+          element: null,
+          scroll_x: window.scrollX,
+          scroll_y: window.scrollY,
+          timestamp: Date.now(),
+          url: window.location.href,
+          title: document.title,
+        });
+      }, 400);
+    }, true);
+  };
+
+  UA.drainEvents = function () {
+    const out = UA.eventQueue;
+    UA.eventQueue = [];
+    return out;
+  };
+
+  window.addEventListener("popstate", function () {
+    UA.eventQueue.push({
+      type: "popstate",
+      element: null,
+      timestamp: Date.now(),
+      url: window.location.href,
+      title: document.title,
+    });
+  }, true);
+
+  // ---- Mutation observing -------------------------------------------
+  UA.startMutationObserver = function () {
+    if (UA._observer) return;
+    UA._observer = new MutationObserver(function (mutations) {
+      mutations.forEach(function (m) {
+        m.addedNodes.forEach(function (node) {
+          if (node.nodeType !== Node.ELEMENT_NODE) return;
+          const sig = domSignature(node);
+          if (UA._seenSignatures.has(sig)) return;
+          UA._seenSignatures.add(sig);
+          const info = UA.getElementInfo(node);
+          if (info) {
+            UA.mutationQueue.push({ change: "added", element: info, timestamp: Date.now(), url: window.location.href });
+          }
+          // also scan descendants that are individually interesting
+          try {
+            node.querySelectorAll && node.querySelectorAll(INTERESTING_SELECTOR).forEach(function (child) {
+              const csig = domSignature(child);
+              if (UA._seenSignatures.has(csig)) return;
+              UA._seenSignatures.add(csig);
+              const cinfo = UA.getElementInfo(child);
+              if (cinfo) UA.mutationQueue.push({ change: "added", element: cinfo, timestamp: Date.now(), url: window.location.href });
             });
-            """,
-            el,
-        )
+          } catch (e) { /* ignore */ }
+        });
+      });
+    });
+    UA._observer.observe(document.documentElement || document.body, { childList: true, subtree: true });
+  };
 
-    # ========================================================================
-    # PRESS KEY
-    # ========================================================================
+  UA.drainMutations = function () {
+    const out = UA.mutationQueue;
+    UA.mutationQueue = [];
+    return out;
+  };
 
-    def press_key(
-        self,
-        by,
-        value: str,
-        key: str,
-    ) -> None:
+  // ---- Modal / popup / overlay detection -----------------------------
+  const MODAL_SELECTORS = [
+    ".modal", ".modal-dialog", ".modal-content", "[role='dialog']", "[role='alertdialog']",
+    "dialog", "[aria-modal='true']", ".popup", ".overlay", ".toast", ".toast-container",
+    ".notification", ".snackbar", ".drawer", ".side-panel", ".sidepanel", ".dropdown-menu.show",
+    ".ant-modal", ".mat-dialog-container", ".MuiDialog-root", ".v-dialog", ".chakra-modal__content"
+  ];
 
-        el = self.wait_for(
-            by,
-            value,
-            condition="visible",
-        )
+  function looksLikeOverlay(el) {
+    try {
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      const position = style.position;
+      const zIndex = parseInt(style.zIndex, 10) || 0;
+      const coversSignificantArea = rect.width > window.innerWidth * 0.25 && rect.height > window.innerHeight * 0.15;
+      return (position === "fixed" || position === "absolute") && zIndex >= 100 && coversSignificantArea && isVisible(el);
+    } catch (e) {
+      return false;
+    }
+  }
 
-        self._ensure_in_view(el)
+  UA.detectModals = function () {
+    const found = [];
+    const seen = new Set();
 
-        key_obj = getattr(
-            Keys,
-            key.upper(),
-            None,
-        )
+    MODAL_SELECTORS.forEach(function (sel) {
+      try {
+        document.querySelectorAll(sel).forEach(function (el) {
+          if (!isVisible(el)) return;
+          const sig = domSignature(el);
+          if (seen.has(sig)) return;
+          seen.add(sig);
+          found.push({ container: UA.getElementInfo(el), detected_via: ["selector:" + sel] });
+        });
+      } catch (e) { /* invalid selector variant on this app, skip */ }
+    });
 
-        el.send_keys(
-            key_obj if key_obj else key
-        )
+    // structural heuristic pass over top-level fixed/absolute large elements
+    document.querySelectorAll("body > div, body > section").forEach(function (el) {
+      if (looksLikeOverlay(el)) {
+        const sig = domSignature(el);
+        if (seen.has(sig)) return;
+        seen.add(sig);
+        found.push({ container: UA.getElementInfo(el), detected_via: ["structural:overlay-heuristic"] });
+      }
+    });
 
-    # ========================================================================
-    # SUBMIT
-    # ========================================================================
+    return found.map(function (m) {
+      const children = [];
+      try {
+        const containerEl = document.querySelector(m.container.css_path) ||
+          (m.container.id ? document.getElementById(m.container.id) : null);
+        if (containerEl) {
+          containerEl.querySelectorAll(INTERESTING_SELECTOR).forEach(function (c) {
+            const info = UA.getElementInfo(c);
+            if (info) children.push(info);
+          });
+        }
+      } catch (e) { /* ignore */ }
+      m.children = children;
+      return m;
+    });
+  };
 
-    def submit(
-        self,
-        by,
-        value: str,
-    ) -> None:
+  // ---- Shadow DOM detection (best-effort) -----------------------------
+  UA.detectShadowRoots = function (root, depth) {
+    root = root || document;
+    depth = depth || 0;
+    if (depth > 4) return [];
+    const out = [];
+    const all = root.querySelectorAll("*");
+    all.forEach(function (el) {
+      if (el.shadowRoot) {
+        const hostInfo = UA.getElementInfo(el);
+        const children = [];
+        try {
+          el.shadowRoot.querySelectorAll(INTERESTING_SELECTOR).forEach(function (c) {
+            const info = UA.getElementInfo(c);
+            if (info) children.push(info);
+          });
+        } catch (e) { /* closed shadow root or inaccessible */ }
+        out.push({ host: hostInfo, children: children });
+        // recurse into nested shadow roots
+        const nested = UA.detectShadowRoots(el.shadowRoot, depth + 1);
+        nested.forEach(function (n) { out.push(n); });
+      }
+    });
+    return out;
+  };
 
-        el = self.wait_for(
-            by,
-            value,
-            condition="present",
-        )
+  // ---- Frame enumeration (top-level only; Python drives recursion) ---
+  UA.getFrames = function () {
+    const frames = document.querySelectorAll("iframe, frame");
+    const out = [];
+    frames.forEach(function (f, idx) {
+      out.push({
+        index: idx,
+        css_path: cssPath(f),
+        id: safeAttr(f, "id"),
+        name: safeAttr(f, "name"),
+        src: safeAttr(f, "src"),
+        visible: isVisible(f),
+      });
+    });
+    return out;
+  };
 
-        try:
-
-            el.submit()
-
-        except Exception:
-
-            # Re-resolve before fallback click.
-            el = self.wait_for(
-                by,
-                value,
-                condition="clickable",
-            )
-
-            self._ensure_in_view(el)
-
-            el.click()
-
-    # ========================================================================
-    # UPLOAD
-    # ========================================================================
-
-    def upload(
-        self,
-        by,
-        value: str,
-        file_path: str,
-    ) -> None:
-
-        el = self.wait_for(
-            by,
-            value,
-            condition="visible",
-        )
-
-        self._ensure_in_view(el)
-
-        el.send_keys(file_path)
-
-    # ========================================================================
-    # FRAME
-    # ========================================================================
-
-    def switch_to_frame(
-        self,
-        by,
-        value: str,
-    ) -> None:
-
-        el = self.wait_for(
-            by,
-            value,
-            condition="present",
-        )
-
-        self.driver.switch_to.frame(el)
-
-    # ========================================================================
-    # DEFAULT CONTENT
-    # ========================================================================
-
-    def switch_to_default(self) -> None:
-
-        self.driver.switch_to.default_content()
-
-    # ========================================================================
-    # WINDOW
-    # ========================================================================
-
-    def switch_window(
-        self,
-        handle: Optional[str] = None,
-    ) -> None:
-
-        if handle:
-
-            self.driver.switch_to.window(
-                handle
-            )
-
-        else:
-
-            handles = self.driver.window_handles
-
-            if handles:
-
-                self.driver.switch_to.window(
-                    handles[-1]
-                )
-
-        # A freshly-opened window/tab can sometimes
-        # swallow the first click/keystroke because
-        # browser focus has not settled yet.
-
-        try:
-
-            self.driver.execute_script(
-                "window.focus();"
-            )
-
-        except Exception:
-
-            pass
-
-    # ========================================================================
-    # NAVIGATION
-    # ========================================================================
-
-    def navigate_back(self) -> None:
-
-        self.driver.back()
-
-    def navigate_forward(self) -> None:
-
-        self.driver.forward()
-
-    # ========================================================================
-    # PRESENCE CHECK
-    # ========================================================================
-
-    def is_present(
-        self,
-        by,
-        value: str,
-        timeout: float = 2.0,
-    ) -> bool:
-        """
-        Presence check.
-
-        Unlike action methods, this method does NOT require uniqueness.
-
-        If one or more elements exist, the element is considered present.
-
-        This is useful for:
-            if self.is_present(...):
-                ...
-        """
-
-        end_time = time.monotonic() + timeout
-
-        while time.monotonic() < end_time:
-
-            try:
-
-                elements = self._find_elements(
-                    by,
-                    value,
-                )
-
-                if elements:
-                    return True
-
-            except Exception:
-
-                pass
-
-            time.sleep(0.1)
-
-        return False
+  window.__UA__ = UA;
+})();
