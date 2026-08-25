@@ -1,774 +1,916 @@
 """
-locator_engine.py
+action_engine.py
 
-Pure-Python locator generation and ranking.
+Generic Selenium action executor.
 
-Important design rules:
-1. Never trust an ID merely because it exists.
-2. Angular-generated classes/attributes are ignored.
-3. Card/tile elements prefer exact visible text.
-4. Generic CSS classes receive a low score.
-5. Text + clickable/card ancestor is preferred for repeated card grids.
-6. The executor MUST validate that the chosen locator matches exactly one
-   element before clicking.
+Responsibilities:
+- Translate generic locator strategies into Selenium By strategies.
+- Resolve locators safely.
+- NEVER silently select the first element when a locator matches
+  multiple elements.
+- Perform common browser actions through one shared ActionEngine.
+
+Important:
+A locator used for an action must resolve to exactly ONE element.
+
+This is especially important for applications such as RLMS where
+the DOM can contain duplicated IDs such as:
+
+    id="dashboardPersonalLoan"
+
+or repeated classes such as:
+
+    mat-card
+    dashboard-content
+    col-md-3
+    ng-star-inserted
 """
 
 from __future__ import annotations
 
-import re
-from typing import Any, Dict, List
+import logging
+import time
+from typing import Optional, Tuple
 
-from backend.storage.models import LocatorCandidate, LocatorStrategy
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    ElementNotInteractableException,
+    NoSuchElementException,
+    StaleElementReferenceException,
+    TimeoutException,
+)
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.remote.webdriver import WebDriver
+from selenium.webdriver.remote.webelement import WebElement
+from selenium.webdriver.support.ui import Select, WebDriverWait
 
-
-# ---------------------------------------------------------------------------
-# Volatile / framework-generated identifiers
-# ---------------------------------------------------------------------------
-
-_VOLATILE_ID_PATTERNS = [
-    # Common generated short IDs:
-    re.compile(r"^[a-z0-9]{1,12}$", re.I),
-
-    # UUID-like values:
-    re.compile(
-        r"^[a-f0-9]{8}-[a-f0-9]{4}-"
-        r"[a-f0-9]{4}-[a-f0-9]{4}-"
-        r"[a-f0-9]{12}$",
-        re.I,
-    ),
-
-    # Long hexadecimal values:
-    re.compile(r"^[a-f0-9]{20,}$", re.I),
-
-    # Framework generated:
-    re.compile(r"^(ember|react|vue|svelte)[-_]?\w*$", re.I),
-
-    # Angular / Material generated IDs:
-    re.compile(r"^(mat|cdk|ng)[-_]?[a-z0-9_-]+$", re.I),
-
-    # Long digit runs:
-    re.compile(r"\d{5,}"),
-]
+from backend.config import settings
+from backend.storage.models import LocatorStrategy
 
 
-_VOLATILE_CLASS_NAMES = {
-    "ng-star-inserted",
-    "ng-untouched",
-    "ng-touched",
-    "ng-pristine",
-    "ng-dirty",
-    "ng-valid",
-    "ng-invalid",
-    "ng-pending",
-    "ng-submitted",
+logger = logging.getLogger(
+    "universal_automation.action_engine"
+)
+
+
+# ============================================================================
+# Locator strategy -> Selenium By
+# ============================================================================
+
+STRATEGY_TO_BY = {
+    LocatorStrategy.ID: By.ID,
+    LocatorStrategy.NAME: By.NAME,
+    LocatorStrategy.CSS: By.CSS_SELECTOR,
+    LocatorStrategy.XPATH: By.XPATH,
+    LocatorStrategy.RELATIVE_XPATH: By.XPATH,
+    LocatorStrategy.LINK_TEXT: By.LINK_TEXT,
+    LocatorStrategy.PARTIAL_LINK_TEXT: By.PARTIAL_LINK_TEXT,
+
+    # locator_engine generates DATA_TESTID as CSS.
+    LocatorStrategy.DATA_TESTID: By.CSS_SELECTOR,
+
+    # locator_engine generates these as XPath.
+    LocatorStrategy.ACCESSIBILITY: By.XPATH,
+    LocatorStrategy.ATTRIBUTE: By.XPATH,
+    LocatorStrategy.TEXT: By.XPATH,
 }
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Backwards compatibility for string strategy names.
 # ---------------------------------------------------------------------------
 
-def _looks_volatile(value: str) -> bool:
-    if not value:
-        return True
+STRATEGY_TO_BY.update(
+    {
+        "ID": By.ID,
+        "NAME": By.NAME,
+        "CSS": By.CSS_SELECTOR,
+        "XPATH": By.XPATH,
+        "RELATIVE_XPATH": By.XPATH,
+        "LINK_TEXT": By.LINK_TEXT,
+        "PARTIAL_LINK_TEXT": By.PARTIAL_LINK_TEXT,
+        "DATA_TESTID": By.CSS_SELECTOR,
+        "ACCESSIBILITY": By.XPATH,
+        "ATTRIBUTE": By.XPATH,
+        "TEXT": By.XPATH,
+    }
+)
 
-    return any(
-        pattern.search(value)
-        for pattern in _VOLATILE_ID_PATTERNS
+
+def by_for(strategy: str):
+    """
+    Convert a generic locator strategy into Selenium's By constant.
+    """
+
+    return STRATEGY_TO_BY.get(
+        strategy,
+        By.CSS_SELECTOR,
     )
 
 
-def _css_escape(value: str) -> str:
+# ============================================================================
+# Action Engine
+# ============================================================================
+
+class ActionEngine:
     """
-    Minimal CSS escaping for generated selectors.
-    """
-    return re.sub(
-        r'([#.:\[\]\(\)"\'\\])',
-        r"\\\1",
-        value,
-    )
+    Generic Selenium action executor.
 
+    Every action takes a locator:
 
-def _xpath_literal(value: str) -> str:
-    """
-    Safely convert arbitrary text into an XPath string literal.
-    """
+        by
+        value
 
-    if "'" not in value:
-        return f"'{value}'"
+    The engine deliberately refuses to act when the locator matches
+    multiple elements.
 
-    if '"' not in value:
-        return f'"{value}"'
+    This prevents the classic Selenium problem:
 
-    parts = value.split("'")
-
-    return "concat(" + ', "\'", '.join(
-        f"'{part}'"
-        for part in parts
-    ) + ")"
-
-
-def _clean_text(value: Any) -> str:
-    if value is None:
-        return ""
-
-    return " ".join(str(value).split()).strip()
-
-
-def _is_framework_class(value: str) -> bool:
-    """
-    Returns True for Angular/framework generated CSS classes.
+        find_element(...)
+            -> silently returns first match
+            -> wrong card gets clicked
     """
 
-    if not value:
-        return True
-
-    lower = value.lower()
-
-    if lower in _VOLATILE_CLASS_NAMES:
-        return True
-
-    prefixes = (
-        "_ngcontent-",
-        "_nghost-",
-        "ng-",
-        "mat-ripple",
-        "cdk-",
-    )
-
-    return lower.startswith(prefixes)
-
-
-def _is_card_like(info: Dict[str, Any], component_type: str) -> bool:
-    """
-    Detect card/tile/grid components.
-
-    Particularly useful for the RLMS screen where many cards share:
-        mat-card
-        dashboard-content
-        col-md-3
-        ng-star-inserted
-    """
-
-    if component_type in {
-        "card",
-        "tile",
-        "product_card",
-    }:
-        return True
-
-    tag = _clean_text(info.get("tag")).lower()
-
-    role = _clean_text(info.get("role")).lower()
-
-    class_name = _clean_text(
-        info.get("class_name")
-    ).lower()
-
-    text = _clean_text(info.get("text"))
-
-    card_words = (
-        "mat-card",
-        "dashboard-content",
-        "product-card",
-        "card",
-        "tile",
-    )
-
-    if any(word in class_name for word in card_words):
-        return True
-
-    if tag in {"article"} and text:
-        return True
-
-    if role in {"button", "listitem"} and text:
-        return True
-
-    return False
-
-
-def _normalise_tag(tag: str) -> str:
-    """
-    Prevent malformed XPath tags.
-    """
-
-    tag = _clean_text(tag).lower()
-
-    if re.fullmatch(r"[a-z][a-z0-9_-]*", tag):
-        return tag
-
-    return "*"
-
-
-# ---------------------------------------------------------------------------
-# Component classification
-# ---------------------------------------------------------------------------
-
-def classify_component(info: Dict[str, Any]) -> str:
-    """
-    Classify the captured DOM element.
-    """
-
-    tag = _clean_text(
-        info.get("tag")
-    ).lower()
-
-    role = _clean_text(
-        info.get("role")
-    ).lower()
-
-    type_attr = _clean_text(
-        info.get("type")
-    ).lower()
-
-    class_name = _clean_text(
-        info.get("class_name")
-    ).lower()
-
-    text = _clean_text(
-        info.get("text")
-    )
-
-    # Explicit card information from bridge.js.
-    if info.get("is_card") is True:
-        return "card"
-
-    if "mat-card" in class_name:
-        return "card"
-
-    if "dashboard-content" in class_name:
-        return "card"
-
-    if role == "listbox" or tag == "select":
-        return "dropdown"
-
-    if tag == "input":
-
-        if type_attr == "checkbox":
-            return "checkbox"
-
-        if type_attr == "radio":
-            return "radio"
-
-        if type_attr == "file":
-            return "file_upload"
-
-        if type_attr in {
-            "submit",
-            "button",
-            "reset",
-        }:
-            return "button"
-
-        return "input"
-
-    if tag == "textarea":
-        return "input"
-
-    if tag == "button" or role == "button":
-        return "button"
-
-    if tag == "a" or role == "link":
-        return "link"
-
-    if tag == "table":
-        return "table"
-
-    if tag in {"tr", "td", "th"}:
-        return "table_cell"
-
-    if tag in {"ul", "ol", "li"} or role == "listitem":
-        return "list_item"
-
-    if role == "tab":
-        return "tab"
-
-    if role == "menuitem":
-        return "menu_item"
-
-    if tag == "iframe":
-        return "frame"
-
-    if role in {"dialog", "alertdialog"} or tag == "dialog":
-        return "dialog"
-
-    if info.get("contenteditable"):
-        return "rich_text"
-
-    # A clickable element with short visible text is often a card/tile.
-    if info.get("clickable") and text and len(text) <= 80:
-        return "card"
-
-    return "element"
-
-
-# ---------------------------------------------------------------------------
-# Human-readable element name
-# ---------------------------------------------------------------------------
-
-def generate_element_name(
-    info: Dict[str, Any],
-    component_type: str,
-) -> str:
-    """
-    Generate a generic human-friendly element name.
-
-    Never derives names from business vocabulary.
-    """
-
-    data_attrs = info.get("data_attrs") or {}
-
-    candidates = [
-        data_attrs.get("data-test-id"),
-        data_attrs.get("data-testid"),
-        data_attrs.get("data-qa"),
-        info.get("name"),
-        info.get("aria_label"),
-        info.get("placeholder"),
-        info.get("text"),
-    ]
-
-    base = next(
-        (
-            _clean_text(c)
-            for c in candidates
-            if _clean_text(c)
-            and not _looks_volatile(_clean_text(c))
-        ),
-        None,
-    )
-
-    if not base:
-        base = component_type
-
-    slug = re.sub(
-        r"[^a-zA-Z0-9]+",
-        "_",
-        str(base),
-    ).strip("_").lower()
-
-    slug = slug[:60]
-
-    return (
-        f"{slug}_{component_type}"
-        if slug
-        else component_type
-    )
-
-
-# ---------------------------------------------------------------------------
-# Locator generation
-# ---------------------------------------------------------------------------
-
-def build_locators(
-    info: Dict[str, Any],
-) -> List[LocatorCandidate]:
-    """
-    Generate ranked locator candidates.
-
-    IMPORTANT:
-    This function does not require Selenium/WebDriver.
-
-    The execution layer must still validate candidate uniqueness.
-    """
-
-    candidates: List[LocatorCandidate] = []
-
-    tag = _normalise_tag(
-        info.get("tag") or ""
-    )
-
-    component_type = classify_component(info)
-
-    is_card = _is_card_like(
-        info,
-        component_type,
-    )
-
-    data_attrs = (
-        info.get("data_attrs") or {}
-    )
-
-    # ------------------------------------------------------------------
-    # 1. data-testid / data-test-id / data-qa
-    # ------------------------------------------------------------------
-
-    for key in (
-        "data-testid",
-        "data-test-id",
-        "data-qa",
+    def __init__(
+        self,
+        driver: WebDriver,
+        timeout: Optional[float] = None,
     ):
-        value = _clean_text(
-            data_attrs.get(key)
+        self.driver = driver
+
+        self.timeout = (
+            timeout
+            or settings.EXPLICIT_WAIT_SECONDS
         )
 
-        if value and not _looks_volatile(value):
-            candidates.append(
-                LocatorCandidate(
-                    strategy=LocatorStrategy.DATA_TESTID,
-                    value=f"[{key}='{_css_escape(value)}']",
-                    reliability_score=1.00,
+    # ========================================================================
+    # LOW-LEVEL LOCATOR RESOLUTION
+    # ========================================================================
+
+    def _find_elements(
+        self,
+        by,
+        value: str,
+    ) -> list[WebElement]:
+        """
+        Return ALL matching elements.
+
+        This is intentionally different from Selenium's find_element().
+
+        We need the complete result set so that we can detect:
+
+            0 matches
+            1 match
+            2+ matches
+
+        before performing an action.
+        """
+
+        try:
+            return self.driver.find_elements(
+                by,
+                value,
+            )
+
+        except (
+            NoSuchElementException,
+            StaleElementReferenceException,
+        ):
+            return []
+
+    def _find_unique_now(
+        self,
+        by,
+        value: str,
+    ) -> Optional[WebElement]:
+        """
+        Return an element only when the locator matches exactly one element.
+
+        Returns:
+            WebElement -> exactly one match
+            None       -> zero or multiple matches
+
+        IMPORTANT:
+        Multiple matches are intentionally treated as unusable.
+        """
+
+        elements = self._find_elements(
+            by,
+            value,
+        )
+
+        if len(elements) == 0:
+            return None
+
+        if len(elements) > 1:
+
+            logger.warning(
+                "Ambiguous locator rejected: "
+                "%s=%r matched %d elements",
+                by,
+                value,
+                len(elements),
+            )
+
+            return None
+
+        return elements[0]
+
+    def _find_any_now(
+        self,
+        by,
+        value: str,
+    ) -> Optional[WebElement]:
+        """
+        Return the first matching element.
+
+        This method is ONLY intended for non-action inspection
+        where uniqueness is not required.
+
+        Do NOT use this for clicks/types/selections.
+        """
+
+        elements = self._find_elements(
+            by,
+            value,
+        )
+
+        if not elements:
+            return None
+
+        return elements[0]
+
+    # ========================================================================
+    # WAIT
+    # ========================================================================
+
+    def wait_for(
+        self,
+        by,
+        value: str,
+        condition: str = "visible",
+    ) -> WebElement:
+        """
+        Wait until a locator resolves to exactly one usable element.
+
+        Conditions:
+
+            clickable
+            visible
+            present
+
+        IMPORTANT:
+        If the locator matches multiple elements, it is considered
+        ambiguous and the wait continues.
+
+        This is the main protection against the RLMS duplicated-ID
+        problem.
+        """
+
+        def resolve(_driver):
+
+            element = self._find_unique_now(
+                by,
+                value,
+            )
+
+            if element is None:
+                return False
+
+            try:
+
+                if condition == "present":
+                    return element
+
+                if condition == "clickable":
+
+                    if not element.is_displayed():
+                        return False
+
+                    if not element.is_enabled():
+                        return False
+
+                    return element
+
+                # Default = visible.
+                if not element.is_displayed():
+                    return False
+
+                return element
+
+            except (
+                StaleElementReferenceException,
+                ElementNotInteractableException,
+            ):
+                return False
+
+        try:
+
+            return WebDriverWait(
+                self.driver,
+                self.timeout,
+                poll_frequency=0.2,
+            ).until(resolve)
+
+        except TimeoutException as exc:
+
+            # Give a useful diagnostic.
+            try:
+                count = len(
+                    self._find_elements(
+                        by,
+                        value,
+                    )
                 )
-            )
+            except Exception:
+                count = -1
 
-    # ------------------------------------------------------------------
-    # 2. ID
-    #
-    # DO NOT assume ID is unique.
-    # The executor must validate it.
-    #
-    # For card elements we intentionally give text/card locators
-    # a higher priority because RLMS contains duplicated IDs.
-    # ------------------------------------------------------------------
+            if count > 1:
 
-    elem_id = _clean_text(
-        info.get("id")
-    )
+                raise TimeoutException(
+                    f"Ambiguous locator: "
+                    f"{by}={value!r} "
+                    f"matched {count} elements. "
+                    f"Refusing to choose the first element."
+                ) from exc
 
-    if elem_id and not _looks_volatile(elem_id):
+            raise TimeoutException(
+                f"Element not found/usable: "
+                f"{by}={value!r}, "
+                f"condition={condition!r}"
+            ) from exc
 
-        id_score = 0.95
+    # ========================================================================
+    # FIND
+    # ========================================================================
 
-        if is_card:
-            # RLMS has duplicated dashboardPersonalLoan IDs.
-            # Keep ID as fallback but don't let it beat card identity.
-            id_score = 0.82
+    def find(
+        self,
+        by,
+        value: str,
+    ) -> WebElement:
+        """
+        Find exactly one element.
 
-        candidates.append(
-            LocatorCandidate(
-                strategy=LocatorStrategy.ID,
-                value=elem_id,
-                reliability_score=id_score,
-            )
+        This replaces unsafe direct usage of:
+
+            driver.find_element(by, value)
+
+        for actions.
+        """
+
+        element = self._find_unique_now(
+            by,
+            value,
         )
 
-    # ------------------------------------------------------------------
-    # 3. NAME
-    # ------------------------------------------------------------------
+        if element is None:
 
-    name = _clean_text(
-        info.get("name")
-    )
-
-    if name:
-        candidates.append(
-            LocatorCandidate(
-                strategy=LocatorStrategy.NAME,
-                value=name,
-                reliability_score=0.88,
-            )
-        )
-
-    # ------------------------------------------------------------------
-    # 4. Accessibility
-    # ------------------------------------------------------------------
-
-    aria_label = _clean_text(
-        info.get("aria_label")
-    )
-
-    role = _clean_text(
-        info.get("role")
-    )
-
-    if aria_label:
-
-        value = (
-            f"//*[@aria-label="
-            f"{_xpath_literal(aria_label)}]"
-        )
-
-        if role:
-            value += (
-                f"[@role={_xpath_literal(role)}]"
+            elements = self._find_elements(
+                by,
+                value,
             )
 
-        candidates.append(
-            LocatorCandidate(
-                strategy=LocatorStrategy.ACCESSIBILITY,
-                value=value,
-                reliability_score=0.94,
-            )
-        )
+            if len(elements) > 1:
 
-    elif role:
-
-        candidates.append(
-            LocatorCandidate(
-                strategy=LocatorStrategy.ACCESSIBILITY,
-                value=(
-                    f"//*[@role="
-                    f"{_xpath_literal(role)}]"
-                ),
-                reliability_score=0.70,
-            )
-        )
-
-    # ------------------------------------------------------------------
-    # 5. Input-specific attributes
-    # ------------------------------------------------------------------
-
-    for attr in (
-        "placeholder",
-        "title",
-        "alt",
-        "type",
-    ):
-
-        value = _clean_text(
-            info.get(attr)
-        )
-
-        if value:
-            candidates.append(
-                LocatorCandidate(
-                    strategy=LocatorStrategy.ATTRIBUTE,
-                    value=(
-                        f"{tag}[{attr}="
-                        f"{_xpath_literal(value)}]"
-                    ),
-                    reliability_score=0.76,
+                raise RuntimeError(
+                    f"Ambiguous locator: "
+                    f"{by}={value!r} "
+                    f"matched {len(elements)} elements. "
+                    f"Refusing to select the first element."
                 )
+
+            raise NoSuchElementException(
+                f"No element found for "
+                f"{by}={value!r}"
             )
 
-            # One attribute is generally enough.
-            break
+        return element
 
-    # ------------------------------------------------------------------
-    # 6. Card / tile text
-    #
-    # THIS IS THE IMPORTANT PART FOR YOUR RLMS SCREEN.
-    # ------------------------------------------------------------------
+    # ========================================================================
+    # VIEW / SCROLL
+    # ========================================================================
 
-    text = _clean_text(
-        info.get("text")
-    )
+    def _ensure_in_view(
+        self,
+        element: WebElement,
+    ) -> None:
+        """
+        Scroll the element into the center of the viewport.
+        """
 
-    if text and len(text) <= 80:
+        try:
 
-        xpath_text = _xpath_literal(text)
-
-        # Exact direct text.
-        candidates.append(
-            LocatorCandidate(
-                strategy=LocatorStrategy.TEXT,
-                value=(
-                    f"//{tag}"
-                    f"[normalize-space(text())="
-                    f"{xpath_text}]"
-                ),
-                reliability_score=0.89,
+            self.driver.execute_script(
+                """
+                arguments[0].scrollIntoView({
+                    block: 'center',
+                    inline: 'center'
+                });
+                """,
+                element,
             )
+
+            # Small delay helps Angular/material animations settle.
+            time.sleep(0.05)
+
+        except Exception:
+            logger.debug(
+                "Could not scroll element into view",
+                exc_info=True,
+            )
+
+    # ========================================================================
+    # CLICK
+    # ========================================================================
+
+    def click(
+        self,
+        by,
+        value: str,
+    ) -> None:
+        """
+        Click exactly one unique element.
+        """
+
+        el = self.wait_for(
+            by,
+            value,
+            condition="clickable",
         )
 
-        # Exact text anywhere in the DOM.
-        candidates.append(
-            LocatorCandidate(
-                strategy=LocatorStrategy.TEXT,
-                value=(
-                    f"//*[normalize-space(text())="
-                    f"{xpath_text}]"
-                ),
-                reliability_score=0.84,
+        self._ensure_in_view(el)
+
+        try:
+
+            el.click()
+
+        except (
+            ElementClickInterceptedException,
+            ElementNotInteractableException,
+        ):
+
+            logger.warning(
+                "Normal click failed; retrying with ActionChains: "
+                "%s=%r",
+                by,
+                value,
             )
+
+            # Re-resolve after scrolling/DOM changes.
+            el = self.wait_for(
+                by,
+                value,
+                condition="clickable",
+            )
+
+            self._ensure_in_view(el)
+
+            ActionChains(
+                self.driver
+            ).move_to_element(el).click().perform()
+
+    # ========================================================================
+    # DOUBLE CLICK
+    # ========================================================================
+
+    def double_click(
+        self,
+        by,
+        value: str,
+    ) -> None:
+
+        el = self.wait_for(
+            by,
+            value,
+            condition="clickable",
         )
 
-        # --------------------------------------------------------------
-        # Card text + card ancestor.
-        #
-        # Example:
-        #
-        # Gold Loan
-        #
-        # ->
-        # find Gold Loan text
-        # ->
-        # find its nearest mat-card/dashboard-content/card
-        # --------------------------------------------------------------
+        self._ensure_in_view(el)
 
-        if is_card:
+        ActionChains(
+            self.driver
+        ).double_click(el).perform()
 
-            card_xpath = (
-                f"//*[normalize-space(text())="
-                f"{xpath_text}]"
-                f"/ancestor::*["
-                f"self::mat-card"
-                f" or self::button"
-                f" or @role='button'"
-                f" or contains("
-                f"concat(' ', normalize-space(@class), ' '),"
-                f"' mat-card '"
-                f")"
-                f" or contains("
-                f"concat(' ', normalize-space(@class), ' '),"
-                f"' dashboard-content '"
-                f")"
-                f" or contains("
-                f"concat(' ', normalize-space(@class), ' '),"
-                f"' product-card '"
-                f")"
-                f"][1]"
-            )
+    # ========================================================================
+    # RIGHT CLICK
+    # ========================================================================
 
-            candidates.append(
-                LocatorCandidate(
-                    strategy=LocatorStrategy.RELATIVE_XPATH,
-                    value=card_xpath,
-                    reliability_score=0.98,
+    def right_click(
+        self,
+        by,
+        value: str,
+    ) -> None:
+
+        el = self.wait_for(
+            by,
+            value,
+            condition="clickable",
+        )
+
+        self._ensure_in_view(el)
+
+        ActionChains(
+            self.driver
+        ).context_click(el).perform()
+
+    # ========================================================================
+    # TYPE
+    # ========================================================================
+
+    def type(
+        self,
+        by,
+        value: str,
+        text: str,
+        clear_first: bool = True,
+    ) -> None:
+
+        el = self.wait_for(
+            by,
+            value,
+            condition="visible",
+        )
+
+        self._ensure_in_view(el)
+
+        if clear_first:
+
+            try:
+                el.clear()
+
+            except (
+                ElementNotInteractableException,
+                StaleElementReferenceException,
+            ):
+
+                # Re-resolve once after DOM refresh.
+                el = self.wait_for(
+                    by,
+                    value,
+                    condition="visible",
                 )
+
+                try:
+                    el.clear()
+                except Exception:
+                    pass
+
+        el.send_keys(text)
+
+    # ========================================================================
+    # CLEAR
+    # ========================================================================
+
+    def clear(
+        self,
+        by,
+        value: str,
+    ) -> None:
+
+        el = self.wait_for(
+            by,
+            value,
+            condition="visible",
+        )
+
+        self._ensure_in_view(el)
+
+        el.clear()
+
+    # ========================================================================
+    # SELECT
+    # ========================================================================
+
+    def select(
+        self,
+        by,
+        value: str,
+        option_text: Optional[str] = None,
+        option_value: Optional[str] = None,
+    ) -> None:
+
+        el = self.wait_for(
+            by,
+            value,
+            condition="visible",
+        )
+
+        self._ensure_in_view(el)
+
+        select = Select(el)
+
+        if option_value is not None:
+
+            select.select_by_value(
+                option_value
             )
 
-        # Link text.
-        if tag == "a":
+        elif option_text is not None:
 
-            candidates.append(
-                LocatorCandidate(
-                    strategy=LocatorStrategy.LINK_TEXT,
-                    value=text,
-                    reliability_score=0.91,
+            select.select_by_visible_text(
+                option_text
+            )
+
+        else:
+
+            raise ValueError(
+                "select() requires either "
+                "option_text or option_value"
+            )
+
+    # ========================================================================
+    # CHECK
+    # ========================================================================
+
+    def check(
+        self,
+        by,
+        value: str,
+    ) -> None:
+
+        el = self.wait_for(
+            by,
+            value,
+            condition="clickable",
+        )
+
+        self._ensure_in_view(el)
+
+        if not el.is_selected():
+            el.click()
+
+    # ========================================================================
+    # UNCHECK
+    # ========================================================================
+
+    def uncheck(
+        self,
+        by,
+        value: str,
+    ) -> None:
+
+        el = self.wait_for(
+            by,
+            value,
+            condition="clickable",
+        )
+
+        self._ensure_in_view(el)
+
+        if el.is_selected():
+            el.click()
+
+    # ========================================================================
+    # HOVER
+    # ========================================================================
+
+    def hover(
+        self,
+        by,
+        value: str,
+    ) -> None:
+
+        el = self.wait_for(
+            by,
+            value,
+            condition="visible",
+        )
+
+        self._ensure_in_view(el)
+
+        ActionChains(
+            self.driver
+        ).move_to_element(el).perform()
+
+    # ========================================================================
+    # SCROLL TO
+    # ========================================================================
+
+    def scroll_to(
+        self,
+        by,
+        value: str,
+    ) -> None:
+
+        el = self.wait_for(
+            by,
+            value,
+            condition="present",
+        )
+
+        self.driver.execute_script(
+            """
+            arguments[0].scrollIntoView({
+                block: 'center',
+                inline: 'center'
+            });
+            """,
+            el,
+        )
+
+    # ========================================================================
+    # PRESS KEY
+    # ========================================================================
+
+    def press_key(
+        self,
+        by,
+        value: str,
+        key: str,
+    ) -> None:
+
+        el = self.wait_for(
+            by,
+            value,
+            condition="visible",
+        )
+
+        self._ensure_in_view(el)
+
+        key_obj = getattr(
+            Keys,
+            key.upper(),
+            None,
+        )
+
+        el.send_keys(
+            key_obj if key_obj else key
+        )
+
+    # ========================================================================
+    # SUBMIT
+    # ========================================================================
+
+    def submit(
+        self,
+        by,
+        value: str,
+    ) -> None:
+
+        el = self.wait_for(
+            by,
+            value,
+            condition="present",
+        )
+
+        try:
+
+            el.submit()
+
+        except Exception:
+
+            # Re-resolve before fallback click.
+            el = self.wait_for(
+                by,
+                value,
+                condition="clickable",
+            )
+
+            self._ensure_in_view(el)
+
+            el.click()
+
+    # ========================================================================
+    # UPLOAD
+    # ========================================================================
+
+    def upload(
+        self,
+        by,
+        value: str,
+        file_path: str,
+    ) -> None:
+
+        el = self.wait_for(
+            by,
+            value,
+            condition="visible",
+        )
+
+        self._ensure_in_view(el)
+
+        el.send_keys(file_path)
+
+    # ========================================================================
+    # FRAME
+    # ========================================================================
+
+    def switch_to_frame(
+        self,
+        by,
+        value: str,
+    ) -> None:
+
+        el = self.wait_for(
+            by,
+            value,
+            condition="present",
+        )
+
+        self.driver.switch_to.frame(el)
+
+    # ========================================================================
+    # DEFAULT CONTENT
+    # ========================================================================
+
+    def switch_to_default(self) -> None:
+
+        self.driver.switch_to.default_content()
+
+    # ========================================================================
+    # WINDOW
+    # ========================================================================
+
+    def switch_window(
+        self,
+        handle: Optional[str] = None,
+    ) -> None:
+
+        if handle:
+
+            self.driver.switch_to.window(
+                handle
+            )
+
+        else:
+
+            handles = self.driver.window_handles
+
+            if handles:
+
+                self.driver.switch_to.window(
+                    handles[-1]
                 )
+
+        # A freshly-opened window/tab can sometimes
+        # swallow the first click/keystroke because
+        # browser focus has not settled yet.
+
+        try:
+
+            self.driver.execute_script(
+                "window.focus();"
             )
 
-    # ------------------------------------------------------------------
-    # 7. CSS class locator
-    #
-    # Deliberately LOW priority.
-    # Generic classes such as:
-    #
-    # mat-card
-    # dashboard-content
-    # col-md-3
-    # ng-star-inserted
-    #
-    # are repeated on this page.
-    # ------------------------------------------------------------------
+        except Exception:
 
-    class_name = _clean_text(
-        info.get("class_name")
-    )
+            pass
 
-    if class_name:
+    # ========================================================================
+    # NAVIGATION
+    # ========================================================================
 
-        classes = [
-            c
-            for c in class_name.split()
-            if c
-            and not _is_framework_class(c)
-            and not _looks_volatile(c)
-        ]
+    def navigate_back(self) -> None:
 
-        if classes:
+        self.driver.back()
 
-            # Use at most 3 stable classes.
-            classes = classes[:3]
+    def navigate_forward(self) -> None:
 
-            css = (
-                tag
-                + "."
-                + ".".join(
-                    _css_escape(c)
-                    for c in classes
+        self.driver.forward()
+
+    # ========================================================================
+    # PRESENCE CHECK
+    # ========================================================================
+
+    def is_present(
+        self,
+        by,
+        value: str,
+        timeout: float = 2.0,
+    ) -> bool:
+        """
+        Presence check.
+
+        Unlike action methods, this method does NOT require uniqueness.
+
+        If one or more elements exist, the element is considered present.
+
+        This is useful for:
+            if self.is_present(...):
+                ...
+        """
+
+        end_time = time.monotonic() + timeout
+
+        while time.monotonic() < end_time:
+
+            try:
+
+                elements = self._find_elements(
+                    by,
+                    value,
                 )
-            )
 
-            candidates.append(
-                LocatorCandidate(
-                    strategy=LocatorStrategy.CSS,
-                    value=css,
-                    reliability_score=0.45,
-                )
-            )
+                if elements:
+                    return True
 
-    # ------------------------------------------------------------------
-    # 8. Existing browser-generated CSS path
-    #
-    # Fallback only.
-    # ------------------------------------------------------------------
+            except Exception:
 
-    css_path = _clean_text(
-        info.get("css_path")
-    )
+                pass
 
-    if css_path:
+            time.sleep(0.1)
 
-        candidates.append(
-            LocatorCandidate(
-                strategy=LocatorStrategy.CSS,
-                value=css_path,
-                reliability_score=0.40,
-            )
-        )
-
-    # ------------------------------------------------------------------
-    # 9. XPath supplied by browser
-    # ------------------------------------------------------------------
-
-    xpath = _clean_text(
-        info.get("xpath")
-    )
-
-    if xpath:
-
-        candidates.append(
-            LocatorCandidate(
-                strategy=LocatorStrategy.XPATH,
-                value=xpath,
-                reliability_score=0.35,
-            )
-        )
-
-    # ------------------------------------------------------------------
-    # 10. Relative XPath based on text
-    # ------------------------------------------------------------------
-
-    if text and len(text) <= 80:
-
-        xpath_text = _xpath_literal(
-            text[:80]
-        )
-
-        relative_xpath = (
-            f"//{tag}[contains("
-            f"normalize-space(.),"
-            f"{xpath_text}"
-            f")]"
-        )
-
-        candidates.append(
-            LocatorCandidate(
-                strategy=LocatorStrategy.RELATIVE_XPATH,
-                value=relative_xpath,
-                reliability_score=0.55,
-            )
-        )
-
-    # ------------------------------------------------------------------
-    # De-duplicate candidates
-    # ------------------------------------------------------------------
-
-    seen = set()
-    unique: List[LocatorCandidate] = []
-
-    for candidate in candidates:
-
-        key = (
-            candidate.strategy,
-            candidate.value,
-        )
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-        unique.append(candidate)
-
-    # ------------------------------------------------------------------
-    # Sort by reliability
-    # ------------------------------------------------------------------
-
-    unique.sort(
-        key=lambda c: c.reliability_score,
-        reverse=True,
-    )
-
-    return unique
+        return False
