@@ -1,516 +1,246 @@
-/*
- * bridge.js
- * ---------------------------------------------------------------------
- * Injected into every document (top-level page AND every iframe the
- * recorder descends into) via Selenium's execute_script. Defines a
- * single window.__UA__ namespace that the Python side polls.
- *
- * This file is 100% generic: no selector, class name, id, or business
- * term from any specific application is hardcoded. Every heuristic
- * below is based on structural/semantic DOM characteristics (role,
- * aria-*, tag, generic class-name *patterns*, computed style) so the
- * same script works against any Angular / React / Vue / plain-JS /
- * Bootstrap / jQuery / enterprise UI site.
- *
- * Safe to inject multiple times (idempotent) because everything is
- * guarded behind `if (!window.__UA__)`.
- * ---------------------------------------------------------------------
- */
-(function () {
-  if (window.__UA__) {
-    return; // already initialized in this document/frame
-  }
+"""
+locator_engine.py
 
-  const UA = {
-    eventQueue: [],
-    mutationQueue: [],
-    _observer: null,
-    _listenersAttached: false,
-    _seenSignatures: new Set(),
-  };
+Pure-Python logic that turns a raw element-info dict (as produced by
+bridge.js's `getElementInfo`) into a ranked list of LocatorCandidate
+objects, plus a `component_type` classification and a generated
+human-friendly element name.
 
-  // ---- Cross-navigation event persistence ----------------------------
-  // A committed "change" event (e.g. a password field losing focus right
-  // before its form's Submit navigates the browser) can be queued here in
-  // JS memory and then never make it back to Python: the ~0.5s polling
-  // interval may not get a chance to drain the queue before the document
-  // is torn down by the navigation, silently losing that action's value
-  // (or, worse, letting a later action on the next page get logged in its
-  // place). To close that gap, stash any still-queued events into
-  // sessionStorage right before unload, and recover them into the fresh
-  // page's queue on injection - sessionStorage survives same-tab
-  // navigation (it does not survive a full external redirect to another
-  // origin, which is a page-storage limitation, not something JS can work
-  // around).
-  const PENDING_KEY = "__UA_pending_events__";
+This module has zero Selenium/webdriver dependency by design - it is
+pure data transformation, which makes it trivially unit-testable and
+reusable by both the recorder (building the repository) and the
+self-healing engine (scoring candidate replacements).
+"""
+from __future__ import annotations
 
-  (function recoverPendingEvents() {
-    try {
-      const raw = window.sessionStorage.getItem(PENDING_KEY);
-      if (raw) {
-        window.sessionStorage.removeItem(PENDING_KEY);
-        const arr = JSON.parse(raw);
-        if (Array.isArray(arr) && arr.length) {
-          // recovered (older, pre-navigation) events go first so they
-          // drain - and get recorded - ahead of anything new on this page
-          UA.eventQueue = arr.concat(UA.eventQueue);
-        }
-      }
-    } catch (e) { /* sessionStorage unavailable/blocked - nothing we can do */ }
-  })();
+import re
+from typing import Any, Dict, List
 
-  window.addEventListener("beforeunload", function () {
-    try {
-      if (UA.eventQueue.length) {
-        let existing = [];
-        const raw = window.sessionStorage.getItem(PENDING_KEY);
-        if (raw) {
-          try { existing = JSON.parse(raw) || []; } catch (e) { existing = []; }
-        }
-        window.sessionStorage.setItem(PENDING_KEY, JSON.stringify(existing.concat(UA.eventQueue)));
-      }
-    } catch (e) { /* ignore - best effort only */ }
-  }, true);
+from backend.storage.models import LocatorCandidate, LocatorStrategy
 
-  // ---- helpers -----------------------------------------------------
-  function safeAttr(el, name) {
-    try {
-      const v = el.getAttribute(name);
-      return v === null ? "" : v;
-    } catch (e) {
-      return "";
-    }
-  }
+# Attribute/id patterns that look auto-generated / volatile (react `:r1a:`
+# style ids, uuid-like ids, ember###, ids with many digits, etc). Locators
+# built from these get penalized since they are unlikely to survive a
+# rebuild.
+_VOLATILE_ID_PATTERNS = [
+    re.compile(r"^:[a-z0-9]+:$", re.I),           # react useId() -> ":r0:"
+    re.compile(r"^[a-f0-9-]{20,}$", re.I),          # uuid-ish
+    re.compile(r"^ember\d+$", re.I),
+    re.compile(r"\d{4,}"),                          # long digit runs
+    re.compile(r"^(ng|mat|mui|css)-[a-z0-9]+$", re.I),
+]
 
-  function isVisible(el) {
-    try {
-      const style = window.getComputedStyle(el);
-      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
-        return false;
-      }
-      const rect = el.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0;
-    } catch (e) {
-      return false;
-    }
-  }
 
-  function isEnabled(el) {
-    return !(el.disabled === true || safeAttr(el, "aria-disabled") === "true");
-  }
+def _looks_volatile(value: str) -> bool:
+    if not value:
+        return True
+    return any(p.search(value) for p in _VOLATILE_ID_PATTERNS)
 
-  function cssPath(el) {
-    if (!(el instanceof Element)) return "";
-    const path = [];
-    let node = el;
-    while (node && node.nodeType === Node.ELEMENT_NODE && path.length < 8) {
-      let selector = node.nodeName.toLowerCase();
-      if (node.id) {
-        selector += "#" + CSS.escape(node.id);
-        path.unshift(selector);
-        break;
-      } else {
-        let sibling = node;
-        let nth = 1;
-        while ((sibling = sibling.previousElementSibling)) {
-          if (sibling.nodeName.toLowerCase() === selector) nth++;
-        }
-        selector += ":nth-of-type(" + nth + ")";
-      }
-      path.unshift(selector);
-      node = node.parentElement;
-    }
-    return path.join(" > ");
-  }
 
-  function xpath(el) {
-    if (!(el instanceof Element)) return "";
-    if (el.id) return '//*[@id="' + el.id + '"]';
-    const parts = [];
-    let node = el;
-    while (node && node.nodeType === Node.ELEMENT_NODE) {
-      let index = 1;
-      let sibling = node.previousSibling;
-      while (sibling) {
-        if (sibling.nodeType === Node.ELEMENT_NODE && sibling.nodeName === node.nodeName) index++;
-        sibling = sibling.previousSibling;
-      }
-      parts.unshift(node.nodeName.toLowerCase() + "[" + index + "]");
-      node = node.parentElement;
-    }
-    return "/" + parts.join("/");
-  }
+def _css_escape(value: str) -> str:
+    return re.sub(r"([ #.:\[\]()\"'])", r"\\\1", value)
 
-  function domSignature(el) {
-    // A best-effort stable-ish fingerprint: tag + id/name/testid + class + position among siblings.
-    const tag = el.nodeName.toLowerCase();
-    const id = safeAttr(el, "id");
-    const testId = safeAttr(el, "data-testid") || safeAttr(el, "data-test-id") || safeAttr(el, "data-qa");
-    const name = safeAttr(el, "name");
-    const cls = (el.className && typeof el.className === "string") ? el.className.trim().split(/\s+/).slice(0, 3).join(".") : "";
-    let idx = 0;
-    if (el.parentElement) {
-      idx = Array.prototype.indexOf.call(el.parentElement.children, el);
-    }
-    return [tag, id, testId, name, cls, idx].join("|");
-  }
 
-  function collectDataAttrs(el) {
-    const out = {};
-    for (const attr of el.attributes || []) {
-      if (attr.name.startsWith("data-") || attr.name.startsWith("aria-")) {
-        out[attr.name] = attr.value;
-      }
-    }
-    return out;
-  }
+def classify_component(info: Dict[str, Any]) -> str:
+    tag = (info.get("tag") or "").lower()
+    role = (info.get("role") or "").lower()
+    type_attr = (info.get("type") or "").lower()
 
-  function textOf(el) {
-    try {
-      let t = (el.innerText || el.textContent || "").trim();
-      if (!t) t = safeAttr(el, "value") || safeAttr(el, "placeholder") || safeAttr(el, "aria-label") || safeAttr(el, "title") || safeAttr(el, "alt");
-      return t.substring(0, 200);
-    } catch (e) {
-      return "";
-    }
-  }
+    if tag == "select" or role == "listbox":
+        return "dropdown"
+    if tag == "input":
+        if type_attr in ("checkbox",):
+            return "checkbox"
+        if type_attr in ("radio",):
+            return "radio"
+        if type_attr in ("file",):
+            return "file_upload"
+        if type_attr in ("submit", "button"):
+            return "button"
+        return "input"
+    if tag == "textarea":
+        return "input"
+    if tag in ("button",) or role == "button":
+        return "button"
+    if tag == "a" or role == "link":
+        return "link"
+    if tag == "table":
+        return "table"
+    if tag in ("tr", "td", "th"):
+        return "table_cell"
+    if tag in ("ul", "ol", "li") or role == "listitem":
+        return "list_item"
+    if role in ("tab",):
+        return "tab"
+    if role in ("menuitem",):
+        return "menu_item"
+    if tag == "iframe":
+        return "frame"
+    if role in ("dialog", "alertdialog") or tag == "dialog":
+        return "dialog"
+    if info.get("contenteditable"):
+        return "rich_text"
+    return "element"
 
-  // Some apps (seen on a real banking dashboard: a grid of near-identical
-  // "product" cards, e.g. Gold Loan / Personal Loan / Home Loan) reuse the
-  // exact same id and class list across every visually-repeated tile -
-  // invalid HTML (ids must be unique), but it happens in the wild, and a
-  // locator built from that id/class combo silently resolves to whichever
-  // tile happens to come first in the DOM rather than the one actually
-  // recorded. build_locators() (Python side) has no live DOM access to
-  // detect this itself, so we check it here, at capture time, while we
-  // still have the real page in front of us, and hand the verdict along
-  // so the locator scoring can react to it.
-  function isUniqueSelectorOnPage(selector) {
-    if (!selector) return true;
-    try {
-      return document.querySelectorAll(selector).length <= 1;
-    } catch (e) {
-      return true; // malformed selector (unusual attribute chars, etc.) - don't penalize speculatively
-    }
-  }
 
-  UA.getElementInfo = function (el) {
-    if (!el || !(el instanceof Element)) return null;
-    const rect = el.getBoundingClientRect();
-    const id = safeAttr(el, "id");
-    const classNameStr = (el.className && typeof el.className === "string") ? el.className : "";
-    const classList = classNameStr.trim().split(/\s+/).filter(Boolean);
-    const tagName = el.nodeName.toLowerCase();
-    return {
-      tag: tagName,
-      id: id,
-      id_unique: id ? isUniqueSelectorOnPage("#" + CSS.escape(id)) : true,
-      name: safeAttr(el, "name"),
-      class_name: classNameStr,
-      class_combo_unique: classList.length
-        ? isUniqueSelectorOnPage(tagName + "." + classList.map(function (c) { return CSS.escape(c); }).join("."))
-        : true,
-      type: safeAttr(el, "type"),
-      value: (el.value !== undefined ? String(el.value).substring(0, 200) : ""),
-      text: textOf(el),
-      placeholder: safeAttr(el, "placeholder"),
-      title: safeAttr(el, "title"),
-      role: safeAttr(el, "role"),
-      aria_label: safeAttr(el, "aria-label"),
-      aria_labelledby: safeAttr(el, "aria-labelledby"),
-      aria_describedby: safeAttr(el, "aria-describedby"),
-      data_attrs: collectDataAttrs(el),
-      href: safeAttr(el, "href"),
-      src: safeAttr(el, "src"),
-      alt: safeAttr(el, "alt"),
-      for_attr: safeAttr(el, "for"),
-      autocomplete: safeAttr(el, "autocomplete"),
-      disabled: el.disabled === true || safeAttr(el, "aria-disabled") === "true",
-      readonly: el.readOnly === true,
-      checked: el.checked === true,
-      selected: el.selected === true,
-      visible: isVisible(el),
-      enabled: isEnabled(el),
-      bounding_box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-      parent_signature: el.parentElement ? domSignature(el.parentElement) : "",
-      dom_signature: domSignature(el),
-      css_path: cssPath(el),
-      xpath: xpath(el),
-      link_text: el.nodeName.toLowerCase() === "a" ? textOf(el) : "",
-    };
-  };
+def generate_element_name(info: Dict[str, Any], component_type: str) -> str:
+    """Human-friendly, generic name for use in Page Objects / reports -
+    never derived from business vocabulary, only from structural hints."""
+    candidates = [
+        info.get("data_attrs", {}).get("data-testid"),
+        info.get("id"),
+        info.get("name"),
+        info.get("aria_label"),
+        info.get("placeholder"),
+        info.get("text"),
+    ]
+    base = next((c for c in candidates if c and not _looks_volatile(c)), None)
+    if not base:
+        base = component_type
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", str(base)).strip("_").lower()
+    slug = slug[:40] if slug else component_type
+    return f"{slug or component_type}_{component_type}"
 
-  // ---- DOM crawling --------------------------------------------------
-  const INTERESTING_SELECTOR = [
-    "a", "button", "input", "select", "textarea", "option", "label",
-    "[role='button']", "[role='link']", "[role='checkbox']", "[role='radio']",
-    "[role='tab']", "[role='menuitem']", "[role='option']", "[role='switch']",
-    "[onclick]", "[data-testid]", "[data-test-id]", "[data-qa]",
-    "table", "tr", "td", "th", "ul", "li", "nav", "form",
-    "[contenteditable='true']", "iframe", "[role='dialog']", "dialog"
-  ].join(",");
 
-  UA.crawlDom = function (root) {
-    root = root || document;
-    const els = root.querySelectorAll(INTERESTING_SELECTOR);
-    const out = [];
-    els.forEach(function (el) {
-      const info = UA.getElementInfo(el);
-      if (info) out.push(info);
-    });
-    return out;
-  };
+def build_locators(info: Dict[str, Any]) -> List[LocatorCandidate]:
+    """Generate every viable locator strategy for an element, each scored."""
+    candidates: List[LocatorCandidate] = []
+    tag = info.get("tag", "*")
+    data_attrs = info.get("data_attrs", {}) or {}
 
-  // ---- Event listening -------------------------------------------------
-  function pushEvent(type, el, extra) {
-    const info = UA.getElementInfo(el);
-    if (!info) return;
-    UA.eventQueue.push(Object.assign({
-      type: type,
-      element: info,
-      timestamp: Date.now(),
-      url: window.location.href,
-      title: document.title,
-    }, extra || {}));
-  }
+    # data-testid / data-test-id / data-qa -> highest reliability
+    for key in ("data-testid", "data-test-id", "data-qa"):
+        if data_attrs.get(key):
+            candidates.append(LocatorCandidate(
+                strategy=LocatorStrategy.DATA_TESTID,
+                value=f"[{key}='{data_attrs[key]}']",
+            ))
 
-  UA.startEventListeners = function () {
-    if (UA._listenersAttached) return;
-    UA._listenersAttached = true;
+    elem_id = info.get("id")
+    if elem_id:
+        if info.get("id_unique") is False:
+            # More than one element on the live page shared this exact id
+            # at capture time (invalid HTML, but real apps do this - e.g. a
+            # grid of "product" cards all wired to the same id instead of
+            # one per item). By.ID would silently resolve to whichever one
+            # happens to be first in the DOM, not the one actually
+            # recorded - so this is scored well below a genuinely
+            # distinguishing candidate (e.g. TEXT) rather than treated as
+            # the near-certain match a unique id would be.
+            candidates.append(LocatorCandidate(strategy=LocatorStrategy.ID, value=elem_id, reliability_score=0.2))
+        else:
+            score_adjust = -0.35 if _looks_volatile(elem_id) else 0.0
+            candidates.append(LocatorCandidate(
+                strategy=LocatorStrategy.ID,
+                value=elem_id,
+                reliability_score=max(0.1, 0.95 + score_adjust),
+            ))
 
-    document.addEventListener("click", function (e) {
-      pushEvent(e.detail === 2 ? "dblclick" : "click", e.target);
-    }, true);
+    name = info.get("name")
+    type_attr = (info.get("type") or "").lower()
+    if name:
+        if type_attr in ("radio", "checkbox") and info.get("value"):
+            # A <input type="radio">/<input type="checkbox">'s `name`
+            # attribute is shared by every option in its group by design
+            # (that's literally how the browser groups them for mutual
+            # exclusion) - a bare By.NAME locator can never tell two
+            # options apart, so Selenium silently resolves it to whichever
+            # option happens to come first in the DOM. That's exactly how
+            # a recorded click on a "No" radio replayed as "Yes": both
+            # options share one `name`, so the un-qualified NAME locator
+            # always landed on the first (Yes) option regardless of which
+            # one was actually recorded. Qualifying the locator with the
+            # option's own `value` attribute (required/meaningful on every
+            # standards-compliant radio/checkbox) makes it target that
+            # specific option, not just the group.
+            candidates.append(LocatorCandidate(
+                strategy=LocatorStrategy.CSS,
+                value=f"{tag}[name='{_css_escape(name)}'][value='{_css_escape(str(info['value']))}']",
+                reliability_score=0.8,
+            ))
+        else:
+            candidates.append(LocatorCandidate(strategy=LocatorStrategy.NAME, value=name))
 
-    document.addEventListener("dblclick", function (e) {
-      pushEvent("dblclick", e.target);
-    }, true);
+    # accessibility-based
+    aria_label = info.get("aria_label")
+    role = info.get("role")
+    if aria_label:
+        candidates.append(LocatorCandidate(
+            strategy=LocatorStrategy.ACCESSIBILITY,
+            value=f"[aria-label='{aria_label}']" + (f"[role='{role}']" if role else ""),
+        ))
+    elif role:
+        candidates.append(LocatorCandidate(strategy=LocatorStrategy.ACCESSIBILITY, value=f"[role='{role}']"))
 
-    document.addEventListener("contextmenu", function (e) {
-      pushEvent("contextmenu", e.target);
-    }, true);
+    # attribute-based (placeholder, title, alt, type+name combos)
+    for attr in ("placeholder", "title", "alt", "type"):
+        val = info.get(attr)
+        if val:
+            candidates.append(LocatorCandidate(
+                strategy=LocatorStrategy.ATTRIBUTE,
+                value=f"{tag}[{attr}='{val}']",
+            ))
+            break  # one attribute-based candidate is usually enough noise-wise
 
-    document.addEventListener("change", function (e) {
-      const el = e.target;
-      if (el && (el.tagName === "SELECT")) {
-        pushEvent("select", el, { value: el.value, selected_text: el.options[el.selectedIndex] ? el.options[el.selectedIndex].text : "" });
-      } else if (el && el.type === "checkbox") {
-        pushEvent(el.checked ? "check" : "uncheck", el);
-      } else if (el && el.type === "radio") {
-        pushEvent("check", el);
-      } else if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) {
-        pushEvent("type", el, { value: el.value });
-      }
-    }, true);
+    # text-based / link text
+    text = (info.get("text") or "").strip()
+    if text and len(text) <= 80:
+        if tag == "a":
+            candidates.append(LocatorCandidate(strategy=LocatorStrategy.LINK_TEXT, value=text))
+            candidates.append(LocatorCandidate(strategy=LocatorStrategy.PARTIAL_LINK_TEXT, value=text[:30]))
+        else:
+            # normalize-space(.) (the element's full aggregated string
+            # value, descendants included) rather than normalize-space
+            # (text()) (direct text-node children ONLY) - a container
+            # element whose visible label lives in a nested child (e.g. a
+            # <mat-card> wrapping a <mat-card-title>Personal Loan</...>)
+            # has no direct text node of its own, so text() would never
+            # match it at all even though the card's own visible text is
+            # exactly what makes it unique among its look-alike siblings.
+            candidates.append(LocatorCandidate(
+                strategy=LocatorStrategy.TEXT,
+                value=f"//{tag}[normalize-space(.)=\"{text}\"]",
+            ))
 
-    document.addEventListener("input", function (e) {
-      const el = e.target;
-      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) {
-        pushEvent("typing", el, { value: el.value !== undefined ? el.value : el.innerText });
-      }
-    }, true);
+    # stable-ish CSS via class names, filtering volatile-looking classes
+    class_name = (info.get("class_name") or "").strip()
+    if class_name:
+        classes = [c for c in class_name.split() if c and not _looks_volatile(c)]
+        if classes:
+            css = tag + "." + ".".join(_css_escape(c) for c in classes[:3])
+            if info.get("class_combo_unique") is False:
+                # This element's full tag+class combination matched more
+                # than one element on the live page (the same "repeated
+                # tile" situation as the id check above - e.g. every card
+                # in a product grid sharing identical styling classes).
+                # A selector built from any subset of these classes can't
+                # be trusted to pick out just this one instance either.
+                candidates.append(LocatorCandidate(strategy=LocatorStrategy.CSS, value=css, reliability_score=0.25))
+            else:
+                candidates.append(LocatorCandidate(strategy=LocatorStrategy.CSS, value=css))
 
-    document.addEventListener("submit", function (e) {
-      pushEvent("submit", e.target);
-    }, true);
+    # css_path / xpath from the browser (always available fallback)
+    if info.get("css_path"):
+        candidates.append(LocatorCandidate(strategy=LocatorStrategy.CSS, value=info["css_path"], reliability_score=0.5))
+    if info.get("xpath"):
+        candidates.append(LocatorCandidate(strategy=LocatorStrategy.XPATH, value=info["xpath"]))
 
-    document.addEventListener("keydown", function (e) {
-      if (e.key === "Enter") {
-        pushEvent("press_enter", e.target, { key: "Enter" });
-      } else if (e.key === "Tab") {
-        pushEvent("press_tab", e.target, { key: "Tab" });
-      } else if (["Escape", "ArrowDown", "ArrowUp"].indexOf(e.key) === -1) {
-        // avoid noise from purely navigational keys; still track generic keypress
-        pushEvent("keydown", e.target, { key: e.key });
-      }
-    }, true);
+    # relative xpath: tag + partial text/attr, more resilient than absolute xpath
+    if text and len(text) <= 80:
+        candidates.append(LocatorCandidate(
+            strategy=LocatorStrategy.RELATIVE_XPATH,
+            value=f"//{tag}[contains(normalize-space(.), \"{text[:40]}\")]",
+        ))
 
-    // NOTE: hover ("mouseover") capture is intentionally disabled. It was
-    // recording incidental mouse movement (the pointer passing over a
-    // background/overlay element on its way to the real target) as if it
-    // were a deliberate action, and even genuine hovers rarely replay
-    // reliably via Selenium (no real pointer movement, so hover-triggered
-    // CSS/JS states often never engage) - so hover steps were a frequent
-    // source of failures/timeouts that didn't reflect an actual problem
-    // with the recording or the target application. Click/type/select/etc.
-    // are unaffected; this only turns off the previous fully-generic
-    // mouseover -> "hover" action capture.
+    # de-dup by (strategy, value)
+    seen = set()
+    unique: List[LocatorCandidate] = []
+    for c in candidates:
+        key = (c.strategy, c.value)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(c)
 
-    let scrollTimer = null;
-    window.addEventListener("scroll", function () {
-      clearTimeout(scrollTimer);
-      scrollTimer = setTimeout(function () {
-        UA.eventQueue.push({
-          type: "scroll",
-          element: null,
-          scroll_x: window.scrollX,
-          scroll_y: window.scrollY,
-          timestamp: Date.now(),
-          url: window.location.href,
-          title: document.title,
-        });
-      }, 400);
-    }, true);
-  };
-
-  UA.drainEvents = function () {
-    const out = UA.eventQueue;
-    UA.eventQueue = [];
-    return out;
-  };
-
-  window.addEventListener("popstate", function () {
-    UA.eventQueue.push({
-      type: "popstate",
-      element: null,
-      timestamp: Date.now(),
-      url: window.location.href,
-      title: document.title,
-    });
-  }, true);
-
-  // ---- Mutation observing -------------------------------------------
-  UA.startMutationObserver = function () {
-    if (UA._observer) return;
-    UA._observer = new MutationObserver(function (mutations) {
-      mutations.forEach(function (m) {
-        m.addedNodes.forEach(function (node) {
-          if (node.nodeType !== Node.ELEMENT_NODE) return;
-          const sig = domSignature(node);
-          if (UA._seenSignatures.has(sig)) return;
-          UA._seenSignatures.add(sig);
-          const info = UA.getElementInfo(node);
-          if (info) {
-            UA.mutationQueue.push({ change: "added", element: info, timestamp: Date.now(), url: window.location.href });
-          }
-          // also scan descendants that are individually interesting
-          try {
-            node.querySelectorAll && node.querySelectorAll(INTERESTING_SELECTOR).forEach(function (child) {
-              const csig = domSignature(child);
-              if (UA._seenSignatures.has(csig)) return;
-              UA._seenSignatures.add(csig);
-              const cinfo = UA.getElementInfo(child);
-              if (cinfo) UA.mutationQueue.push({ change: "added", element: cinfo, timestamp: Date.now(), url: window.location.href });
-            });
-          } catch (e) { /* ignore */ }
-        });
-      });
-    });
-    UA._observer.observe(document.documentElement || document.body, { childList: true, subtree: true });
-  };
-
-  UA.drainMutations = function () {
-    const out = UA.mutationQueue;
-    UA.mutationQueue = [];
-    return out;
-  };
-
-  // ---- Modal / popup / overlay detection -----------------------------
-  const MODAL_SELECTORS = [
-    ".modal", ".modal-dialog", ".modal-content", "[role='dialog']", "[role='alertdialog']",
-    "dialog", "[aria-modal='true']", ".popup", ".overlay", ".toast", ".toast-container",
-    ".notification", ".snackbar", ".drawer", ".side-panel", ".sidepanel", ".dropdown-menu.show",
-    ".ant-modal", ".mat-dialog-container", ".MuiDialog-root", ".v-dialog", ".chakra-modal__content"
-  ];
-
-  function looksLikeOverlay(el) {
-    try {
-      const style = window.getComputedStyle(el);
-      const rect = el.getBoundingClientRect();
-      const position = style.position;
-      const zIndex = parseInt(style.zIndex, 10) || 0;
-      const coversSignificantArea = rect.width > window.innerWidth * 0.25 && rect.height > window.innerHeight * 0.15;
-      return (position === "fixed" || position === "absolute") && zIndex >= 100 && coversSignificantArea && isVisible(el);
-    } catch (e) {
-      return false;
-    }
-  }
-
-  UA.detectModals = function () {
-    const found = [];
-    const seen = new Set();
-
-    MODAL_SELECTORS.forEach(function (sel) {
-      try {
-        document.querySelectorAll(sel).forEach(function (el) {
-          if (!isVisible(el)) return;
-          const sig = domSignature(el);
-          if (seen.has(sig)) return;
-          seen.add(sig);
-          found.push({ container: UA.getElementInfo(el), detected_via: ["selector:" + sel] });
-        });
-      } catch (e) { /* invalid selector variant on this app, skip */ }
-    });
-
-    // structural heuristic pass over top-level fixed/absolute large elements
-    document.querySelectorAll("body > div, body > section").forEach(function (el) {
-      if (looksLikeOverlay(el)) {
-        const sig = domSignature(el);
-        if (seen.has(sig)) return;
-        seen.add(sig);
-        found.push({ container: UA.getElementInfo(el), detected_via: ["structural:overlay-heuristic"] });
-      }
-    });
-
-    return found.map(function (m) {
-      const children = [];
-      try {
-        const containerEl = document.querySelector(m.container.css_path) ||
-          (m.container.id ? document.getElementById(m.container.id) : null);
-        if (containerEl) {
-          containerEl.querySelectorAll(INTERESTING_SELECTOR).forEach(function (c) {
-            const info = UA.getElementInfo(c);
-            if (info) children.push(info);
-          });
-        }
-      } catch (e) { /* ignore */ }
-      m.children = children;
-      return m;
-    });
-  };
-
-  // ---- Shadow DOM detection (best-effort) -----------------------------
-  UA.detectShadowRoots = function (root, depth) {
-    root = root || document;
-    depth = depth || 0;
-    if (depth > 4) return [];
-    const out = [];
-    const all = root.querySelectorAll("*");
-    all.forEach(function (el) {
-      if (el.shadowRoot) {
-        const hostInfo = UA.getElementInfo(el);
-        const children = [];
-        try {
-          el.shadowRoot.querySelectorAll(INTERESTING_SELECTOR).forEach(function (c) {
-            const info = UA.getElementInfo(c);
-            if (info) children.push(info);
-          });
-        } catch (e) { /* closed shadow root or inaccessible */ }
-        out.push({ host: hostInfo, children: children });
-        // recurse into nested shadow roots
-        const nested = UA.detectShadowRoots(el.shadowRoot, depth + 1);
-        nested.forEach(function (n) { out.push(n); });
-      }
-    });
-    return out;
-  };
-
-  // ---- Frame enumeration (top-level only; Python drives recursion) ---
-  UA.getFrames = function () {
-    const frames = document.querySelectorAll("iframe, frame");
-    const out = [];
-    frames.forEach(function (f, idx) {
-      out.push({
-        index: idx,
-        css_path: cssPath(f),
-        id: safeAttr(f, "id"),
-        name: safeAttr(f, "name"),
-        src: safeAttr(f, "src"),
-        visible: isVisible(f),
-      });
-    });
-    return out;
-  };
-
-  window.__UA__ = UA;
-})();
+    unique.sort(key=lambda c: c.reliability_score, reverse=True)
+    return unique
