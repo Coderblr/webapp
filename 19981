@@ -1,266 +1,279 @@
 """
-action_engine.py
+locator_engine.py
 
-The single place that knows how to translate a generic action
-(click/type/select/...) plus a resolved Selenium locator into real
-WebDriver calls. Both the Excel-driven executor and every generated
-Page Object (via generator/base_page.py) go through this class, which is
-what keeps the platform's "generic action abstraction" principle
-(spec section 16) real: we do not generate a bespoke function per
-recorded click - we generate data (locators, element names) and call
-these shared methods.
+Pure-Python logic that turns a raw element-info dict (as produced by
+bridge.js's `getElementInfo`) into a ranked list of LocatorCandidate
+objects, plus a `component_type` classification and a generated
+human-friendly element name.
+
+This module has zero Selenium/webdriver dependency by design - it is
+pure data transformation, which makes it trivially unit-testable and
+reusable by both the recorder (building the repository) and the
+self-healing engine (scoring candidate replacements).
 """
 from __future__ import annotations
 
-import logging
-import time
-from typing import Optional, Tuple
+import re
+from typing import Any, Dict, List
 
-from selenium.common.exceptions import (
-    ElementClickInterceptedException,
-    ElementNotInteractableException,
-    StaleElementReferenceException,
-    TimeoutException,
-)
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.remote.webdriver import WebDriver
-from selenium.webdriver.remote.webelement import WebElement
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import Select, WebDriverWait
+from backend.storage.models import LocatorCandidate, LocatorStrategy
 
-from backend.config import settings
-from backend.storage.models import LocatorStrategy
-
-logger = logging.getLogger("universal_automation.action_engine")
-
-# Maps our generic LocatorStrategy vocabulary onto Selenium's By constants.
-# A handful of our strategies (DATA_TESTID, ACCESSIBILITY, ATTRIBUTE) are
-# always expressed as CSS by the locator_engine, and TEXT/RELATIVE_XPATH
-# are expressed as XPath.
-STRATEGY_TO_BY = {
-    LocatorStrategy.ID: By.ID,
-    LocatorStrategy.NAME: By.NAME,
-    LocatorStrategy.CSS: By.CSS_SELECTOR,
-    LocatorStrategy.XPATH: By.XPATH,
-    LocatorStrategy.RELATIVE_XPATH: By.XPATH,
-    LocatorStrategy.LINK_TEXT: By.LINK_TEXT,
-    LocatorStrategy.PARTIAL_LINK_TEXT: By.PARTIAL_LINK_TEXT,
-    LocatorStrategy.DATA_TESTID: By.CSS_SELECTOR,
-    LocatorStrategy.ACCESSIBILITY: By.CSS_SELECTOR,
-    LocatorStrategy.ATTRIBUTE: By.CSS_SELECTOR,
-    LocatorStrategy.TEXT: By.XPATH,
-    "ID": By.ID,
-    "NAME": By.NAME,
-    "CSS": By.CSS_SELECTOR,
-    "XPATH": By.XPATH,
-    "RELATIVE_XPATH": By.XPATH,
-    "LINK_TEXT": By.LINK_TEXT,
-    "PARTIAL_LINK_TEXT": By.PARTIAL_LINK_TEXT,
-    "DATA_TESTID": By.CSS_SELECTOR,
-    "ACCESSIBILITY": By.CSS_SELECTOR,
-    "ATTRIBUTE": By.CSS_SELECTOR,
-    "TEXT": By.XPATH,
-}
+# Attribute/id patterns that look auto-generated / volatile (react `:r1a:`
+# style ids, uuid-like ids, ember###, ids with many digits, etc). Locators
+# built from these get penalized since they are unlikely to survive a
+# rebuild.
+_VOLATILE_ID_PATTERNS = [
+    re.compile(r"^:[a-z0-9]+:$", re.I),           # react useId() -> ":r0:"
+    re.compile(r"^[a-f0-9-]{20,}$", re.I),          # uuid-ish
+    re.compile(r"^ember\d+$", re.I),
+    re.compile(r"\d{4,}"),                          # long digit runs
+    re.compile(r"^(ng|mat|mui|css)-[a-z0-9]+$", re.I),
+]
 
 
-def by_for(strategy: str):
-    return STRATEGY_TO_BY.get(strategy, By.CSS_SELECTOR)
+def _looks_volatile(value: str) -> bool:
+    if not value:
+        return True
+    return any(p.search(value) for p in _VOLATILE_ID_PATTERNS)
 
 
-class ActionEngine:
-    """Generic Selenium action executor. Stateless with respect to any
-    particular application - every method takes a (by, value) locator."""
+def _css_escape(value: str) -> str:
+    return re.sub(r"([ #.:\[\]()\"'])", r"\\\1", value)
 
-    def __init__(self, driver: WebDriver, timeout: Optional[float] = None):
-        self.driver = driver
-        self.timeout = timeout or settings.EXPLICIT_WAIT_SECONDS
 
-    # ------------------------------------------------------------------
-    def wait_for(self, by, value: str, condition="visible") -> WebElement:
-        wait = WebDriverWait(self.driver, self.timeout)
-        locator = (by, value)
-        if condition == "clickable":
-            return wait.until(EC.element_to_be_clickable(locator))
-        if condition == "present":
-            return wait.until(EC.presence_of_element_located(locator))
-        return wait.until(EC.visibility_of_element_located(locator))
+def classify_component(info: Dict[str, Any]) -> str:
+    tag = (info.get("tag") or "").lower()
+    role = (info.get("role") or "").lower()
+    type_attr = (info.get("type") or "").lower()
 
-    def find(self, by, value: str) -> WebElement:
-        return self.wait_for(by, value, condition="present")
+    if tag == "select" or role == "listbox":
+        return "dropdown"
+    if tag == "input":
+        if type_attr in ("checkbox",):
+            return "checkbox"
+        if type_attr in ("radio",):
+            return "radio"
+        if type_attr in ("file",):
+            return "file_upload"
+        if type_attr in ("submit", "button"):
+            return "button"
+        return "input"
+    if tag == "textarea":
+        return "input"
+    if tag in ("button",) or role == "button":
+        return "button"
+    if tag == "a" or role == "link":
+        return "link"
+    if tag == "table":
+        return "table"
+    if tag in ("tr", "td", "th"):
+        return "table_cell"
+    if tag in ("ul", "ol", "li") or role == "listitem":
+        return "list_item"
+    if role in ("tab",):
+        return "tab"
+    if role in ("menuitem",):
+        return "menu_item"
+    if tag == "iframe":
+        return "frame"
+    if role in ("dialog", "alertdialog") or tag == "dialog":
+        return "dialog"
+    if info.get("contenteditable"):
+        return "rich_text"
+    return "element"
 
-    # ------------------------------------------------------------------
-    def _ensure_in_view(self, el: WebElement) -> None:
-        """Proactively scrolls an element into the center of the viewport
-        if it isn't already fully visible there, with a brief settle pause.
-        The WebDriver spec has native click()/send_keys() auto-scroll an
-        element into view, but only just enough to be minimally on-screen -
-        not necessarily clear of sticky/fixed-position headers, footers, or
-        cookie banners, which is the most common real-world cause of a
-        recorded step needing a manual scroll to "reveal" the element it's
-        targeting, or a click landing on the wrong thing underneath an
-        overlapping element. Skips the extra scroll+wait entirely when the
-        element is already fully in view, so normal steps aren't slowed
-        down by this."""
-        try:
-            already_in_view = self.driver.execute_script(
-                "var r = arguments[0].getBoundingClientRect();"
-                "return r.top >= 0 && r.left >= 0 && r.bottom <= (window.innerHeight || document.documentElement.clientHeight)"
-                " && r.right <= (window.innerWidth || document.documentElement.clientWidth);",
-                el,
-            )
-        except Exception:
-            return  # can't tell (stale/detached element etc.) - let the caller's own wait/retry logic handle it
-        if not already_in_view:
-            try:
-                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", el)
-                time.sleep(0.15)  # give sticky headers/animations a moment to settle post-scroll
-            except Exception:
-                pass
 
-    def click(self, by, value: str) -> None:
-        el = self.wait_for(by, value, condition="clickable")
-        self._ensure_in_view(el)
-        try:
-            el.click()
-        except (ElementClickInterceptedException, ElementNotInteractableException):
-            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-            self.driver.execute_script("arguments[0].click();", el)
+def generate_element_name(info: Dict[str, Any], component_type: str) -> str:
+    """Human-friendly, generic name for use in Page Objects / reports -
+    never derived from business vocabulary, only from structural hints."""
+    candidates = [
+        info.get("data_attrs", {}).get("data-testid"),
+        info.get("id"),
+        info.get("name"),
+        info.get("aria_label"),
+        info.get("placeholder"),
+        info.get("text"),
+    ]
+    base = next((c for c in candidates if c and not _looks_volatile(c)), None)
+    if not base:
+        base = component_type
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", str(base)).strip("_").lower()
+    slug = slug[:40] if slug else component_type
+    return f"{slug or component_type}_{component_type}"
 
-    def double_click(self, by, value: str) -> None:
-        el = self.wait_for(by, value, condition="clickable")
-        self._ensure_in_view(el)
-        ActionChains(self.driver).double_click(el).perform()
 
-    def right_click(self, by, value: str) -> None:
-        el = self.wait_for(by, value, condition="clickable")
-        self._ensure_in_view(el)
-        ActionChains(self.driver).context_click(el).perform()
+def build_locators(info: Dict[str, Any]) -> List[LocatorCandidate]:
+    """Generate every viable locator strategy for an element, each scored."""
+    candidates: List[LocatorCandidate] = []
+    tag = info.get("tag", "*")
+    data_attrs = info.get("data_attrs", {}) or {}
 
-    def type(self, by, value: str, text: str, clear_first: bool = True) -> None:
-        el = self.wait_for(by, value, condition="visible")
-        self._ensure_in_view(el)
-        if clear_first:
-            try:
-                el.clear()
-            except (ElementNotInteractableException, StaleElementReferenceException):
-                pass
-        el.send_keys(text)
-        self._verify_typed_value(el, text)
+    # data-testid / data-test-id / data-qa -> highest reliability
+    for key in ("data-testid", "data-test-id", "data-qa"):
+        if data_attrs.get(key):
+            candidates.append(LocatorCandidate(
+                strategy=LocatorStrategy.DATA_TESTID,
+                value=f"[{key}='{data_attrs[key]}']",
+            ))
 
-    def _verify_typed_value(self, el: WebElement, text: str) -> None:
-        """Segmented/auto-advancing inputs (the most common real case:
-        4-6 separate single-digit OTP/PIN boxes) are almost always
-        React/Angular "controlled" fields - the app's own JS re-validates
-        and can shift focus to the next box on every keystroke. send_keys()
-        racing against that can occasionally drop or overwrite a
-        character, leaving a box wrong or empty with no error at all -
-        just a "Verify"-style button that never enables, which looks like
-        execution silently stalling on the login screen. One quick,
-        cheap re-check (and a single retry if it doesn't match) closes
-        that race without slowing down the much more common case where
-        nothing needed retrying."""
-        if not text:
-            return
-        try:
-            actual = self.driver.execute_script("return arguments[0].value;", el)
-        except Exception:
-            return  # can't verify (e.g. not a value-bearing element) - not worth failing the step over
-        if actual == text:
-            return
-        try:
-            el.clear()
-        except (ElementNotInteractableException, StaleElementReferenceException):
-            pass
-        el.send_keys(text)
-
-    def clear(self, by, value: str) -> None:
-        el = self.wait_for(by, value, condition="visible")
-        el.clear()
-
-    def select(self, by, value: str, option_text: Optional[str] = None, option_value: Optional[str] = None) -> None:
-        el = self.wait_for(by, value, condition="visible")
-        self._ensure_in_view(el)
-        select = Select(el)
-        if option_value is not None:
-            select.select_by_value(option_value)
-        elif option_text is not None:
-            select.select_by_visible_text(option_text)
-
-    def check(self, by, value: str) -> None:
-        el = self.wait_for(by, value, condition="clickable")
-        self._ensure_in_view(el)
-        if not el.is_selected():
-            el.click()
-
-    def uncheck(self, by, value: str) -> None:
-        el = self.wait_for(by, value, condition="clickable")
-        self._ensure_in_view(el)
-        if el.is_selected():
-            el.click()
-
-    def hover(self, by, value: str) -> None:
-        el = self.wait_for(by, value, condition="visible")
-        self._ensure_in_view(el)
-        ActionChains(self.driver).move_to_element(el).perform()
-
-    def scroll_to(self, by, value: str) -> None:
-        el = self.find(by, value)
-        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-
-    def press_key(self, by, value: str, key: str) -> None:
-        el = self.wait_for(by, value, condition="visible")
-        self._ensure_in_view(el)
-        key_obj = getattr(Keys, key.upper(), None)
-        el.send_keys(key_obj if key_obj else key)
-
-    def submit(self, by, value: str) -> None:
-        el = self.wait_for(by, value, condition="present")
-        try:
-            el.submit()
-        except Exception:
-            el.click()
-
-    def upload(self, by, value: str, file_path: str) -> None:
-        el = self.find(by, value)
-        el.send_keys(file_path)
-
-    def switch_to_frame(self, by, value: str) -> None:
-        el = self.find(by, value)
-        self.driver.switch_to.frame(el)
-
-    def switch_to_default(self) -> None:
-        self.driver.switch_to.default_content()
-
-    def switch_window(self, handle: Optional[str] = None) -> None:
-        if handle:
-            self.driver.switch_to.window(handle)
+    elem_id = info.get("id")
+    if elem_id:
+        if info.get("id_unique") is False:
+            # More than one element on the live page shared this exact id
+            # at capture time (invalid HTML, but real apps do this - e.g. a
+            # grid of "product" cards all wired to the same id instead of
+            # one per item). By.ID would silently resolve to whichever one
+            # happens to be first in the DOM, not the one actually
+            # recorded - so this is scored well below a genuinely
+            # distinguishing candidate (e.g. TEXT) rather than treated as
+            # the near-certain match a unique id would be.
+            candidates.append(LocatorCandidate(strategy=LocatorStrategy.ID, value=elem_id, reliability_score=0.2))
         else:
-            handles = self.driver.window_handles
-            if handles:
-                self.driver.switch_to.window(handles[-1])
-        # A freshly-opened window/tab (e.g. an SSO/login popup) sometimes
-        # doesn't get real OS/browser focus just from switch_to.window() -
-        # a known Selenium quirk where the *first* click/keystroke after
-        # switching into a new window is "swallowed" (the click seems to
-        # focus the window itself rather than reach the page), making it
-        # look like the target needs a second click to actually respond.
-        # A harmless window.focus() call closes that gap.
-        try:
-            self.driver.execute_script("window.focus();")
-        except Exception:
-            pass
+            score_adjust = -0.35 if _looks_volatile(elem_id) else 0.0
+            candidates.append(LocatorCandidate(
+                strategy=LocatorStrategy.ID,
+                value=elem_id,
+                reliability_score=max(0.1, 0.95 + score_adjust),
+            ))
 
-    def navigate_back(self) -> None:
-        self.driver.back()
+    name = info.get("name")
+    type_attr = (info.get("type") or "").lower()
+    if name:
+        if type_attr in ("radio", "checkbox") and info.get("value"):
+            # A <input type="radio">/<input type="checkbox">'s `name`
+            # attribute is shared by every option in its group by design
+            # (that's literally how the browser groups them for mutual
+            # exclusion) - a bare By.NAME locator can never tell two
+            # options apart, so Selenium silently resolves it to whichever
+            # option happens to come first in the DOM. That's exactly how
+            # a recorded click on a "No" radio replayed as "Yes": both
+            # options share one `name`, so the un-qualified NAME locator
+            # always landed on the first (Yes) option regardless of which
+            # one was actually recorded. Qualifying the locator with the
+            # option's own `value` attribute (required/meaningful on every
+            # standards-compliant radio/checkbox) makes it target that
+            # specific option, not just the group.
+            candidates.append(LocatorCandidate(
+                strategy=LocatorStrategy.CSS,
+                value=f"{tag}[name='{_css_escape(name)}'][value='{_css_escape(str(info['value']))}']",
+                reliability_score=0.8,
+            ))
+        else:
+            candidates.append(LocatorCandidate(strategy=LocatorStrategy.NAME, value=name))
 
-    def navigate_forward(self) -> None:
-        self.driver.forward()
+    # accessibility-based
+    aria_label = info.get("aria_label")
+    role = info.get("role")
+    if aria_label:
+        candidates.append(LocatorCandidate(
+            strategy=LocatorStrategy.ACCESSIBILITY,
+            value=f"[aria-label='{aria_label}']" + (f"[role='{role}']" if role else ""),
+        ))
+    elif role:
+        candidates.append(LocatorCandidate(strategy=LocatorStrategy.ACCESSIBILITY, value=f"[role='{role}']"))
 
-    def is_present(self, by, value: str, timeout: float = 2.0) -> bool:
-        try:
-            WebDriverWait(self.driver, timeout).until(EC.presence_of_element_located((by, value)))
-            return True
-        except TimeoutException:
-            return False
+    # attribute-based (placeholder, title, alt, type+name combos)
+    for attr in ("placeholder", "title", "alt", "type"):
+        val = info.get(attr)
+        if val:
+            candidates.append(LocatorCandidate(
+                strategy=LocatorStrategy.ATTRIBUTE,
+                value=f"{tag}[{attr}='{val}']",
+            ))
+            break  # one attribute-based candidate is usually enough noise-wise
+
+    # text-based / link text
+    text = (info.get("text") or "").strip()
+    if text and len(text) <= 80:
+        if tag == "a":
+            candidates.append(LocatorCandidate(strategy=LocatorStrategy.LINK_TEXT, value=text))
+            candidates.append(LocatorCandidate(strategy=LocatorStrategy.PARTIAL_LINK_TEXT, value=text[:30]))
+        else:
+            # normalize-space(.) (the element's full aggregated string
+            # value, descendants included) rather than normalize-space
+            # (text()) (direct text-node children ONLY) - a container
+            # element whose visible label lives in a nested child (e.g. a
+            # <mat-card> wrapping a <mat-card-title>Personal Loan</...>)
+            # has no direct text node of its own, so text() would never
+            # match it at all even though the card's own visible text is
+            # exactly what makes it unique among its look-alike siblings.
+            candidates.append(LocatorCandidate(
+                strategy=LocatorStrategy.TEXT,
+                value=f"//{tag}[normalize-space(.)=\"{text}\"]",
+            ))
+
+    # stable-ish CSS via class names, filtering volatile-looking classes
+    class_name = (info.get("class_name") or "").strip()
+    if class_name:
+        classes = [c for c in class_name.split() if c and not _looks_volatile(c)]
+        if classes:
+            css = tag + "." + ".".join(_css_escape(c) for c in classes[:3])
+            if info.get("class_combo_unique") is False:
+                # This element's full tag+class combination matched more
+                # than one element on the live page (the same "repeated
+                # tile" situation as the id check above - e.g. every card
+                # in a product grid sharing identical styling classes).
+                # A selector built from any subset of these classes can't
+                # be trusted to pick out just this one instance either.
+                candidates.append(LocatorCandidate(strategy=LocatorStrategy.CSS, value=css, reliability_score=0.25))
+            else:
+                candidates.append(LocatorCandidate(strategy=LocatorStrategy.CSS, value=css))
+
+    # css_path / xpath from the browser (always available fallback)
+    if info.get("css_path"):
+        if info.get("css_path_unique") is False:
+            # cssPath() (bridge.js) anchors on the FIRST ancestor id it
+            # finds while climbing up, without checking whether that id is
+            # actually unique on the page - so this selector can look
+            # perfectly specific (tag#id > child:nth-of-type(n)) while
+            # still resolving to whichever look-alike tile happens to come
+            # first in the DOM (the same repeated-card-grid problem as the
+            # id/class-combo checks above, just reached through a
+            # different candidate). Demoted the same way.
+            candidates.append(LocatorCandidate(strategy=LocatorStrategy.CSS, value=info["css_path"], reliability_score=0.2))
+        else:
+            candidates.append(LocatorCandidate(strategy=LocatorStrategy.CSS, value=info["css_path"], reliability_score=0.5))
+    if info.get("xpath"):
+        candidates.append(LocatorCandidate(strategy=LocatorStrategy.XPATH, value=info["xpath"]))
+
+    # Container/ancestor text fallback: when the clicked element carries no
+    # distinguishing text of its own at all (a decorative icon/image inside
+    # a clickable "tile" card is the most common real case - see
+    # nearestDistinguishingAncestor() in bridge.js), every OTHER candidate
+    # for it either falls back to a shared, non-unique id/class (a repeated
+    # card grid) or a raw DOM-position path that's fragile across a
+    # rebuild. If the nearest ancestor carrying visible text is short/
+    # specific enough to plausibly BE this tile's own label (e.g. a
+    # <mat-card> whose title says "Auto Loan"), target THAT ancestor
+    # instead - for a clickable-tile UI pattern (the whole card, not just
+    # the icon, responds to a click) this reaches the identical outcome
+    # while actually distinguishing this tile from its look-alike siblings.
+    container = info.get("container") or {}
+    container_text = (container.get("text") or "").strip()
+    container_tag = container.get("tag")
+    if not text and container_text and container_tag and len(container_text) <= 150:
+        candidates.append(LocatorCandidate(
+            strategy=LocatorStrategy.TEXT,
+            value=f'//{container_tag}[normalize-space(.)="{container_text}"]',
+            reliability_score=0.5,
+        ))
+
+    # relative xpath: tag + partial text/attr, more resilient than absolute xpath
+    if text and len(text) <= 80:
+        candidates.append(LocatorCandidate(
+            strategy=LocatorStrategy.RELATIVE_XPATH,
+            value=f"//{tag}[contains(normalize-space(.), \"{text[:40]}\")]",
+        ))
+
+    # de-dup by (strategy, value)
+    seen = set()
+    unique: List[LocatorCandidate] = []
+    for c in candidates:
+        key = (c.strategy, c.value)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(c)
+
+    unique.sort(key=lambda c: c.reliability_score, reverse=True)
+    return unique
