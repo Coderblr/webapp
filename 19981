@@ -1,110 +1,266 @@
 """
-Central configuration for the Universal AI-Powered Web Automation Platform.
+action_engine.py
 
-All configuration is environment-driven (see .env.example). Nothing
-application-specific (no business domain, no site names) lives here -
-this module only knows about infrastructure concerns: paths, browser
-defaults, and AI provider credentials.
-
-NOTE: this build has value masking disabled throughout (recorder,
-executor, logs) - it's configured for UAT use, where recorded/executed
-values are written to the Excel dataset, logs, and reports as-is. Do not
-point this configuration at a production environment.
+The single place that knows how to translate a generic action
+(click/type/select/...) plus a resolved Selenium locator into real
+WebDriver calls. Both the Excel-driven executor and every generated
+Page Object (via generator/base_page.py) go through this class, which is
+what keeps the platform's "generic action abstraction" principle
+(spec section 16) real: we do not generate a bespoke function per
+recorded click - we generate data (locators, element names) and call
+these shared methods.
 """
 from __future__ import annotations
 
-import os
-from pathlib import Path
+import logging
+import time
+from typing import Optional, Tuple
 
-from dotenv import load_dotenv
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    ElementNotInteractableException,
+    StaleElementReferenceException,
+    TimeoutException,
+)
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.remote.webdriver import WebDriver
+from selenium.webdriver.remote.webelement import WebElement
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import Select, WebDriverWait
 
-# Load .env from the project root (one level above backend/) if present.
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(_PROJECT_ROOT / ".env")
+from backend.config import settings
+from backend.storage.models import LocatorStrategy
 
+logger = logging.getLogger("universal_automation.action_engine")
 
-def _bool(name: str, default: bool) -> bool:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    return val.strip().lower() in ("1", "true", "yes", "on")
-
-
-def _resolve(path_str: str) -> Path:
-    p = Path(path_str)
-    if not p.is_absolute():
-        p = (Path(__file__).resolve().parent / p).resolve()
-    return p
-
-
-class Settings:
-    """Runtime settings, resolved once at import time."""
-
-    # --- General ---
-    APP_ENV: str = os.getenv("APP_ENV", "development")
-    APP_HOST: str = os.getenv("APP_HOST", "0.0.0.0")
-    APP_PORT: int = int(os.getenv("APP_PORT", "8000"))
-    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-
-    PROJECT_ROOT: Path = _PROJECT_ROOT
-    RECORDINGS_DIR: Path = _resolve(os.getenv("RECORDINGS_DIR", "../recordings"))
-    REPORTS_DIR: Path = _resolve(os.getenv("REPORTS_DIR", "../reports"))
-    LOGS_DIR: Path = _resolve(os.getenv("LOGS_DIR", "../logs"))
-    FRONTEND_DIR: Path = _PROJECT_ROOT / "frontend"
-
-    # --- Browser ---
-    DEFAULT_BROWSER: str = os.getenv("DEFAULT_BROWSER", "chrome")
-    BROWSER_HEADLESS: bool = _bool("BROWSER_HEADLESS", False)
-    IMPLICIT_WAIT_SECONDS: float = float(os.getenv("IMPLICIT_WAIT_SECONDS", "2"))
-    EXPLICIT_WAIT_SECONDS: float = float(os.getenv("EXPLICIT_WAIT_SECONDS", "10"))
-    # Used only for fallback locator attempts (selenium_executor.py's
-    # execute_with_fallbacks), never for the primary locator. The primary
-    # attempt gets the full EXPLICIT_WAIT_SECONDS since a page may
-    # genuinely still be loading. By the time a fallback is tried, that
-    # full wait has already happened once for this step - waiting another
-    # complete EXPLICIT_WAIT_SECONDS for EACH of up to 3 fallback locators
-    # in turn (up to 30+ seconds on top of the primary's own 10s) is what
-    # made data-heavy screens with several failing/ambiguous locators (many
-    # radio buttons, a variable-length row table, ...) take minutes to
-    # execute - almost all of that time was spent waiting out timeouts,
-    # not doing anything. A short, separate timeout here keeps fallback
-    # attempts fast without shortening the one wait that actually matters
-    # (the primary locator's).
-    FALLBACK_WAIT_SECONDS: float = float(os.getenv("FALLBACK_WAIT_SECONDS", "3"))
-
-    # Manual driver binary paths. When set, browser_factory.py uses these
-    # directly instead of asking webdriver-manager to auto-download a
-    # matching driver - required on machines with no internet access or
-    # where outbound downloads are blocked (e.g. corporate/offline setups).
-    # Leave blank to keep the automatic download behavior.
-    CHROME_DRIVER_PATH: str = os.getenv("CHROME_DRIVER_PATH", "").strip()
-    EDGE_DRIVER_PATH: str = os.getenv("EDGE_DRIVER_PATH", "").strip()
-
-    # --- AI ---
-    DEFAULT_AI_PROVIDER: str = os.getenv("DEFAULT_AI_PROVIDER", "azure_openai")
-    AI_ENABLED: bool = _bool("AI_ENABLED", True)
-
-    AZURE_OPENAI_API_KEY: str = os.getenv("AZURE_OPENAI_API_KEY", "")
-    AZURE_OPENAI_ENDPOINT: str = os.getenv("AZURE_OPENAI_ENDPOINT", "")
-    AZURE_OPENAI_DEPLOYMENT: str = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-    AZURE_OPENAI_API_VERSION: str = os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview")
-
-    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
-    CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
-
-    DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
-    DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-
-    # --- Self-healing ---
-    HEALING_CONFIDENCE_THRESHOLD: float = float(os.getenv("HEALING_CONFIDENCE_THRESHOLD", "0.75"))
-    HEALING_MAX_CANDIDATES: int = int(os.getenv("HEALING_MAX_CANDIDATES", "15"))
-
-    @classmethod
-    def ensure_dirs(cls) -> None:
-        for d in (cls.RECORDINGS_DIR, cls.REPORTS_DIR, cls.LOGS_DIR):
-            d.mkdir(parents=True, exist_ok=True)
+# Maps our generic LocatorStrategy vocabulary onto Selenium's By constants.
+# A handful of our strategies (DATA_TESTID, ACCESSIBILITY, ATTRIBUTE) are
+# always expressed as CSS by the locator_engine, and TEXT/RELATIVE_XPATH
+# are expressed as XPath.
+STRATEGY_TO_BY = {
+    LocatorStrategy.ID: By.ID,
+    LocatorStrategy.NAME: By.NAME,
+    LocatorStrategy.CSS: By.CSS_SELECTOR,
+    LocatorStrategy.XPATH: By.XPATH,
+    LocatorStrategy.RELATIVE_XPATH: By.XPATH,
+    LocatorStrategy.LINK_TEXT: By.LINK_TEXT,
+    LocatorStrategy.PARTIAL_LINK_TEXT: By.PARTIAL_LINK_TEXT,
+    LocatorStrategy.DATA_TESTID: By.CSS_SELECTOR,
+    LocatorStrategy.ACCESSIBILITY: By.CSS_SELECTOR,
+    LocatorStrategy.ATTRIBUTE: By.CSS_SELECTOR,
+    LocatorStrategy.TEXT: By.XPATH,
+    "ID": By.ID,
+    "NAME": By.NAME,
+    "CSS": By.CSS_SELECTOR,
+    "XPATH": By.XPATH,
+    "RELATIVE_XPATH": By.XPATH,
+    "LINK_TEXT": By.LINK_TEXT,
+    "PARTIAL_LINK_TEXT": By.PARTIAL_LINK_TEXT,
+    "DATA_TESTID": By.CSS_SELECTOR,
+    "ACCESSIBILITY": By.CSS_SELECTOR,
+    "ATTRIBUTE": By.CSS_SELECTOR,
+    "TEXT": By.XPATH,
+}
 
 
-settings = Settings()
-settings.ensure_dirs()
+def by_for(strategy: str):
+    return STRATEGY_TO_BY.get(strategy, By.CSS_SELECTOR)
+
+
+class ActionEngine:
+    """Generic Selenium action executor. Stateless with respect to any
+    particular application - every method takes a (by, value) locator."""
+
+    def __init__(self, driver: WebDriver, timeout: Optional[float] = None):
+        self.driver = driver
+        self.timeout = timeout or settings.EXPLICIT_WAIT_SECONDS
+
+    # ------------------------------------------------------------------
+    def wait_for(self, by, value: str, condition="visible") -> WebElement:
+        wait = WebDriverWait(self.driver, self.timeout)
+        locator = (by, value)
+        if condition == "clickable":
+            return wait.until(EC.element_to_be_clickable(locator))
+        if condition == "present":
+            return wait.until(EC.presence_of_element_located(locator))
+        return wait.until(EC.visibility_of_element_located(locator))
+
+    def find(self, by, value: str) -> WebElement:
+        return self.wait_for(by, value, condition="present")
+
+    # ------------------------------------------------------------------
+    def _ensure_in_view(self, el: WebElement) -> None:
+        """Proactively scrolls an element into the center of the viewport
+        if it isn't already fully visible there, with a brief settle pause.
+        The WebDriver spec has native click()/send_keys() auto-scroll an
+        element into view, but only just enough to be minimally on-screen -
+        not necessarily clear of sticky/fixed-position headers, footers, or
+        cookie banners, which is the most common real-world cause of a
+        recorded step needing a manual scroll to "reveal" the element it's
+        targeting, or a click landing on the wrong thing underneath an
+        overlapping element. Skips the extra scroll+wait entirely when the
+        element is already fully in view, so normal steps aren't slowed
+        down by this."""
+        try:
+            already_in_view = self.driver.execute_script(
+                "var r = arguments[0].getBoundingClientRect();"
+                "return r.top >= 0 && r.left >= 0 && r.bottom <= (window.innerHeight || document.documentElement.clientHeight)"
+                " && r.right <= (window.innerWidth || document.documentElement.clientWidth);",
+                el,
+            )
+        except Exception:
+            return  # can't tell (stale/detached element etc.) - let the caller's own wait/retry logic handle it
+        if not already_in_view:
+            try:
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", el)
+                time.sleep(0.15)  # give sticky headers/animations a moment to settle post-scroll
+            except Exception:
+                pass
+
+    def click(self, by, value: str) -> None:
+        el = self.wait_for(by, value, condition="clickable")
+        self._ensure_in_view(el)
+        try:
+            el.click()
+        except (ElementClickInterceptedException, ElementNotInteractableException):
+            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            self.driver.execute_script("arguments[0].click();", el)
+
+    def double_click(self, by, value: str) -> None:
+        el = self.wait_for(by, value, condition="clickable")
+        self._ensure_in_view(el)
+        ActionChains(self.driver).double_click(el).perform()
+
+    def right_click(self, by, value: str) -> None:
+        el = self.wait_for(by, value, condition="clickable")
+        self._ensure_in_view(el)
+        ActionChains(self.driver).context_click(el).perform()
+
+    def type(self, by, value: str, text: str, clear_first: bool = True) -> None:
+        el = self.wait_for(by, value, condition="visible")
+        self._ensure_in_view(el)
+        if clear_first:
+            try:
+                el.clear()
+            except (ElementNotInteractableException, StaleElementReferenceException):
+                pass
+        el.send_keys(text)
+        self._verify_typed_value(el, text)
+
+    def _verify_typed_value(self, el: WebElement, text: str) -> None:
+        """Segmented/auto-advancing inputs (the most common real case:
+        4-6 separate single-digit OTP/PIN boxes) are almost always
+        React/Angular "controlled" fields - the app's own JS re-validates
+        and can shift focus to the next box on every keystroke. send_keys()
+        racing against that can occasionally drop or overwrite a
+        character, leaving a box wrong or empty with no error at all -
+        just a "Verify"-style button that never enables, which looks like
+        execution silently stalling on the login screen. One quick,
+        cheap re-check (and a single retry if it doesn't match) closes
+        that race without slowing down the much more common case where
+        nothing needed retrying."""
+        if not text:
+            return
+        try:
+            actual = self.driver.execute_script("return arguments[0].value;", el)
+        except Exception:
+            return  # can't verify (e.g. not a value-bearing element) - not worth failing the step over
+        if actual == text:
+            return
+        try:
+            el.clear()
+        except (ElementNotInteractableException, StaleElementReferenceException):
+            pass
+        el.send_keys(text)
+
+    def clear(self, by, value: str) -> None:
+        el = self.wait_for(by, value, condition="visible")
+        el.clear()
+
+    def select(self, by, value: str, option_text: Optional[str] = None, option_value: Optional[str] = None) -> None:
+        el = self.wait_for(by, value, condition="visible")
+        self._ensure_in_view(el)
+        select = Select(el)
+        if option_value is not None:
+            select.select_by_value(option_value)
+        elif option_text is not None:
+            select.select_by_visible_text(option_text)
+
+    def check(self, by, value: str) -> None:
+        el = self.wait_for(by, value, condition="clickable")
+        self._ensure_in_view(el)
+        if not el.is_selected():
+            el.click()
+
+    def uncheck(self, by, value: str) -> None:
+        el = self.wait_for(by, value, condition="clickable")
+        self._ensure_in_view(el)
+        if el.is_selected():
+            el.click()
+
+    def hover(self, by, value: str) -> None:
+        el = self.wait_for(by, value, condition="visible")
+        self._ensure_in_view(el)
+        ActionChains(self.driver).move_to_element(el).perform()
+
+    def scroll_to(self, by, value: str) -> None:
+        el = self.find(by, value)
+        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+
+    def press_key(self, by, value: str, key: str) -> None:
+        el = self.wait_for(by, value, condition="visible")
+        self._ensure_in_view(el)
+        key_obj = getattr(Keys, key.upper(), None)
+        el.send_keys(key_obj if key_obj else key)
+
+    def submit(self, by, value: str) -> None:
+        el = self.wait_for(by, value, condition="present")
+        try:
+            el.submit()
+        except Exception:
+            el.click()
+
+    def upload(self, by, value: str, file_path: str) -> None:
+        el = self.find(by, value)
+        el.send_keys(file_path)
+
+    def switch_to_frame(self, by, value: str) -> None:
+        el = self.find(by, value)
+        self.driver.switch_to.frame(el)
+
+    def switch_to_default(self) -> None:
+        self.driver.switch_to.default_content()
+
+    def switch_window(self, handle: Optional[str] = None) -> None:
+        if handle:
+            self.driver.switch_to.window(handle)
+        else:
+            handles = self.driver.window_handles
+            if handles:
+                self.driver.switch_to.window(handles[-1])
+        # A freshly-opened window/tab (e.g. an SSO/login popup) sometimes
+        # doesn't get real OS/browser focus just from switch_to.window() -
+        # a known Selenium quirk where the *first* click/keystroke after
+        # switching into a new window is "swallowed" (the click seems to
+        # focus the window itself rather than reach the page), making it
+        # look like the target needs a second click to actually respond.
+        # A harmless window.focus() call closes that gap.
+        try:
+            self.driver.execute_script("window.focus();")
+        except Exception:
+            pass
+
+    def navigate_back(self) -> None:
+        self.driver.back()
+
+    def navigate_forward(self) -> None:
+        self.driver.forward()
+
+    def is_present(self, by, value: str, timeout: float = 2.0) -> bool:
+        try:
+            WebDriverWait(self.driver, timeout).until(EC.presence_of_element_located((by, value)))
+            return True
+        except TimeoutException:
+            return False
