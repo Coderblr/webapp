@@ -1,121 +1,489 @@
 """
-Central configuration for the Universal AI-Powered Web Automation Platform.
+Shared data models for the platform.
 
-All configuration is environment-driven (see .env.example). Nothing
-application-specific (no business domain, no site names) lives here -
-this module only knows about infrastructure concerns: paths, browser
-defaults, and AI provider credentials.
+These dataclasses are the contract every other module (recorder, generator,
+execution, healing, reporting) builds on. Keeping them centralized is what
+lets Layer A (locator repository) and Layer B (execution dataset) stay
+logically separate while still referencing the same underlying concepts.
 
-NOTE: this build has value masking disabled throughout (recorder,
-executor, logs) - it's configured for UAT use, where recorded/executed
-values are written to the Excel dataset, logs, and reports as-is. Do not
-point this configuration at a production environment.
+Nothing here is application-specific: no field is named after a business
+concept (no "account_number", no "login_button"). Everything is generic
+DOM/action vocabulary.
 """
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
-from dotenv import load_dotenv
-
-# Load .env from the project root (one level above backend/) if present.
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(_PROJECT_ROOT / ".env")
+import time
+import uuid
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from typing import Any, Dict, List, Optional
 
 
-def _bool(name: str, default: bool) -> bool:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    return val.strip().lower() in ("1", "true", "yes", "on")
+def new_id(prefix: str = "") -> str:
+    suffix = uuid.uuid4().hex[:12]
+    return f"{prefix}{suffix}" if prefix else suffix
 
 
-def _resolve(path_str: str) -> Path:
-    p = Path(path_str)
-    if not p.is_absolute():
-        p = (Path(__file__).resolve().parent / p).resolve()
-    return p
+def now_ts() -> float:
+    return time.time()
 
 
-class Settings:
-    """Runtime settings, resolved once at import time."""
+# --------------------------------------------------------------------------
+# Action vocabulary (Layer B - user execution recording)
+class StrValueEnum(str, Enum):
+    """Base for every (str, Enum) in this module. Plain `class X(str, Enum)`
+    still uses Enum.__str__ by default (-> "ActionType.CLICK" instead of
+    "CLICK"), which silently corrupts anything that interpolates a member
+    into an f-string/format spec (Excel cells, generated code, report
+    text). Overriding __str__ to return the value fixes str(), f-strings,
+    and format-spec interpolation all at once, while asdict()/json.dumps
+    already worked correctly (they serialize str subclasses by value)."""
 
-    # --- General ---
-    APP_ENV: str = os.getenv("APP_ENV", "development")
-    APP_HOST: str = os.getenv("APP_HOST", "0.0.0.0")
-    APP_PORT: int = int(os.getenv("APP_PORT", "8000"))
-    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-
-    PROJECT_ROOT: Path = _PROJECT_ROOT
-    RECORDINGS_DIR: Path = _resolve(os.getenv("RECORDINGS_DIR", "../recordings"))
-    REPORTS_DIR: Path = _resolve(os.getenv("REPORTS_DIR", "../reports"))
-    LOGS_DIR: Path = _resolve(os.getenv("LOGS_DIR", "../logs"))
-    FRONTEND_DIR: Path = _PROJECT_ROOT / "frontend"
-
-    # --- Browser ---
-    DEFAULT_BROWSER: str = os.getenv("DEFAULT_BROWSER", "chrome")
-    BROWSER_HEADLESS: bool = _bool("BROWSER_HEADLESS", False)
-    IMPLICIT_WAIT_SECONDS: float = float(os.getenv("IMPLICIT_WAIT_SECONDS", "2"))
-    EXPLICIT_WAIT_SECONDS: float = float(os.getenv("EXPLICIT_WAIT_SECONDS", "10"))
-    # Used only for fallback locator attempts (selenium_executor.py's
-    # execute_with_fallbacks), never for the primary locator. The primary
-    # attempt gets the full EXPLICIT_WAIT_SECONDS since a page may
-    # genuinely still be loading. By the time a fallback is tried, that
-    # full wait has already happened once for this step - waiting another
-    # complete EXPLICIT_WAIT_SECONDS for EACH of up to 3 fallback locators
-    # in turn (up to 30+ seconds on top of the primary's own 10s) is what
-    # made data-heavy screens with several failing/ambiguous locators (many
-    # radio buttons, a variable-length row table, ...) take minutes to
-    # execute - almost all of that time was spent waiting out timeouts,
-    # not doing anything. A short, separate timeout here keeps fallback
-    # attempts fast without shortening the one wait that actually matters
-    # (the primary locator's).
-    FALLBACK_WAIT_SECONDS: float = float(os.getenv("FALLBACK_WAIT_SECONDS", "3"))
-
-    # A step marked "Optional_Step" in the Excel dataset (e.g. a table row
-    # that only renders for some denomination/amount combinations, or one
-    # branch of a conditional maker-checker workflow) is EXPECTED to
-    # sometimes not exist on the live page at all - unlike a normal step,
-    # spending the full EXPLICIT_WAIT_SECONDS and then running AI
-    # self-healing on it is pure wasted time, since there is nothing for
-    # self-healing to find (the element genuinely isn't there this run, not
-    # merely moved/renamed). Optional steps get this short, separate wait
-    # instead, and skip self-healing entirely - see Executor._run_step().
-    OPTIONAL_STEP_WAIT_SECONDS: float = float(os.getenv("OPTIONAL_STEP_WAIT_SECONDS", "3"))
-
-    # Manual driver binary paths. When set, browser_factory.py uses these
-    # directly instead of asking webdriver-manager to auto-download a
-    # matching driver - required on machines with no internet access or
-    # where outbound downloads are blocked (e.g. corporate/offline setups).
-    # Leave blank to keep the automatic download behavior.
-    CHROME_DRIVER_PATH: str = os.getenv("CHROME_DRIVER_PATH", "").strip()
-    EDGE_DRIVER_PATH: str = os.getenv("EDGE_DRIVER_PATH", "").strip()
-
-    # --- AI ---
-    DEFAULT_AI_PROVIDER: str = os.getenv("DEFAULT_AI_PROVIDER", "azure_openai")
-    AI_ENABLED: bool = _bool("AI_ENABLED", True)
-
-    AZURE_OPENAI_API_KEY: str = os.getenv("AZURE_OPENAI_API_KEY", "")
-    AZURE_OPENAI_ENDPOINT: str = os.getenv("AZURE_OPENAI_ENDPOINT", "")
-    AZURE_OPENAI_DEPLOYMENT: str = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-    AZURE_OPENAI_API_VERSION: str = os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview")
-
-    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
-    CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
-
-    DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
-    DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-
-    # --- Self-healing ---
-    HEALING_CONFIDENCE_THRESHOLD: float = float(os.getenv("HEALING_CONFIDENCE_THRESHOLD", "0.75"))
-    HEALING_MAX_CANDIDATES: int = int(os.getenv("HEALING_MAX_CANDIDATES", "15"))
-
-    @classmethod
-    def ensure_dirs(cls) -> None:
-        for d in (cls.RECORDINGS_DIR, cls.REPORTS_DIR, cls.LOGS_DIR):
-            d.mkdir(parents=True, exist_ok=True)
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return str(self.value)
 
 
-settings = Settings()
-settings.ensure_dirs()
+# --------------------------------------------------------------------------
+class ActionType(StrValueEnum):
+    OPEN_URL = "OPEN_URL"
+    CLICK = "CLICK"
+    DOUBLE_CLICK = "DOUBLE_CLICK"
+    RIGHT_CLICK = "RIGHT_CLICK"
+    TYPE = "TYPE"
+    CLEAR = "CLEAR"
+    SELECT = "SELECT"
+    CHECK = "CHECK"
+    UNCHECK = "UNCHECK"
+    HOVER = "HOVER"
+    SCROLL = "SCROLL"
+    PRESS_KEY = "PRESS_KEY"
+    PRESS_ENTER = "PRESS_ENTER"
+    PRESS_TAB = "PRESS_TAB"
+    WAIT = "WAIT"
+    SUBMIT = "SUBMIT"
+    UPLOAD = "UPLOAD"
+    SWITCH_FRAME = "SWITCH_FRAME"
+    SWITCH_WINDOW = "SWITCH_WINDOW"
+    NEW_TAB = "NEW_TAB"
+    CLOSE_TAB = "CLOSE_TAB"
+    NAVIGATE_BACK = "NAVIGATE_BACK"
+    NAVIGATE_FORWARD = "NAVIGATE_FORWARD"
+    CAPTURE = "CAPTURE"               # reads an element's CURRENT live value/text into a {{variable}}
+                                       # for later reuse - see Capture -> Store -> Reuse in recorder.py
+
+
+class LocatorStrategy(StrValueEnum):
+    ID = "ID"
+    NAME = "NAME"
+    CSS = "CSS"
+    XPATH = "XPATH"
+    RELATIVE_XPATH = "RELATIVE_XPATH"
+    LINK_TEXT = "LINK_TEXT"
+    PARTIAL_LINK_TEXT = "PARTIAL_LINK_TEXT"
+    ACCESSIBILITY = "ACCESSIBILITY"       # aria-label / role based
+    TEXT = "TEXT"                         # visible text based
+    DATA_TESTID = "DATA_TESTID"
+    ATTRIBUTE = "ATTRIBUTE"               # generic data-* / custom attribute
+    SHADOW_PATH = "SHADOW_PATH"           # shadow DOM traversal path
+
+
+class ReliabilityLevel(StrValueEnum):
+    HIGH = "HIGH"
+    MEDIUM_HIGH = "MEDIUM_HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+
+
+# Base reliability weight per strategy - used by locator_engine to score.
+STRATEGY_BASE_RELIABILITY: Dict[str, float] = {
+    LocatorStrategy.DATA_TESTID: 0.97,
+    LocatorStrategy.ID: 0.95,
+    LocatorStrategy.NAME: 0.85,
+    LocatorStrategy.ACCESSIBILITY: 0.80,
+    LocatorStrategy.CSS: 0.70,
+    LocatorStrategy.LINK_TEXT: 0.65,
+    LocatorStrategy.ATTRIBUTE: 0.60,
+    LocatorStrategy.TEXT: 0.55,
+    LocatorStrategy.PARTIAL_LINK_TEXT: 0.50,
+    LocatorStrategy.RELATIVE_XPATH: 0.45,
+    LocatorStrategy.XPATH: 0.30,
+    LocatorStrategy.SHADOW_PATH: 0.40,
+}
+
+
+def reliability_level(score: float) -> str:
+    if score >= 0.85:
+        return ReliabilityLevel.HIGH
+    if score >= 0.65:
+        return ReliabilityLevel.MEDIUM_HIGH
+    if score >= 0.45:
+        return ReliabilityLevel.MEDIUM
+    return ReliabilityLevel.LOW
+
+
+# --------------------------------------------------------------------------
+# Layer A: Locator / DOM knowledge repository models
+# --------------------------------------------------------------------------
+@dataclass
+class LocatorCandidate:
+    strategy: str
+    value: str
+    reliability_score: float = 0.0
+    reliability_level: str = ReliabilityLevel.LOW
+
+    def __post_init__(self):
+        # Normalize to a plain string value even if a LocatorStrategy enum
+        # member was passed in - `class X(str, Enum)` members still use
+        # Enum.__str__ (-> "LocatorStrategy.ID") unless coerced explicitly,
+        # which would otherwise leak into Excel cells, JSON, and generated
+        # Page Object locator dicts.
+        if isinstance(self.strategy, LocatorStrategy):
+            self.strategy = self.strategy.value
+        else:
+            self.strategy = str(self.strategy)
+
+        if not self.reliability_score:
+            self.reliability_score = STRATEGY_BASE_RELIABILITY.get(self.strategy, 0.4)
+        level = reliability_level(self.reliability_score)
+        self.reliability_level = level.value if isinstance(level, ReliabilityLevel) else str(level)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class FramePath:
+    """Describes the full iframe nesting path required to reach an element."""
+    path: List[Dict[str, Any]] = field(default_factory=list)  # each: {frame_locator, frame_index, id, name}
+    nested_depth: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @property
+    def is_top_level(self) -> bool:
+        return self.nested_depth == 0 or not self.path
+
+
+@dataclass
+class ShadowPath:
+    """Describes a shadow DOM traversal path (list of host selectors)."""
+    hosts: List[str] = field(default_factory=list)
+    final_selector: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @property
+    def is_shadow(self) -> bool:
+        return bool(self.hosts)
+
+
+@dataclass
+class ElementRecord:
+    element_id: str
+    page_id: str
+    dom_signature: str
+    tag: str
+    attributes: Dict[str, Any] = field(default_factory=dict)
+    text: str = ""
+    role: str = ""
+    visible: bool = True
+    enabled: bool = True
+    interactable: bool = True
+    bounding_box: Dict[str, float] = field(default_factory=dict)
+    parent_signature: str = ""
+    child_signatures: List[str] = field(default_factory=list)
+    locators: List[LocatorCandidate] = field(default_factory=list)
+    frame_path: Optional[FramePath] = None
+    shadow_path: Optional[ShadowPath] = None
+    component_type: str = ""       # e.g. "input", "button", "dropdown", "table_row" (structural, not business)
+    discovered_at: float = field(default_factory=now_ts)
+    last_seen_at: float = field(default_factory=now_ts)
+    dynamic: bool = False          # discovered via mutation observer after initial crawl
+
+    def best_locator(self) -> Optional[LocatorCandidate]:
+        if not self.locators:
+            return None
+        return max(self.locators, key=lambda l: l.reliability_score)
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        return d
+
+
+@dataclass
+class ModalRecord:
+    modal_id: str
+    page_id: str
+    container_signature: str
+    modal_type: str  # modal | popup | overlay | toast | dialog | side_panel | dropdown_overlay
+    trigger_element_id: Optional[str] = None
+    trigger_action_step: Optional[int] = None
+    appeared_relative_to_action: str = "after"  # "before" | "after"
+    child_element_ids: List[str] = field(default_factory=list)
+    detected_via: List[str] = field(default_factory=list)  # which heuristics matched
+    frame_path: Optional[FramePath] = None
+    discovered_at: float = field(default_factory=now_ts)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class FrameRecord:
+    frame_id: str
+    page_id: str
+    frame_locator: str
+    frame_index: int
+    parent_frame_id: Optional[str]
+    nested_depth: int
+    src: str = ""
+    name: str = ""
+    discovered_at: float = field(default_factory=now_ts)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class PageRecord:
+    page_id: str
+    url: str
+    title: str = ""
+    normalized_key: str = ""       # url path w/o volatile query params - used for page-object naming/dedup
+    first_seen_at: float = field(default_factory=now_ts)
+    last_seen_at: float = field(default_factory=now_ts)
+    dom_snapshot_path: str = ""
+    screenshot_path: str = ""
+    element_ids: List[str] = field(default_factory=list)
+    modal_ids: List[str] = field(default_factory=list)
+    frame_ids: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# --------------------------------------------------------------------------
+# Layer B: User execution recording models
+# --------------------------------------------------------------------------
+@dataclass
+class ActionRecord:
+    step_number: int
+    action: str                       # ActionType
+    timestamp: float = field(default_factory=now_ts)
+    page_url: str = ""
+    page_title: str = ""
+    page_id: str = ""
+    element_id: Optional[str] = None
+    element_text: str = ""
+    element_tag: str = ""
+    element_name: str = ""            # human-friendly generated name, e.g. "email_input_1"
+    primary_locator_type: str = ""
+    primary_locator: str = ""
+    fallback_locators: List[Dict[str, str]] = field(default_factory=list)  # [{type, value}]
+    value: str = ""
+    test_data_key: Optional[str] = None   # e.g. "{{USERNAME}}" placeholder key
+    # Capture -> Store -> Reuse (see recorder.py's _derive_variable_name /
+    # correlation logic, and execution/variable_store.py): a value the app
+    # itself GENERATES fresh every run (an application ID, a reference
+    # number, a freshly-issued OTP) can't be replayed as a static literal -
+    # it's different every execution. When the user copies such a value
+    # during recording, captured_as names the {{variable}} it's stored
+    # under; any LATER step whose recorded value exactly matched that copy
+    # gets resolved_var set to the same name, so at execution time it's
+    # re-read live and re-typed live instead of replaying the stale
+    # recorded string. Independent of test_data_key/Test Data overrides -
+    # an explicit override still wins if both are present.
+    captured_as: Optional[str] = None
+    resolved_var: Optional[str] = None
+    frame_path: Optional[FramePath] = None
+    window_context: str = ""
+    modal_context: Optional[str] = None
+    wait_condition: str = ""
+    # Marks a step whose target element is EXPECTED to sometimes be absent
+    # on the live page - e.g. a denomination-table row that only renders
+    # for certain amounts, or one branch of a conditional/maker-checker
+    # workflow that the recorded run happened to take but a later run
+    # might not. Never set by the recorder itself (there is no reliable
+    # way to auto-detect "this element is conditionally absent" from a
+    # single recording) - it is a manual designation the user adds in
+    # Review & Edit Steps after seeing a step fail for a data/flow reason
+    # rather than a locator bug. When true, a failed lookup gets a short
+    # wait (OPTIONAL_STEP_WAIT_SECONDS), skips AI self-healing entirely,
+    # and is reported as SKIP rather than FAIL - see Executor._run_step().
+    is_optional: bool = False
+    expected_result: str = ""
+    screenshot: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        return d
+
+    def to_flat_row(self) -> Dict[str, Any]:
+        """Flattened representation matching the Excel execution schema."""
+        fb = self.fallback_locators or []
+        return {
+            "Step_Number": self.step_number,
+            "Action": self.action,
+            "Page_URL": self.page_url,
+            "Page_Title": self.page_title,
+            "Element_Name": self.element_name,
+            "Element_Text": self.element_text,
+            "Element_Tag": self.element_tag,
+            "Primary_Locator_Type": self.primary_locator_type,
+            "Primary_Locator": self.primary_locator,
+            "Fallback_Locator_1": _fb_value(fb, 0),
+            "Fallback_Locator_2": _fb_value(fb, 1),
+            "Fallback_Locator_3": _fb_value(fb, 2),
+            "Value": self.value,
+            "Test_Data_Key": self.test_data_key or "",
+            "Captured_As": self.captured_as or "",
+            "Resolved_Variable": self.resolved_var or "",
+            "Frame_Path": _frame_path_str(self.frame_path),
+            "Window_Context": self.window_context,
+            "Modal_Context": self.modal_context or "",
+            "Wait_Condition": self.wait_condition,
+            "Optional_Step": "Y" if self.is_optional else "",
+            "Expected_Result": self.expected_result,
+            "Screenshot": self.screenshot,
+        }
+
+
+def _fb_value(fallbacks: List[Dict[str, str]], idx: int) -> str:
+    if idx < len(fallbacks):
+        f = fallbacks[idx]
+        return f"{f.get('type', '')}::{f.get('value', '')}"
+    return ""
+
+
+def _frame_path_str(fp: Optional[FramePath]) -> str:
+    """Serialized as JSON (not a display string) so the executor can
+    losslessly reconstruct the FramePath to drive Selenium through the
+    exact same iframe hierarchy that was recorded. Empty string means
+    top-level document (no frames)."""
+    if not fp or not fp.path:
+        return ""
+    import json as _json
+    return _json.dumps(fp.to_dict())
+
+
+def parse_frame_path(value: str) -> Optional["FramePath"]:
+    if not value:
+        return None
+    import json as _json
+    try:
+        data = _json.loads(value)
+        return FramePath(**data)
+    except (ValueError, TypeError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# Recording metadata
+# --------------------------------------------------------------------------
+@dataclass
+class RecordingMetadata:
+    recording_id: str
+    name: str
+    target_url: str
+    created_at: float = field(default_factory=now_ts)
+    updated_at: float = field(default_factory=now_ts)
+    status: str = "in_progress"   # in_progress | stopped | paused
+    browser: str = "chrome"
+    total_steps: int = 0
+    total_pages: int = 0
+    total_executions: int = 0
+    last_execution_at: Optional[float] = None
+    test_data_keys: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# --------------------------------------------------------------------------
+# Healing event model
+# --------------------------------------------------------------------------
+@dataclass
+class HealingEvent:
+    healing_id: str
+    step_number: int
+    page_url: str
+    old_locator_type: str
+    old_locator: str
+    new_locator_type: str
+    new_locator: str
+    confidence: float
+    healing_method: str        # "fallback" | "repository" | "dom_similarity" | "ai_semantic"
+    reason: str = ""
+    timestamp: float = field(default_factory=now_ts)
+    applied: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# --------------------------------------------------------------------------
+# Execution result models
+# --------------------------------------------------------------------------
+@dataclass
+class StepResult:
+    step_number: int
+    action: str
+    page_url: str
+    element_name: str
+    locator_used: str
+    locator_strategy: str
+    input_data: str
+    expected_result: str
+    actual_result: str
+    execution_time_ms: float
+    status: str                 # PASS | FAIL | SKIP | HEALED
+    screenshot: str = ""
+    error: str = ""
+    healing_event: Optional[Dict[str, Any]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ExecutionSummary:
+    execution_id: str
+    recording_id: str
+    recording_name: str
+    target_url: str
+    browser: str
+    start_time: float
+    end_time: Optional[float] = None
+    total_steps: int = 0
+    passed: int = 0
+    failed: int = 0
+    skipped: int = 0
+    healed: int = 0
+    step_results: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def duration_seconds(self) -> float:
+        if self.end_time is None:
+            return 0.0
+        return round(self.end_time - self.start_time, 2)
+
+    @property
+    def pass_percentage(self) -> float:
+        if self.total_steps == 0:
+            return 0.0
+        return round(100.0 * self.passed / self.total_steps, 2)
+
+    @property
+    def fail_percentage(self) -> float:
+        if self.total_steps == 0:
+            return 0.0
+        return round(100.0 * self.failed / self.total_steps, 2)
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["duration_seconds"] = self.duration_seconds
+        d["pass_percentage"] = self.pass_percentage
+        d["fail_percentage"] = self.fail_percentage
+        return d
