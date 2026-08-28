@@ -1,618 +1,70 @@
-/*
- * bridge.js
- * ---------------------------------------------------------------------
- * Injected into every document (top-level page AND every iframe the
- * recorder descends into) via Selenium's execute_script. Defines a
- * single window.__UA__ namespace that the Python side polls.
- *
- * This file is 100% generic: no selector, class name, id, or business
- * term from any specific application is hardcoded. Every heuristic
- * below is based on structural/semantic DOM characteristics (role,
- * aria-*, tag, generic class-name *patterns*, computed style) so the
- * same script works against any Angular / React / Vue / plain-JS /
- * Bootstrap / jQuery / enterprise UI site.
- *
- * Safe to inject multiple times (idempotent) because everything is
- * guarded behind `if (!window.__UA__)`.
- * ---------------------------------------------------------------------
- */
-(function () {
-  if (window.__UA__) {
-    return; // already initialized in this document/frame
-  }
+"""
+event_listener.py
 
-  const UA = {
-    eventQueue: [],
-    mutationQueue: [],
-    _observer: null,
-    _listenersAttached: false,
-    _seenSignatures: new Set(),
-  };
+Wraps bridge.js's document-level (capture-phase) event listeners, and
+translates the raw browser events it queues into the platform's generic
+ActionType vocabulary (CLICK, TYPE, SELECT, CHECK, ... - see
+storage/models.py). This is the module that makes "manual recording"
+possible: the user just uses the app normally in the Selenium-controlled
+browser, and every meaningful interaction is captured here.
+"""
+from __future__ import annotations
 
-  // ---- Cross-navigation event persistence ----------------------------
-  // A committed "change" event (e.g. a password field losing focus right
-  // before its form's Submit navigates the browser) can be queued here in
-  // JS memory and then never make it back to Python: the ~0.5s polling
-  // interval may not get a chance to drain the queue before the document
-  // is torn down by the navigation, silently losing that action's value
-  // (or, worse, letting a later action on the next page get logged in its
-  // place). To close that gap, stash any still-queued events into
-  // sessionStorage right before unload, and recover them into the fresh
-  // page's queue on injection - sessionStorage survives same-tab
-  // navigation (it does not survive a full external redirect to another
-  // origin, which is a page-storage limitation, not something JS can work
-  // around).
-  const PENDING_KEY = "__UA_pending_events__";
+from typing import Any, Dict, List, Optional
 
-  (function recoverPendingEvents() {
-    try {
-      const raw = window.sessionStorage.getItem(PENDING_KEY);
-      if (raw) {
-        window.sessionStorage.removeItem(PENDING_KEY);
-        const arr = JSON.parse(raw);
-        if (Array.isArray(arr) && arr.length) {
-          // recovered (older, pre-navigation) events go first so they
-          // drain - and get recorded - ahead of anything new on this page
-          UA.eventQueue = arr.concat(UA.eventQueue);
-        }
-      }
-    } catch (e) { /* sessionStorage unavailable/blocked - nothing we can do */ }
-  })();
+from selenium.webdriver.remote.webdriver import WebDriver
 
-  window.addEventListener("beforeunload", function () {
-    try {
-      if (UA.eventQueue.length) {
-        let existing = [];
-        const raw = window.sessionStorage.getItem(PENDING_KEY);
-        if (raw) {
-          try { existing = JSON.parse(raw) || []; } catch (e) { existing = []; }
-        }
-        window.sessionStorage.setItem(PENDING_KEY, JSON.stringify(existing.concat(UA.eventQueue)));
-      }
-    } catch (e) { /* ignore - best effort only */ }
-  }, true);
+from backend.recorder import js_bridge
+from backend.storage.models import ActionType
 
-  // ---- helpers -----------------------------------------------------
-  function safeAttr(el, name) {
-    try {
-      const v = el.getAttribute(name);
-      return v === null ? "" : v;
-    } catch (e) {
-      return "";
-    }
-  }
+# Raw JS event type -> platform ActionType. Some JS event types (e.g.
+# "typing") are transient/debounced signals used only to build up live
+# "typing in progress" UI feedback; the *committed* value arrives via the
+# "type"/"change" event and is what actually becomes an ActionRecord.
+_TYPE_MAP: Dict[str, str] = {
+    "click": ActionType.CLICK,
+    "dblclick": ActionType.DOUBLE_CLICK,
+    "contextmenu": ActionType.RIGHT_CLICK,
+    "type": ActionType.TYPE,
+    "select": ActionType.SELECT,
+    "check": ActionType.CHECK,
+    "uncheck": ActionType.UNCHECK,
+    "hover": ActionType.HOVER,
+    "scroll": ActionType.SCROLL,
+    "submit": ActionType.SUBMIT,
+    "press_enter": ActionType.PRESS_ENTER,
+    "press_tab": ActionType.PRESS_TAB,
+    # Capture -> Store -> Reuse (see recorder.py's correlation logic): the
+    # user copying a value off the screen (Ctrl+C on a system-generated
+    # application ID / reference number / OTP) is the signal that this
+    # value must be re-read live at execution time, not replayed as a
+    # stale recorded literal.
+    "copy": ActionType.CAPTURE,
+    # A file input's own `.value` is always a browser-redacted fake path -
+    # bridge.js records this as its own event (with an explicit
+    # PROVIDE_FILE_PATH placeholder) rather than letting it fall into the
+    # generic "type" case, which used to silently record a non-functional
+    # value that looked fine during recording but did nothing on replay.
+    "upload": ActionType.UPLOAD,
+}
 
-  function isVisible(el) {
-    try {
-      const style = window.getComputedStyle(el);
-      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
-        return false;
-      }
-      const rect = el.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0;
-    } catch (e) {
-      return false;
-    }
-  }
+# Raw events we intentionally do NOT turn into standalone ActionRecords
+# (too noisy / superseded by a "committed" event later).
+_IGNORED_RAW_TYPES = {"typing", "keydown"}
 
-  function isEnabled(el) {
-    return !(el.disabled === true || safeAttr(el, "aria-disabled") === "true");
-  }
 
-  function cssPath(el) {
-    if (!(el instanceof Element)) return "";
-    const path = [];
-    let node = el;
-    while (node && node.nodeType === Node.ELEMENT_NODE && path.length < 8) {
-      let selector = node.nodeName.toLowerCase();
-      if (node.id) {
-        selector += "#" + CSS.escape(node.id);
-        path.unshift(selector);
-        break;
-      } else {
-        let sibling = node;
-        let nth = 1;
-        while ((sibling = sibling.previousElementSibling)) {
-          if (sibling.nodeName.toLowerCase() === selector) nth++;
-        }
-        selector += ":nth-of-type(" + nth + ")";
-      }
-      path.unshift(selector);
-      node = node.parentElement;
-    }
-    return path.join(" > ");
-  }
+def start(driver: WebDriver) -> None:
+    js_bridge.call(driver, "window.__UA__.startEventListeners(); return true;")
 
-  function xpath(el) {
-    if (!(el instanceof Element)) return "";
-    if (el.id) return '//*[@id="' + el.id + '"]';
-    const parts = [];
-    let node = el;
-    while (node && node.nodeType === Node.ELEMENT_NODE) {
-      let index = 1;
-      let sibling = node.previousSibling;
-      while (sibling) {
-        if (sibling.nodeType === Node.ELEMENT_NODE && sibling.nodeName === node.nodeName) index++;
-        sibling = sibling.previousSibling;
-      }
-      parts.unshift(node.nodeName.toLowerCase() + "[" + index + "]");
-      node = node.parentElement;
-    }
-    return "/" + parts.join("/");
-  }
 
-  function domSignature(el) {
-    // A best-effort stable-ish fingerprint: tag + id/name/testid + class + position among siblings.
-    const tag = el.nodeName.toLowerCase();
-    const id = safeAttr(el, "id");
-    const testId = safeAttr(el, "data-testid") || safeAttr(el, "data-test-id") || safeAttr(el, "data-qa");
-    const name = safeAttr(el, "name");
-    const cls = (el.className && typeof el.className === "string") ? el.className.trim().split(/\s+/).slice(0, 3).join(".") : "";
-    let idx = 0;
-    if (el.parentElement) {
-      idx = Array.prototype.indexOf.call(el.parentElement.children, el);
-    }
-    return [tag, id, testId, name, cls, idx].join("|");
-  }
+def drain(driver: WebDriver) -> List[Dict[str, Any]]:
+    try:
+        return js_bridge.call(driver, "return window.__UA__.drainEvents();") or []
+    except Exception:
+        return []
 
-  function collectDataAttrs(el) {
-    const out = {};
-    for (const attr of el.attributes || []) {
-      if (attr.name.startsWith("data-") || attr.name.startsWith("aria-")) {
-        out[attr.name] = attr.value;
-      }
-    }
-    return out;
-  }
 
-  function textOf(el) {
-    try {
-      let t = (el.innerText || el.textContent || "").trim();
-      if (!t) t = safeAttr(el, "value") || safeAttr(el, "placeholder") || safeAttr(el, "aria-label") || safeAttr(el, "title") || safeAttr(el, "alt");
-      return t.substring(0, 200);
-    } catch (e) {
-      return "";
-    }
-  }
-
-  // Some apps (seen on a real banking dashboard: a grid of near-identical
-  // "product" cards, e.g. Gold Loan / Personal Loan / Home Loan) reuse the
-  // exact same id and class list across every visually-repeated tile -
-  // invalid HTML (ids must be unique), but it happens in the wild, and a
-  // locator built from that id/class combo silently resolves to whichever
-  // tile happens to come first in the DOM rather than the one actually
-  // recorded. build_locators() (Python side) has no live DOM access to
-  // detect this itself, so we check it here, at capture time, while we
-  // still have the real page in front of us, and hand the verdict along
-  // so the locator scoring can react to it.
-  function isUniqueSelectorOnPage(selector) {
-    if (!selector) return true;
-    try {
-      return document.querySelectorAll(selector).length <= 1;
-    } catch (e) {
-      return true; // malformed selector (unusual attribute chars, etc.) - don't penalize speculatively
-    }
-  }
-
-  // Climbs from el's PARENT upward (never el itself) looking for the
-  // closest ancestor whose own aggregated visible text is non-empty and
-  // short enough to plausibly BE a single distinguishing label (a card's
-  // title, a row's name, ...) rather than a whole section/page's worth of
-  // unrelated text. Used as a locator fallback for elements that carry no
-  // distinguishing text of their own - a decorative icon/image inside a
-  // clickable "tile" card is the most common real case: the click lands on
-  // the icon, but the CARD's title is what actually identifies which tile
-  // this is, and for a clickable-tile pattern (the whole card responds to
-  // a click, not just the icon) targeting that ancestor instead reaches
-  // the exact same outcome while actually distinguishing this tile from
-  // its look-alike siblings.
-  function nearestDistinguishingAncestor(el) {
-    try {
-      var node = el ? el.parentElement : null;
-      var depth = 0;
-      while (node && depth < 6) {
-        var t = (node.innerText || node.textContent || "").trim();
-        if (t && t.length <= 150) {
-          return { tag: node.nodeName.toLowerCase(), text: t };
-        }
-        node = node.parentElement;
-        depth++;
-      }
-    } catch (e) { /* ignore */ }
-    return null;
-  }
-
-  UA.getElementInfo = function (el) {
-    if (!el || !(el instanceof Element)) return null;
-    const rect = el.getBoundingClientRect();
-    const id = safeAttr(el, "id");
-    const classNameStr = (el.className && typeof el.className === "string") ? el.className : "";
-    const classList = classNameStr.trim().split(/\s+/).filter(Boolean);
-    const tagName = el.nodeName.toLowerCase();
-    const cssPathValue = cssPath(el);
-    return {
-      tag: tagName,
-      id: id,
-      id_unique: id ? isUniqueSelectorOnPage("#" + CSS.escape(id)) : true,
-      name: safeAttr(el, "name"),
-      class_name: classNameStr,
-      class_combo_unique: classList.length
-        ? isUniqueSelectorOnPage(tagName + "." + classList.map(function (c) { return CSS.escape(c); }).join("."))
-        : true,
-      type: safeAttr(el, "type"),
-      value: (el.value !== undefined ? String(el.value).substring(0, 200) : ""),
-      text: textOf(el),
-      placeholder: safeAttr(el, "placeholder"),
-      title: safeAttr(el, "title"),
-      role: safeAttr(el, "role"),
-      aria_label: safeAttr(el, "aria-label"),
-      aria_labelledby: safeAttr(el, "aria-labelledby"),
-      aria_describedby: safeAttr(el, "aria-describedby"),
-      data_attrs: collectDataAttrs(el),
-      href: safeAttr(el, "href"),
-      src: safeAttr(el, "src"),
-      alt: safeAttr(el, "alt"),
-      for_attr: safeAttr(el, "for"),
-      autocomplete: safeAttr(el, "autocomplete"),
-      disabled: el.disabled === true || safeAttr(el, "aria-disabled") === "true",
-      readonly: el.readOnly === true,
-      checked: el.checked === true,
-      selected: el.selected === true,
-      visible: isVisible(el),
-      enabled: isEnabled(el),
-      bounding_box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-      parent_signature: el.parentElement ? domSignature(el.parentElement) : "",
-      dom_signature: domSignature(el),
-      css_path: cssPathValue,
-      // cssPath() stops climbing the instant it finds ANY ancestor with an
-      // id (see its own comment above) and anchors the whole selector on
-      // that id, WITHOUT checking whether that id is actually unique on
-      // the page - so a repeated-card grid where every tile shares one
-      // copy-pasted id (e.g. id="dashboardPersonalLoan" on every single
-      // product card, not just one) produced a selector that looked
-      // perfectly specific ("mat-card#dashboardPersonalLoan > img:nth-of-
-      // type(1)") but silently resolved to whichever tile came first in
-      // the DOM every time, regardless of which one was actually recorded.
-      // Checking the FINAL selector's own uniqueness (rather than trying
-      // to re-derive which id it used) catches this regardless of where
-      // in the path the non-unique id sits.
-      css_path_unique: cssPathValue ? isUniqueSelectorOnPage(cssPathValue) : true,
-      xpath: xpath(el),
-      link_text: el.nodeName.toLowerCase() === "a" ? textOf(el) : "",
-      container: nearestDistinguishingAncestor(el),
-    };
-  };
-
-  // ---- DOM crawling --------------------------------------------------
-  const INTERESTING_SELECTOR = [
-    "a", "button", "input", "select", "textarea", "option", "label",
-    "[role='button']", "[role='link']", "[role='checkbox']", "[role='radio']",
-    "[role='tab']", "[role='menuitem']", "[role='option']", "[role='switch']",
-    "[onclick]", "[data-testid]", "[data-test-id]", "[data-qa]",
-    "table", "tr", "td", "th", "ul", "li", "nav", "form",
-    "[contenteditable='true']", "iframe", "[role='dialog']", "dialog"
-  ].join(",");
-
-  UA.crawlDom = function (root) {
-    root = root || document;
-    const els = root.querySelectorAll(INTERESTING_SELECTOR);
-    const out = [];
-    els.forEach(function (el) {
-      const info = UA.getElementInfo(el);
-      if (info) out.push(info);
-    });
-    return out;
-  };
-
-  // ---- Event listening -------------------------------------------------
-  function pushEvent(type, el, extra) {
-    const info = UA.getElementInfo(el);
-    if (!info) return;
-    UA.eventQueue.push(Object.assign({
-      type: type,
-      element: info,
-      timestamp: Date.now(),
-      url: window.location.href,
-      title: document.title,
-    }, extra || {}));
-  }
-
-  // The source of a copy is whatever currently has selected text - either
-  // an <input>/<textarea>'s own selection range, or the page's live text
-  // selection (window.getSelection()) for a plain read-only display element
-  // (a <span>/<div> showing a system-generated ID, the most common real
-  // case). document.activeElement is the best-effort "source element" to
-  // attach the captured value to either way.
-  function selectedTextFrom(el) {
-    try {
-      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA") &&
-          typeof el.selectionStart === "number" && el.selectionStart !== el.selectionEnd) {
-        return el.value.substring(el.selectionStart, el.selectionEnd);
-      }
-      var sel = window.getSelection();
-      return sel ? sel.toString() : "";
-    } catch (e) {
-      return "";
-    }
-  }
-
-  function recordCopy() {
-    var el = document.activeElement;
-    var text = selectedTextFrom(el);
-    if (!text) return;
-    pushEvent("copy", (el instanceof Element) ? el : document.body, { value: text });
-  }
-
-  UA.startEventListeners = function () {
-    if (UA._listenersAttached) return;
-    UA._listenersAttached = true;
-
-    document.addEventListener("click", function (e) {
-      pushEvent(e.detail === 2 ? "dblclick" : "click", e.target);
-    }, true);
-
-    document.addEventListener("dblclick", function (e) {
-      pushEvent("dblclick", e.target);
-    }, true);
-
-    document.addEventListener("contextmenu", function (e) {
-      pushEvent("contextmenu", e.target);
-    }, true);
-
-    document.addEventListener("change", function (e) {
-      const el = e.target;
-      if (el && (el.tagName === "SELECT")) {
-        pushEvent("select", el, { value: el.value, selected_text: el.options[el.selectedIndex] ? el.options[el.selectedIndex].text : "" });
-      } else if (el && el.type === "checkbox") {
-        pushEvent(el.checked ? "check" : "uncheck", el);
-      } else if (el && el.type === "radio") {
-        pushEvent("check", el);
-      } else if (el && el.type === "file") {
-        // A file input's `.value` is ALWAYS a browser-redacted fake path
-        // (e.g. "C:\fakepath\invoice.pdf") for security reasons - the real
-        // path used during recording can never be read back via JS. Before
-        // this, a file upload fell into the generic INPUT branch below and
-        // got recorded as a plain TYPE step with that fake, non-functional
-        // value - looked like it "worked" during recording, then silently
-        // did nothing useful on replay (typing a fake path into a file
-        // input selects nothing). Recording this as its own UPLOAD action
-        // with an explicit placeholder makes it obvious, in Review & Edit
-        // Steps, that a real file path for THIS execution environment
-        // still needs to be filled in - failing loudly/clearly instead of
-        // silently.
-        var fileNames = (el.files && el.files.length)
-          ? Array.prototype.map.call(el.files, function (f) { return f.name; }).join(", ")
-          : "";
-        pushEvent("upload", el, {
-          value: fileNames ? ("PROVIDE_FILE_PATH (originally uploaded: " + fileNames + ")") : "PROVIDE_FILE_PATH",
-        });
-      } else if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) {
-        pushEvent("type", el, { value: el.value });
-      }
-    }, true);
-
-    document.addEventListener("input", function (e) {
-      const el = e.target;
-      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) {
-        pushEvent("typing", el, { value: el.value !== undefined ? el.value : el.innerText });
-      }
-    }, true);
-
-    document.addEventListener("submit", function (e) {
-      pushEvent("submit", e.target);
-    }, true);
-
-    document.addEventListener("keydown", function (e) {
-      if (e.key === "Enter") {
-        pushEvent("press_enter", e.target, { key: "Enter" });
-      } else if (e.key === "Tab") {
-        pushEvent("press_tab", e.target, { key: "Tab" });
-      } else if (["Escape", "ArrowDown", "ArrowUp"].indexOf(e.key) === -1) {
-        // avoid noise from purely navigational keys; still track generic keypress
-        pushEvent("keydown", e.target, { key: e.key });
-      }
-    }, true);
-
-    // Capture -> Store -> Reuse: a value the app itself GENERATES fresh
-    // every run (an application ID, a reference number, a freshly-issued
-    // OTP) can't be replayed as a static recorded literal - it's different
-    // every execution. When the user copies such a value off the screen
-    // during recording (Ctrl+C / Edit > Copy - realistic tester behavior
-    // for a long generated ID they need to reuse a few screens later), that
-    // copy is what marks it as "this needs live re-capture, not a fixed
-    // value". The later paste/retype of that same value already gets
-    // captured normally by the existing "change" listener above (whatever
-    // ends up in the field's value, typed or pasted, fires change on blur
-    // the same way) - recorder.py correlates the two by matching value.
-    document.addEventListener("copy", recordCopy, true);
-    document.addEventListener("cut", recordCopy, true);
-
-    // NOTE: hover ("mouseover") capture is intentionally disabled. It was
-    // recording incidental mouse movement (the pointer passing over a
-    // background/overlay element on its way to the real target) as if it
-    // were a deliberate action, and even genuine hovers rarely replay
-    // reliably via Selenium (no real pointer movement, so hover-triggered
-    // CSS/JS states often never engage) - so hover steps were a frequent
-    // source of failures/timeouts that didn't reflect an actual problem
-    // with the recording or the target application. Click/type/select/etc.
-    // are unaffected; this only turns off the previous fully-generic
-    // mouseover -> "hover" action capture.
-
-    let scrollTimer = null;
-    window.addEventListener("scroll", function () {
-      clearTimeout(scrollTimer);
-      scrollTimer = setTimeout(function () {
-        UA.eventQueue.push({
-          type: "scroll",
-          element: null,
-          scroll_x: window.scrollX,
-          scroll_y: window.scrollY,
-          timestamp: Date.now(),
-          url: window.location.href,
-          title: document.title,
-        });
-      }, 400);
-    }, true);
-  };
-
-  UA.drainEvents = function () {
-    const out = UA.eventQueue;
-    UA.eventQueue = [];
-    return out;
-  };
-
-  window.addEventListener("popstate", function () {
-    UA.eventQueue.push({
-      type: "popstate",
-      element: null,
-      timestamp: Date.now(),
-      url: window.location.href,
-      title: document.title,
-    });
-  }, true);
-
-  // ---- Mutation observing -------------------------------------------
-  UA.startMutationObserver = function () {
-    if (UA._observer) return;
-    UA._observer = new MutationObserver(function (mutations) {
-      mutations.forEach(function (m) {
-        m.addedNodes.forEach(function (node) {
-          if (node.nodeType !== Node.ELEMENT_NODE) return;
-          const sig = domSignature(node);
-          if (UA._seenSignatures.has(sig)) return;
-          UA._seenSignatures.add(sig);
-          const info = UA.getElementInfo(node);
-          if (info) {
-            UA.mutationQueue.push({ change: "added", element: info, timestamp: Date.now(), url: window.location.href });
-          }
-          // also scan descendants that are individually interesting
-          try {
-            node.querySelectorAll && node.querySelectorAll(INTERESTING_SELECTOR).forEach(function (child) {
-              const csig = domSignature(child);
-              if (UA._seenSignatures.has(csig)) return;
-              UA._seenSignatures.add(csig);
-              const cinfo = UA.getElementInfo(child);
-              if (cinfo) UA.mutationQueue.push({ change: "added", element: cinfo, timestamp: Date.now(), url: window.location.href });
-            });
-          } catch (e) { /* ignore */ }
-        });
-      });
-    });
-    UA._observer.observe(document.documentElement || document.body, { childList: true, subtree: true });
-  };
-
-  UA.drainMutations = function () {
-    const out = UA.mutationQueue;
-    UA.mutationQueue = [];
-    return out;
-  };
-
-  // ---- Modal / popup / overlay detection -----------------------------
-  const MODAL_SELECTORS = [
-    ".modal", ".modal-dialog", ".modal-content", "[role='dialog']", "[role='alertdialog']",
-    "dialog", "[aria-modal='true']", ".popup", ".overlay", ".toast", ".toast-container",
-    ".notification", ".snackbar", ".drawer", ".side-panel", ".sidepanel", ".dropdown-menu.show",
-    ".ant-modal", ".mat-dialog-container", ".MuiDialog-root", ".v-dialog", ".chakra-modal__content"
-  ];
-
-  function looksLikeOverlay(el) {
-    try {
-      const style = window.getComputedStyle(el);
-      const rect = el.getBoundingClientRect();
-      const position = style.position;
-      const zIndex = parseInt(style.zIndex, 10) || 0;
-      const coversSignificantArea = rect.width > window.innerWidth * 0.25 && rect.height > window.innerHeight * 0.15;
-      return (position === "fixed" || position === "absolute") && zIndex >= 100 && coversSignificantArea && isVisible(el);
-    } catch (e) {
-      return false;
-    }
-  }
-
-  UA.detectModals = function () {
-    const found = [];
-    const seen = new Set();
-
-    MODAL_SELECTORS.forEach(function (sel) {
-      try {
-        document.querySelectorAll(sel).forEach(function (el) {
-          if (!isVisible(el)) return;
-          const sig = domSignature(el);
-          if (seen.has(sig)) return;
-          seen.add(sig);
-          found.push({ container: UA.getElementInfo(el), detected_via: ["selector:" + sel] });
-        });
-      } catch (e) { /* invalid selector variant on this app, skip */ }
-    });
-
-    // structural heuristic pass over top-level fixed/absolute large elements
-    document.querySelectorAll("body > div, body > section").forEach(function (el) {
-      if (looksLikeOverlay(el)) {
-        const sig = domSignature(el);
-        if (seen.has(sig)) return;
-        seen.add(sig);
-        found.push({ container: UA.getElementInfo(el), detected_via: ["structural:overlay-heuristic"] });
-      }
-    });
-
-    return found.map(function (m) {
-      const children = [];
-      try {
-        const containerEl = document.querySelector(m.container.css_path) ||
-          (m.container.id ? document.getElementById(m.container.id) : null);
-        if (containerEl) {
-          containerEl.querySelectorAll(INTERESTING_SELECTOR).forEach(function (c) {
-            const info = UA.getElementInfo(c);
-            if (info) children.push(info);
-          });
-        }
-      } catch (e) { /* ignore */ }
-      m.children = children;
-      return m;
-    });
-  };
-
-  // ---- Shadow DOM detection (best-effort) -----------------------------
-  UA.detectShadowRoots = function (root, depth) {
-    root = root || document;
-    depth = depth || 0;
-    if (depth > 4) return [];
-    const out = [];
-    const all = root.querySelectorAll("*");
-    all.forEach(function (el) {
-      if (el.shadowRoot) {
-        const hostInfo = UA.getElementInfo(el);
-        const children = [];
-        try {
-          el.shadowRoot.querySelectorAll(INTERESTING_SELECTOR).forEach(function (c) {
-            const info = UA.getElementInfo(c);
-            if (info) children.push(info);
-          });
-        } catch (e) { /* closed shadow root or inaccessible */ }
-        out.push({ host: hostInfo, children: children });
-        // recurse into nested shadow roots
-        const nested = UA.detectShadowRoots(el.shadowRoot, depth + 1);
-        nested.forEach(function (n) { out.push(n); });
-      }
-    });
-    return out;
-  };
-
-  // ---- Frame enumeration (top-level only; Python drives recursion) ---
-  UA.getFrames = function () {
-    const frames = document.querySelectorAll("iframe, frame");
-    const out = [];
-    frames.forEach(function (f, idx) {
-      out.push({
-        index: idx,
-        css_path: cssPath(f),
-        id: safeAttr(f, "id"),
-        name: safeAttr(f, "name"),
-        src: safeAttr(f, "src"),
-        visible: isVisible(f),
-      });
-    });
-    return out;
-  };
-
-  window.__UA__ = UA;
-})();
+def to_action_type(raw_type: str) -> Optional[str]:
+    if raw_type in _IGNORED_RAW_TYPES:
+        return None
+    return _TYPE_MAP.get(raw_type)
