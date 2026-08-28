@@ -1,551 +1,297 @@
-"""
-executor.py
+/*
+ * execution.js
+ * "Select Recording -> Execute Recording" screen (spec sections 25-28):
+ * recording dropdown, browser choice, custom test data, AI provider
+ * override, live execution progress via WebSocket.
+ */
 
-Top-level Excel-driven execution orchestrator (spec sections 19, 36,
-39). This is the "fast path" entry point the FastAPI backend calls when
-the user hits "Execute Recording":
+let executionSocket = null;
+let lastExecutionId = null;
+let lastRecordingIdForReport = null;
 
-    Excel -> Pandas -> stored locator -> Selenium -> action
-                              |
-                        (on failure)
-                              v
-                     fallback locators -> locator repository ->
-                     DOM analysis -> AI self-healing -> validate ->
-                     update repository + Excel -> continue
+// ---------------------------------------------------------------------
+// Review & Edit Steps (spec: the Excel dataset is the editable source of
+// truth for the fast execution path). The executor always re-reads
+// execution.xlsx from disk right before running, so saving edits here
+// takes effect on the very next "Execute Recording" click - no separate
+// "apply" step needed.
+// ---------------------------------------------------------------------
+let editableSteps = []; // last-loaded full row dicts (every Excel column), edited in place
+let removedStepRows = new Set(); // indices into editableSteps marked for deletion, applied on Save
+let stepColumns = []; // full Excel column list for this recording, from GET .../steps
 
-AI is never invoked on a normal passing step - only self_healer.heal()
-(called after Stage 1/2 already failed) may reach into LangChain, keeping
-the "no AI call for every action" performance requirement intact.
-"""
-from __future__ import annotations
+const STEPS_EDITABLE_COLUMNS = [
+  { key: "Action", label: "Action" },
+  { key: "Element_Name", label: "Element" },
+  { key: "Primary_Locator_Type", label: "Locator Type" },
+  { key: "Primary_Locator", label: "Primary Locator" },
+  { key: "Value", label: "Value" },
+  { key: "Test_Data_Key", label: "Test Data Key" },
+  // Capture -> Store -> Reuse: Captured_As names the {{variable}} a CAPTURE
+  // step's live-read value gets stored under; Resolved_Variable names the
+  // variable a LATER step's value should be re-read from at execution time
+  // instead of replaying the (possibly stale, e.g. a system-generated
+  // application ID/OTP) literal in the Value column. Both are auto-filled
+  // by the recorder's correlation logic but editable here like every other
+  // column, e.g. to correct a false-positive match or wire one up by hand.
+  { key: "Captured_As", label: "Captured As" },
+  { key: "Resolved_Variable", label: "Resolved Variable" },
+  // Optional_Step: type Y (or yes/true/1) to mark this step's element as
+  // expected to sometimes be legitimately absent (a conditional table row,
+  // one branch of a maker-checker flow, etc). A failed lookup then gets a
+  // short wait, skips AI self-healing, and is reported as SKIP instead of
+  // FAIL - see Executor._run_step() in the backend. Leave blank for a
+  // normal step.
+  { key: "Optional_Step", label: "Optional (Y/blank)" },
+  { key: "Expected_Result", label: "Expected Result" },
+];
 
-import logging
-import threading
-import time
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+// escapeHtml() is defined once in app.js (loaded before this file) and
+// reused here.
 
-from selenium.common.exceptions import InvalidSessionIdException, WebDriverException
-from selenium.webdriver.remote.webdriver import WebDriver
+async function loadStepsEditor() {
+  const recording_id = document.getElementById("exec-recording").value;
+  const statusEl = document.getElementById("steps-editor-status");
+  const saveBtn = document.getElementById("btn-save-steps");
+  if (!recording_id) { statusEl.textContent = "Select a recording first."; return; }
+  statusEl.textContent = "Loading steps...";
+  try {
+    const res = await Api.get(`/api/recordings/${recording_id}/steps`);
+    editableSteps = res.steps || [];
+    stepColumns = res.columns || [];
+    removedStepRows = new Set();
+    renderStepsEditorTable();
+    statusEl.textContent = editableSteps.length ? `Loaded ${editableSteps.length} step(s). Edit any cell (including the locator, if self-healing couldn't fix a broken one), tick Remove for a step that shouldn't run, or Add Step to insert a new one, then Save Changes.` : "This recording has no steps yet. Use Add Step to create one.";
+    saveBtn.disabled = true;
+  } catch (e) {
+    document.getElementById("steps-editor-table").innerHTML = "";
+    statusEl.textContent = "Failed to load steps: " + e.message;
+  }
+}
 
-from backend.config import settings
-from backend.execution import selenium_executor
-from backend.execution.action_engine import ActionEngine
-from backend.execution.excel_executor import ExcelExecutor
-from backend.execution.variable_store import VariableStore
-from backend.healing import self_healer
-from backend.recorder import browser_factory
-from backend.storage.excel_store import ExcelStore
-from backend.storage.locator_store import LocatorRepository
-from backend.storage.metadata_store import MetadataStore
-from backend.storage.models import ActionType, ExecutionSummary, StepResult, new_id
-from backend.storage.recording_store import RecordingPaths, RecordingStore
+function renderStepsEditorTable() {
+  const container = document.getElementById("steps-editor-table");
+  if (!editableSteps.length) {
+    container.innerHTML = "";
+    return;
+  }
+  const rows = editableSteps.map((step, idx) => {
+    const editableCells = STEPS_EDITABLE_COLUMNS.map(
+      (c) => `<td><input type="text" data-row="${idx}" data-col="${c.key}" value="${escapeHtml(step[c.key])}"></td>`
+    ).join("");
+    const removed = removedStepRows.has(idx);
+    return `<tr style="${removed ? "opacity:0.4;text-decoration:line-through;" : ""}">
+      <td><input type="checkbox" data-remove-row="${idx}" ${removed ? "checked" : ""} title="Remove this step - it won't be executed"></td>
+      <td>${escapeHtml(step.Step_Number)}</td>
+      ${editableCells}
+    </tr>`;
+  }).join("");
 
-logger = logging.getLogger("universal_automation.executor")
+  container.innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Remove</th><th>Step</th>
+        ${STEPS_EDITABLE_COLUMNS.map((c) => `<th>${c.label}</th>`).join("")}
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
 
-ProgressCallback = Callable[[Dict[str, Any]], None]
+  container.querySelectorAll("input[data-row]").forEach((input) => {
+    input.addEventListener("input", () => {
+      const row = Number(input.dataset.row);
+      const col = input.dataset.col;
+      editableSteps[row][col] = input.value;
+      document.getElementById("btn-save-steps").disabled = false;
+    });
+  });
 
+  container.querySelectorAll("input[data-remove-row]").forEach((checkbox) => {
+    checkbox.addEventListener("change", () => {
+      const row = Number(checkbox.dataset.removeRow);
+      if (checkbox.checked) removedStepRows.add(row); else removedStepRows.delete(row);
+      document.getElementById("btn-save-steps").disabled = false;
+      renderStepsEditorTable();
+    });
+  });
+}
 
-def resolve_step_value(step: Dict[str, Any], test_data_overrides: Dict[str, str], variable_store: VariableStore) -> str:
-    """Decides what value a step actually types/uses, in order of
-    precedence: an explicit Test Data override (by Test_Data_Key or
-    Element_Name) always wins if present; otherwise, if this step was
-    correlated to an earlier CAPTURE in the SAME run (Capture -> Store ->
-    Reuse - see recorder.py and variable_store.py), use the live value
-    captured earlier THIS run; otherwise fall back to the literal value
-    that was recorded. A pure function (no Selenium/self access) so the
-    precedence logic can be unit-tested without a browser."""
-    value = step.get("value", "")
-    key = step.get("test_data_key") or ""
-    clean_key = key.strip("{}").strip() if key else ""
-    if clean_key and clean_key in test_data_overrides:
-        return test_data_overrides[clean_key]
-    if step.get("element_name") in test_data_overrides:
-        return test_data_overrides[step["element_name"]]
-    resolved_var = step.get("resolved_var") or ""
-    if resolved_var and variable_store.has(resolved_var):
-        return variable_store.get(resolved_var, value)
-    return value
+function addStepRow() {
+  if (!stepColumns.length) return; // Load Steps first so we know the column shape
+  const maxStep = editableSteps.reduce((m, s) => Math.max(m, Number(s.Step_Number) || 0), 0);
+  const blank = {};
+  stepColumns.forEach((col) => { blank[col] = ""; });
+  blank.Step_Number = maxStep + 1;
+  blank.Action = "HOVER";
+  // best-effort default so a brand-new step still lands on the right page;
+  // the user can overwrite Primary_Locator_Type/Primary_Locator themselves.
+  const last = editableSteps[editableSteps.length - 1];
+  if (last) {
+    blank.Page_URL = last.Page_URL || "";
+    blank.Page_Title = last.Page_Title || "";
+  }
+  editableSteps.push(blank);
+  renderStepsEditorTable();
+  document.getElementById("btn-save-steps").disabled = false;
+  document.getElementById("steps-editor-status").textContent = `Added step ${blank.Step_Number} (defaulted to Action=HOVER) — fill in Element/Locator Type/Primary Locator, then Save Changes.`;
+}
 
+async function saveStepsEditor() {
+  const recording_id = document.getElementById("exec-recording").value;
+  const statusEl = document.getElementById("steps-editor-status");
+  if (!recording_id || !editableSteps.length) return;
+  const stepsToSave = editableSteps.filter((_, idx) => !removedStepRows.has(idx));
+  if (!stepsToSave.length) { statusEl.textContent = "Can't save - every step is marked Remove. Un-tick at least one."; return; }
+  statusEl.textContent = "Saving...";
+  try {
+    await Api.put(`/api/recordings/${recording_id}/steps`, { steps: stepsToSave });
+    editableSteps = stepsToSave;
+    removedStepRows = new Set();
+    renderStepsEditorTable();
+    statusEl.textContent = `Saved. Execution will use these ${stepsToSave.length} step(s).`;
+    document.getElementById("btn-save-steps").disabled = true;
+  } catch (e) {
+    statusEl.textContent = "Failed to save: " + e.message;
+  }
+}
 
-class Executor:
-    def __init__(
-        self,
-        recording_id: str,
-        browser: Optional[str] = None,
-        test_data_overrides: Optional[Dict[str, str]] = None,
-        ai_provider: Optional[str] = None,
-        screenshot_on_every_step: bool = False,
-        cancel_event: Optional[threading.Event] = None,
-        remote_node_url: Optional[str] = None,
-    ):
-        self.recording_id = recording_id
-        self.store = RecordingStore()
-        self.paths: RecordingPaths = self.store.paths(recording_id)
-        self.meta = self.store.load_metadata(recording_id)
-        self.browser = browser or (self.meta.browser if self.meta else "chrome")
-        self.test_data_overrides = test_data_overrides or {}
-        self.ai_provider = ai_provider
-        self.screenshot_on_every_step = screenshot_on_every_step
-        # Optional: drive the browser on a remote WebDriver node (someone
-        # else's PC) instead of launching one locally - see
-        # browser_factory._create_remote(). None preserves the existing
-        # local-launch behavior exactly.
-        self.remote_node_url = remote_node_url
-        # Cooperative cancellation flag for the "Terminate Execution" button
-        # (spec-adjacent addition: let the user stop a run mid-flight
-        # instead of waiting for it to finish or fail on its own). Checked
-        # between steps in run(); ExecutionManager.terminate() additionally
-        # force-quits the driver so a step currently blocked in a Selenium
-        # wait fails immediately instead of running out its full timeout.
-        self.cancel_event = cancel_event
+async function refreshExecuteRecordingOptions() {
+  const select = document.getElementById("exec-recording");
+  try {
+    const recordings = await Api.get("/api/recordings");
+    select.innerHTML = recordings
+      .filter((r) => r.status !== "recording")
+      .map((r) => `<option value="${r.recording_id}">${r.name} (${r.total_steps || 0} steps)</option>`)
+      .join("");
+  } catch (e) {
+    select.innerHTML = "<option>Unable to load recordings</option>";
+  }
+}
 
-        self.locator_repo = LocatorRepository(recording_id, self.paths)
-        self.excel_executor = ExcelExecutor(self.paths.execution_excel)
-        # Capture -> Store -> Reuse: one store per run, so a CAPTURE step's
-        # live-read value is available to every LATER step in THIS run, but
-        # never leaks into a different execution - see variable_store.py.
-        self.variable_store = VariableStore()
+function connectExecutionSocket(executionId, recordingId) {
+  if (executionSocket) executionSocket.close();
+  executionSocket = new WebSocket(Api.wsUrl(`/ws/execution/${executionId}`));
+  const bar = document.getElementById("exec-progress-bar");
+  const summaryEl = document.getElementById("exec-progress-summary");
+  const stepEl = document.getElementById("exec-current-step");
 
-        self.driver: Optional[WebDriver] = None
-        self.engine: Optional[ActionEngine] = None
-        # Set once the browser session is confirmed gone (crashed/closed
-        # mid-run). Once True, remaining steps are skipped immediately
-        # instead of being run through the fallback-locator + self-healing
-        # pipeline against a session that can no longer respond.
-        self._session_dead = False
-        # Set once the user has clicked "Terminate Execution". Distinct from
-        # _session_dead so the skip message/summary can say what actually
-        # happened, even though the two short-circuit the same way.
-        self._terminated = False
+  executionSocket.onmessage = (msg) => {
+    const evt = JSON.parse(msg.data);
+    if (evt.type === "progress") {
+      const pct = Math.round((evt.step_number / Math.max(evt.total_steps, 1)) * 100);
+      bar.style.width = pct + "%";
+      summaryEl.textContent = `Step ${evt.step_number} / ${evt.total_steps} — ${evt.status}`;
+      stepEl.textContent = `Action: ${evt.action}  |  Element: ${evt.element_name || "-"}  |  Locator: ${evt.locator_used || "-"}  |  Status: ${evt.status}`;
+    } else if (evt.type === "done") {
+      summaryEl.textContent = `Execution finished with status: ${evt.status}`;
+      document.getElementById("btn-terminate-execution").disabled = true;
+      fetchExecutionResult(executionId, recordingId);
+    } else if (evt.type === "error") {
+      summaryEl.textContent = "Error: " + evt.message;
+      document.getElementById("btn-terminate-execution").disabled = true;
+    }
+  };
+}
 
-    def run(self, on_progress: Optional[ProgressCallback] = None) -> ExecutionSummary:
-        steps = self.excel_executor.load_steps()
-        summary = ExecutionSummary(
-            execution_id=new_id("exec_"),
-            recording_id=self.recording_id,
-            recording_name=self.meta.name if self.meta else self.recording_id,
-            target_url=self.meta.target_url if self.meta else "",
-            browser=self.browser,
-            start_time=time.time(),
-            total_steps=len(steps),
-        )
+async function fetchExecutionResult(executionId, recordingId) {
+  document.getElementById("btn-terminate-execution").disabled = true;
+  try {
+    const result = await Api.get(`/api/executions/${executionId}`);
+    if (result.status === "terminated") {
+      // Excel path still produces a proper pass/fail/heal/skip summary
+      // (remaining steps are just marked SKIP); the Behave path's result
+      // is a raw {success, error, terminated} dict instead - handle both.
+      const s = result.summary && typeof result.summary.passed === "number" ? result.summary : null;
+      document.getElementById("exec-progress-summary").textContent = s
+        ? `Terminated by user: ${s.passed || 0} passed, ${s.failed || 0} failed, ${s.healed || 0} healed, ${s.skipped || 0} skipped before stopping.`
+        : "Execution terminated by user.";
+      refreshDashboard();
+    } else if (result.summary) {
+      const s = result.summary;
+      document.getElementById("exec-progress-summary").textContent =
+        `Completed: ${s.passed || 0} passed, ${s.failed || 0} failed, ${s.healed || 0} healed, ${s.skipped || 0} skipped.`;
+      // Auto-generate the downloadable report.
+      await Api.post(`/api/executions/${executionId}/report?recording_id=${recordingId}`);
+      refreshDashboard();
+      if (typeof refreshReportsTable === "function") refreshReportsTable();
+    } else if (result.status === "error") {
+      // The run failed before it could produce a step summary - most often
+      // a browser/driver launch failure (e.g. a bad CHROME_DRIVER_PATH /
+      // EDGE_DRIVER_PATH, or Chrome/Edge not installed). Surface it clearly
+      // instead of leaving the progress line stuck on "Starting execution...".
+      document.getElementById("exec-progress-summary").textContent = "Execution failed: " + (result.error || "unknown error");
+    }
+  } catch (e) {
+    document.getElementById("exec-progress-summary").textContent = "Failed to fetch execution result: " + e.message;
+  }
+}
 
-        self.driver = browser_factory.create_driver(self.browser, remote_node_url=self.remote_node_url)
-        self.engine = ActionEngine(self.driver)
+document.addEventListener("DOMContentLoaded", () => {
+  // Shares the same remembered value as the Recorder tab's field (same
+  // localStorage key) - most people executing on their own PC recorded on
+  // it too, so this saves re-typing it a second time.
+  try {
+    const savedNode = window.localStorage.getItem("ua_remote_node_url");
+    if (savedNode) document.getElementById("exec-remote-node").value = savedNode;
+  } catch (e) { /* localStorage unavailable - not critical */ }
 
-        self.paths.screenshots_dir.mkdir(parents=True, exist_ok=True)
+  document.getElementById("btn-load-steps").addEventListener("click", loadStepsEditor);
+  document.getElementById("btn-add-step").addEventListener("click", addStepRow);
+  document.getElementById("btn-save-steps").addEventListener("click", saveStepsEditor);
+  document.getElementById("exec-recording").addEventListener("change", () => {
+    editableSteps = [];
+    removedStepRows = new Set();
+    stepColumns = [];
+    document.getElementById("steps-editor-table").innerHTML = "";
+    document.getElementById("steps-editor-status").textContent = "";
+    document.getElementById("btn-save-steps").disabled = true;
+  });
 
-        try:
-            for step in steps:
-                if self.cancel_event is not None and self.cancel_event.is_set():
-                    self._terminated = True
-                try:
-                    result = self._run_step(step)
-                except Exception as exc:  # pragma: no cover - defensive
-                    # Most likely cause: ExecutionManager.terminate() force-
-                    # quit the driver while this step's Selenium call was
-                    # in-flight, raising a raw connection error that isn't a
-                    # WebDriverException subclass (so try_locator's own
-                    # exception handling didn't catch it). Treat it the same
-                    # as a lost session rather than letting one exception
-                    # abort the whole run with no summary.
-                    self._session_dead = True
-                    logger.warning("Step %s raised an unexpected error (%s); treating the session as lost.", step.get("step_number"), exc)
-                    result = StepResult(
-                        step_number=step.get("step_number", 0),
-                        action=step.get("action", ""),
-                        page_url=step.get("page_url", ""),
-                        element_name=step.get("element_name", ""),
-                        locator_used="",
-                        locator_strategy="",
-                        input_data=str(step.get("value", "")),
-                        expected_result=step.get("expected_result", ""),
-                        actual_result="Execution terminated by user" if self._terminated else f"Unexpected error: {exc}",
-                        execution_time_ms=0.0,
-                        status="SKIP" if self._terminated else "FAIL",
-                        error=str(exc),
-                    )
-                summary.step_results.append(result.to_dict())
-                if result.status == "PASS":
-                    summary.passed += 1
-                elif result.status == "HEALED":
-                    summary.passed += 1
-                    summary.healed += 1
-                elif result.status == "SKIP":
-                    summary.skipped += 1
-                else:
-                    summary.failed += 1
-                if on_progress:
-                    on_progress({
-                        "step_number": step["step_number"],
-                        "total_steps": len(steps),
-                        "status": result.status,
-                        "action": step["action"],
-                        "element_name": step.get("element_name", ""),
-                        "locator_used": result.locator_used,
-                    })
-        finally:
-            summary.end_time = time.time()
-            try:
-                if self.driver:
-                    self.driver.quit()
-            except Exception:
-                pass
+  document.getElementById("btn-execute").addEventListener("click", async () => {
+    const recording_id = document.getElementById("exec-recording").value;
+    const browser = document.getElementById("exec-browser").value;
+    const ai_provider = document.getElementById("exec-ai-provider").value || null;
+    const run_via_behave = document.getElementById("exec-via-behave").checked;
+    const remote_node_url = document.getElementById("exec-remote-node").value.trim();
+    let test_data = {};
+    const raw = document.getElementById("exec-test-data").value.trim();
+    if (raw) {
+      try { test_data = JSON.parse(raw); } catch (e) { alert("Test Data must be valid JSON"); return; }
+    }
+    if (!recording_id) { alert("Select a recording first."); return; }
 
-        self.locator_repo.flush()
-        MetadataStore.record_execution(summary.to_dict())
-        if self.meta:
-            self.meta.total_executions += 1
-            self.meta.last_execution_at = summary.end_time
-            self.store.save_metadata(self.meta)
+    try { window.localStorage.setItem("ua_remote_node_url", remote_node_url); } catch (e) { /* ignore */ }
 
-        return summary
+    document.getElementById("exec-progress-summary").textContent = remote_node_url
+      ? `Starting execution on ${remote_node_url}...`
+      : "Starting execution...";
+    document.getElementById("exec-progress-bar").style.width = "0%";
+    document.getElementById("exec-current-step").textContent = "";
 
-    # ------------------------------------------------------------------
-    def _run_step(self, step: Dict[str, Any]) -> StepResult:
-        start = time.time()
-        step_number = step["step_number"]
+    try {
+      const res = await Api.post("/api/execute", { recording_id, browser, test_data, ai_provider, run_via_behave, remote_node_url });
+      lastExecutionId = res.execution_id;
+      lastRecordingIdForReport = recording_id;
+      document.getElementById("btn-terminate-execution").disabled = false;
+      connectExecutionSocket(res.execution_id, recording_id);
+    } catch (e) {
+      document.getElementById("exec-progress-summary").textContent = "Failed to start execution: " + e.message;
+    }
+  });
 
-        # Once the browser session is known dead OR the user has clicked
-        # Terminate Execution, every remaining step is a fast, no-op SKIP -
-        # don't touch the driver, don't self-heal, don't screenshot. Avoids
-        # the "60+ failed heal attempts in 2.7 seconds" cascade when the
-        # browser crashes/closes mid-run, and makes Terminate take effect
-        # immediately for every step still queued up.
-        if self._session_dead or self._terminated:
-            reason = "browser session was lost earlier in this run" if self._session_dead else "execution was terminated by the user"
-            return StepResult(
-                step_number=step_number,
-                action=step.get("action", ""),
-                page_url=step.get("page_url", ""),
-                element_name=step.get("element_name", ""),
-                locator_used="",
-                locator_strategy="",
-                input_data=str(step.get("value", "")),
-                expected_result=step.get("expected_result", ""),
-                actual_result=f"Skipped - {reason}",
-                execution_time_ms=0.0,
-                status="SKIP",
-                error="Browser session lost" if self._session_dead else "Terminated by user",
-            )
-
-        # Decide the value this step actually uses (spec section 26's Test
-        # Data overrides take precedence, then a live Capture -> Store ->
-        # Reuse value from earlier in THIS run, then the recorded literal -
-        # see resolve_step_value() above).
-        value = resolve_step_value(step, self.test_data_overrides, self.variable_store)
-        step = {**step, "value": value}
-
-        # A step marked optional (see excel_executor._parse_optional_flag)
-        # is expected to sometimes have nothing to find - give it a short
-        # wait instead of the full EXPLICIT_WAIT_SECONDS so a run full of
-        # conditional/data-dependent steps doesn't spend minutes waiting
-        # out timeouts for elements that were never going to appear.
-        # Restored in the `finally` below regardless of outcome, so no
-        # later step in this run is ever affected by it.
-        is_optional = bool(step.get("optional"))
-        original_engine_timeout = self.engine.timeout
-        if is_optional:
-            self.engine.timeout = min(original_engine_timeout, settings.OPTIONAL_STEP_WAIT_SECONDS)
-        try:
-            outcome = selenium_executor.execute_with_fallbacks(self.engine, self.driver, step)
-        finally:
-            self.engine.timeout = original_engine_timeout
-        status = "PASS"
-        error = outcome.get("error", "")
-        locator_used = f"{outcome.get('locator_type','')}::{outcome.get('locator_value','')}"
-        healing_event_dict = None
-        # Set below whenever a CAPTURE step succeeds (either on the first
-        # attempt or after healing) - carries the live value actually read
-        # off the page THIS run, for both variable_store.store() and the
-        # StepResult's actual_result message at the end of this method.
-        captured_this_run: Optional[str] = None
-
-        # Capture -> Store -> Reuse: on a successful CAPTURE step, stash the
-        # value that was actually read live off the page so any later step
-        # in THIS run whose resolved_var names the same variable picks it
-        # up via resolve_step_value() above, instead of replaying whatever
-        # literal value happened to be recorded originally.
-        if outcome.get("success") and step.get("action") == ActionType.CAPTURE and step.get("captured_as"):
-            captured_this_run = step.get("_captured_value", "")
-            self.variable_store.store(step["captured_as"], captured_this_run)
-
-        if not outcome["success"]:
-            if self._is_dead_session_error(error) or not self._session_alive():
-                self._session_dead = True
-                status = "FAIL"
-                error = (
-                    "Browser session lost (the browser was closed or crashed mid-execution). "
-                    "Remaining steps were skipped. If you're using a manually-configured "
-                    "CHROME_DRIVER_PATH/EDGE_DRIVER_PATH, verify the driver version matches "
-                    "your installed browser version."
-                )
-                logger.error("Step %s: %s Original error: %s", step_number, error, outcome.get("error", ""))
-            elif is_optional:
-                # No self-healing/AI - this is precisely the case optional
-                # steps exist for: the element is expected to sometimes be
-                # legitimately absent (a conditional table row, one branch
-                # of a maker-checker flow), so searching harder for it
-                # would just waste time chasing something that was never
-                # going to be found. Reported as SKIP (doesn't count
-                # against pass rate the way FAIL does) rather than PASS,
-                # since the step genuinely didn't run.
-                status = "SKIP"
-                error = (
-                    f"Optional step skipped - element not found within "
-                    f"{settings.OPTIONAL_STEP_WAIT_SECONDS:.0f}s. Marked "
-                    "Optional_Step, so no self-healing was attempted; this is "
-                    "expected when this step's element doesn't apply to "
-                    f"every run. Original error: {error}"
-                )
-            else:
-                try:
-                    heal_result = self_healer.heal(self.driver, self.engine, step, self.locator_repo, self.ai_provider)
-                except InvalidSessionIdException:
-                    self._session_dead = True
-                    heal_result = {"success": False}
-                except WebDriverException as exc:
-                    logger.warning("Self-healing aborted for step %s due to a WebDriver error: %s", step_number, exc)
-                    heal_result = {"success": False}
-
-                if self._session_dead:
-                    status = "FAIL"
-                    error = (
-                        "Browser session lost during self-healing (the browser was closed or "
-                        "crashed mid-execution). Remaining steps were skipped."
-                    )
-                else:
-                    event = self_healer.make_event(
-                        step_number, step.get("page_url", ""),
-                        step.get("primary_locator_type", ""), step.get("primary_locator", ""),
-                        heal_result,
-                    )
-                    MetadataStore.record_healing_event(event.to_dict())
-                    healing_event_dict = event.to_dict()
-
-                    if heal_result["success"]:
-                        retry_step = {**step, "primary_locator_type": heal_result["new_locator_type"], "primary_locator": heal_result["new_locator"], "fallback_locators": []}
-                        retry_outcome = selenium_executor.execute_with_fallbacks(self.engine, self.driver, retry_step)
-                        if retry_outcome["success"]:
-                            status = "HEALED"
-                            locator_used = f"{heal_result['new_locator_type']}::{heal_result['new_locator']}"
-                            # Self-Healing Update Cycle (spec section 21): persist
-                            # the healed locator so future executions are fast again.
-                            self.excel_executor.update_locator(step_number, heal_result["new_locator_type"], heal_result["new_locator"])
-                            error = ""
-                            # Same Capture -> Store -> Reuse bookkeeping as the
-                            # plain-PASS case above, but reading from retry_step
-                            # (a separate dict) since that's what actually ran.
-                            if step.get("action") == ActionType.CAPTURE and step.get("captured_as"):
-                                captured_this_run = retry_step.get("_captured_value", "")
-                                self.variable_store.store(step["captured_as"], captured_this_run)
-                        else:
-                            status = "FAIL"
-                            error = retry_outcome.get("error", error)
-                            if self._is_dead_session_error(error):
-                                self._session_dead = True
-                    else:
-                        status = "FAIL"
-
-        screenshot_path = ""
-        if (status == "FAIL" or status == "HEALED" or self.screenshot_on_every_step) and not self._session_dead:
-            screenshot_path = self._capture_screenshot(step_number, status)
-
-        elapsed_ms = round((time.time() - start) * 1000, 1)
-        # For a successful CAPTURE step, report what was actually read live
-        # off the page this run (captured_this_run, set above) - not the
-        # (necessarily stale) value that happened to be recorded originally -
-        # so the report/Excel reflect reality rather than a leftover
-        # recording-time literal.
-        actual_result = "OK" if status in ("PASS", "HEALED") else error
-        if status in ("PASS", "HEALED") and step.get("action") == ActionType.CAPTURE and step.get("captured_as"):
-            actual_result = f"Captured '{captured_this_run or ''}' as {{{{{step['captured_as']}}}}}"
-        return StepResult(
-            step_number=step_number,
-            action=step.get("action", ""),
-            page_url=step.get("page_url", ""),
-            element_name=step.get("element_name", ""),
-            locator_used=locator_used,
-            locator_strategy=outcome.get("locator_type", "") if status == "PASS" else (healing_event_dict or {}).get("new_locator_type", ""),
-            input_data=str(step.get("value", "")),
-            expected_result=step.get("expected_result", ""),
-            actual_result=actual_result,
-            execution_time_ms=elapsed_ms,
-            status=status,
-            screenshot=screenshot_path,
-            error=error,
-            healing_event=healing_event_dict,
-        )
-
-    def terminate(self) -> None:
-        """Called from the API/request thread (NOT the worker thread this
-        Executor is running on) when the user clicks Terminate Execution.
-        Setting the flag alone would only take effect once the in-flight
-        Selenium call returns, which could be up to EXPLICIT_WAIT_SECONDS
-        away if the current step is stuck waiting on a locator - so this
-        also force-quits the driver, which fails that blocked call
-        immediately. The resulting exception is handled by run()'s
-        defensive try/except and by the existing dead-session detection,
-        so it degrades into a clean "terminated" summary rather than a
-        crash."""
-        self._terminated = True
-        if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
-
-    def _capture_screenshot(self, step_number: int, status: str) -> str:
-        try:
-            filename = f"step_{step_number}_{status}.png"
-            path = self.paths.screenshots_dir / filename
-            self.driver.save_screenshot(str(path))
-            return str(path)
-        except InvalidSessionIdException:
-            self._session_dead = True
-            return ""
-        except Exception:
-            return ""
-
-    @staticmethod
-    def _is_dead_session_error(error: str) -> bool:
-        """Distinguishes a truly-dead browser session (whole run should
-        stop) from a narrower WebDriver error like a closed single tab
-        (NoSuchWindowException), which shouldn't abort the rest of the
-        run. selenium_executor stringifies exceptions as
-        "ExceptionClassName: message", so a substring check is reliable
-        without changing that layer's return contract."""
-        return "InvalidSessionIdException" in (error or "")
-
-    def _session_alive(self) -> bool:
-        """Cheap liveness probe used once a step has already failed, to
-        catch cases where the session died via a path that didn't surface
-        InvalidSessionIdException in the error string (e.g. a driver-level
-        crash surfaced through a different WebDriverException subtype)."""
-        if not self.driver:
-            return False
-        try:
-            _ = self.driver.window_handles
-            return True
-        except InvalidSessionIdException:
-            return False
-        except Exception:
-            # Any other WebDriverException here (e.g. no open windows) does
-            # not necessarily mean the session itself is dead.
-            return True
-
-
-class ExecutionManager:
-    """Process-wide registry of in-flight/completed executions, so the
-    FastAPI layer can kick off a run in a background thread and let the
-    frontend poll/stream progress via WebSocket without blocking the
-    HTTP request."""
-
-    _executions: Dict[str, Dict[str, Any]] = {}
-    _lock = None
-
-    @classmethod
-    def _ensure_lock(cls):
-        if cls._lock is None:
-            import threading
-            cls._lock = threading.Lock()
-        return cls._lock
-
-    @classmethod
-    def start(
-        cls,
-        recording_id: str,
-        browser: Optional[str] = None,
-        test_data: Optional[Dict[str, str]] = None,
-        ai_provider: Optional[str] = None,
-        run_via_behave: bool = False,
-        remote_node_url: Optional[str] = None,
-    ) -> str:
-        import queue
-
-        execution_id = new_id("run_")
-        progress_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
-        cancel_event = threading.Event()
-        # "executor" (Excel path) / "behave_process" (Behave path) are
-        # filled in by _worker once the run actually starts, so terminate()
-        # has something concrete to act on regardless of which path this
-        # execution took.
-        state = {
-            "status": "running", "queue": progress_queue, "summary": None, "error": None,
-            "cancel_event": cancel_event, "executor": None, "behave_process": None,
-            "terminate_requested": False,
-        }
-        with cls._ensure_lock():
-            cls._executions[execution_id] = state
-
-        def _worker():
-            try:
-                if run_via_behave:
-                    from backend.execution.behave_executor import run_behave
-
-                    def _on_process_started(proc) -> None:
-                        state["behave_process"] = proc
-
-                    result = run_behave(
-                        recording_id, browser or "chrome", test_data,
-                        on_process_started=_on_process_started, cancel_event=cancel_event,
-                        remote_node_url=remote_node_url,
-                    )
-                    state["summary"] = result
-                else:
-                    executor = Executor(
-                        recording_id, browser=browser, test_data_overrides=test_data,
-                        ai_provider=ai_provider, cancel_event=cancel_event,
-                        remote_node_url=remote_node_url,
-                    )
-                    state["executor"] = executor
-
-                    def on_progress(evt: Dict[str, Any]) -> None:
-                        progress_queue.put({"type": "progress", **evt})
-
-                    summary = executor.run(on_progress=on_progress)
-                    state["summary"] = summary.to_dict()
-                state["status"] = "terminated" if state["terminate_requested"] else "completed"
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.exception("Execution %s failed: %s", execution_id, exc)
-                state["status"] = "terminated" if state["terminate_requested"] else "error"
-                state["error"] = str(exc)
-            finally:
-                progress_queue.put({"type": "done", "status": state["status"]})
-
-        thread = threading.Thread(target=_worker, daemon=True)
-        state["thread"] = thread
-        thread.start()
-        return execution_id
-
-    @classmethod
-    def get(cls, execution_id: str) -> Optional[Dict[str, Any]]:
-        return cls._executions.get(execution_id)
-
-    @classmethod
-    def terminate(cls, execution_id: str) -> bool:
-        """Stops a running execution as soon as possible (spec-adjacent
-        addition: "Terminate Execution" button). Works for both the Excel
-        fast path (force-quits the driver so any in-flight Selenium wait
-        fails immediately) and the Behave path (terminates the `behave`
-        subprocess). Returns False if the execution isn't found; returns
-        True if a stop signal was sent, even if the run happens to finish
-        on its own a moment later anyway."""
-        state = cls._executions.get(execution_id)
-        if not state:
-            return False
-        state["terminate_requested"] = True
-        cancel_event = state.get("cancel_event")
-        if cancel_event is not None:
-            cancel_event.set()
-        executor = state.get("executor")
-        if executor is not None:
-            executor.terminate()
-        proc = state.get("behave_process")
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-        return True
+  document.getElementById("btn-terminate-execution").addEventListener("click", async () => {
+    if (!lastExecutionId) return;
+    const btn = document.getElementById("btn-terminate-execution");
+    btn.disabled = true;
+    document.getElementById("exec-progress-summary").textContent = "Stopping execution...";
+    try {
+      const res = await Api.post(`/api/executions/${lastExecutionId}/terminate`);
+      document.getElementById("exec-progress-summary").textContent = res.message || "Stop requested.";
+      // The execution WebSocket's "done" event (and fetchExecutionResult)
+      // will report the final terminated/completed status shortly; this is
+      // just immediate feedback that the click registered.
+    } catch (e) {
+      document.getElementById("exec-progress-summary").textContent = "Failed to stop execution: " + e.message;
+      btn.disabled = false;
+    }
+  });
+});
