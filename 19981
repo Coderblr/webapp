@@ -1,779 +1,90 @@
-"""
-app.py
+"use client";
 
-FastAPI backend for the Universal AI-Powered Web Automation Platform.
-Wires together the recorder, generator, execution, healing, AI, storage,
-and reporting modules behind a REST + WebSocket API consumed by the
-plain HTML/CSS/JS frontend in ../frontend.
+/*
+ * RecordingsTable.js
+ * Shared table for the Dashboard's "Recent Recordings" (withActions=false)
+ * and the full Recordings tab (withActions=true, with download links +
+ * Delete). Ported from app.js's renderRecordingsTable().
+ */
 
-Run with:
-    uvicorn backend.app:app --host 0.0.0.0 --port 8000
-(from the project root, with the virtualenv / requirements installed)
-"""
-from __future__ import annotations
+import { useState } from "react";
+import { Api } from "@/lib/api";
+import { dateTimeStr } from "@/lib/format";
+import { useAuth } from "@/components/AuthProvider";
 
-import asyncio
-import json
-import queue
-import tempfile
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+export default function RecordingsTable({ recordings, withActions = false, onChanged }) {
+  const [deletingId, setDeletingId] = useState(null);
+  const { user } = useAuth();
+  // A regular user's list is already scoped server-side to just their own
+  // recordings (see backend/app.py's list_recordings()) - an "Owner"
+  // column would be redundant noise there. An admin's list spans every
+  // user, so it's the one case worth showing who each row belongs to.
+  const showOwner = user?.role === "admin";
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+  if (!recordings || !recordings.length) {
+    return <div className="empty-note">No recordings yet. Start one from the Recorder tab.</div>;
+  }
 
-from backend.ai.providers import available_providers
-from backend.auth.activity_log import ActivityLogStore
-from backend.auth.admin_router import router as admin_router
-from backend.auth.dependencies import user_from_cookies, user_store
-from backend.auth.middleware import AuthMiddleware
-from backend.auth.router import router as auth_router
-from backend.change_detection import brd_parser, change_applier, document_extractor, element_resolver, transaction_matcher
-from backend.config import settings
-from backend.execution.excel_executor import ExcelExecutor
-from backend.execution.executor import ExecutionManager
-from backend.recorder.recorder import RecorderManager
-from backend.reporting import log_manager, report_generator
-from backend.storage.excel_store import EXECUTION_COLUMNS, ExcelStore
-from backend.storage.metadata_store import MetadataStore
-from backend.storage.recording_store import RecordingStore
-
-log_manager.configure_logging()
-logger = log_manager.get_logger("app")
-
-app = FastAPI(title="Universal AI-Powered Web Automation Platform", version="1.0.0")
-
-# IMPORTANT - registration order: AuthMiddleware MUST be added before
-# CORSMiddleware (i.e. earlier, textually, right here). Starlette's
-# add_middleware() inserts each new middleware at the front of the stack,
-# so whichever is added LAST ends up OUTERMOST - see AuthMiddleware's own
-# docstring (backend/auth/middleware.py) for the empirically-verified
-# details. Getting this order backwards breaks CORS preflight (OPTIONS)
-# requests from the Next.js dev server.
-app.add_middleware(AuthMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    # NOT allow_origins=["*"] - Starlette's CORSMiddleware only reflects the
-    # real Origin back on every response when it isn't in "allow all
-    # origins" mode (i.e. a literal "*" isn't in allow_origins). With a
-    # literal "*" here, its simple_response() heuristic only reflects the
-    # real origin back once the request already carries a session cookie -
-    # so it looks fine once you're logged in, but the very first response
-    # of all (POST /api/auth/login, before any cookie exists) comes back
-    # with "Access-Control-Allow-Origin: *" AND
-    # "Access-Control-Allow-Credentials: true" together, which is invalid
-    # per the fetch spec - browsers silently reject that combination, so
-    # login itself fails cross-origin (Next.js dev server on a different
-    # port, or a different machine on the LAN) with what looks like a CORS
-    # preflight failure even though the preflight itself was fine.
-    # allow_origin_regex matching everything sidesteps that "allow all
-    # origins" fast path entirely - is_allowed_origin() then runs (and
-    # correctly reflects the real origin) on every single response,
-    # cookie or not.
-    allow_origin_regex=r".*",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-app.include_router(auth_router)
-app.include_router(admin_router)
-
-recording_store = RecordingStore()
-activity_log = ActivityLogStore()
-
-# There is no public self-registration page (see backend/auth/__init__.py) -
-# this is the one-time bootstrap that lets a brand-new install log in at
-# all, by creating a single default admin account the first time
-# users.json is completely empty. No-op on every later restart.
-user_store.bootstrap_default_admin()
-
-
-# ----------------------------------------------------------------------
-# Per-user data isolation
-#
-# Every recording belongs to whoever started it (RecordingMetadata.
-# owner_user_id - see backend/storage/models.py). A regular user only
-# ever sees/acts on their own recordings (Dashboard, Recordings, Execute,
-# Change Detection, Reports); an admin sees and can act on everyone's,
-# consistent with the admin oversight already built for the activity log.
-# Executions/healing events don't carry their own owner field - they're
-# scoped by which recording_id they belong to instead (see
-# _owned_recording_ids() below), which is the same thing one level removed.
-# ----------------------------------------------------------------------
-def _is_admin(user) -> bool:
-    return getattr(user, "role", "") == "admin"
-
-
-def _can_access_recording(meta, user) -> bool:
-    """A blank owner_user_id (a pre-this-feature recording that somehow
-    never got backfilled, or any other edge case) is deliberately treated
-    as "admin-only", not "everyone" - the safe default when ownership is
-    unknown is the narrower one."""
-    if _is_admin(user):
-        return True
-    return bool(meta.owner_user_id) and meta.owner_user_id == user.user_id
-
-
-def _require_recording_access(recording_id: str, user):
-    """Loads and returns the recording's metadata, or raises 404 - the
-    same 404 whether the recording genuinely doesn't exist or the caller
-    just isn't allowed to see it, so a non-admin probing recording_ids
-    can't distinguish "not found" from "not yours" by response."""
-    meta = recording_store.load_metadata(recording_id)
-    if not meta or not _can_access_recording(meta, user):
-        raise HTTPException(404, "Recording not found")
-    return meta
-
-
-def _can_access_execution(state: Dict[str, Any], user) -> bool:
-    """Same rule as _can_access_recording(), applied to an ExecutionManager
-    state dict (see backend/execution/executor.py's ExecutionManager.start,
-    which stamps every execution with the recording_id/owner_user_id it
-    belongs to)."""
-    if _is_admin(user):
-        return True
-    return bool(state.get("owner_user_id")) and state.get("owner_user_id") == user.user_id
-
-
-def _owned_recording_ids(user) -> Optional[set]:
-    """None means "no filter" (admin - sees everything). Otherwise the set
-    of recording_ids this user owns, for scoping executions/healing
-    events/dashboard stats, none of which carry their own owner field."""
-    if _is_admin(user):
-        return None
-    return {
-        r["recording_id"] for r in recording_store.list_recordings()
-        if r.get("owner_user_id") == user.user_id
+  async function handleDelete(recordingId, name) {
+    if (!window.confirm(`Delete "${name}" permanently? This removes its Excel dataset, locator repository, and generated Behave artifacts. This cannot be undone.`)) {
+      return;
     }
-
-
-def _backfill_legacy_recording_owners() -> None:
-    """One-time migration for recordings created before per-user ownership
-    existed. Without this, every recording from before this feature would
-    have a blank owner_user_id, which _can_access_recording() deliberately
-    treats as "admin can see it, nobody else can" - correct as a safety
-    default, but it would mean those recordings just silently disappear
-    from view rather than staying reachable by an admin exactly as they
-    were before. Assigns every still-unowned recording to the platform's
-    first admin account (by created_at) instead - a brand-new user's
-    dashboard is still genuinely empty (they never owned any of these),
-    which is the point of this feature; only pre-existing recordings, and
-    only an admin's view of them, keeps working unchanged.
-
-    Runs once at every startup, but only ever writes a recording that is
-    still unowned - already-owned recordings (the normal case after the
-    first run) are untouched, so this is cheap after the first pass."""
-    admins = sorted((u for u in user_store.list_users() if u.is_admin), key=lambda u: u.created_at)
-    if not admins:
-        return  # shouldn't happen - bootstrap_default_admin() above guarantees at least one
-    target = admins[0]
-    for r in recording_store.list_recordings():
-        if r.get("owner_user_id"):
-            continue
-        meta = recording_store.load_metadata(r["recording_id"])
-        if not meta or meta.owner_user_id:
-            continue
-        meta.owner_user_id = target.user_id
-        meta.owner_username = target.username
-        recording_store.save_metadata(meta)
-
-
-_backfill_legacy_recording_owners()
-
-
-# ----------------------------------------------------------------------
-# Request/response models
-# ----------------------------------------------------------------------
-class StartRecordingRequest(BaseModel):
-    name: str
-    target_url: str
-    browser: str = "chrome"
-    # Optional: record via a WebDriver node running on someone else's PC
-    # instead of launching a browser on this machine - see README section
-    # on remote / multi-user browser sessions. Omit/leave blank for the
-    # existing local-launch behavior.
-    remote_node_url: Optional[str] = None
-
-
-class ExecuteRequest(BaseModel):
-    recording_id: str
-    browser: Optional[str] = None
-    test_data: Optional[Dict[str, str]] = None
-    ai_provider: Optional[str] = None
-    run_via_behave: bool = False
-    remote_node_url: Optional[str] = None
-    # Run only the steps a previously-applied BRD/SD change-set touched
-    # (its added/re-numbered steps), instead of the whole transaction from
-    # the top - see /api/changes/{recording_id} for the available IDs and
-    # change_detection/change_applier.py for how a change-set's step
-    # numbers are recorded. Ignored when run_via_behave=True (Behave always
-    # runs the full feature file).
-    change_set_id: Optional[str] = None
-
-
-class UpdateStepRequest(BaseModel):
-    updates: Dict[str, Any]
-
-
-class TransactionCodeRequest(BaseModel):
-    transaction_code: str
-
-
-class ReplaceStepsRequest(BaseModel):
-    steps: List[Dict[str, Any]]
-
-
-class ResolveChangeRequest(BaseModel):
-    recording_id: str
-    change_entry: Dict[str, Any]
-    browser: Optional[str] = None
-    remote_node_url: Optional[str] = None
-    ai_provider: Optional[str] = None
-
-
-class ApplyChangesRequest(BaseModel):
-    recording_id: str
-    source_document: str
-    entries: List[Dict[str, Any]]
-
-
-# ----------------------------------------------------------------------
-# Recording management
-# ----------------------------------------------------------------------
-@app.post("/api/recordings/start")
-def start_recording(req: StartRecordingRequest, request: Request) -> Dict[str, Any]:
-    if not req.target_url.strip():
-        raise HTTPException(400, "target_url is required")
-    user = request.state.user
-    try:
-        session = RecorderManager.start_recording(
-            req.name or "Untitled Recording", req.target_url.strip(), req.browser,
-            remote_node_url=(req.remote_node_url or "").strip() or None,
-            owner_user_id=user.user_id, owner_username=user.username,
-        )
-    except Exception as exc:
-        logger.error("Failed to start recording: %s", exc)
-        raise HTTPException(500, f"Failed to launch browser/recorder: {exc}")
-    activity_log.record(
-        user.user_id, user.username, "start_recording",
-        recording_id=session.recording_id, details={"name": req.name, "target_url": req.target_url},
-    )
-    return {"recording_id": session.recording_id, "status": session.status}
-
-
-@app.post("/api/recordings/{recording_id}/pause")
-def pause_recording(recording_id: str, request: Request) -> Dict[str, Any]:
-    session = RecorderManager.get(recording_id)
-    if not session or not _can_access_recording(session, request.state.user):
-        raise HTTPException(404, "Recording session not active")
-    session.pause()
-    return {"status": session.status}
-
-
-@app.post("/api/recordings/{recording_id}/resume")
-def resume_recording(recording_id: str, request: Request) -> Dict[str, Any]:
-    session = RecorderManager.get(recording_id)
-    if not session or not _can_access_recording(session, request.state.user):
-        raise HTTPException(404, "Recording session not active")
-    session.resume()
-    return {"status": session.status}
-
-
-@app.post("/api/recordings/{recording_id}/stop")
-def stop_recording(recording_id: str, request: Request) -> Dict[str, Any]:
-    user = request.state.user
-    session = RecorderManager.get(recording_id)
-    if not session or not _can_access_recording(session, user):
-        raise HTTPException(404, "Recording session not active")
-    summary = RecorderManager.stop_recording(recording_id)
-    if summary is None:
-        raise HTTPException(404, "Recording session not active")
-    activity_log.record(user.user_id, user.username, "stop_recording", recording_id=recording_id)
-    return summary
-
-
-@app.delete("/api/recordings/{recording_id}/actions/{step_number}")
-def delete_recorded_action(recording_id: str, step_number: int, request: Request) -> Dict[str, Any]:
-    """Deletes one already-recorded action from an in-progress recording
-    session - e.g. a transaction that failed partway through and shouldn't
-    be saved/replayed. Only works while the recording is still active;
-    once stopped, edit the Excel dataset instead (Execute Recording ->
-    Review & Edit Steps -> tick Remove)."""
-    session = RecorderManager.get(recording_id)
-    if not session or not _can_access_recording(session, request.state.user):
-        raise HTTPException(404, "Recording session not active - actions can only be deleted while recording is in progress. Once stopped, use Review & Edit Steps instead.")
-    ok = session.delete_action(step_number)
-    if not ok:
-        raise HTTPException(404, f"Step {step_number} not found in the current recording")
-    return {"deleted": True, "step_number": step_number, "remaining_steps": len(session.actions)}
-
-
-@app.get("/api/recordings")
-def list_recordings(request: Request) -> List[Dict[str, Any]]:
-    user = request.state.user
-    all_recordings = recording_store.list_recordings()
-    if _is_admin(user):
-        return all_recordings
-    return [r for r in all_recordings if r.get("owner_user_id") == user.user_id]
-
-
-@app.get("/api/recordings/{recording_id}")
-def get_recording(recording_id: str, request: Request) -> Dict[str, Any]:
-    meta = _require_recording_access(recording_id, request.state.user)
-    return meta.to_dict()
-
-
-@app.put("/api/recordings/{recording_id}/transaction_code")
-def set_transaction_code(recording_id: str, req: TransactionCodeRequest, request: Request) -> Dict[str, Any]:
-    """Tags a recording with a business transaction code/name (e.g. "1010")
-    so a later BRD/Solution Document upload mentioning that same code can
-    be automatically matched to it - see /api/changes/detect."""
-    user = request.state.user
-    _require_recording_access(recording_id, user)
-    meta = recording_store.set_transaction_code(recording_id, req.transaction_code)
-    if not meta:
-        raise HTTPException(404, "Recording not found")
-    activity_log.record(
-        user.user_id, user.username, "set_transaction_code",
-        recording_id=recording_id, details={"transaction_code": req.transaction_code},
-    )
-    return meta.to_dict()
-
-
-@app.delete("/api/recordings/{recording_id}")
-def delete_recording(recording_id: str, request: Request) -> Dict[str, Any]:
-    user = request.state.user
-    _require_recording_access(recording_id, user)
-    if RecorderManager.get(recording_id):
-        raise HTTPException(400, "Stop the active recording session before deleting it")
-    ok = recording_store.delete(recording_id)
-    if not ok:
-        raise HTTPException(404, "Recording not found")
-    activity_log.record(user.user_id, user.username, "delete_recording", recording_id=recording_id)
-    return {"deleted": True}
-
-
-# ----------------------------------------------------------------------
-# Live recorder event stream
-# ----------------------------------------------------------------------
-@app.websocket("/ws/recording/{recording_id}")
-async def recording_events_ws(websocket: WebSocket, recording_id: str):
-    # WebSocket handshakes don't go through AuthMiddleware (that's an HTTP
-    # middleware, and this is a different ASGI scope type) - check the same
-    # session cookie by hand before accepting, using the same
-    # user_from_cookies() helper the HTTP side uses. See
-    # backend/auth/dependencies.py's docstring for why one helper covers
-    # both.
-    user = user_from_cookies(websocket.cookies)
-    if not user:
-        await websocket.close(code=4401)
-        return
-    session = RecorderManager.get(recording_id)
-    if session and not _can_access_recording(session, user):
-        # Someone else's recording - a 404-shaped close, same as "not
-        # active", rather than confirming a session with this id exists.
-        await websocket.close(code=4404)
-        return
-    await websocket.accept()
-    if not session:
-        await websocket.send_json({"event_type": "error", "message": "Recording session not active"})
-        await websocket.close()
-        return
-    try:
-        while True:
-            try:
-                evt = session.events.get_nowait()
-                await websocket.send_json(evt.to_dict())
-            except queue.Empty:
-                await asyncio.sleep(0.3)
-                if session.status not in ("recording", "paused", "starting"):
-                    break
-    except WebSocketDisconnect:
-        pass
-
-
-# ----------------------------------------------------------------------
-# Excel dataset editing (spec section 19/26: the Excel dataset is the
-# editable source of truth for the fast execution path - lets a user
-# correct a value the recorder missed or mis-captured, e.g. a password
-# field, before hitting Execute, without touching the file on disk by
-# hand).
-# ----------------------------------------------------------------------
-@app.get("/api/recordings/{recording_id}/steps")
-def get_steps(recording_id: str, request: Request) -> Dict[str, Any]:
-    _require_recording_access(recording_id, request.state.user)
-    paths = recording_store.paths(recording_id)
-    store = ExcelStore(paths.execution_excel)
-    return {"columns": list(EXECUTION_COLUMNS), "steps": store.read_rows()}
-
-
-@app.put("/api/recordings/{recording_id}/steps/{step_number}")
-def update_step(recording_id: str, step_number: int, req: UpdateStepRequest, request: Request) -> Dict[str, Any]:
-    user = request.state.user
-    _require_recording_access(recording_id, user)
-    if not req.updates:
-        raise HTTPException(400, "No updates provided")
-    paths = recording_store.paths(recording_id)
-    store = ExcelStore(paths.execution_excel)
-    ok = store.update_row(step_number, req.updates)
-    if not ok:
-        raise HTTPException(404, f"Step {step_number} not found in this recording's Excel dataset")
-    activity_log.record(
-        user.user_id, user.username, "update_step",
-        recording_id=recording_id, details={"step_number": step_number, "updates": req.updates},
-    )
-    return {"updated": True, "step_number": step_number}
-
-
-@app.put("/api/recordings/{recording_id}/steps")
-def replace_steps(recording_id: str, req: ReplaceStepsRequest, request: Request) -> Dict[str, Any]:
-    user = request.state.user
-    _require_recording_access(recording_id, user)
-    if not req.steps:
-        raise HTTPException(400, "steps must be a non-empty list")
-    paths = recording_store.paths(recording_id)
-    store = ExcelStore(paths.execution_excel)
-    store.write_rows(req.steps)
-    activity_log.record(
-        user.user_id, user.username, "replace_steps",
-        recording_id=recording_id, details={"row_count": len(req.steps)},
-    )
-    return {"updated": True, "row_count": len(req.steps)}
-
-
-# ----------------------------------------------------------------------
-# BRD/Solution Document change detection (backend/change_detection/):
-# upload a document -> AI extracts "element added/removed" entries ->
-# each entry is resolved to a real locator (ADD, via a live re-crawl) or
-# an existing step (REMOVE) -> the user confirms -> apply patches
-# execution.xlsx and remembers which step numbers were affected so they
-# can be re-executed alone. See README's "BRD/SD change detection"
-# section for the full flow.
-# ----------------------------------------------------------------------
-@app.post("/api/changes/detect")
-async def detect_changes(request: Request, file: UploadFile = File(...), ai_provider: Optional[str] = Form(None)) -> Dict[str, Any]:
-    suffix = Path(file.filename or "").suffix
-    tmp_dir = Path(tempfile.mkdtemp())
-    tmp_path = tmp_dir / f"upload{suffix}"
-    try:
-        tmp_path.write_bytes(await file.read())
-        try:
-            text = document_extractor.extract_text(tmp_path)
-        except (document_extractor.UnsupportedDocumentError, ValueError) as exc:
-            raise HTTPException(400, str(exc))
-
-        try:
-            changes = brd_parser.extract_changes(text, ai_provider)
-        except brd_parser.BRDParsingUnavailableError as exc:
-            raise HTTPException(400, str(exc))
-    finally:
-        import shutil as _shutil
-        _shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    user = request.state.user
-    owned_ids = _owned_recording_ids(user)  # None for admin - matches against every recording
-    for entry in changes:
-        match = transaction_matcher.find_recording(entry, recording_store)
-        # A regular user's BRD/SD upload must never surface another user's
-        # recording id/name just because the document text happened to
-        # match it - discard the match entirely rather than leaking it.
-        if match and owned_ids is not None and match["recording_id"] not in owned_ids:
-            match = None
-        entry["matched_recording_id"] = match["recording_id"] if match else None
-        entry["matched_recording_name"] = match["recording_name"] if match else ""
-        entry["match_type"] = match["match_type"] if match else "none"
-        entry["match_confidence"] = match["confidence"] if match else 0.0
-
-    activity_log.record(
-        user.user_id, user.username, "changes_detected",
-        details={"source_document": file.filename or "uploaded_document", "change_count": len(changes)},
-    )
-    return {"source_document": file.filename or "uploaded_document", "changes": changes}
-
-
-@app.post("/api/changes/resolve")
-def resolve_change(req: ResolveChangeRequest, request: Request) -> Dict[str, Any]:
-    """Given one change entry (from /api/changes/detect, possibly edited by
-    the user first - e.g. to correct which recording it applies to), works
-    out where it goes and, for an ADD, what its live locator actually is.
-    Nothing is written yet - the result is meant to be shown to the user
-    for a final confirm/edit before /api/changes/apply."""
-    meta = _require_recording_access(req.recording_id, request.state.user)
-    paths = recording_store.paths(req.recording_id)
-    steps = ExcelExecutor(paths.execution_excel).load_steps()
-    entry = dict(req.change_entry)
-    change_type = entry.get("change_type")
-
-    if change_type == "ADDED":
-        result = element_resolver.resolve_added_element(
-            entry, steps, meta.target_url if meta else "",
-            browser=req.browser, remote_node_url=req.remote_node_url, ai_provider=req.ai_provider,
-        )
-    elif change_type == "REMOVED":
-        result = element_resolver.resolve_removed_element(entry, steps)
-    else:
-        raise HTTPException(400, f"Unknown or missing change_type '{change_type}' - expected 'ADDED' or 'REMOVED'")
-
-    return {**entry, **result}
-
-
-@app.post("/api/changes/apply")
-def apply_changes_endpoint(req: ApplyChangesRequest, request: Request) -> Dict[str, Any]:
-    """Patches execution.xlsx with every confirmed change entry (each one
-    already resolved via /api/changes/resolve, and reviewed/edited by the
-    user) and records a change-set for audit + scoped re-execution."""
-    user = request.state.user
-    _require_recording_access(req.recording_id, user)
-    if not req.entries:
-        raise HTTPException(400, "entries must be a non-empty list")
-    paths = recording_store.paths(req.recording_id)
-    result = change_applier.apply_changes(paths, req.source_document, req.entries)
-    activity_log.record(
-        user.user_id, user.username, "changes_applied",
-        recording_id=req.recording_id,
-        details={"source_document": req.source_document, "entry_count": len(req.entries)},
-    )
-    return result
-
-
-@app.get("/api/changes/{recording_id}")
-def list_changes(recording_id: str, request: Request) -> List[Dict[str, Any]]:
-    _require_recording_access(recording_id, request.state.user)
-    paths = recording_store.paths(recording_id)
-    return change_applier.load_change_log(paths)
-
-
-# ----------------------------------------------------------------------
-# Execution
-# ----------------------------------------------------------------------
-@app.post("/api/execute")
-def execute_recording(req: ExecuteRequest, request: Request) -> Dict[str, Any]:
-    user = request.state.user
-    _require_recording_access(req.recording_id, user)
-
-    only_step_numbers: Optional[List[int]] = None
-    if req.change_set_id and not req.run_via_behave:
-        paths = recording_store.paths(req.recording_id)
-        change_set = change_applier.find_change_set(paths, req.change_set_id)
-        if not change_set:
-            raise HTTPException(404, f"Change-set '{req.change_set_id}' not found for this recording")
-        only_step_numbers = list(change_set.get("added_step_numbers") or []) + list(change_set.get("removed_step_numbers") or [])
-        if not only_step_numbers:
-            raise HTTPException(400, "This change-set has no steps to run")
-
-    execution_id = ExecutionManager.start(
-        req.recording_id, browser=req.browser, test_data=req.test_data,
-        ai_provider=req.ai_provider, run_via_behave=req.run_via_behave,
-        remote_node_url=(req.remote_node_url or "").strip() or None,
-        only_step_numbers=only_step_numbers, owner_user_id=user.user_id,
-    )
-    activity_log.record(
-        user.user_id, user.username, "execute_recording",
-        recording_id=req.recording_id, details={"execution_id": execution_id, "run_via_behave": req.run_via_behave},
-    )
-    return {"execution_id": execution_id, "status": "running", "only_step_numbers": only_step_numbers}
-
-
-@app.get("/api/executions/{execution_id}")
-def get_execution(execution_id: str, request: Request) -> Dict[str, Any]:
-    state = ExecutionManager.get(execution_id)
-    if not state or not _can_access_execution(state, request.state.user):
-        raise HTTPException(404, "Execution not found")
-    return {"status": state["status"], "summary": state["summary"], "error": state["error"]}
-
-
-@app.post("/api/executions/{execution_id}/terminate")
-def terminate_execution(execution_id: str, request: Request) -> Dict[str, Any]:
-    state = ExecutionManager.get(execution_id)
-    if not state or not _can_access_execution(state, request.state.user):
-        raise HTTPException(404, "Execution not found")
-    if state["status"] != "running":
-        return {"terminated": False, "message": f"Execution already {state['status']}; nothing to stop."}
-    ExecutionManager.terminate(execution_id)
-    user = request.state.user
-    activity_log.record(user.user_id, user.username, "terminate_execution", details={"execution_id": execution_id})
-    return {"terminated": True, "message": "Stop requested - remaining steps will be skipped."}
-
-
-@app.websocket("/ws/execution/{execution_id}")
-async def execution_progress_ws(websocket: WebSocket, execution_id: str):
-    # Same reasoning as recording_events_ws above - AuthMiddleware doesn't
-    # cover WebSocket scopes, so check the cookie by hand here too.
-    user = user_from_cookies(websocket.cookies)
-    if not user:
-        await websocket.close(code=4401)
-        return
-    state = ExecutionManager.get(execution_id)
-    if state and not _can_access_execution(state, user):
-        await websocket.close(code=4404)
-        return
-    await websocket.accept()
-    if not state:
-        await websocket.send_json({"type": "error", "message": "Execution not found"})
-        await websocket.close()
-        return
-    q: "queue.Queue" = state["queue"]
-    try:
-        while True:
-            try:
-                evt = q.get_nowait()
-                await websocket.send_json(evt)
-                if evt.get("type") == "done":
-                    break
-            except queue.Empty:
-                await asyncio.sleep(0.3)
-    except WebSocketDisconnect:
-        pass
-
-
-@app.get("/api/executions")
-def list_executions(request: Request) -> List[Dict[str, Any]]:
-    owned_ids = _owned_recording_ids(request.state.user)
-    executions = MetadataStore.list_executions()
-    if owned_ids is None:
-        return executions
-    return [e for e in executions if e.get("recording_id") in owned_ids]
-
-
-@app.get("/api/healing_events")
-def list_healing_events(request: Request) -> List[Dict[str, Any]]:
-    owned_ids = _owned_recording_ids(request.state.user)
-    events = MetadataStore.list_healing_events()
-    if owned_ids is None:
-        return events
-    return [e for e in events if e.get("recording_id") in owned_ids]
-
-
-# ----------------------------------------------------------------------
-# Reports
-# ----------------------------------------------------------------------
-@app.post("/api/executions/{execution_id}/report")
-def generate_report(execution_id: str, recording_id: str, request: Request) -> Dict[str, Any]:
-    state = ExecutionManager.get(execution_id)
-    if not state or not state.get("summary") or not _can_access_execution(state, request.state.user):
-        raise HTTPException(404, "Execution summary not available yet")
-    paths = recording_store.paths(recording_id)
-    files = report_generator.save_report(paths.reports_dir, state["summary"])
-    return files
-
-
-# ----------------------------------------------------------------------
-# Downloads
-# ----------------------------------------------------------------------
-_DOWNLOADABLE = {
-    "excel": lambda p: p.execution_excel,
-    "feature": lambda p: p.feature_file,
-    "locator_repository": lambda p: p.locator_repo_file,
-    "metadata": lambda p: p.metadata_file,
+    setDeletingId(recordingId);
+    try {
+      await Api.del(`/api/recordings/${recordingId}`);
+      if (onChanged) onChanged();
+    } catch (e) {
+      window.alert("Failed to delete: " + e.message);
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th><th>URL</th><th>Transaction Code</th><th>Status</th>
+            <th>Steps</th><th>Pages</th><th>Executions</th><th>Created</th>
+            {showOwner && <th>Owner</th>}
+            {withActions && <th>Downloads</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {recordings.map((r) => (
+            <tr key={r.recording_id}>
+              <td>{r.name}</td>
+              <td>{r.target_url}</td>
+              <td>{r.transaction_code || "-"}</td>
+              <td><span className={`badge ${r.status}`}>{r.status}</span></td>
+              <td>{r.total_steps || 0}</td>
+              <td>{r.total_pages || 0}</td>
+              <td>{r.total_executions || 0}</td>
+              <td>{dateTimeStr(r.created_at)}</td>
+              {showOwner && <td>{r.owner_username || "-"}</td>}
+              {withActions && (
+                <td>
+                  <a className="link-btn" href={Api.href(`/api/recordings/${r.recording_id}/download/excel`)}>Excel</a>
+                  <a className="link-btn" href={Api.href(`/api/recordings/${r.recording_id}/download/feature`)}>Feature</a>
+                  <a className="link-btn" href={Api.href(`/api/recordings/${r.recording_id}/download/locator_repository`)}>Locator JSON</a>
+                  <a className="link-btn" href={Api.href(`/api/recordings/${r.recording_id}/download/page_objects`)}>Page Objects</a>
+                  <a className="link-btn" href={Api.href(`/api/recordings/${r.recording_id}/download/step_definitions`)}>Step Defs</a>
+                  <button
+                    type="button"
+                    className="link-btn danger"
+                    disabled={r.status === "recording" || deletingId === r.recording_id}
+                    title={r.status === "recording" ? "Stop the recording before deleting it" : undefined}
+                    onClick={() => handleDelete(r.recording_id, r.name)}
+                  >
+                    {deletingId === r.recording_id ? "Deleting..." : "Delete"}
+                  </button>
+                </td>
+              )}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }
-
-
-@app.get("/api/recordings/{recording_id}/download/{artifact}")
-def download_artifact(recording_id: str, artifact: str, request: Request):
-    _require_recording_access(recording_id, request.state.user)
-    paths = recording_store.paths(recording_id)
-    if artifact in _DOWNLOADABLE:
-        file_path = _DOWNLOADABLE[artifact](paths)
-        if not file_path.exists():
-            raise HTTPException(404, f"{artifact} not generated yet")
-        return FileResponse(str(file_path), filename=file_path.name)
-    if artifact == "page_objects":
-        return _zip_dir(paths.pages_dir, f"{recording_id}_page_objects.zip")
-    if artifact == "step_definitions":
-        return _zip_dir(paths.steps_dir, f"{recording_id}_step_definitions.zip")
-    if artifact == "logs":
-        return _zip_dir(settings.LOGS_DIR, f"{recording_id}_logs.zip")
-    if artifact == "reports":
-        return _zip_dir(paths.reports_dir, f"{recording_id}_reports.zip")
-    raise HTTPException(404, "Unknown artifact type")
-
-
-def _zip_dir(directory: Path, download_name: str):
-    import shutil
-    import tempfile
-
-    has_content = directory.exists() and any(
-        p.is_file() and p.name != "__init__.py" for p in directory.rglob("*")
-    )
-    if not has_content:
-        raise HTTPException(404, "Nothing generated yet")
-    tmp = Path(tempfile.mkdtemp()) / download_name.replace(".zip", "")
-    archive_path = shutil.make_archive(str(tmp), "zip", root_dir=str(directory))
-    return FileResponse(archive_path, filename=download_name)
-
-
-# ----------------------------------------------------------------------
-# Dashboard / AI config
-# ----------------------------------------------------------------------
-@app.get("/api/dashboard/stats")
-def dashboard_stats(request: Request) -> Dict[str, Any]:
-    user = request.state.user
-    owned_ids = _owned_recording_ids(user)
-    if owned_ids is None:
-        count = len(recording_store.list_recordings())
-        return MetadataStore.dashboard_stats(count)
-
-    count = len(owned_ids)
-    executions = [e for e in MetadataStore.list_executions() if e.get("recording_id") in owned_ids]
-    return {
-        "total_recordings": count,
-        "total_executions": len(executions),
-        "total_passed": sum(e.get("passed", 0) for e in executions),
-        "total_failed": sum(e.get("failed", 0) for e in executions),
-        "total_self_healed": sum(e.get("healed", 0) for e in executions),
-    }
-
-
-@app.get("/api/ai/providers")
-def ai_providers() -> Dict[str, Any]:
-    return {"default": settings.DEFAULT_AI_PROVIDER, "ai_enabled": settings.AI_ENABLED, "providers": available_providers()}
-
-
-@app.get("/api/health")
-def health() -> Dict[str, str]:
-    return {"status": "ok"}
-
-
-# ----------------------------------------------------------------------
-# Frontend static hosting
-# ----------------------------------------------------------------------
-# NoCacheStaticFiles: plain StaticFiles sends no Cache-Control header at
-# all, which leaves browsers free to apply their own heuristic caching to
-# index.html/app.js/styles.css - in practice this means editing a frontend
-# file on disk and reloading the page can silently keep serving the old
-# cached copy from the browser's disk cache (no request even reaches this
-# server), which is exactly the "I changed the code but nothing changed on
-# screen" symptom. Force every static response to always be revalidated so
-# a plain reload always reflects whatever is on disk right now.
-class NoCacheStaticFiles(StaticFiles):
-    async def get_response(self, path: str, scope):
-        response = await super().get_response(path, scope)
-        # Next.js's static export puts every built JS/CSS chunk under
-        # _next/static/ with a content hash baked into the filename (e.g.
-        # _next/static/chunks/app/page-a1b2c3.js) - a new build never
-        # reuses an old filename, so these specific assets are safe (and
-        # meant) to cache aggressively forever. Everything else (the HTML
-        # pages themselves, favicon, etc.) keeps the no-cache behavior
-        # above, so editing frontend code and rebuilding is always
-        # reflected on the next reload rather than served from a stale
-        # browser cache.
-        if "/_next/static/" in path:
-            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-        else:
-            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-            response.headers["Pragma"] = "no-cache"
-            response.headers["Expires"] = "0"
-        return response
-
-
-# IMPORTANT: this mount must be registered LAST. Starlette matches routes
-# in registration order, and a mount at "/" is a catch-all prefix match -
-# if it were registered before the /api/* routes above, every API request
-# would be swallowed by StaticFiles (returning 404 for any path that
-# isn't a literal file on disk) instead of ever reaching our handlers.
-if settings.FRONTEND_DIR.exists():
-    app.mount("/", NoCacheStaticFiles(directory=str(settings.FRONTEND_DIR), html=True), name="frontend")
