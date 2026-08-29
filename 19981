@@ -1,297 +1,650 @@
-/*
- * execution.js
- * "Select Recording -> Execute Recording" screen (spec sections 25-28):
- * recording dropdown, browser choice, custom test data, AI provider
- * override, live execution progress via WebSocket.
- */
+"""
+app.py
 
-let executionSocket = null;
-let lastExecutionId = null;
-let lastRecordingIdForReport = null;
+FastAPI backend for the Universal AI-Powered Web Automation Platform.
+Wires together the recorder, generator, execution, healing, AI, storage,
+and reporting modules behind a REST + WebSocket API consumed by the
+plain HTML/CSS/JS frontend in ../frontend.
 
-// ---------------------------------------------------------------------
-// Review & Edit Steps (spec: the Excel dataset is the editable source of
-// truth for the fast execution path). The executor always re-reads
-// execution.xlsx from disk right before running, so saving edits here
-// takes effect on the very next "Execute Recording" click - no separate
-// "apply" step needed.
-// ---------------------------------------------------------------------
-let editableSteps = []; // last-loaded full row dicts (every Excel column), edited in place
-let removedStepRows = new Set(); // indices into editableSteps marked for deletion, applied on Save
-let stepColumns = []; // full Excel column list for this recording, from GET .../steps
+Run with:
+    uvicorn backend.app:app --host 0.0.0.0 --port 8000
+(from the project root, with the virtualenv / requirements installed)
+"""
+from __future__ import annotations
 
-const STEPS_EDITABLE_COLUMNS = [
-  { key: "Action", label: "Action" },
-  { key: "Element_Name", label: "Element" },
-  { key: "Primary_Locator_Type", label: "Locator Type" },
-  { key: "Primary_Locator", label: "Primary Locator" },
-  { key: "Value", label: "Value" },
-  { key: "Test_Data_Key", label: "Test Data Key" },
-  // Capture -> Store -> Reuse: Captured_As names the {{variable}} a CAPTURE
-  // step's live-read value gets stored under; Resolved_Variable names the
-  // variable a LATER step's value should be re-read from at execution time
-  // instead of replaying the (possibly stale, e.g. a system-generated
-  // application ID/OTP) literal in the Value column. Both are auto-filled
-  // by the recorder's correlation logic but editable here like every other
-  // column, e.g. to correct a false-positive match or wire one up by hand.
-  { key: "Captured_As", label: "Captured As" },
-  { key: "Resolved_Variable", label: "Resolved Variable" },
-  // Optional_Step: type Y (or yes/true/1) to mark this step's element as
-  // expected to sometimes be legitimately absent (a conditional table row,
-  // one branch of a maker-checker flow, etc). A failed lookup then gets a
-  // short wait, skips AI self-healing, and is reported as SKIP instead of
-  // FAIL - see Executor._run_step() in the backend. Leave blank for a
-  // normal step.
-  { key: "Optional_Step", label: "Optional (Y/blank)" },
-  { key: "Expected_Result", label: "Expected Result" },
-];
+import asyncio
+import json
+import queue
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-// escapeHtml() is defined once in app.js (loaded before this file) and
-// reused here.
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
-async function loadStepsEditor() {
-  const recording_id = document.getElementById("exec-recording").value;
-  const statusEl = document.getElementById("steps-editor-status");
-  const saveBtn = document.getElementById("btn-save-steps");
-  if (!recording_id) { statusEl.textContent = "Select a recording first."; return; }
-  statusEl.textContent = "Loading steps...";
-  try {
-    const res = await Api.get(`/api/recordings/${recording_id}/steps`);
-    editableSteps = res.steps || [];
-    stepColumns = res.columns || [];
-    removedStepRows = new Set();
-    renderStepsEditorTable();
-    statusEl.textContent = editableSteps.length ? `Loaded ${editableSteps.length} step(s). Edit any cell (including the locator, if self-healing couldn't fix a broken one), tick Remove for a step that shouldn't run, or Add Step to insert a new one, then Save Changes.` : "This recording has no steps yet. Use Add Step to create one.";
-    saveBtn.disabled = true;
-  } catch (e) {
-    document.getElementById("steps-editor-table").innerHTML = "";
-    statusEl.textContent = "Failed to load steps: " + e.message;
-  }
+from backend.ai.providers import available_providers
+from backend.auth.activity_log import ActivityLogStore
+from backend.auth.admin_router import router as admin_router
+from backend.auth.dependencies import user_from_cookies, user_store
+from backend.auth.middleware import AuthMiddleware
+from backend.auth.router import router as auth_router
+from backend.change_detection import brd_parser, change_applier, document_extractor, element_resolver, transaction_matcher
+from backend.config import settings
+from backend.execution.excel_executor import ExcelExecutor
+from backend.execution.executor import ExecutionManager
+from backend.recorder.recorder import RecorderManager
+from backend.reporting import log_manager, report_generator
+from backend.storage.excel_store import EXECUTION_COLUMNS, ExcelStore
+from backend.storage.metadata_store import MetadataStore
+from backend.storage.recording_store import RecordingStore
+
+log_manager.configure_logging()
+logger = log_manager.get_logger("app")
+
+app = FastAPI(title="Universal AI-Powered Web Automation Platform", version="1.0.0")
+
+# IMPORTANT - registration order: AuthMiddleware MUST be added before
+# CORSMiddleware (i.e. earlier, textually, right here). Starlette's
+# add_middleware() inserts each new middleware at the front of the stack,
+# so whichever is added LAST ends up OUTERMOST - see AuthMiddleware's own
+# docstring (backend/auth/middleware.py) for the empirically-verified
+# details. Getting this order backwards breaks CORS preflight (OPTIONS)
+# requests from the Next.js dev server.
+app.add_middleware(AuthMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    # NOT allow_origins=["*"] - Starlette's CORSMiddleware only reflects the
+    # real Origin back on every response when it isn't in "allow all
+    # origins" mode (i.e. a literal "*" isn't in allow_origins). With a
+    # literal "*" here, its simple_response() heuristic only reflects the
+    # real origin back once the request already carries a session cookie -
+    # so it looks fine once you're logged in, but the very first response
+    # of all (POST /api/auth/login, before any cookie exists) comes back
+    # with "Access-Control-Allow-Origin: *" AND
+    # "Access-Control-Allow-Credentials: true" together, which is invalid
+    # per the fetch spec - browsers silently reject that combination, so
+    # login itself fails cross-origin (Next.js dev server on a different
+    # port, or a different machine on the LAN) with what looks like a CORS
+    # preflight failure even though the preflight itself was fine.
+    # allow_origin_regex matching everything sidesteps that "allow all
+    # origins" fast path entirely - is_allowed_origin() then runs (and
+    # correctly reflects the real origin) on every single response,
+    # cookie or not.
+    allow_origin_regex=r".*",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(auth_router)
+app.include_router(admin_router)
+
+recording_store = RecordingStore()
+activity_log = ActivityLogStore()
+
+# There is no public self-registration page (see backend/auth/__init__.py) -
+# this is the one-time bootstrap that lets a brand-new install log in at
+# all, by creating a single default admin account the first time
+# users.json is completely empty. No-op on every later restart.
+user_store.bootstrap_default_admin()
+
+
+# ----------------------------------------------------------------------
+# Request/response models
+# ----------------------------------------------------------------------
+class StartRecordingRequest(BaseModel):
+    name: str
+    target_url: str
+    browser: str = "chrome"
+    # Optional: record via a WebDriver node running on someone else's PC
+    # instead of launching a browser on this machine - see README section
+    # on remote / multi-user browser sessions. Omit/leave blank for the
+    # existing local-launch behavior.
+    remote_node_url: Optional[str] = None
+
+
+class ExecuteRequest(BaseModel):
+    recording_id: str
+    browser: Optional[str] = None
+    test_data: Optional[Dict[str, str]] = None
+    ai_provider: Optional[str] = None
+    run_via_behave: bool = False
+    remote_node_url: Optional[str] = None
+    # Run only the steps a previously-applied BRD/SD change-set touched
+    # (its added/re-numbered steps), instead of the whole transaction from
+    # the top - see /api/changes/{recording_id} for the available IDs and
+    # change_detection/change_applier.py for how a change-set's step
+    # numbers are recorded. Ignored when run_via_behave=True (Behave always
+    # runs the full feature file).
+    change_set_id: Optional[str] = None
+
+
+class UpdateStepRequest(BaseModel):
+    updates: Dict[str, Any]
+
+
+class TransactionCodeRequest(BaseModel):
+    transaction_code: str
+
+
+class ReplaceStepsRequest(BaseModel):
+    steps: List[Dict[str, Any]]
+
+
+class ResolveChangeRequest(BaseModel):
+    recording_id: str
+    change_entry: Dict[str, Any]
+    browser: Optional[str] = None
+    remote_node_url: Optional[str] = None
+    ai_provider: Optional[str] = None
+
+
+class ApplyChangesRequest(BaseModel):
+    recording_id: str
+    source_document: str
+    entries: List[Dict[str, Any]]
+
+
+# ----------------------------------------------------------------------
+# Recording management
+# ----------------------------------------------------------------------
+@app.post("/api/recordings/start")
+def start_recording(req: StartRecordingRequest, request: Request) -> Dict[str, Any]:
+    if not req.target_url.strip():
+        raise HTTPException(400, "target_url is required")
+    try:
+        session = RecorderManager.start_recording(
+            req.name or "Untitled Recording", req.target_url.strip(), req.browser,
+            remote_node_url=(req.remote_node_url or "").strip() or None,
+        )
+    except Exception as exc:
+        logger.error("Failed to start recording: %s", exc)
+        raise HTTPException(500, f"Failed to launch browser/recorder: {exc}")
+    user = request.state.user
+    activity_log.record(
+        user.user_id, user.username, "start_recording",
+        recording_id=session.recording_id, details={"name": req.name, "target_url": req.target_url},
+    )
+    return {"recording_id": session.recording_id, "status": session.status}
+
+
+@app.post("/api/recordings/{recording_id}/pause")
+def pause_recording(recording_id: str) -> Dict[str, Any]:
+    session = RecorderManager.get(recording_id)
+    if not session:
+        raise HTTPException(404, "Recording session not active")
+    session.pause()
+    return {"status": session.status}
+
+
+@app.post("/api/recordings/{recording_id}/resume")
+def resume_recording(recording_id: str) -> Dict[str, Any]:
+    session = RecorderManager.get(recording_id)
+    if not session:
+        raise HTTPException(404, "Recording session not active")
+    session.resume()
+    return {"status": session.status}
+
+
+@app.post("/api/recordings/{recording_id}/stop")
+def stop_recording(recording_id: str, request: Request) -> Dict[str, Any]:
+    summary = RecorderManager.stop_recording(recording_id)
+    if summary is None:
+        raise HTTPException(404, "Recording session not active")
+    user = request.state.user
+    activity_log.record(user.user_id, user.username, "stop_recording", recording_id=recording_id)
+    return summary
+
+
+@app.delete("/api/recordings/{recording_id}/actions/{step_number}")
+def delete_recorded_action(recording_id: str, step_number: int) -> Dict[str, Any]:
+    """Deletes one already-recorded action from an in-progress recording
+    session - e.g. a transaction that failed partway through and shouldn't
+    be saved/replayed. Only works while the recording is still active;
+    once stopped, edit the Excel dataset instead (Execute Recording ->
+    Review & Edit Steps -> tick Remove)."""
+    session = RecorderManager.get(recording_id)
+    if not session:
+        raise HTTPException(404, "Recording session not active - actions can only be deleted while recording is in progress. Once stopped, use Review & Edit Steps instead.")
+    ok = session.delete_action(step_number)
+    if not ok:
+        raise HTTPException(404, f"Step {step_number} not found in the current recording")
+    return {"deleted": True, "step_number": step_number, "remaining_steps": len(session.actions)}
+
+
+@app.get("/api/recordings")
+def list_recordings() -> List[Dict[str, Any]]:
+    return recording_store.list_recordings()
+
+
+@app.get("/api/recordings/{recording_id}")
+def get_recording(recording_id: str) -> Dict[str, Any]:
+    meta = recording_store.load_metadata(recording_id)
+    if not meta:
+        raise HTTPException(404, "Recording not found")
+    return meta.to_dict()
+
+
+@app.put("/api/recordings/{recording_id}/transaction_code")
+def set_transaction_code(recording_id: str, req: TransactionCodeRequest, request: Request) -> Dict[str, Any]:
+    """Tags a recording with a business transaction code/name (e.g. "1010")
+    so a later BRD/Solution Document upload mentioning that same code can
+    be automatically matched to it - see /api/changes/detect."""
+    meta = recording_store.set_transaction_code(recording_id, req.transaction_code)
+    if not meta:
+        raise HTTPException(404, "Recording not found")
+    user = request.state.user
+    activity_log.record(
+        user.user_id, user.username, "set_transaction_code",
+        recording_id=recording_id, details={"transaction_code": req.transaction_code},
+    )
+    return meta.to_dict()
+
+
+@app.delete("/api/recordings/{recording_id}")
+def delete_recording(recording_id: str, request: Request) -> Dict[str, Any]:
+    if RecorderManager.get(recording_id):
+        raise HTTPException(400, "Stop the active recording session before deleting it")
+    ok = recording_store.delete(recording_id)
+    if not ok:
+        raise HTTPException(404, "Recording not found")
+    user = request.state.user
+    activity_log.record(user.user_id, user.username, "delete_recording", recording_id=recording_id)
+    return {"deleted": True}
+
+
+# ----------------------------------------------------------------------
+# Live recorder event stream
+# ----------------------------------------------------------------------
+@app.websocket("/ws/recording/{recording_id}")
+async def recording_events_ws(websocket: WebSocket, recording_id: str):
+    # WebSocket handshakes don't go through AuthMiddleware (that's an HTTP
+    # middleware, and this is a different ASGI scope type) - check the same
+    # session cookie by hand before accepting, using the same
+    # user_from_cookies() helper the HTTP side uses. See
+    # backend/auth/dependencies.py's docstring for why one helper covers
+    # both.
+    user = user_from_cookies(websocket.cookies)
+    if not user:
+        await websocket.close(code=4401)
+        return
+    await websocket.accept()
+    session = RecorderManager.get(recording_id)
+    if not session:
+        await websocket.send_json({"event_type": "error", "message": "Recording session not active"})
+        await websocket.close()
+        return
+    try:
+        while True:
+            try:
+                evt = session.events.get_nowait()
+                await websocket.send_json(evt.to_dict())
+            except queue.Empty:
+                await asyncio.sleep(0.3)
+                if session.status not in ("recording", "paused", "starting"):
+                    break
+    except WebSocketDisconnect:
+        pass
+
+
+# ----------------------------------------------------------------------
+# Excel dataset editing (spec section 19/26: the Excel dataset is the
+# editable source of truth for the fast execution path - lets a user
+# correct a value the recorder missed or mis-captured, e.g. a password
+# field, before hitting Execute, without touching the file on disk by
+# hand).
+# ----------------------------------------------------------------------
+@app.get("/api/recordings/{recording_id}/steps")
+def get_steps(recording_id: str) -> Dict[str, Any]:
+    if not recording_store.exists(recording_id):
+        raise HTTPException(404, "Recording not found")
+    paths = recording_store.paths(recording_id)
+    store = ExcelStore(paths.execution_excel)
+    return {"columns": list(EXECUTION_COLUMNS), "steps": store.read_rows()}
+
+
+@app.put("/api/recordings/{recording_id}/steps/{step_number}")
+def update_step(recording_id: str, step_number: int, req: UpdateStepRequest, request: Request) -> Dict[str, Any]:
+    if not recording_store.exists(recording_id):
+        raise HTTPException(404, "Recording not found")
+    if not req.updates:
+        raise HTTPException(400, "No updates provided")
+    paths = recording_store.paths(recording_id)
+    store = ExcelStore(paths.execution_excel)
+    ok = store.update_row(step_number, req.updates)
+    if not ok:
+        raise HTTPException(404, f"Step {step_number} not found in this recording's Excel dataset")
+    user = request.state.user
+    activity_log.record(
+        user.user_id, user.username, "update_step",
+        recording_id=recording_id, details={"step_number": step_number, "updates": req.updates},
+    )
+    return {"updated": True, "step_number": step_number}
+
+
+@app.put("/api/recordings/{recording_id}/steps")
+def replace_steps(recording_id: str, req: ReplaceStepsRequest, request: Request) -> Dict[str, Any]:
+    if not recording_store.exists(recording_id):
+        raise HTTPException(404, "Recording not found")
+    if not req.steps:
+        raise HTTPException(400, "steps must be a non-empty list")
+    paths = recording_store.paths(recording_id)
+    store = ExcelStore(paths.execution_excel)
+    store.write_rows(req.steps)
+    user = request.state.user
+    activity_log.record(
+        user.user_id, user.username, "replace_steps",
+        recording_id=recording_id, details={"row_count": len(req.steps)},
+    )
+    return {"updated": True, "row_count": len(req.steps)}
+
+
+# ----------------------------------------------------------------------
+# BRD/Solution Document change detection (backend/change_detection/):
+# upload a document -> AI extracts "element added/removed" entries ->
+# each entry is resolved to a real locator (ADD, via a live re-crawl) or
+# an existing step (REMOVE) -> the user confirms -> apply patches
+# execution.xlsx and remembers which step numbers were affected so they
+# can be re-executed alone. See README's "BRD/SD change detection"
+# section for the full flow.
+# ----------------------------------------------------------------------
+@app.post("/api/changes/detect")
+async def detect_changes(request: Request, file: UploadFile = File(...), ai_provider: Optional[str] = Form(None)) -> Dict[str, Any]:
+    suffix = Path(file.filename or "").suffix
+    tmp_dir = Path(tempfile.mkdtemp())
+    tmp_path = tmp_dir / f"upload{suffix}"
+    try:
+        tmp_path.write_bytes(await file.read())
+        try:
+            text = document_extractor.extract_text(tmp_path)
+        except (document_extractor.UnsupportedDocumentError, ValueError) as exc:
+            raise HTTPException(400, str(exc))
+
+        try:
+            changes = brd_parser.extract_changes(text, ai_provider)
+        except brd_parser.BRDParsingUnavailableError as exc:
+            raise HTTPException(400, str(exc))
+    finally:
+        import shutil as _shutil
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    for entry in changes:
+        match = transaction_matcher.find_recording(entry, recording_store)
+        entry["matched_recording_id"] = match["recording_id"] if match else None
+        entry["matched_recording_name"] = match["recording_name"] if match else ""
+        entry["match_type"] = match["match_type"] if match else "none"
+        entry["match_confidence"] = match["confidence"] if match else 0.0
+
+    user = request.state.user
+    activity_log.record(
+        user.user_id, user.username, "changes_detected",
+        details={"source_document": file.filename or "uploaded_document", "change_count": len(changes)},
+    )
+    return {"source_document": file.filename or "uploaded_document", "changes": changes}
+
+
+@app.post("/api/changes/resolve")
+def resolve_change(req: ResolveChangeRequest) -> Dict[str, Any]:
+    """Given one change entry (from /api/changes/detect, possibly edited by
+    the user first - e.g. to correct which recording it applies to), works
+    out where it goes and, for an ADD, what its live locator actually is.
+    Nothing is written yet - the result is meant to be shown to the user
+    for a final confirm/edit before /api/changes/apply."""
+    if not recording_store.exists(req.recording_id):
+        raise HTTPException(404, "Recording not found")
+    meta = recording_store.load_metadata(req.recording_id)
+    paths = recording_store.paths(req.recording_id)
+    steps = ExcelExecutor(paths.execution_excel).load_steps()
+    entry = dict(req.change_entry)
+    change_type = entry.get("change_type")
+
+    if change_type == "ADDED":
+        result = element_resolver.resolve_added_element(
+            entry, steps, meta.target_url if meta else "",
+            browser=req.browser, remote_node_url=req.remote_node_url, ai_provider=req.ai_provider,
+        )
+    elif change_type == "REMOVED":
+        result = element_resolver.resolve_removed_element(entry, steps)
+    else:
+        raise HTTPException(400, f"Unknown or missing change_type '{change_type}' - expected 'ADDED' or 'REMOVED'")
+
+    return {**entry, **result}
+
+
+@app.post("/api/changes/apply")
+def apply_changes_endpoint(req: ApplyChangesRequest, request: Request) -> Dict[str, Any]:
+    """Patches execution.xlsx with every confirmed change entry (each one
+    already resolved via /api/changes/resolve, and reviewed/edited by the
+    user) and records a change-set for audit + scoped re-execution."""
+    if not recording_store.exists(req.recording_id):
+        raise HTTPException(404, "Recording not found")
+    if not req.entries:
+        raise HTTPException(400, "entries must be a non-empty list")
+    paths = recording_store.paths(req.recording_id)
+    result = change_applier.apply_changes(paths, req.source_document, req.entries)
+    user = request.state.user
+    activity_log.record(
+        user.user_id, user.username, "changes_applied",
+        recording_id=req.recording_id,
+        details={"source_document": req.source_document, "entry_count": len(req.entries)},
+    )
+    return result
+
+
+@app.get("/api/changes/{recording_id}")
+def list_changes(recording_id: str) -> List[Dict[str, Any]]:
+    if not recording_store.exists(recording_id):
+        raise HTTPException(404, "Recording not found")
+    paths = recording_store.paths(recording_id)
+    return change_applier.load_change_log(paths)
+
+
+# ----------------------------------------------------------------------
+# Execution
+# ----------------------------------------------------------------------
+@app.post("/api/execute")
+def execute_recording(req: ExecuteRequest, request: Request) -> Dict[str, Any]:
+    if not recording_store.exists(req.recording_id):
+        raise HTTPException(404, "Recording not found")
+
+    only_step_numbers: Optional[List[int]] = None
+    if req.change_set_id and not req.run_via_behave:
+        paths = recording_store.paths(req.recording_id)
+        change_set = change_applier.find_change_set(paths, req.change_set_id)
+        if not change_set:
+            raise HTTPException(404, f"Change-set '{req.change_set_id}' not found for this recording")
+        only_step_numbers = list(change_set.get("added_step_numbers") or []) + list(change_set.get("removed_step_numbers") or [])
+        if not only_step_numbers:
+            raise HTTPException(400, "This change-set has no steps to run")
+
+    execution_id = ExecutionManager.start(
+        req.recording_id, browser=req.browser, test_data=req.test_data,
+        ai_provider=req.ai_provider, run_via_behave=req.run_via_behave,
+        remote_node_url=(req.remote_node_url or "").strip() or None,
+        only_step_numbers=only_step_numbers,
+    )
+    user = request.state.user
+    activity_log.record(
+        user.user_id, user.username, "execute_recording",
+        recording_id=req.recording_id, details={"execution_id": execution_id, "run_via_behave": req.run_via_behave},
+    )
+    return {"execution_id": execution_id, "status": "running", "only_step_numbers": only_step_numbers}
+
+
+@app.get("/api/executions/{execution_id}")
+def get_execution(execution_id: str) -> Dict[str, Any]:
+    state = ExecutionManager.get(execution_id)
+    if not state:
+        raise HTTPException(404, "Execution not found")
+    return {"status": state["status"], "summary": state["summary"], "error": state["error"]}
+
+
+@app.post("/api/executions/{execution_id}/terminate")
+def terminate_execution(execution_id: str, request: Request) -> Dict[str, Any]:
+    state = ExecutionManager.get(execution_id)
+    if not state:
+        raise HTTPException(404, "Execution not found")
+    if state["status"] != "running":
+        return {"terminated": False, "message": f"Execution already {state['status']}; nothing to stop."}
+    ExecutionManager.terminate(execution_id)
+    user = request.state.user
+    activity_log.record(user.user_id, user.username, "terminate_execution", details={"execution_id": execution_id})
+    return {"terminated": True, "message": "Stop requested - remaining steps will be skipped."}
+
+
+@app.websocket("/ws/execution/{execution_id}")
+async def execution_progress_ws(websocket: WebSocket, execution_id: str):
+    # Same reasoning as recording_events_ws above - AuthMiddleware doesn't
+    # cover WebSocket scopes, so check the cookie by hand here too.
+    user = user_from_cookies(websocket.cookies)
+    if not user:
+        await websocket.close(code=4401)
+        return
+    await websocket.accept()
+    state = ExecutionManager.get(execution_id)
+    if not state:
+        await websocket.send_json({"type": "error", "message": "Execution not found"})
+        await websocket.close()
+        return
+    q: "queue.Queue" = state["queue"]
+    try:
+        while True:
+            try:
+                evt = q.get_nowait()
+                await websocket.send_json(evt)
+                if evt.get("type") == "done":
+                    break
+            except queue.Empty:
+                await asyncio.sleep(0.3)
+    except WebSocketDisconnect:
+        pass
+
+
+@app.get("/api/executions")
+def list_executions() -> List[Dict[str, Any]]:
+    return MetadataStore.list_executions()
+
+
+@app.get("/api/healing_events")
+def list_healing_events() -> List[Dict[str, Any]]:
+    return MetadataStore.list_healing_events()
+
+
+# ----------------------------------------------------------------------
+# Reports
+# ----------------------------------------------------------------------
+@app.post("/api/executions/{execution_id}/report")
+def generate_report(execution_id: str, recording_id: str) -> Dict[str, Any]:
+    state = ExecutionManager.get(execution_id)
+    if not state or not state.get("summary"):
+        raise HTTPException(404, "Execution summary not available yet")
+    paths = recording_store.paths(recording_id)
+    files = report_generator.save_report(paths.reports_dir, state["summary"])
+    return files
+
+
+# ----------------------------------------------------------------------
+# Downloads
+# ----------------------------------------------------------------------
+_DOWNLOADABLE = {
+    "excel": lambda p: p.execution_excel,
+    "feature": lambda p: p.feature_file,
+    "locator_repository": lambda p: p.locator_repo_file,
+    "metadata": lambda p: p.metadata_file,
 }
 
-function renderStepsEditorTable() {
-  const container = document.getElementById("steps-editor-table");
-  if (!editableSteps.length) {
-    container.innerHTML = "";
-    return;
-  }
-  const rows = editableSteps.map((step, idx) => {
-    const editableCells = STEPS_EDITABLE_COLUMNS.map(
-      (c) => `<td><input type="text" data-row="${idx}" data-col="${c.key}" value="${escapeHtml(step[c.key])}"></td>`
-    ).join("");
-    const removed = removedStepRows.has(idx);
-    return `<tr style="${removed ? "opacity:0.4;text-decoration:line-through;" : ""}">
-      <td><input type="checkbox" data-remove-row="${idx}" ${removed ? "checked" : ""} title="Remove this step - it won't be executed"></td>
-      <td>${escapeHtml(step.Step_Number)}</td>
-      ${editableCells}
-    </tr>`;
-  }).join("");
 
-  container.innerHTML = `
-    <table>
-      <thead><tr>
-        <th>Remove</th><th>Step</th>
-        ${STEPS_EDITABLE_COLUMNS.map((c) => `<th>${c.label}</th>`).join("")}
-      </tr></thead>
-      <tbody>${rows}</tbody>
-    </table>`;
+@app.get("/api/recordings/{recording_id}/download/{artifact}")
+def download_artifact(recording_id: str, artifact: str):
+    paths = recording_store.paths(recording_id)
+    if artifact in _DOWNLOADABLE:
+        file_path = _DOWNLOADABLE[artifact](paths)
+        if not file_path.exists():
+            raise HTTPException(404, f"{artifact} not generated yet")
+        return FileResponse(str(file_path), filename=file_path.name)
+    if artifact == "page_objects":
+        return _zip_dir(paths.pages_dir, f"{recording_id}_page_objects.zip")
+    if artifact == "step_definitions":
+        return _zip_dir(paths.steps_dir, f"{recording_id}_step_definitions.zip")
+    if artifact == "logs":
+        return _zip_dir(settings.LOGS_DIR, f"{recording_id}_logs.zip")
+    if artifact == "reports":
+        return _zip_dir(paths.reports_dir, f"{recording_id}_reports.zip")
+    raise HTTPException(404, "Unknown artifact type")
 
-  container.querySelectorAll("input[data-row]").forEach((input) => {
-    input.addEventListener("input", () => {
-      const row = Number(input.dataset.row);
-      const col = input.dataset.col;
-      editableSteps[row][col] = input.value;
-      document.getElementById("btn-save-steps").disabled = false;
-    });
-  });
 
-  container.querySelectorAll("input[data-remove-row]").forEach((checkbox) => {
-    checkbox.addEventListener("change", () => {
-      const row = Number(checkbox.dataset.removeRow);
-      if (checkbox.checked) removedStepRows.add(row); else removedStepRows.delete(row);
-      document.getElementById("btn-save-steps").disabled = false;
-      renderStepsEditorTable();
-    });
-  });
-}
+def _zip_dir(directory: Path, download_name: str):
+    import shutil
+    import tempfile
 
-function addStepRow() {
-  if (!stepColumns.length) return; // Load Steps first so we know the column shape
-  const maxStep = editableSteps.reduce((m, s) => Math.max(m, Number(s.Step_Number) || 0), 0);
-  const blank = {};
-  stepColumns.forEach((col) => { blank[col] = ""; });
-  blank.Step_Number = maxStep + 1;
-  blank.Action = "HOVER";
-  // best-effort default so a brand-new step still lands on the right page;
-  // the user can overwrite Primary_Locator_Type/Primary_Locator themselves.
-  const last = editableSteps[editableSteps.length - 1];
-  if (last) {
-    blank.Page_URL = last.Page_URL || "";
-    blank.Page_Title = last.Page_Title || "";
-  }
-  editableSteps.push(blank);
-  renderStepsEditorTable();
-  document.getElementById("btn-save-steps").disabled = false;
-  document.getElementById("steps-editor-status").textContent = `Added step ${blank.Step_Number} (defaulted to Action=HOVER) — fill in Element/Locator Type/Primary Locator, then Save Changes.`;
-}
+    has_content = directory.exists() and any(
+        p.is_file() and p.name != "__init__.py" for p in directory.rglob("*")
+    )
+    if not has_content:
+        raise HTTPException(404, "Nothing generated yet")
+    tmp = Path(tempfile.mkdtemp()) / download_name.replace(".zip", "")
+    archive_path = shutil.make_archive(str(tmp), "zip", root_dir=str(directory))
+    return FileResponse(archive_path, filename=download_name)
 
-async function saveStepsEditor() {
-  const recording_id = document.getElementById("exec-recording").value;
-  const statusEl = document.getElementById("steps-editor-status");
-  if (!recording_id || !editableSteps.length) return;
-  const stepsToSave = editableSteps.filter((_, idx) => !removedStepRows.has(idx));
-  if (!stepsToSave.length) { statusEl.textContent = "Can't save - every step is marked Remove. Un-tick at least one."; return; }
-  statusEl.textContent = "Saving...";
-  try {
-    await Api.put(`/api/recordings/${recording_id}/steps`, { steps: stepsToSave });
-    editableSteps = stepsToSave;
-    removedStepRows = new Set();
-    renderStepsEditorTable();
-    statusEl.textContent = `Saved. Execution will use these ${stepsToSave.length} step(s).`;
-    document.getElementById("btn-save-steps").disabled = true;
-  } catch (e) {
-    statusEl.textContent = "Failed to save: " + e.message;
-  }
-}
 
-async function refreshExecuteRecordingOptions() {
-  const select = document.getElementById("exec-recording");
-  try {
-    const recordings = await Api.get("/api/recordings");
-    select.innerHTML = recordings
-      .filter((r) => r.status !== "recording")
-      .map((r) => `<option value="${r.recording_id}">${r.name} (${r.total_steps || 0} steps)</option>`)
-      .join("");
-  } catch (e) {
-    select.innerHTML = "<option>Unable to load recordings</option>";
-  }
-}
+# ----------------------------------------------------------------------
+# Dashboard / AI config
+# ----------------------------------------------------------------------
+@app.get("/api/dashboard/stats")
+def dashboard_stats() -> Dict[str, Any]:
+    count = len(recording_store.list_recordings())
+    return MetadataStore.dashboard_stats(count)
 
-function connectExecutionSocket(executionId, recordingId) {
-  if (executionSocket) executionSocket.close();
-  executionSocket = new WebSocket(Api.wsUrl(`/ws/execution/${executionId}`));
-  const bar = document.getElementById("exec-progress-bar");
-  const summaryEl = document.getElementById("exec-progress-summary");
-  const stepEl = document.getElementById("exec-current-step");
 
-  executionSocket.onmessage = (msg) => {
-    const evt = JSON.parse(msg.data);
-    if (evt.type === "progress") {
-      const pct = Math.round((evt.step_number / Math.max(evt.total_steps, 1)) * 100);
-      bar.style.width = pct + "%";
-      summaryEl.textContent = `Step ${evt.step_number} / ${evt.total_steps} — ${evt.status}`;
-      stepEl.textContent = `Action: ${evt.action}  |  Element: ${evt.element_name || "-"}  |  Locator: ${evt.locator_used || "-"}  |  Status: ${evt.status}`;
-    } else if (evt.type === "done") {
-      summaryEl.textContent = `Execution finished with status: ${evt.status}`;
-      document.getElementById("btn-terminate-execution").disabled = true;
-      fetchExecutionResult(executionId, recordingId);
-    } else if (evt.type === "error") {
-      summaryEl.textContent = "Error: " + evt.message;
-      document.getElementById("btn-terminate-execution").disabled = true;
-    }
-  };
-}
+@app.get("/api/ai/providers")
+def ai_providers() -> Dict[str, Any]:
+    return {"default": settings.DEFAULT_AI_PROVIDER, "ai_enabled": settings.AI_ENABLED, "providers": available_providers()}
 
-async function fetchExecutionResult(executionId, recordingId) {
-  document.getElementById("btn-terminate-execution").disabled = true;
-  try {
-    const result = await Api.get(`/api/executions/${executionId}`);
-    if (result.status === "terminated") {
-      // Excel path still produces a proper pass/fail/heal/skip summary
-      // (remaining steps are just marked SKIP); the Behave path's result
-      // is a raw {success, error, terminated} dict instead - handle both.
-      const s = result.summary && typeof result.summary.passed === "number" ? result.summary : null;
-      document.getElementById("exec-progress-summary").textContent = s
-        ? `Terminated by user: ${s.passed || 0} passed, ${s.failed || 0} failed, ${s.healed || 0} healed, ${s.skipped || 0} skipped before stopping.`
-        : "Execution terminated by user.";
-      refreshDashboard();
-    } else if (result.summary) {
-      const s = result.summary;
-      document.getElementById("exec-progress-summary").textContent =
-        `Completed: ${s.passed || 0} passed, ${s.failed || 0} failed, ${s.healed || 0} healed, ${s.skipped || 0} skipped.`;
-      // Auto-generate the downloadable report.
-      await Api.post(`/api/executions/${executionId}/report?recording_id=${recordingId}`);
-      refreshDashboard();
-      if (typeof refreshReportsTable === "function") refreshReportsTable();
-    } else if (result.status === "error") {
-      // The run failed before it could produce a step summary - most often
-      // a browser/driver launch failure (e.g. a bad CHROME_DRIVER_PATH /
-      // EDGE_DRIVER_PATH, or Chrome/Edge not installed). Surface it clearly
-      // instead of leaving the progress line stuck on "Starting execution...".
-      document.getElementById("exec-progress-summary").textContent = "Execution failed: " + (result.error || "unknown error");
-    }
-  } catch (e) {
-    document.getElementById("exec-progress-summary").textContent = "Failed to fetch execution result: " + e.message;
-  }
-}
 
-document.addEventListener("DOMContentLoaded", () => {
-  // Shares the same remembered value as the Recorder tab's field (same
-  // localStorage key) - most people executing on their own PC recorded on
-  // it too, so this saves re-typing it a second time.
-  try {
-    const savedNode = window.localStorage.getItem("ua_remote_node_url");
-    if (savedNode) document.getElementById("exec-remote-node").value = savedNode;
-  } catch (e) { /* localStorage unavailable - not critical */ }
+@app.get("/api/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
 
-  document.getElementById("btn-load-steps").addEventListener("click", loadStepsEditor);
-  document.getElementById("btn-add-step").addEventListener("click", addStepRow);
-  document.getElementById("btn-save-steps").addEventListener("click", saveStepsEditor);
-  document.getElementById("exec-recording").addEventListener("change", () => {
-    editableSteps = [];
-    removedStepRows = new Set();
-    stepColumns = [];
-    document.getElementById("steps-editor-table").innerHTML = "";
-    document.getElementById("steps-editor-status").textContent = "";
-    document.getElementById("btn-save-steps").disabled = true;
-  });
 
-  document.getElementById("btn-execute").addEventListener("click", async () => {
-    const recording_id = document.getElementById("exec-recording").value;
-    const browser = document.getElementById("exec-browser").value;
-    const ai_provider = document.getElementById("exec-ai-provider").value || null;
-    const run_via_behave = document.getElementById("exec-via-behave").checked;
-    const remote_node_url = document.getElementById("exec-remote-node").value.trim();
-    let test_data = {};
-    const raw = document.getElementById("exec-test-data").value.trim();
-    if (raw) {
-      try { test_data = JSON.parse(raw); } catch (e) { alert("Test Data must be valid JSON"); return; }
-    }
-    if (!recording_id) { alert("Select a recording first."); return; }
+# ----------------------------------------------------------------------
+# Frontend static hosting
+# ----------------------------------------------------------------------
+# NoCacheStaticFiles: plain StaticFiles sends no Cache-Control header at
+# all, which leaves browsers free to apply their own heuristic caching to
+# index.html/app.js/styles.css - in practice this means editing a frontend
+# file on disk and reloading the page can silently keep serving the old
+# cached copy from the browser's disk cache (no request even reaches this
+# server), which is exactly the "I changed the code but nothing changed on
+# screen" symptom. Force every static response to always be revalidated so
+# a plain reload always reflects whatever is on disk right now.
+class NoCacheStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        # Next.js's static export puts every built JS/CSS chunk under
+        # _next/static/ with a content hash baked into the filename (e.g.
+        # _next/static/chunks/app/page-a1b2c3.js) - a new build never
+        # reuses an old filename, so these specific assets are safe (and
+        # meant) to cache aggressively forever. Everything else (the HTML
+        # pages themselves, favicon, etc.) keeps the no-cache behavior
+        # above, so editing frontend code and rebuilding is always
+        # reflected on the next reload rather than served from a stale
+        # browser cache.
+        if "/_next/static/" in path:
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
 
-    try { window.localStorage.setItem("ua_remote_node_url", remote_node_url); } catch (e) { /* ignore */ }
 
-    document.getElementById("exec-progress-summary").textContent = remote_node_url
-      ? `Starting execution on ${remote_node_url}...`
-      : "Starting execution...";
-    document.getElementById("exec-progress-bar").style.width = "0%";
-    document.getElementById("exec-current-step").textContent = "";
-
-    try {
-      const res = await Api.post("/api/execute", { recording_id, browser, test_data, ai_provider, run_via_behave, remote_node_url });
-      lastExecutionId = res.execution_id;
-      lastRecordingIdForReport = recording_id;
-      document.getElementById("btn-terminate-execution").disabled = false;
-      connectExecutionSocket(res.execution_id, recording_id);
-    } catch (e) {
-      document.getElementById("exec-progress-summary").textContent = "Failed to start execution: " + e.message;
-    }
-  });
-
-  document.getElementById("btn-terminate-execution").addEventListener("click", async () => {
-    if (!lastExecutionId) return;
-    const btn = document.getElementById("btn-terminate-execution");
-    btn.disabled = true;
-    document.getElementById("exec-progress-summary").textContent = "Stopping execution...";
-    try {
-      const res = await Api.post(`/api/executions/${lastExecutionId}/terminate`);
-      document.getElementById("exec-progress-summary").textContent = res.message || "Stop requested.";
-      // The execution WebSocket's "done" event (and fetchExecutionResult)
-      // will report the final terminated/completed status shortly; this is
-      // just immediate feedback that the click registered.
-    } catch (e) {
-      document.getElementById("exec-progress-summary").textContent = "Failed to stop execution: " + e.message;
-      btn.disabled = false;
-    }
-  });
-});
+# IMPORTANT: this mount must be registered LAST. Starlette matches routes
+# in registration order, and a mount at "/" is a catch-all prefix match -
+# if it were registered before the /api/* routes above, every API request
+# would be swallowed by StaticFiles (returning 404 for any path that
+# isn't a literal file on disk) instead of ever reaching our handlers.
+if settings.FRONTEND_DIR.exists():
+    app.mount("/", NoCacheStaticFiles(directory=str(settings.FRONTEND_DIR), html=True), name="frontend")
