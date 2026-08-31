@@ -1,25 +1,193 @@
-async function _errorMessage(res) {
-  const text = await res.text().catch(() => "");
-  try {
-    const parsed = JSON.parse(text);
-    if (parsed && typeof parsed.detail === "string") return parsed.detail;
-  } catch {
-    // Not JSON - fall through to the raw text.
-  }
-  return text || `${res.status} ${res.statusText}`;
-}
+"""
+browser_factory.py
 
-async function handle(res) {
-  if (res.status === 401) {
-    const isLoginAttempt = res.url && res.url.endsWith("/api/auth/login");
-    if (!isLoginAttempt) {
-      if (onUnauthorized) onUnauthorized();
-      throw new Error("Not authenticated");
-    }
-    throw new Error(await _errorMessage(res));
-  }
-  if (!res.ok) {
-    throw new Error(await _errorMessage(res));
-  }
-  return res.json();
-}
+Creates (or connects to) a Playwright browser + context + page, shared by
+both the recorder (manual recording session) and the executor (replay).
+
+IMPORTANT - Playwright's sync API is single-threaded: every Playwright
+call (launch, navigate, click, evaluate, ...) must happen on the same
+Python thread that started `sync_playwright()`. Calling Playwright objects
+from a different thread raises a greenlet/threading error, not a clean
+exception you can catch and ignore. Both callers of this module -
+RecorderSession's background polling thread, and Executor.run() (already
+invoked from ExecutionManager's own worker thread) - create their
+PlaywrightSession here and use it ENTIRELY within that one owning thread,
+including final cleanup via close(). Neither caller may hand the session
+to another thread, and Executor.terminate() (called from a different,
+request-handling thread - see executor.py) deliberately does not touch
+the Playwright objects directly for exactly this reason.
+
+Driver/browser binary resolution: unlike Selenium (which needed a
+matching chromedriver/msedgedriver binary, downloaded via webdriver-
+manager or pointed at manually), Playwright manages its own browser
+binaries - run `playwright install` once (see README section 4) and every
+supported browser is available with no separate driver management, no
+version-matching headaches, and no CHROME_DRIVER_PATH/EDGE_DRIVER_PATH
+settings to configure.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+from playwright.sync_api import Browser, BrowserContext, BrowserType, Page, Playwright, sync_playwright
+
+from backend.config import settings
+
+
+class RemoteNodeUnreachableError(RuntimeError):
+    pass
+
+
+@dataclass
+class PlaywrightSession:
+    """Owns the full Playwright object graph for one browser session -
+    must be created AND closed on the same thread (see module docstring).
+    `page` is the one active tab callers interact with; recorder.py tracks
+    additional tabs itself via `context.pages` as they open."""
+    playwright: Playwright
+    browser: Browser
+    context: BrowserContext
+    page: Page
+
+    def close(self) -> None:
+        """Best-effort, ignores errors - mirrors the old driver.quit()'s
+        "don't fail the caller just because cleanup hit a snag (browser
+        already crashed/closed)" behavior."""
+        for obj, method in ((self.context, "close"), (self.browser, "close"), (self.playwright, "stop")):
+            try:
+                getattr(obj, method)()
+            except Exception:
+                pass
+
+
+def _resolve_browser_type(pw: Playwright, browser: str) -> BrowserType:
+    b = (browser or "chrome").lower()
+    if b == "firefox":
+        return pw.firefox
+    if b in ("webkit", "safari"):
+        return pw.webkit
+    # "chrome" and "edge" both run on Chromium under Playwright - the
+    # bundled Chromium build is used for both by default (no separate
+    # driver/binary to install or version-match). Set PLAYWRIGHT_CHANNEL
+    # (e.g. "msedge" or "chrome") in .env if you specifically need the
+    # real installed browser binary instead of Playwright's bundled one.
+    return pw.chromium
+
+
+def create_session(
+    browser: str = None,
+    headless: bool = None,
+    remote_node_url: Optional[str] = None,
+) -> PlaywrightSession:
+    """Launches (or connects to) a browser and returns a ready-to-use
+    PlaywrightSession. Must be called on the thread that will go on to use
+    it - see the module docstring."""
+    browser = (browser or settings.DEFAULT_BROWSER).lower()
+    headless = settings.BROWSER_HEADLESS if headless is None else headless
+
+    pw = sync_playwright().start()
+    browser_type = _resolve_browser_type(pw, browser)
+
+    if remote_node_url:
+        return _connect_remote(pw, browser_type, remote_node_url)
+
+    launch_kwargs = {"headless": headless, "args": ["--disable-notifications", "--disable-popup-blocking"]}
+    if settings.PLAYWRIGHT_CHANNEL:
+        launch_kwargs["channel"] = settings.PLAYWRIGHT_CHANNEL
+    elif browser == "edge":
+        launch_kwargs["channel"] = "msedge"
+
+    # Reported symptom: recording and replay both open a visibly small
+    # browser window. `viewport=None` below (kept from before) only stops
+    # Playwright from clamping the CONTENT area to its own fixed 1280x720
+    # default on top of whatever window size the browser actually opened
+    # at - it does nothing to make that OS-level window itself large in
+    # the first place, despite the comment that used to be here claiming
+    # it was "the closest equivalent of Selenium's --start-maximized". A
+    # real --start-maximized-equivalent flag has to be passed at launch.
+    # Only relevant for a headed browser (headless has no real window to
+    # size) and differs per engine - Chromium takes a genuine
+    # --start-maximized flag; Firefox has no such flag but does honor
+    # -width/-height, which combined with viewport=None gets it just as
+    # large. WebKit has neither and is only ever used here for
+    # cross-engine spot-checks, not everyday recording/execution.
+    if not headless:
+        if browser_type is pw.chromium:
+            launch_kwargs["args"].append("--start-maximized")
+        elif browser_type is pw.firefox:
+            launch_kwargs["args"].extend(["-width", "1920", "-height", "1080"])
+
+    # A second, separate bug in the same "small window" symptom, easy to
+    # miss because it looks like it should work: passing viewport=None to
+    # new_context() below (which is what this used to do) does NOT reach
+    # Playwright's server at all. The Python bindings' locals_to_params()
+    # helper strips every argument whose value is exactly None before
+    # sending the call over the wire - so `new_context(viewport=None)` and
+    # `new_context()` produce the byte-for-byte identical request. Once
+    # neither `viewport` nor `noDefaultViewport` is present in that
+    # request, Playwright's own server-side default kicks in
+    # unconditionally: `if (!options.viewport && !options.noDefaultViewport)
+    # options.viewport = {width: 1280, height: 720}` (see
+    # driver/package/lib/server/browserContext.js). The end result: even
+    # with --start-maximized correctly maximizing the actual OS window
+    # above, the PAGE CONTENT inside it was still being force-rendered into
+    # a fixed 1280x720 box - which is exactly what "the browser opens
+    # half-screen" looks like on any monitor larger than that. The real,
+    # working flag is no_viewport=True (see below) - an explicit True
+    # survives locals_to_params() and actually sets noDefaultViewport.
+    try:
+        b = browser_type.launch(**launch_kwargs)
+    except Exception:
+        # Most likely cause: the requested channel (a real installed
+        # browser binary) isn't present on this machine - fall back to
+        # Playwright's own bundled build rather than failing outright.
+        launch_kwargs.pop("channel", None)
+        b = browser_type.launch(**launch_kwargs)
+
+    # no_viewport=True (NOT viewport=None - see the note above try/except
+    # for why that looked plausible but silently did nothing) lets the
+    # actual (now maximized/full-size) browser window's size drive content
+    # size instead of Playwright's default fixed 1280x720 viewport.
+    context = b.new_context(no_viewport=True)
+    page = context.new_page()
+    return PlaywrightSession(playwright=pw, browser=b, context=context, page=page)
+
+
+def _connect_remote(pw: Playwright, browser_type: BrowserType, remote_node_url: str) -> PlaywrightSession:
+    """Connects to a browser already running on someone else's PC instead
+    of launching one locally - lets multiple people share one central
+    instance of this platform while each person's recording/execution
+    runs in their own local browser (see the README's "remote browser
+    sessions" section).
+
+    NOTE for anyone who used this feature under the old Selenium version:
+    the endpoint you point this at has CHANGED. Selenium connected to a
+    bare chromedriver/msedgedriver binary (or a Selenium Grid node)
+    speaking the WebDriver wire protocol. Playwright has no such protocol;
+    it instead connects either to Chromium's own DevTools Protocol (CDP)
+    endpoint (launch Chrome/Chromium on their machine with
+    `--remote-debugging-port=<port>`, reachable as
+    `http://<their-ip>:<port>`) or to a `playwright run-server` endpoint
+    (a `ws://` / `wss://` URL). A `ws://`/`wss://` URL is treated as a
+    Playwright server endpoint; anything else is treated as a CDP
+    endpoint.
+    """
+    try:
+        if remote_node_url.startswith(("ws://", "wss://")):
+            b = browser_type.connect(remote_node_url)
+        else:
+            b = browser_type.connect_over_cdp(remote_node_url)
+    except Exception as exc:
+        pw.stop()
+        raise RemoteNodeUnreachableError(
+            f"Could not reach the remote browser endpoint '{remote_node_url}'. Under Playwright this must "
+            "be a Chromium DevTools Protocol endpoint (launch Chrome/Chromium there with "
+            "--remote-debugging-port=<port>, reachable as http://<their-ip>:<port>) or a `playwright "
+            "run-server` ws:// endpoint - NOT a chromedriver/msedgedriver binary, which is what the old "
+            f"Selenium version of this platform used. Original error: {exc}"
+        ) from exc
+
+    context = b.contexts[0] if b.contexts else b.new_context(no_viewport=True)
+    page = context.pages[0] if context.pages else context.new_page()
+    return PlaywrightSession(playwright=pw, browser=b, context=context, page=page)
