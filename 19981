@@ -1,653 +1,227 @@
 """
-executor.py
+recording_store.py
 
-Top-level Excel-driven execution orchestrator (spec sections 19, 36,
-39). This is the "fast path" entry point the FastAPI backend calls when
-the user hits "Execute Recording":
+Owns the on-disk layout of a single recording:
 
-    Excel -> Pandas -> stored locator -> Selenium -> action
-                              |
-                        (on failure)
-                              v
-                     fallback locators -> locator repository ->
-                     DOM analysis -> AI self-healing -> validate ->
-                     update repository + Excel -> continue
+    recordings/<recording_id>/
+        metadata.json
+        locator_repository/
+            locator_repository.json
+        execution/
+            execution.xlsx
+        behave/
+            feature.feature
+            pages/*.py
+            steps/*.py
+        screenshots/
+        dom/
+        logs/
 
-AI is never invoked on a normal passing step - only self_healer.heal()
-(called after Stage 1/2 already failed) may reach into LangChain, keeping
-the "no AI call for every action" performance requirement intact.
+Also provides recording-management helpers (list / create / delete) used by
+the FastAPI backend so multiple independent recordings never clobber each
+other.
 """
 from __future__ import annotations
 
-import logging
-import threading
+import json
+import shutil
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
-
-from playwright.sync_api import Error as PlaywrightError
+from typing import Any, Dict, List, Optional
 
 from backend.config import settings
-from backend.execution import playwright_executor
-from backend.execution.action_engine import ActionEngine
-from backend.execution.excel_executor import ExcelExecutor
-from backend.execution.variable_store import VariableStore
-from backend.healing import self_healer
-from backend.recorder import browser_factory
-from backend.recorder.browser_factory import PlaywrightSession
-from backend.storage.excel_store import ExcelStore
-from backend.storage.locator_store import LocatorRepository
-from backend.storage.metadata_store import MetadataStore
-from backend.storage.models import ActionType, ExecutionSummary, StepResult, new_id
-from backend.storage.recording_store import RecordingPaths, RecordingStore
-
-logger = logging.getLogger("universal_automation.executor")
-
-ProgressCallback = Callable[[Dict[str, Any]], None]
+from backend.storage.models import RecordingMetadata, new_id
 
 
-def resolve_step_value(step: Dict[str, Any], test_data_overrides: Dict[str, str], variable_store: VariableStore) -> str:
-    """Decides what value a step actually types/uses, in order of
-    precedence: an explicit Test Data override (by Test_Data_Key or
-    Element_Name) always wins if present; otherwise, if this step was
-    correlated to an earlier CAPTURE in the SAME run (Capture -> Store ->
-    Reuse - see recorder.py and variable_store.py), use the live value
-    captured earlier THIS run; otherwise fall back to the literal value
-    that was recorded. A pure function (no Selenium/self access) so the
-    precedence logic can be unit-tested without a browser."""
-    value = step.get("value", "")
-    key = step.get("test_data_key") or ""
-    clean_key = key.strip("{}").strip() if key else ""
-    if clean_key and clean_key in test_data_overrides:
-        return test_data_overrides[clean_key]
-    if step.get("element_name") in test_data_overrides:
-        return test_data_overrides[step["element_name"]]
-    resolved_var = step.get("resolved_var") or ""
-    if resolved_var and variable_store.has(resolved_var):
-        return variable_store.get(resolved_var, value)
-    return value
+class RecordingPaths:
+    """Resolves every path that belongs to a given recording_id."""
 
-
-class Executor:
-    def __init__(
-        self,
-        recording_id: str,
-        browser: Optional[str] = None,
-        test_data_overrides: Optional[Dict[str, str]] = None,
-        ai_provider: Optional[str] = None,
-        screenshot_on_every_step: bool = False,
-        cancel_event: Optional[threading.Event] = None,
-        remote_node_url: Optional[str] = None,
-        only_step_numbers: Optional[List[int]] = None,
-    ):
+    def __init__(self, recording_id: str, base_dir: Optional[Path] = None):
         self.recording_id = recording_id
-        self.store = RecordingStore()
-        self.paths: RecordingPaths = self.store.paths(recording_id)
-        self.meta = self.store.load_metadata(recording_id)
-        self.browser = browser or (self.meta.browser if self.meta else "chrome")
-        self.test_data_overrides = test_data_overrides or {}
-        self.ai_provider = ai_provider
-        self.screenshot_on_every_step = screenshot_on_every_step
-        # Optional: drive a browser already running on someone else's PC
-        # instead of launching one locally - see
-        # browser_factory._connect_remote(). None preserves the existing
-        # local-launch behavior exactly.
-        self.remote_node_url = remote_node_url
-        # Restricts this run to only the given step numbers - e.g. "just the
-        # steps a BRD/Solution Document change just added or disabled",
-        # rather than the whole transaction from the top. None (the
-        # default) runs every step, exactly as before this existed. See
-        # change_detection/change_applier.py, which records the affected
-        # step numbers for each change-set so the UI can pass them back
-        # here without the user needing to remember/re-select them by hand.
-        self.only_step_numbers = set(only_step_numbers) if only_step_numbers else None
-        # Cooperative cancellation flag for the "Terminate Execution" button
-        # (spec-adjacent addition: let the user stop a run mid-flight
-        # instead of waiting for it to finish or fail on its own). Checked
-        # between steps in run(); ExecutionManager.terminate() additionally
-        # force-quits the driver so a step currently blocked in a Selenium
-        # wait fails immediately instead of running out its full timeout.
-        self.cancel_event = cancel_event
+        self.root = (base_dir or settings.RECORDINGS_DIR) / recording_id
 
-        self.locator_repo = LocatorRepository(recording_id, self.paths)
-        self.excel_executor = ExcelExecutor(self.paths.execution_excel)
-        # Capture -> Store -> Reuse: one store per run, so a CAPTURE step's
-        # live-read value is available to every LATER step in THIS run, but
-        # never leaks into a different execution - see variable_store.py.
-        self.variable_store = VariableStore()
+    @property
+    def metadata_file(self) -> Path:
+        return self.root / "metadata.json"
 
-        # Playwright's sync API is single-threaded (see browser_factory.py's
-        # module docstring): self.session is created inside run(), which is
-        # always invoked from ExecutionManager's own dedicated worker
-        # thread, and every Playwright call this Executor makes happens on
-        # that same thread. terminate() (called from a DIFFERENT thread -
-        # the API/request thread) deliberately never touches self.session
-        # directly for exactly this reason - see terminate()'s docstring.
-        self.session: Optional[PlaywrightSession] = None
-        self.engine: Optional[ActionEngine] = None
-        # Set once the browser session is confirmed gone (crashed/closed
-        # mid-run). Once True, remaining steps are skipped immediately
-        # instead of being run through the fallback-locator + self-healing
-        # pipeline against a session that can no longer respond.
-        self._session_dead = False
-        # Set once the user has clicked "Terminate Execution". Distinct from
-        # _session_dead so the skip message/summary can say what actually
-        # happened, even though the two short-circuit the same way.
-        self._terminated = False
+    @property
+    def locator_repo_dir(self) -> Path:
+        return self.root / "locator_repository"
 
-    def run(self, on_progress: Optional[ProgressCallback] = None) -> ExecutionSummary:
-        steps = self.excel_executor.load_steps()
-        if self.only_step_numbers is not None:
-            steps = [s for s in steps if s["step_number"] in self.only_step_numbers]
-        summary = ExecutionSummary(
-            execution_id=new_id("exec_"),
-            recording_id=self.recording_id,
-            recording_name=self.meta.name if self.meta else self.recording_id,
-            target_url=self.meta.target_url if self.meta else "",
-            browser=self.browser,
-            start_time=time.time(),
-            total_steps=len(steps),
+    @property
+    def locator_repo_file(self) -> Path:
+        return self.locator_repo_dir / "locator_repository.json"
+
+    @property
+    def execution_dir(self) -> Path:
+        return self.root / "execution"
+
+    @property
+    def execution_excel(self) -> Path:
+        return self.execution_dir / "execution.xlsx"
+
+    @property
+    def behave_dir(self) -> Path:
+        return self.root / "behave"
+
+    @property
+    def feature_file(self) -> Path:
+        return self.behave_dir / "feature.feature"
+
+    @property
+    def pages_dir(self) -> Path:
+        return self.behave_dir / "pages"
+
+    @property
+    def steps_dir(self) -> Path:
+        return self.behave_dir / "steps"
+
+    @property
+    def screenshots_dir(self) -> Path:
+        return self.root / "screenshots"
+
+    @property
+    def dom_dir(self) -> Path:
+        return self.root / "dom"
+
+    @property
+    def logs_dir(self) -> Path:
+        return self.root / "logs"
+
+    @property
+    def reports_dir(self) -> Path:
+        return self.root / "reports"
+
+    @property
+    def changes_dir(self) -> Path:
+        return self.root / "changes"
+
+    @property
+    def change_log_file(self) -> Path:
+        """History of every BRD/Solution Document change-set applied to
+        this recording - see backend/change_detection/change_applier.py."""
+        return self.changes_dir / "change_log.json"
+
+    def ensure_all(self) -> None:
+        for d in (
+            self.root,
+            self.locator_repo_dir,
+            self.execution_dir,
+            self.behave_dir,
+            self.pages_dir,
+            self.steps_dir,
+            self.screenshots_dir,
+            self.dom_dir,
+            self.logs_dir,
+            self.reports_dir,
+            self.changes_dir,
+        ):
+            d.mkdir(parents=True, exist_ok=True)
+
+
+class RecordingStore:
+    """CRUD operations for recording metadata + directory lifecycle."""
+
+    def __init__(self, base_dir: Optional[Path] = None):
+        self.base_dir = base_dir or settings.RECORDINGS_DIR
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+
+    def create(
+        self, name: str, target_url: str, browser: str = "chrome",
+        owner_user_id: str = "", owner_username: str = "", application_id: str = "",
+    ) -> RecordingMetadata:
+        recording_id = new_id("rec_")
+        meta = RecordingMetadata(
+            recording_id=recording_id, name=name, target_url=target_url, browser=browser,
+            owner_user_id=owner_user_id, owner_username=owner_username, application_id=application_id,
         )
+        paths = RecordingPaths(recording_id, self.base_dir)
+        paths.ensure_all()
+        self.save_metadata(meta)
+        return meta
 
-        self.session = browser_factory.create_session(self.browser, remote_node_url=self.remote_node_url)
-        self.engine = ActionEngine(self.session.page)
+    def paths(self, recording_id: str) -> RecordingPaths:
+        return RecordingPaths(recording_id, self.base_dir)
 
-        # Navigation only ever happens via an explicit OPEN_URL step's own
-        # page.goto() (see playwright_executor.execute_with_fallbacks) -
-        # every other step just assumes the browser is already on the
-        # right page from earlier in the flow. A normal full run always
-        # starts with OPEN_URL, so this is never needed there - but a
-        # scoped only_step_numbers run (see change_detection/) can easily
-        # start from a step in the MIDDLE of a transaction, whose OPEN_URL
-        # got filtered out. Without an explicit navigation here, the
-        # browser would sit on a blank page and every step would fail for
-        # a reason that has nothing to do with the change being tested.
-        if self.only_step_numbers is not None and steps and steps[0]["action"] != ActionType.OPEN_URL:
-            try:
-                self.session.page.goto(steps[0]["page_url"], wait_until="domcontentloaded")
-            except PlaywrightError as exc:
-                logger.warning(
-                    "Scoped run's implicit navigation to %s failed (%s); continuing anyway - "
-                    "the first step will surface its own failure if the page truly isn't reachable.",
-                    steps[0]["page_url"], exc,
-                )
+    def save_metadata(self, meta: RecordingMetadata) -> None:
+        paths = self.paths(meta.recording_id)
+        paths.ensure_all()
+        with open(paths.metadata_file, "w", encoding="utf-8") as f:
+            json.dump(meta.to_dict(), f, indent=2)
 
-        self.paths.screenshots_dir.mkdir(parents=True, exist_ok=True)
+    def load_metadata(self, recording_id: str) -> Optional[RecordingMetadata]:
+        paths = self.paths(recording_id)
+        if not paths.metadata_file.exists():
+            return None
+        with open(paths.metadata_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return RecordingMetadata(**data)
 
-        try:
-            for step in steps:
-                if self.cancel_event is not None and self.cancel_event.is_set():
-                    self._terminated = True
+    def list_recordings(self) -> List[Dict[str, Any]]:
+        results = []
+        if not self.base_dir.exists():
+            return results
+        for child in sorted(self.base_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            meta_file = child / "metadata.json"
+            if meta_file.exists():
                 try:
-                    result = self._run_step(step)
-                except Exception as exc:  # pragma: no cover - defensive
-                    # Most likely cause: the browser crashed/closed mid-step,
-                    # raising a raw connection error that isn't a
-                    # PlaywrightError subclass (so try_locator's own
-                    # exception handling didn't catch it). Treat it the same
-                    # as a lost session rather than letting one exception
-                    # abort the whole run with no summary.
-                    self._session_dead = True
-                    logger.warning("Step %s raised an unexpected error (%s); treating the session as lost.", step.get("step_number"), exc)
-                    result = StepResult(
-                        step_number=step.get("step_number", 0),
-                        action=step.get("action", ""),
-                        page_url=step.get("page_url", ""),
-                        element_name=step.get("element_name", ""),
-                        locator_used="",
-                        locator_strategy="",
-                        input_data=str(step.get("value", "")),
-                        expected_result=step.get("expected_result", ""),
-                        actual_result="Execution terminated by user" if self._terminated else f"Unexpected error: {exc}",
-                        execution_time_ms=0.0,
-                        status="SKIP" if self._terminated else "FAIL",
-                        error=str(exc),
-                    )
-                summary.step_results.append(result.to_dict())
-                if result.status == "PASS":
-                    summary.passed += 1
-                elif result.status == "HEALED":
-                    summary.passed += 1
-                    summary.healed += 1
-                elif result.status == "SKIP":
-                    summary.skipped += 1
-                else:
-                    summary.failed += 1
-                if on_progress:
-                    on_progress({
-                        "step_number": step["step_number"],
-                        "total_steps": len(steps),
-                        "status": result.status,
-                        "action": step["action"],
-                        "element_name": step.get("element_name", ""),
-                        "locator_used": result.locator_used,
-                    })
-        finally:
-            summary.end_time = time.time()
-            if self.session:
-                self.session.close()
+                    with open(meta_file, "r", encoding="utf-8") as f:
+                        results.append(json.load(f))
+                except (json.JSONDecodeError, OSError):
+                    continue
+        results.sort(key=lambda r: r.get("created_at", 0), reverse=True)
+        return results
 
-        self.locator_repo.flush()
-        MetadataStore.record_execution(summary.to_dict())
-        if self.meta:
-            self.meta.total_executions += 1
-            self.meta.last_execution_at = summary.end_time
-            self.store.save_metadata(self.meta)
+    def delete(self, recording_id: str) -> bool:
+        paths = self.paths(recording_id)
+        if paths.root.exists():
+            shutil.rmtree(paths.root)
+            return True
+        return False
 
-        return summary
+    def exists(self, recording_id: str) -> bool:
+        return self.paths(recording_id).metadata_file.exists()
 
-    # ------------------------------------------------------------------
-    def _run_step(self, step: Dict[str, Any]) -> StepResult:
-        start = time.time()
-        step_number = step["step_number"]
+    def set_transaction_code(self, recording_id: str, transaction_code: str) -> Optional[RecordingMetadata]:
+        """Tags a recording with a business transaction code/name (e.g.
+        "1010") so a BRD/Solution Document mentioning that same code can be
+        matched to it later - see change_detection/transaction_matcher.py."""
+        meta = self.load_metadata(recording_id)
+        if not meta:
+            return None
+        meta.transaction_code = transaction_code.strip()
+        meta.updated_at = time.time()
+        self.save_metadata(meta)
+        return meta
 
-        # Once the browser session is known dead OR the user has clicked
-        # Terminate Execution, every remaining step is a fast, no-op SKIP -
-        # don't touch the driver, don't self-heal, don't screenshot. Avoids
-        # the "60+ failed heal attempts in 2.7 seconds" cascade when the
-        # browser crashes/closes mid-run, and makes Terminate take effect
-        # immediately for every step still queued up.
-        if self._session_dead or self._terminated:
-            reason = "browser session was lost earlier in this run" if self._session_dead else "execution was terminated by the user"
-            return StepResult(
-                step_number=step_number,
-                action=step.get("action", ""),
-                page_url=step.get("page_url", ""),
-                element_name=step.get("element_name", ""),
-                locator_used="",
-                locator_strategy="",
-                input_data=str(step.get("value", "")),
-                expected_result=step.get("expected_result", ""),
-                actual_result=f"Skipped - {reason}",
-                execution_time_ms=0.0,
-                status="SKIP",
-                error="Browser session lost" if self._session_dead else "Terminated by user",
-            )
+    def set_application(self, recording_id: str, application_id: str) -> Optional[RecordingMetadata]:
+        """Tags (or re-tags) a recording with which application it belongs
+        to (see backend/applications/application_store.py) - the retroactive
+        counterpart to picking one on the Recorder start form, for a
+        recording made before that field existed or before its application
+        had been added to the list yet. Blank clears the tag. Only stores
+        the id (never a copy of the name), same reasoning as
+        RecordingMetadata.application_id itself - renaming the application
+        later still resolves correctly for this recording with no further
+        action needed here."""
+        meta = self.load_metadata(recording_id)
+        if not meta:
+            return None
+        meta.application_id = (application_id or "").strip()
+        meta.updated_at = time.time()
+        self.save_metadata(meta)
+        return meta
 
-        # A step whose Disabled cell is set means change_detection
-        # determined (and the user confirmed) that this step's target
-        # element was REMOVED from the application per a BRD/Solution
-        # Document update - see backend/change_detection/change_applier.py.
-        # Unlike an optional step (which still attempts the locator with a
-        # short timeout before giving up), a disabled step is skipped
-        # instantly: no locator attempt, no wait, no self-healing, no
-        # screenshot. It reports SKIP, same as an optional step, since it
-        # didn't count as a real failure either.
-        if step.get("disabled"):
-            reason = step.get("disabled_reason") or "Removed per a BRD/Solution Document change"
-            return StepResult(
-                step_number=step_number,
-                action=step.get("action", ""),
-                page_url=step.get("page_url", ""),
-                element_name=step.get("element_name", ""),
-                locator_used="",
-                locator_strategy="",
-                input_data=str(step.get("value", "")),
-                expected_result=step.get("expected_result", ""),
-                actual_result=f"Skipped - step disabled ({reason})",
-                execution_time_ms=round((time.time() - start) * 1000, 1),
-                status="SKIP",
-                error="",
-            )
-
-        # Decide the value this step actually uses (spec section 26's Test
-        # Data overrides take precedence, then a live Capture -> Store ->
-        # Reuse value from earlier in THIS run, then the recorded literal -
-        # see resolve_step_value() above).
-        value = resolve_step_value(step, self.test_data_overrides, self.variable_store)
-        step = {**step, "value": value}
-
-        # A step marked optional (see excel_executor._parse_optional_flag)
-        # is expected to sometimes have nothing to find - give it a short
-        # wait instead of the full EXPLICIT_WAIT_SECONDS so a run full of
-        # conditional/data-dependent steps doesn't spend minutes waiting
-        # out timeouts for elements that were never going to appear.
-        # Restored in the `finally` below regardless of outcome, so no
-        # later step in this run is ever affected by it.
-        is_optional = bool(step.get("optional"))
-        original_engine_timeout = self.engine.timeout
-        if is_optional:
-            self.engine.timeout = min(original_engine_timeout, settings.OPTIONAL_STEP_WAIT_SECONDS)
-        else:
-            # Recorder-observed pause (see recorder.py's
-            # RECORDED_PAUSE_THRESHOLD_MS): a real, human-perceptible gap
-            # before this step was recorded means the target application
-            # itself took that long to become ready last time (a report
-            # generating, an async eligibility check, a heavy render) - not
-            # that the user was slow. Reused from the Wait_Condition column
-            # (a plain seconds value, e.g. "8.4"; blank/non-numeric for
-            # every ordinary step, which leaves this step's timeout
-            # untouched). Only ever RAISES the timeout for this one step,
-            # never lowers it below the configured default.
-            recorded_wait = step.get("wait_condition")
-            if recorded_wait:
-                try:
-                    recorded_wait_seconds = float(recorded_wait)
-                except (TypeError, ValueError):
-                    recorded_wait_seconds = 0.0
-                if recorded_wait_seconds > original_engine_timeout:
-                    self.engine.timeout = recorded_wait_seconds
-        try:
-            outcome = playwright_executor.execute_with_fallbacks(self.engine, self.session, step)
-        finally:
-            self.engine.timeout = original_engine_timeout
-        status = "PASS"
-        error = outcome.get("error", "")
-        locator_used = f"{outcome.get('locator_type','')}::{outcome.get('locator_value','')}"
-        healing_event_dict = None
-        # Set below whenever a CAPTURE step succeeds (either on the first
-        # attempt or after healing) - carries the live value actually read
-        # off the page THIS run, for both variable_store.store() and the
-        # StepResult's actual_result message at the end of this method.
-        captured_this_run: Optional[str] = None
-
-        # Capture -> Store -> Reuse: on a successful CAPTURE step, stash the
-        # value that was actually read live off the page so any later step
-        # in THIS run whose resolved_var names the same variable picks it
-        # up via resolve_step_value() above, instead of replaying whatever
-        # literal value happened to be recorded originally.
-        if outcome.get("success") and step.get("action") == ActionType.CAPTURE and step.get("captured_as"):
-            captured_this_run = step.get("_captured_value", "")
-            self.variable_store.store(step["captured_as"], captured_this_run)
-
-        if not outcome["success"]:
-            if self._is_dead_session_error(error) or not self._session_alive():
-                self._session_dead = True
-                status = "FAIL"
-                error = (
-                    "Browser session lost (the browser was closed or crashed mid-execution). "
-                    "Remaining steps were skipped. If browsers fail to launch at all, make sure "
-                    "`playwright install` has been run in this environment."
-                )
-                logger.error("Step %s: %s Original error: %s", step_number, error, outcome.get("error", ""))
-            elif is_optional:
-                # No self-healing/AI - this is precisely the case optional
-                # steps exist for: the element is expected to sometimes be
-                # legitimately absent (a conditional table row, one branch
-                # of a maker-checker flow), so searching harder for it
-                # would just waste time chasing something that was never
-                # going to be found. Reported as SKIP (doesn't count
-                # against pass rate the way FAIL does) rather than PASS,
-                # since the step genuinely didn't run.
-                status = "SKIP"
-                error = (
-                    f"Optional step skipped - element not found within "
-                    f"{settings.OPTIONAL_STEP_WAIT_SECONDS:.0f}s. Marked "
-                    "Optional_Step, so no self-healing was attempted; this is "
-                    "expected when this step's element doesn't apply to "
-                    f"every run. Original error: {error}"
-                )
-            else:
-                try:
-                    heal_result = self_healer.heal(self.session, self.engine, step, self.locator_repo, self.ai_provider)
-                except PlaywrightError as exc:
-                    if self._is_dead_session_error(str(exc)) or not self._session_alive():
-                        self._session_dead = True
-                    else:
-                        logger.warning("Self-healing aborted for step %s due to a Playwright error: %s", step_number, exc)
-                    heal_result = {"success": False}
-
-                if self._session_dead:
-                    status = "FAIL"
-                    error = (
-                        "Browser session lost during self-healing (the browser was closed or "
-                        "crashed mid-execution). Remaining steps were skipped."
-                    )
-                else:
-                    event = self_healer.make_event(
-                        step_number, step.get("page_url", ""),
-                        step.get("primary_locator_type", ""), step.get("primary_locator", ""),
-                        heal_result,
-                    )
-                    # HealingEvent itself carries no recording_id (it's a
-                    # generic Layer-A/B concept - see backend/storage/models.py) -
-                    # stamp it on here, at the one place healing events are
-                    # actually recorded, so backend/app.py's
-                    # list_healing_events() can scope "whose healing events
-                    # are these" the same way it scopes executions, by
-                    # recording ownership rather than a separate field.
-                    MetadataStore.record_healing_event({**event.to_dict(), "recording_id": self.recording_id})
-                    healing_event_dict = event.to_dict()
-
-                    if heal_result["success"]:
-                        retry_step = {**step, "primary_locator_type": heal_result["new_locator_type"], "primary_locator": heal_result["new_locator"], "fallback_locators": []}
-                        retry_outcome = playwright_executor.execute_with_fallbacks(self.engine, self.session, retry_step)
-                        if retry_outcome["success"]:
-                            status = "HEALED"
-                            locator_used = f"{heal_result['new_locator_type']}::{heal_result['new_locator']}"
-                            # Self-Healing Update Cycle (spec section 21): persist
-                            # the healed locator so future executions are fast again.
-                            self.excel_executor.update_locator(step_number, heal_result["new_locator_type"], heal_result["new_locator"])
-                            error = ""
-                            # Same Capture -> Store -> Reuse bookkeeping as the
-                            # plain-PASS case above, but reading from retry_step
-                            # (a separate dict) since that's what actually ran.
-                            if step.get("action") == ActionType.CAPTURE and step.get("captured_as"):
-                                captured_this_run = retry_step.get("_captured_value", "")
-                                self.variable_store.store(step["captured_as"], captured_this_run)
-                        else:
-                            status = "FAIL"
-                            error = retry_outcome.get("error", error)
-                            if self._is_dead_session_error(error):
-                                self._session_dead = True
-                    else:
-                        status = "FAIL"
-
-        screenshot_path = ""
-        if (status == "FAIL" or status == "HEALED" or self.screenshot_on_every_step) and not self._session_dead:
-            screenshot_path = self._capture_screenshot(step_number, status)
-
-        elapsed_ms = round((time.time() - start) * 1000, 1)
-        # For a successful CAPTURE step, report what was actually read live
-        # off the page this run (captured_this_run, set above) - not the
-        # (necessarily stale) value that happened to be recorded originally -
-        # so the report/Excel reflect reality rather than a leftover
-        # recording-time literal.
-        actual_result = "OK" if status in ("PASS", "HEALED") else error
-        if status in ("PASS", "HEALED") and step.get("action") == ActionType.CAPTURE and step.get("captured_as"):
-            actual_result = f"Captured '{captured_this_run or ''}' as {{{{{step['captured_as']}}}}}"
-        return StepResult(
-            step_number=step_number,
-            action=step.get("action", ""),
-            page_url=step.get("page_url", ""),
-            element_name=step.get("element_name", ""),
-            locator_used=locator_used,
-            locator_strategy=outcome.get("locator_type", "") if status == "PASS" else (healing_event_dict or {}).get("new_locator_type", ""),
-            input_data=str(step.get("value", "")),
-            expected_result=step.get("expected_result", ""),
-            actual_result=actual_result,
-            execution_time_ms=elapsed_ms,
-            status=status,
-            screenshot=screenshot_path,
-            error=error,
-            healing_event=healing_event_dict,
-        )
-
-    def terminate(self) -> None:
-        """Called from the API/request thread (NOT the worker thread this
-        Executor is running on) when the user clicks Terminate Execution.
-
-        Deliberately does NOT touch self.session/self.engine/Playwright in
-        any way. Playwright's sync API is single-threaded (see
-        browser_factory.py's module docstring) - every Playwright object
-        here belongs to the worker thread running run(), and calling into
-        it from this (different) thread is unsafe, unlike Selenium's
-        WebDriver, which the old version of this method force-quit
-        cross-thread to make an in-flight blocked call fail immediately.
-
-        Setting these flags alone means Terminate takes effect at the next
-        checkpoint - either before the next step starts, or when the
-        CURRENT step's own Playwright timeout elapses if one is already
-        in-flight - rather than interrupting a blocked call instantly.
-        That's a real, honest trade-off versus the old Selenium behavior,
-        made for thread-safety; in practice it means Terminate takes effect
-        within, worst case, one step's own timeout (a few seconds), not an
-        indefinite wait."""
-        self._terminated = True
-        if self.cancel_event is not None:
-            self.cancel_event.set()
-
-    def _capture_screenshot(self, step_number: int, status: str) -> str:
-        try:
-            filename = f"step_{step_number}_{status}.png"
-            path = self.paths.screenshots_dir / filename
-            self.session.page.screenshot(path=str(path))
-            return str(path)
-        except PlaywrightError as exc:
-            if self._is_dead_session_error(str(exc)):
-                self._session_dead = True
-            return ""
-        except Exception:
-            return ""
-
-    # Substrings Playwright uses across its own exception messages when the
-    # browser/context/page is already gone (closed or crashed) - there is no
-    # single dedicated exception subclass to catch across every Playwright
-    # version this pins against, so a substring check (same pattern the old
-    # Selenium version used for "InvalidSessionIdException") is the reliable
-    # option. playwright_executor.py stringifies exceptions as
-    # "ExceptionClassName: message", so this works against that format too.
-    _DEAD_SESSION_MARKERS = (
-        "has been closed", "Target closed", "Target page, context or browser has been closed",
-        "Connection closed", "Browser has been closed",
-    )
-
-    @classmethod
-    def _is_dead_session_error(cls, error: str) -> bool:
-        """Distinguishes a truly-dead browser session (whole run should
-        stop) from a narrower, recoverable error (e.g. a single closed tab
-        when others remain open)."""
-        err = error or ""
-        return any(marker in err for marker in cls._DEAD_SESSION_MARKERS)
-
-    def _session_alive(self) -> bool:
-        """Cheap liveness probe used once a step has already failed, to
-        catch cases where the session died via a path whose error message
-        didn't match _DEAD_SESSION_MARKERS. Browser.is_connected() is a
-        purpose-built Playwright API for exactly this check."""
-        if not self.session:
-            return False
-        try:
-            return self.session.browser.is_connected()
-        except Exception:
-            return False
-
-
-class ExecutionManager:
-    """Process-wide registry of in-flight/completed executions, so the
-    FastAPI layer can kick off a run in a background thread and let the
-    frontend poll/stream progress via WebSocket without blocking the
-    HTTP request."""
-
-    _executions: Dict[str, Dict[str, Any]] = {}
-    _lock = None
-
-    @classmethod
-    def _ensure_lock(cls):
-        if cls._lock is None:
-            import threading
-            cls._lock = threading.Lock()
-        return cls._lock
-
-    @classmethod
-    def start(
-        cls,
-        recording_id: str,
-        browser: Optional[str] = None,
-        test_data: Optional[Dict[str, str]] = None,
-        ai_provider: Optional[str] = None,
-        run_via_behave: bool = False,
-        remote_node_url: Optional[str] = None,
-        only_step_numbers: Optional[List[int]] = None,
-        owner_user_id: str = "",
-    ) -> str:
-        import queue
-
-        execution_id = new_id("run_")
-        progress_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
-        cancel_event = threading.Event()
-        # "executor" (Excel path) / "behave_process" (Behave path) are
-        # filled in by _worker once the run actually starts, so terminate()
-        # has something concrete to act on regardless of which path this
-        # execution took. recording_id/owner_user_id let the FastAPI layer
-        # (backend/app.py) check "does the caller own the recording this
-        # execution belongs to" without needing a separate lookup table -
-        # see _can_access_recording()/its execution-scoped equivalent there.
-        state = {
-            "status": "running", "queue": progress_queue, "summary": None, "error": None,
-            "cancel_event": cancel_event, "executor": None, "behave_process": None,
-            "terminate_requested": False, "recording_id": recording_id, "owner_user_id": owner_user_id,
-        }
-        with cls._ensure_lock():
-            cls._executions[execution_id] = state
-
-        def _worker():
-            try:
-                if run_via_behave:
-                    from backend.execution.behave_executor import run_behave
-
-                    def _on_process_started(proc) -> None:
-                        state["behave_process"] = proc
-
-                    result = run_behave(
-                        recording_id, browser or "chrome", test_data,
-                        on_process_started=_on_process_started, cancel_event=cancel_event,
-                        remote_node_url=remote_node_url,
-                    )
-                    state["summary"] = result
-                else:
-                    executor = Executor(
-                        recording_id, browser=browser, test_data_overrides=test_data,
-                        ai_provider=ai_provider, cancel_event=cancel_event,
-                        remote_node_url=remote_node_url, only_step_numbers=only_step_numbers,
-                    )
-                    state["executor"] = executor
-
-                    def on_progress(evt: Dict[str, Any]) -> None:
-                        progress_queue.put({"type": "progress", **evt})
-
-                    summary = executor.run(on_progress=on_progress)
-                    state["summary"] = summary.to_dict()
-                state["status"] = "terminated" if state["terminate_requested"] else "completed"
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.exception("Execution %s failed: %s", execution_id, exc)
-                state["status"] = "terminated" if state["terminate_requested"] else "error"
-                state["error"] = str(exc)
-            finally:
-                progress_queue.put({"type": "done", "status": state["status"]})
-
-        thread = threading.Thread(target=_worker, daemon=True)
-        state["thread"] = thread
-        thread.start()
-        return execution_id
-
-    @classmethod
-    def get(cls, execution_id: str) -> Optional[Dict[str, Any]]:
-        return cls._executions.get(execution_id)
-
-    @classmethod
-    def terminate(cls, execution_id: str) -> bool:
-        """Stops a running execution as soon as possible (spec-adjacent
-        addition: "Terminate Execution" button). Works for both the Excel
-        fast path (force-quits the driver so any in-flight Selenium wait
-        fails immediately) and the Behave path (terminates the `behave`
-        subprocess). Returns False if the execution isn't found; returns
-        True if a stop signal was sent, even if the run happens to finish
-        on its own a moment later anyway."""
-        state = cls._executions.get(execution_id)
-        if not state:
-            return False
-        state["terminate_requested"] = True
-        cancel_event = state.get("cancel_event")
-        if cancel_event is not None:
-            cancel_event.set()
-        executor = state.get("executor")
-        if executor is not None:
-            executor.terminate()
-        proc = state.get("behave_process")
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-        return True
+    def find_by_transaction_code(self, transaction_code: str) -> Optional[Dict[str, Any]]:
+        """Case-insensitive exact match against every recording's tagged
+        transaction_code. Returns the raw metadata dict (as list_recordings()
+        does) or None if no recording is tagged with this code."""
+        code = (transaction_code or "").strip().lower()
+        if not code:
+            return None
+        for meta_dict in self.list_recordings():
+            if str(meta_dict.get("transaction_code", "")).strip().lower() == code:
+                return meta_dict
+        return None
