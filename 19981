@@ -1,193 +1,649 @@
-"""
-browser_factory.py
+/*
+ * bridge.js
+ * ---------------------------------------------------------------------
+ * Injected into every document (top-level page AND every iframe the
+ * recorder descends into) via Selenium's execute_script. Defines a
+ * single window.__UA__ namespace that the Python side polls.
+ *
+ * This file is 100% generic: no selector, class name, id, or business
+ * term from any specific application is hardcoded. Every heuristic
+ * below is based on structural/semantic DOM characteristics (role,
+ * aria-*, tag, generic class-name *patterns*, computed style) so the
+ * same script works against any Angular / React / Vue / plain-JS /
+ * Bootstrap / jQuery / enterprise UI site.
+ *
+ * Safe to inject multiple times (idempotent) because everything is
+ * guarded behind `if (!window.__UA__)`.
+ * ---------------------------------------------------------------------
+ */
+(function () {
+  if (window.__UA__) {
+    return; // already initialized in this document/frame
+  }
 
-Creates (or connects to) a Playwright browser + context + page, shared by
-both the recorder (manual recording session) and the executor (replay).
+  const UA = {
+    eventQueue: [],
+    mutationQueue: [],
+    _observer: null,
+    _listenersAttached: false,
+    _seenSignatures: new Set(),
+  };
 
-IMPORTANT - Playwright's sync API is single-threaded: every Playwright
-call (launch, navigate, click, evaluate, ...) must happen on the same
-Python thread that started `sync_playwright()`. Calling Playwright objects
-from a different thread raises a greenlet/threading error, not a clean
-exception you can catch and ignore. Both callers of this module -
-RecorderSession's background polling thread, and Executor.run() (already
-invoked from ExecutionManager's own worker thread) - create their
-PlaywrightSession here and use it ENTIRELY within that one owning thread,
-including final cleanup via close(). Neither caller may hand the session
-to another thread, and Executor.terminate() (called from a different,
-request-handling thread - see executor.py) deliberately does not touch
-the Playwright objects directly for exactly this reason.
+  // ---- Cross-navigation event persistence ----------------------------
+  // A committed "change" event (e.g. a password field losing focus right
+  // before its form's Submit navigates the browser) can be queued here in
+  // JS memory and then never make it back to Python: the ~0.5s polling
+  // interval may not get a chance to drain the queue before the document
+  // is torn down by the navigation, silently losing that action's value
+  // (or, worse, letting a later action on the next page get logged in its
+  // place). To close that gap, stash any still-queued events into
+  // sessionStorage right before unload, and recover them into the fresh
+  // page's queue on injection - sessionStorage survives same-tab
+  // navigation (it does not survive a full external redirect to another
+  // origin, which is a page-storage limitation, not something JS can work
+  // around).
+  const PENDING_KEY = "__UA_pending_events__";
 
-Driver/browser binary resolution: unlike Selenium (which needed a
-matching chromedriver/msedgedriver binary, downloaded via webdriver-
-manager or pointed at manually), Playwright manages its own browser
-binaries - run `playwright install` once (see README section 4) and every
-supported browser is available with no separate driver management, no
-version-matching headaches, and no CHROME_DRIVER_PATH/EDGE_DRIVER_PATH
-settings to configure.
-"""
-from __future__ import annotations
+  (function recoverPendingEvents() {
+    try {
+      const raw = window.sessionStorage.getItem(PENDING_KEY);
+      if (raw) {
+        window.sessionStorage.removeItem(PENDING_KEY);
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr) && arr.length) {
+          // recovered (older, pre-navigation) events go first so they
+          // drain - and get recorded - ahead of anything new on this page
+          UA.eventQueue = arr.concat(UA.eventQueue);
+        }
+      }
+    } catch (e) { /* sessionStorage unavailable/blocked - nothing we can do */ }
+  })();
 
-from dataclasses import dataclass
-from typing import Optional
+  window.addEventListener("beforeunload", function () {
+    try {
+      if (UA.eventQueue.length) {
+        let existing = [];
+        const raw = window.sessionStorage.getItem(PENDING_KEY);
+        if (raw) {
+          try { existing = JSON.parse(raw) || []; } catch (e) { existing = []; }
+        }
+        window.sessionStorage.setItem(PENDING_KEY, JSON.stringify(existing.concat(UA.eventQueue)));
+      }
+    } catch (e) { /* ignore - best effort only */ }
+  }, true);
 
-from playwright.sync_api import Browser, BrowserContext, BrowserType, Page, Playwright, sync_playwright
+  // ---- helpers -----------------------------------------------------
+  function safeAttr(el, name) {
+    try {
+      const v = el.getAttribute(name);
+      return v === null ? "" : v;
+    } catch (e) {
+      return "";
+    }
+  }
 
-from backend.config import settings
+  function isVisible(el) {
+    try {
+      const style = window.getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    } catch (e) {
+      return false;
+    }
+  }
 
+  function isEnabled(el) {
+    return !(el.disabled === true || safeAttr(el, "aria-disabled") === "true");
+  }
 
-class RemoteNodeUnreachableError(RuntimeError):
-    pass
+  function cssPath(el) {
+    if (!(el instanceof Element)) return "";
+    const path = [];
+    let node = el;
+    while (node && node.nodeType === Node.ELEMENT_NODE && path.length < 8) {
+      let selector = node.nodeName.toLowerCase();
+      if (node.id) {
+        selector += "#" + CSS.escape(node.id);
+        path.unshift(selector);
+        break;
+      } else {
+        let sibling = node;
+        let nth = 1;
+        while ((sibling = sibling.previousElementSibling)) {
+          if (sibling.nodeName.toLowerCase() === selector) nth++;
+        }
+        selector += ":nth-of-type(" + nth + ")";
+      }
+      path.unshift(selector);
+      node = node.parentElement;
+    }
+    return path.join(" > ");
+  }
 
+  function xpath(el) {
+    if (!(el instanceof Element)) return "";
+    if (el.id) return '//*[@id="' + el.id + '"]';
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === Node.ELEMENT_NODE) {
+      let index = 1;
+      let sibling = node.previousSibling;
+      while (sibling) {
+        if (sibling.nodeType === Node.ELEMENT_NODE && sibling.nodeName === node.nodeName) index++;
+        sibling = sibling.previousSibling;
+      }
+      parts.unshift(node.nodeName.toLowerCase() + "[" + index + "]");
+      node = node.parentElement;
+    }
+    return "/" + parts.join("/");
+  }
 
-@dataclass
-class PlaywrightSession:
-    """Owns the full Playwright object graph for one browser session -
-    must be created AND closed on the same thread (see module docstring).
-    `page` is the one active tab callers interact with; recorder.py tracks
-    additional tabs itself via `context.pages` as they open."""
-    playwright: Playwright
-    browser: Browser
-    context: BrowserContext
-    page: Page
+  function domSignature(el) {
+    // A best-effort stable-ish fingerprint: tag + id/name/testid + class + position among siblings.
+    const tag = el.nodeName.toLowerCase();
+    const id = safeAttr(el, "id");
+    const testId = safeAttr(el, "data-testid") || safeAttr(el, "data-test-id") || safeAttr(el, "data-qa");
+    const name = safeAttr(el, "name");
+    const cls = (el.className && typeof el.className === "string") ? el.className.trim().split(/\s+/).slice(0, 3).join(".") : "";
+    let idx = 0;
+    if (el.parentElement) {
+      idx = Array.prototype.indexOf.call(el.parentElement.children, el);
+    }
+    return [tag, id, testId, name, cls, idx].join("|");
+  }
 
-    def close(self) -> None:
-        """Best-effort, ignores errors - mirrors the old driver.quit()'s
-        "don't fail the caller just because cleanup hit a snag (browser
-        already crashed/closed)" behavior."""
-        for obj, method in ((self.context, "close"), (self.browser, "close"), (self.playwright, "stop")):
-            try:
-                getattr(obj, method)()
-            except Exception:
-                pass
+  function collectDataAttrs(el) {
+    const out = {};
+    for (const attr of el.attributes || []) {
+      if (attr.name.startsWith("data-") || attr.name.startsWith("aria-")) {
+        out[attr.name] = attr.value;
+      }
+    }
+    return out;
+  }
 
+  function textOf(el) {
+    try {
+      let t = (el.innerText || el.textContent || "").trim();
+      if (!t) t = safeAttr(el, "value") || safeAttr(el, "placeholder") || safeAttr(el, "aria-label") || safeAttr(el, "title") || safeAttr(el, "alt");
+      return t.substring(0, 200);
+    } catch (e) {
+      return "";
+    }
+  }
 
-def _resolve_browser_type(pw: Playwright, browser: str) -> BrowserType:
-    b = (browser or "chrome").lower()
-    if b == "firefox":
-        return pw.firefox
-    if b in ("webkit", "safari"):
-        return pw.webkit
-    # "chrome" and "edge" both run on Chromium under Playwright - the
-    # bundled Chromium build is used for both by default (no separate
-    # driver/binary to install or version-match). Set PLAYWRIGHT_CHANNEL
-    # (e.g. "msedge" or "chrome") in .env if you specifically need the
-    # real installed browser binary instead of Playwright's bundled one.
-    return pw.chromium
+  // Some apps (seen on a real banking dashboard: a grid of near-identical
+  // "product" cards, e.g. Gold Loan / Personal Loan / Home Loan) reuse the
+  // exact same id and class list across every visually-repeated tile -
+  // invalid HTML (ids must be unique), but it happens in the wild, and a
+  // locator built from that id/class combo silently resolves to whichever
+  // tile happens to come first in the DOM rather than the one actually
+  // recorded. build_locators() (Python side) has no live DOM access to
+  // detect this itself, so we check it here, at capture time, while we
+  // still have the real page in front of us, and hand the verdict along
+  // so the locator scoring can react to it.
+  function isUniqueSelectorOnPage(selector) {
+    if (!selector) return true;
+    try {
+      return document.querySelectorAll(selector).length <= 1;
+    } catch (e) {
+      return true; // malformed selector (unusual attribute chars, etc.) - don't penalize speculatively
+    }
+  }
 
+  // Climbs from el's PARENT upward (never el itself) looking for the
+  // closest ancestor whose own aggregated visible text is non-empty and
+  // short enough to plausibly BE a single distinguishing label (a card's
+  // title, a row's name, ...) rather than a whole section/page's worth of
+  // unrelated text. Used as a locator fallback for elements that carry no
+  // distinguishing text of their own - a decorative icon/image inside a
+  // clickable "tile" card is the most common real case: the click lands on
+  // the icon, but the CARD's title is what actually identifies which tile
+  // this is, and for a clickable-tile pattern (the whole card responds to
+  // a click, not just the icon) targeting that ancestor instead reaches
+  // the exact same outcome while actually distinguishing this tile from
+  // its look-alike siblings.
+  function nearestDistinguishingAncestor(el) {
+    try {
+      var node = el ? el.parentElement : null;
+      var depth = 0;
+      while (node && depth < 6) {
+        var t = (node.innerText || node.textContent || "").trim();
+        if (t && t.length <= 150) {
+          return { tag: node.nodeName.toLowerCase(), text: t };
+        }
+        node = node.parentElement;
+        depth++;
+      }
+    } catch (e) { /* ignore */ }
+    return null;
+  }
 
-def create_session(
-    browser: str = None,
-    headless: bool = None,
-    remote_node_url: Optional[str] = None,
-) -> PlaywrightSession:
-    """Launches (or connects to) a browser and returns a ready-to-use
-    PlaywrightSession. Must be called on the thread that will go on to use
-    it - see the module docstring."""
-    browser = (browser or settings.DEFAULT_BROWSER).lower()
-    headless = settings.BROWSER_HEADLESS if headless is None else headless
+  // A plain attribute-value selector (`tag[attr='val']`) is only as good
+  // as it is UNIQUE - `input[placeholder='Search customers']` almost
+  // certainly is, but `button[type='button']` almost certainly is not
+  // (true of nearly every plain button in a form-heavy app). The Python
+  // side (locator_engine.py's attribute-based candidate) had no way to
+  // tell those two cases apart and trusted both equally, until a real
+  // failure showed two different recorded buttons - neither with an id,
+  // name, aria-label or visible text of its own, just an icon - both
+  // falling through to `type` and producing the IDENTICAL selector
+  // `button[type='button']`, which then silently resolved to whichever
+  // button happened to be first on the page at execution time. Checking
+  // uniqueness here, at capture time (the same isUniqueSelectorOnPage()
+  // already used for id/class/css_path below), lets locator_engine.py
+  // demote a non-unique one exactly like it already does for those.
+  function attributeSelectorUnique(tagName, attr, val) {
+    if (!val) return true;
+    try {
+      return isUniqueSelectorOnPage(tagName + "[" + attr + "='" + val.replace(/'/g, "\\'") + "']");
+    } catch (e) {
+      return true; // don't penalize speculatively on an unexpected value shape
+    }
+  }
 
-    pw = sync_playwright().start()
-    browser_type = _resolve_browser_type(pw, browser)
+  UA.getElementInfo = function (el) {
+    if (!el || !(el instanceof Element)) return null;
+    const rect = el.getBoundingClientRect();
+    const id = safeAttr(el, "id");
+    const classNameStr = (el.className && typeof el.className === "string") ? el.className : "";
+    const classList = classNameStr.trim().split(/\s+/).filter(Boolean);
+    const tagName = el.nodeName.toLowerCase();
+    const cssPathValue = cssPath(el);
+    const placeholderVal = safeAttr(el, "placeholder");
+    const titleVal = safeAttr(el, "title");
+    const altVal = safeAttr(el, "alt");
+    const typeVal = safeAttr(el, "type");
+    return {
+      tag: tagName,
+      id: id,
+      id_unique: id ? isUniqueSelectorOnPage("#" + CSS.escape(id)) : true,
+      name: safeAttr(el, "name"),
+      class_name: classNameStr,
+      class_combo_unique: classList.length
+        ? isUniqueSelectorOnPage(tagName + "." + classList.map(function (c) { return CSS.escape(c); }).join("."))
+        : true,
+      type: typeVal,
+      type_unique: attributeSelectorUnique(tagName, "type", typeVal),
+      value: (el.value !== undefined ? String(el.value).substring(0, 200) : ""),
+      text: textOf(el),
+      placeholder: placeholderVal,
+      placeholder_unique: attributeSelectorUnique(tagName, "placeholder", placeholderVal),
+      title: titleVal,
+      title_unique: attributeSelectorUnique(tagName, "title", titleVal),
+      alt: altVal,
+      alt_unique: attributeSelectorUnique(tagName, "alt", altVal),
+      role: safeAttr(el, "role"),
+      aria_label: safeAttr(el, "aria-label"),
+      aria_labelledby: safeAttr(el, "aria-labelledby"),
+      aria_describedby: safeAttr(el, "aria-describedby"),
+      data_attrs: collectDataAttrs(el),
+      href: safeAttr(el, "href"),
+      src: safeAttr(el, "src"),
+      for_attr: safeAttr(el, "for"),
+      autocomplete: safeAttr(el, "autocomplete"),
+      disabled: el.disabled === true || safeAttr(el, "aria-disabled") === "true",
+      readonly: el.readOnly === true,
+      checked: el.checked === true,
+      selected: el.selected === true,
+      visible: isVisible(el),
+      enabled: isEnabled(el),
+      bounding_box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+      parent_signature: el.parentElement ? domSignature(el.parentElement) : "",
+      dom_signature: domSignature(el),
+      css_path: cssPathValue,
+      // cssPath() stops climbing the instant it finds ANY ancestor with an
+      // id (see its own comment above) and anchors the whole selector on
+      // that id, WITHOUT checking whether that id is actually unique on
+      // the page - so a repeated-card grid where every tile shares one
+      // copy-pasted id (e.g. id="dashboardPersonalLoan" on every single
+      // product card, not just one) produced a selector that looked
+      // perfectly specific ("mat-card#dashboardPersonalLoan > img:nth-of-
+      // type(1)") but silently resolved to whichever tile came first in
+      // the DOM every time, regardless of which one was actually recorded.
+      // Checking the FINAL selector's own uniqueness (rather than trying
+      // to re-derive which id it used) catches this regardless of where
+      // in the path the non-unique id sits.
+      css_path_unique: cssPathValue ? isUniqueSelectorOnPage(cssPathValue) : true,
+      xpath: xpath(el),
+      link_text: el.nodeName.toLowerCase() === "a" ? textOf(el) : "",
+      container: nearestDistinguishingAncestor(el),
+    };
+  };
 
-    if remote_node_url:
-        return _connect_remote(pw, browser_type, remote_node_url)
+  // ---- DOM crawling --------------------------------------------------
+  const INTERESTING_SELECTOR = [
+    "a", "button", "input", "select", "textarea", "option", "label",
+    "[role='button']", "[role='link']", "[role='checkbox']", "[role='radio']",
+    "[role='tab']", "[role='menuitem']", "[role='option']", "[role='switch']",
+    "[onclick]", "[data-testid]", "[data-test-id]", "[data-qa]",
+    "table", "tr", "td", "th", "ul", "li", "nav", "form",
+    "[contenteditable='true']", "iframe", "[role='dialog']", "dialog"
+  ].join(",");
 
-    launch_kwargs = {"headless": headless, "args": ["--disable-notifications", "--disable-popup-blocking"]}
-    if settings.PLAYWRIGHT_CHANNEL:
-        launch_kwargs["channel"] = settings.PLAYWRIGHT_CHANNEL
-    elif browser == "edge":
-        launch_kwargs["channel"] = "msedge"
+  UA.crawlDom = function (root) {
+    root = root || document;
+    const els = root.querySelectorAll(INTERESTING_SELECTOR);
+    const out = [];
+    els.forEach(function (el) {
+      const info = UA.getElementInfo(el);
+      if (info) out.push(info);
+    });
+    return out;
+  };
 
-    # Reported symptom: recording and replay both open a visibly small
-    # browser window. `viewport=None` below (kept from before) only stops
-    # Playwright from clamping the CONTENT area to its own fixed 1280x720
-    # default on top of whatever window size the browser actually opened
-    # at - it does nothing to make that OS-level window itself large in
-    # the first place, despite the comment that used to be here claiming
-    # it was "the closest equivalent of Selenium's --start-maximized". A
-    # real --start-maximized-equivalent flag has to be passed at launch.
-    # Only relevant for a headed browser (headless has no real window to
-    # size) and differs per engine - Chromium takes a genuine
-    # --start-maximized flag; Firefox has no such flag but does honor
-    # -width/-height, which combined with viewport=None gets it just as
-    # large. WebKit has neither and is only ever used here for
-    # cross-engine spot-checks, not everyday recording/execution.
-    if not headless:
-        if browser_type is pw.chromium:
-            launch_kwargs["args"].append("--start-maximized")
-        elif browser_type is pw.firefox:
-            launch_kwargs["args"].extend(["-width", "1920", "-height", "1080"])
+  // ---- Event listening -------------------------------------------------
+  function pushEvent(type, el, extra) {
+    const info = UA.getElementInfo(el);
+    if (!info) return;
+    UA.eventQueue.push(Object.assign({
+      type: type,
+      element: info,
+      timestamp: Date.now(),
+      url: window.location.href,
+      title: document.title,
+    }, extra || {}));
+  }
 
-    # A second, separate bug in the same "small window" symptom, easy to
-    # miss because it looks like it should work: passing viewport=None to
-    # new_context() below (which is what this used to do) does NOT reach
-    # Playwright's server at all. The Python bindings' locals_to_params()
-    # helper strips every argument whose value is exactly None before
-    # sending the call over the wire - so `new_context(viewport=None)` and
-    # `new_context()` produce the byte-for-byte identical request. Once
-    # neither `viewport` nor `noDefaultViewport` is present in that
-    # request, Playwright's own server-side default kicks in
-    # unconditionally: `if (!options.viewport && !options.noDefaultViewport)
-    # options.viewport = {width: 1280, height: 720}` (see
-    # driver/package/lib/server/browserContext.js). The end result: even
-    # with --start-maximized correctly maximizing the actual OS window
-    # above, the PAGE CONTENT inside it was still being force-rendered into
-    # a fixed 1280x720 box - which is exactly what "the browser opens
-    # half-screen" looks like on any monitor larger than that. The real,
-    # working flag is no_viewport=True (see below) - an explicit True
-    # survives locals_to_params() and actually sets noDefaultViewport.
-    try:
-        b = browser_type.launch(**launch_kwargs)
-    except Exception:
-        # Most likely cause: the requested channel (a real installed
-        # browser binary) isn't present on this machine - fall back to
-        # Playwright's own bundled build rather than failing outright.
-        launch_kwargs.pop("channel", None)
-        b = browser_type.launch(**launch_kwargs)
+  // The source of a copy is whatever currently has selected text - either
+  // an <input>/<textarea>'s own selection range, or the page's live text
+  // selection (window.getSelection()) for a plain read-only display element
+  // (a <span>/<div> showing a system-generated ID, the most common real
+  // case). document.activeElement is the best-effort "source element" to
+  // attach the captured value to either way.
+  function selectedTextFrom(el) {
+    try {
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA") &&
+          typeof el.selectionStart === "number" && el.selectionStart !== el.selectionEnd) {
+        return el.value.substring(el.selectionStart, el.selectionEnd);
+      }
+      var sel = window.getSelection();
+      return sel ? sel.toString() : "";
+    } catch (e) {
+      return "";
+    }
+  }
 
-    # no_viewport=True (NOT viewport=None - see the note above try/except
-    # for why that looked plausible but silently did nothing) lets the
-    # actual (now maximized/full-size) browser window's size drive content
-    # size instead of Playwright's default fixed 1280x720 viewport.
-    context = b.new_context(no_viewport=True)
-    page = context.new_page()
-    return PlaywrightSession(playwright=pw, browser=b, context=context, page=page)
+  function recordCopy() {
+    var el = document.activeElement;
+    var text = selectedTextFrom(el);
+    if (!text) return;
+    pushEvent("copy", (el instanceof Element) ? el : document.body, { value: text });
+  }
 
+  UA.startEventListeners = function () {
+    if (UA._listenersAttached) return;
+    UA._listenersAttached = true;
 
-def _connect_remote(pw: Playwright, browser_type: BrowserType, remote_node_url: str) -> PlaywrightSession:
-    """Connects to a browser already running on someone else's PC instead
-    of launching one locally - lets multiple people share one central
-    instance of this platform while each person's recording/execution
-    runs in their own local browser (see the README's "remote browser
-    sessions" section).
+    document.addEventListener("click", function (e) {
+      pushEvent(e.detail === 2 ? "dblclick" : "click", e.target);
+    }, true);
 
-    NOTE for anyone who used this feature under the old Selenium version:
-    the endpoint you point this at has CHANGED. Selenium connected to a
-    bare chromedriver/msedgedriver binary (or a Selenium Grid node)
-    speaking the WebDriver wire protocol. Playwright has no such protocol;
-    it instead connects either to Chromium's own DevTools Protocol (CDP)
-    endpoint (launch Chrome/Chromium on their machine with
-    `--remote-debugging-port=<port>`, reachable as
-    `http://<their-ip>:<port>`) or to a `playwright run-server` endpoint
-    (a `ws://` / `wss://` URL). A `ws://`/`wss://` URL is treated as a
-    Playwright server endpoint; anything else is treated as a CDP
-    endpoint.
-    """
-    try:
-        if remote_node_url.startswith(("ws://", "wss://")):
-            b = browser_type.connect(remote_node_url)
-        else:
-            b = browser_type.connect_over_cdp(remote_node_url)
-    except Exception as exc:
-        pw.stop()
-        raise RemoteNodeUnreachableError(
-            f"Could not reach the remote browser endpoint '{remote_node_url}'. Under Playwright this must "
-            "be a Chromium DevTools Protocol endpoint (launch Chrome/Chromium there with "
-            "--remote-debugging-port=<port>, reachable as http://<their-ip>:<port>) or a `playwright "
-            "run-server` ws:// endpoint - NOT a chromedriver/msedgedriver binary, which is what the old "
-            f"Selenium version of this platform used. Original error: {exc}"
-        ) from exc
+    document.addEventListener("dblclick", function (e) {
+      pushEvent("dblclick", e.target);
+    }, true);
 
-    context = b.contexts[0] if b.contexts else b.new_context(no_viewport=True)
-    page = context.pages[0] if context.pages else context.new_page()
-    return PlaywrightSession(playwright=pw, browser=b, context=context, page=page)
+    document.addEventListener("contextmenu", function (e) {
+      pushEvent("contextmenu", e.target);
+    }, true);
+
+    document.addEventListener("change", function (e) {
+      const el = e.target;
+      if (el && (el.tagName === "SELECT")) {
+        pushEvent("select", el, { value: el.value, selected_text: el.options[el.selectedIndex] ? el.options[el.selectedIndex].text : "" });
+      } else if (el && el.type === "checkbox") {
+        pushEvent(el.checked ? "check" : "uncheck", el);
+      } else if (el && el.type === "radio") {
+        pushEvent("check", el);
+      } else if (el && el.type === "file") {
+        // A file input's `.value` is ALWAYS a browser-redacted fake path
+        // (e.g. "C:\fakepath\invoice.pdf") for security reasons - the real
+        // path used during recording can never be read back via JS. Before
+        // this, a file upload fell into the generic INPUT branch below and
+        // got recorded as a plain TYPE step with that fake, non-functional
+        // value - looked like it "worked" during recording, then silently
+        // did nothing useful on replay (typing a fake path into a file
+        // input selects nothing). Recording this as its own UPLOAD action
+        // with an explicit placeholder makes it obvious, in Review & Edit
+        // Steps, that a real file path for THIS execution environment
+        // still needs to be filled in - failing loudly/clearly instead of
+        // silently.
+        var fileNames = (el.files && el.files.length)
+          ? Array.prototype.map.call(el.files, function (f) { return f.name; }).join(", ")
+          : "";
+        pushEvent("upload", el, {
+          value: fileNames ? ("PROVIDE_FILE_PATH (originally uploaded: " + fileNames + ")") : "PROVIDE_FILE_PATH",
+        });
+      } else if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) {
+        pushEvent("type", el, { value: el.value });
+      }
+    }, true);
+
+    document.addEventListener("input", function (e) {
+      const el = e.target;
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) {
+        pushEvent("typing", el, { value: el.value !== undefined ? el.value : el.innerText });
+      }
+    }, true);
+
+    document.addEventListener("submit", function (e) {
+      pushEvent("submit", e.target);
+    }, true);
+
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") {
+        pushEvent("press_enter", e.target, { key: "Enter" });
+      } else if (e.key === "Tab") {
+        pushEvent("press_tab", e.target, { key: "Tab" });
+      } else if (["Escape", "ArrowDown", "ArrowUp"].indexOf(e.key) === -1) {
+        // avoid noise from purely navigational keys; still track generic keypress
+        pushEvent("keydown", e.target, { key: e.key });
+      }
+    }, true);
+
+    // Capture -> Store -> Reuse: a value the app itself GENERATES fresh
+    // every run (an application ID, a reference number, a freshly-issued
+    // OTP) can't be replayed as a static recorded literal - it's different
+    // every execution. When the user copies such a value off the screen
+    // during recording (Ctrl+C / Edit > Copy - realistic tester behavior
+    // for a long generated ID they need to reuse a few screens later), that
+    // copy is what marks it as "this needs live re-capture, not a fixed
+    // value". The later paste/retype of that same value already gets
+    // captured normally by the existing "change" listener above (whatever
+    // ends up in the field's value, typed or pasted, fires change on blur
+    // the same way) - recorder.py correlates the two by matching value.
+    document.addEventListener("copy", recordCopy, true);
+    document.addEventListener("cut", recordCopy, true);
+
+    // NOTE: hover ("mouseover") capture is intentionally disabled. It was
+    // recording incidental mouse movement (the pointer passing over a
+    // background/overlay element on its way to the real target) as if it
+    // were a deliberate action, and even genuine hovers rarely replay
+    // reliably via Selenium (no real pointer movement, so hover-triggered
+    // CSS/JS states often never engage) - so hover steps were a frequent
+    // source of failures/timeouts that didn't reflect an actual problem
+    // with the recording or the target application. Click/type/select/etc.
+    // are unaffected; this only turns off the previous fully-generic
+    // mouseover -> "hover" action capture.
+
+    let scrollTimer = null;
+    window.addEventListener("scroll", function () {
+      clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(function () {
+        UA.eventQueue.push({
+          type: "scroll",
+          element: null,
+          scroll_x: window.scrollX,
+          scroll_y: window.scrollY,
+          timestamp: Date.now(),
+          url: window.location.href,
+          title: document.title,
+        });
+      }, 400);
+    }, true);
+  };
+
+  UA.drainEvents = function () {
+    const out = UA.eventQueue;
+    UA.eventQueue = [];
+    return out;
+  };
+
+  window.addEventListener("popstate", function () {
+    UA.eventQueue.push({
+      type: "popstate",
+      element: null,
+      timestamp: Date.now(),
+      url: window.location.href,
+      title: document.title,
+    });
+  }, true);
+
+  // ---- Mutation observing -------------------------------------------
+  UA.startMutationObserver = function () {
+    if (UA._observer) return;
+    UA._observer = new MutationObserver(function (mutations) {
+      mutations.forEach(function (m) {
+        m.addedNodes.forEach(function (node) {
+          if (node.nodeType !== Node.ELEMENT_NODE) return;
+          const sig = domSignature(node);
+          if (UA._seenSignatures.has(sig)) return;
+          UA._seenSignatures.add(sig);
+          const info = UA.getElementInfo(node);
+          if (info) {
+            UA.mutationQueue.push({ change: "added", element: info, timestamp: Date.now(), url: window.location.href });
+          }
+          // also scan descendants that are individually interesting
+          try {
+            node.querySelectorAll && node.querySelectorAll(INTERESTING_SELECTOR).forEach(function (child) {
+              const csig = domSignature(child);
+              if (UA._seenSignatures.has(csig)) return;
+              UA._seenSignatures.add(csig);
+              const cinfo = UA.getElementInfo(child);
+              if (cinfo) UA.mutationQueue.push({ change: "added", element: cinfo, timestamp: Date.now(), url: window.location.href });
+            });
+          } catch (e) { /* ignore */ }
+        });
+      });
+    });
+    UA._observer.observe(document.documentElement || document.body, { childList: true, subtree: true });
+  };
+
+  UA.drainMutations = function () {
+    const out = UA.mutationQueue;
+    UA.mutationQueue = [];
+    return out;
+  };
+
+  // ---- Modal / popup / overlay detection -----------------------------
+  const MODAL_SELECTORS = [
+    ".modal", ".modal-dialog", ".modal-content", "[role='dialog']", "[role='alertdialog']",
+    "dialog", "[aria-modal='true']", ".popup", ".overlay", ".toast", ".toast-container",
+    ".notification", ".snackbar", ".drawer", ".side-panel", ".sidepanel", ".dropdown-menu.show",
+    ".ant-modal", ".mat-dialog-container", ".MuiDialog-root", ".v-dialog", ".chakra-modal__content"
+  ];
+
+  function looksLikeOverlay(el) {
+    try {
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      const position = style.position;
+      const zIndex = parseInt(style.zIndex, 10) || 0;
+      const coversSignificantArea = rect.width > window.innerWidth * 0.25 && rect.height > window.innerHeight * 0.15;
+      return (position === "fixed" || position === "absolute") && zIndex >= 100 && coversSignificantArea && isVisible(el);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  UA.detectModals = function () {
+    const found = [];
+    const seen = new Set();
+
+    MODAL_SELECTORS.forEach(function (sel) {
+      try {
+        document.querySelectorAll(sel).forEach(function (el) {
+          if (!isVisible(el)) return;
+          const sig = domSignature(el);
+          if (seen.has(sig)) return;
+          seen.add(sig);
+          found.push({ container: UA.getElementInfo(el), detected_via: ["selector:" + sel] });
+        });
+      } catch (e) { /* invalid selector variant on this app, skip */ }
+    });
+
+    // structural heuristic pass over top-level fixed/absolute large elements
+    document.querySelectorAll("body > div, body > section").forEach(function (el) {
+      if (looksLikeOverlay(el)) {
+        const sig = domSignature(el);
+        if (seen.has(sig)) return;
+        seen.add(sig);
+        found.push({ container: UA.getElementInfo(el), detected_via: ["structural:overlay-heuristic"] });
+      }
+    });
+
+    return found.map(function (m) {
+      const children = [];
+      try {
+        const containerEl = document.querySelector(m.container.css_path) ||
+          (m.container.id ? document.getElementById(m.container.id) : null);
+        if (containerEl) {
+          containerEl.querySelectorAll(INTERESTING_SELECTOR).forEach(function (c) {
+            const info = UA.getElementInfo(c);
+            if (info) children.push(info);
+          });
+        }
+      } catch (e) { /* ignore */ }
+      m.children = children;
+      return m;
+    });
+  };
+
+  // ---- Shadow DOM detection (best-effort) -----------------------------
+  UA.detectShadowRoots = function (root, depth) {
+    root = root || document;
+    depth = depth || 0;
+    if (depth > 4) return [];
+    const out = [];
+    const all = root.querySelectorAll("*");
+    all.forEach(function (el) {
+      if (el.shadowRoot) {
+        const hostInfo = UA.getElementInfo(el);
+        const children = [];
+        try {
+          el.shadowRoot.querySelectorAll(INTERESTING_SELECTOR).forEach(function (c) {
+            const info = UA.getElementInfo(c);
+            if (info) children.push(info);
+          });
+        } catch (e) { /* closed shadow root or inaccessible */ }
+        out.push({ host: hostInfo, children: children });
+        // recurse into nested shadow roots
+        const nested = UA.detectShadowRoots(el.shadowRoot, depth + 1);
+        nested.forEach(function (n) { out.push(n); });
+      }
+    });
+    return out;
+  };
+
+  // ---- Frame enumeration (top-level only; Python drives recursion) ---
+  UA.getFrames = function () {
+    const frames = document.querySelectorAll("iframe, frame");
+    const out = [];
+    frames.forEach(function (f, idx) {
+      out.push({
+        index: idx,
+        css_path: cssPath(f),
+        id: safeAttr(f, "id"),
+        name: safeAttr(f, "name"),
+        src: safeAttr(f, "src"),
+        visible: isVisible(f),
+      });
+    });
+    return out;
+  };
+
+  window.__UA__ = UA;
+})();
