@@ -1,48 +1,127 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+/*
+ * RecordingsTable.js
+ * Shared table for the Dashboard's "Recent Recordings" (withActions=false)
+ * and the full Recordings tab (withActions=true, with download links +
+ * Delete). Ported from app.js's renderRecordingsTable().
+ */
+
+import { useEffect, useState } from "react";
 import { Api } from "@/lib/api";
-import RecordingsTable from "@/components/RecordingsTable";
+import { dateTimeStr } from "@/lib/format";
+import { useAuth } from "@/components/AuthProvider";
 
-// Sentinel filter values, distinct from any real application_id (which is
-// always "app_..." - see application_store.new_id()).
-const FILTER_ALL = "";
-const FILTER_UNTAGGED = "__untagged__";
-
-export default function RecordingsPage() {
-  const [recordings, setRecordings] = useState([]);
+export default function RecordingsTable({ recordings, withActions = false, onChanged }) {
+  const [deletingId, setDeletingId] = useState(null);
+  const { user } = useAuth();
+  // Application tagging (see backend/applications/application_store.py) -
+  // only fetched/shown on the full Recordings tab (withActions=true), not
+  // the Dashboard's compact "Recent Recordings" list, mirroring how
+  // Downloads/Delete are already gated the same way.
   const [applications, setApplications] = useState([]);
-  const [applicationFilter, setApplicationFilter] = useState(FILTER_ALL);
+  const [savingAppFor, setSavingAppFor] = useState(null);
 
-  const refresh = useCallback(() => {
-    Api.get("/api/recordings").then(setRecordings).catch(() => {});
-  }, []);
-
-  useEffect(() => { refresh(); }, [refresh]);
   useEffect(() => {
+    if (!withActions) return;
     Api.get("/api/applications").then((data) => setApplications(data.applications || [])).catch(() => {});
-  }, []);
+  }, [withActions]);
 
-  const filteredRecordings = useMemo(() => {
-    if (applicationFilter === FILTER_ALL) return recordings;
-    if (applicationFilter === FILTER_UNTAGGED) return recordings.filter((r) => !r.application_id);
-    return recordings.filter((r) => r.application_id === applicationFilter);
-  }, [recordings, applicationFilter]);
+  async function handleApplicationChange(recordingId, applicationId) {
+    setSavingAppFor(recordingId);
+    try {
+      await Api.put(`/api/recordings/${recordingId}/application`, { application_id: applicationId });
+      if (onChanged) onChanged();
+    } catch (e) {
+      window.alert("Failed to update application: " + e.message);
+    } finally {
+      setSavingAppFor(null);
+    }
+  }
+  // A regular user's list is already scoped server-side to just their own
+  // recordings (see backend/app.py's list_recordings()) - an "Owner"
+  // column would be redundant noise there. An admin's list spans every
+  // user, so it's the one case worth showing who each row belongs to.
+  const showOwner = user?.role === "admin";
+
+  if (!recordings || !recordings.length) {
+    return <div className="empty-note">No recordings yet. Start one from the Recorder tab.</div>;
+  }
+
+  async function handleDelete(recordingId, name) {
+    if (!window.confirm(`Delete "${name}" permanently? This removes its Excel dataset, locator repository, and generated Behave artifacts. This cannot be undone.`)) {
+      return;
+    }
+    setDeletingId(recordingId);
+    try {
+      await Api.del(`/api/recordings/${recordingId}`);
+      if (onChanged) onChanged();
+    } catch (e) {
+      window.alert("Failed to delete: " + e.message);
+    } finally {
+      setDeletingId(null);
+    }
+  }
 
   return (
-    <section>
-      <h1>Recordings</h1>
-      <div className="form-row">
-        <label>Filter by Application</label>
-        <select value={applicationFilter} onChange={(e) => setApplicationFilter(e.target.value)}>
-          <option value={FILTER_ALL}>— All applications —</option>
-          {applications.map((a) => (
-            <option key={a.application_id} value={a.application_id}>{a.name}</option>
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th><th>URL</th>{withActions && <th>Application</th>}<th>Transaction Code</th><th>Status</th>
+            <th>Steps</th><th>Pages</th><th>Executions</th><th>Created</th>
+            {showOwner && <th>Owner</th>}
+            {withActions && <th>Downloads</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {recordings.map((r) => (
+            <tr key={r.recording_id}>
+              <td>{r.name}</td>
+              <td>{r.target_url}</td>
+              {withActions && (
+                <td>
+                  <select
+                    value={r.application_id || ""}
+                    disabled={savingAppFor === r.recording_id}
+                    onChange={(e) => handleApplicationChange(r.recording_id, e.target.value)}
+                  >
+                    <option value="">— None —</option>
+                    {applications.map((a) => (
+                      <option key={a.application_id} value={a.application_id}>{a.name}</option>
+                    ))}
+                  </select>
+                </td>
+              )}
+              <td>{r.transaction_code || "-"}</td>
+              <td><span className={`badge ${r.status}`}>{r.status}</span></td>
+              <td>{r.total_steps || 0}</td>
+              <td>{r.total_pages || 0}</td>
+              <td>{r.total_executions || 0}</td>
+              <td>{dateTimeStr(r.created_at)}</td>
+              {showOwner && <td>{r.owner_username || "-"}</td>}
+              {withActions && (
+                <td>
+                  <a className="link-btn" href={Api.href(`/api/recordings/${r.recording_id}/download/excel`)}>Excel</a>
+                  <a className="link-btn" href={Api.href(`/api/recordings/${r.recording_id}/download/feature`)}>Feature</a>
+                  <a className="link-btn" href={Api.href(`/api/recordings/${r.recording_id}/download/locator_repository`)}>Locator JSON</a>
+                  <a className="link-btn" href={Api.href(`/api/recordings/${r.recording_id}/download/page_objects`)}>Page Objects</a>
+                  <a className="link-btn" href={Api.href(`/api/recordings/${r.recording_id}/download/step_definitions`)}>Step Defs</a>
+                  <button
+                    type="button"
+                    className="link-btn danger"
+                    disabled={r.status === "recording" || deletingId === r.recording_id}
+                    title={r.status === "recording" ? "Stop the recording before deleting it" : undefined}
+                    onClick={() => handleDelete(r.recording_id, r.name)}
+                  >
+                    {deletingId === r.recording_id ? "Deleting..." : "Delete"}
+                  </button>
+                </td>
+              )}
+            </tr>
           ))}
-          <option value={FILTER_UNTAGGED}>Untagged (no application set yet)</option>
-        </select>
-      </div>
-      <RecordingsTable recordings={filteredRecordings} withActions onChanged={refresh} />
-    </section>
+        </tbody>
+      </table>
+    </div>
   );
 }
