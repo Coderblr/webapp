@@ -1,408 +1,48 @@
 "use client";
 
-/*
- * Execute Recording tab: pick a recording, optionally override test data /
- * AI provider / remote node, run it, and watch live progress over
- * WebSocket. Also hosts the Review & Edit Steps grid, since the Excel
- * dataset is the editable source of truth for the fast execution path -
- * the executor always re-reads execution.xlsx from disk right before
- * running, so saving an edit here takes effect on the very next
- * "Execute Recording" click, no separate "apply" step needed.
- * Ported from execution.js + the steps-editor markup that used to live in
- * index.html directly.
- */
-
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Api } from "@/lib/api";
-import { readStoredRemoteNode, storeRemoteNode } from "@/lib/format";
+import RecordingsTable from "@/components/RecordingsTable";
 
 // Sentinel filter values, distinct from any real application_id (which is
 // always "app_..." - see application_store.new_id()).
 const FILTER_ALL = "";
 const FILTER_UNTAGGED = "__untagged__";
 
-const STEPS_EDITABLE_COLUMNS = [
-  { key: "Action", label: "Action" },
-  { key: "Element_Name", label: "Element" },
-  { key: "Primary_Locator_Type", label: "Locator Type" },
-  { key: "Primary_Locator", label: "Primary Locator" },
-  { key: "Value", label: "Value" },
-  { key: "Test_Data_Key", label: "Test Data Key" },
-  // Capture -> Store -> Reuse: Captured_As names the {{variable}} a CAPTURE
-  // step's live-read value gets stored under; Resolved_Variable names the
-  // variable a LATER step's value should be re-read from at execution time
-  // instead of replaying the (possibly stale) literal in Value. Both are
-  // auto-filled by the recorder's correlation logic but editable here too.
-  { key: "Captured_As", label: "Captured As" },
-  { key: "Resolved_Variable", label: "Resolved Variable" },
-  // Optional_Step: Y/yes/true/1 marks this step's element as expected to
-  // sometimes legitimately be absent - a failed lookup gets a short wait,
-  // skips AI self-healing, and reports SKIP instead of FAIL.
-  { key: "Optional_Step", label: "Optional (Y/blank)" },
-  // Disabled: Y/yes/true/1 makes this step skip instantly, no locator
-  // attempt at all - unlike Optional_Step. Normally set automatically by
-  // the Change Detection tab; Change_Status is an informational audit
-  // trail from that same feature (the executor never reads it).
-  { key: "Disabled", label: "Disabled (Y/blank)" },
-  { key: "Disabled_Reason", label: "Disabled Reason" },
-  { key: "Change_Status", label: "Change Status" },
-  { key: "Expected_Result", label: "Expected Result" },
-];
-
-export default function ExecutePage() {
+export default function RecordingsPage() {
   const [recordings, setRecordings] = useState([]);
   const [applications, setApplications] = useState([]);
   const [applicationFilter, setApplicationFilter] = useState(FILTER_ALL);
-  const [recordingId, setRecordingId] = useState("");
-  const [browser, setBrowser] = useState("edge");
-  const [testDataRaw, setTestDataRaw] = useState("");
-  const [aiProvider, setAiProvider] = useState("");
-  const [runViaBehave, setRunViaBehave] = useState(false);
-  const [remoteNode, setRemoteNode] = useState("");
 
-  const [editableSteps, setEditableSteps] = useState([]);
-  const [stepColumns, setStepColumns] = useState([]);
-  const [removedRows, setRemovedRows] = useState(new Set());
-  const [dirty, setDirty] = useState(false);
-  const [stepsStatus, setStepsStatus] = useState("");
-
-  const [executionId, setExecutionId] = useState(null);
-  const [terminateDisabled, setTerminateDisabled] = useState(true);
-  const [progressPct, setProgressPct] = useState(0);
-  const [progressSummary, setProgressSummary] = useState("No execution running.");
-  const [currentStepText, setCurrentStepText] = useState("");
-
-  const socketRef = useRef(null);
-  const recordingIdForReportRef = useRef(null);
-
-  async function refreshRecordingOptions() {
-    try {
-      const all = await Api.get("/api/recordings");
-      setRecordings(all.filter((r) => r.status !== "recording"));
-    } catch {
-      setRecordings([]);
-    }
-  }
-
-  useEffect(() => {
-    // Reading localStorage (readStoredRemoteNode) has to happen after
-    // mount - it's a browser-only API, and this page is prerendered to
-    // static HTML at build time (see next.config.mjs's output: "export"),
-    // where `window` doesn't exist. Setting it here (rather than as a
-    // useState lazy initializer) deliberately means the very first client
-    // render matches that prerendered HTML - avoiding a hydration mismatch
-    // - and then updates a moment later once the real stored value is
-    // known. Same reasoning for refreshRecordingOptions()'s initial fetch.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setRemoteNode(readStoredRemoteNode());
-    refreshRecordingOptions();
-    Api.get("/api/applications").then((data) => setApplications(data.applications || [])).catch(() => {});
-    return () => { if (socketRef.current) socketRef.current.close(); };
+  const refresh = useCallback(() => {
+    Api.get("/api/recordings").then(setRecordings).catch(() => {});
   }, []);
 
-  // Application (see backend/applications/application_store.py) is picked
-  // FIRST here - the Recording dropdown below it then only lists
-  // recordings mapped to that application, matching how each is tagged
-  // either at recording time (Recorder start form) or retroactively (the
-  // Recordings tab's per-row Application column).
+  useEffect(() => { refresh(); }, [refresh]);
+  useEffect(() => {
+    Api.get("/api/applications").then((data) => setApplications(data.applications || [])).catch(() => {});
+  }, []);
+
   const filteredRecordings = useMemo(() => {
     if (applicationFilter === FILTER_ALL) return recordings;
     if (applicationFilter === FILTER_UNTAGGED) return recordings.filter((r) => !r.application_id);
     return recordings.filter((r) => r.application_id === applicationFilter);
   }, [recordings, applicationFilter]);
 
-  function handleApplicationFilterChange(value) {
-    setApplicationFilter(value);
-    // The previously-selected recording may no longer be in the filtered
-    // list - clear it (and any loaded steps for it) rather than leave a
-    // stale selection that doesn't match what's now shown below.
-    setRecordingId("");
-    resetStepsEditor();
-  }
-
-  function resetStepsEditor() {
-    setEditableSteps([]);
-    setStepColumns([]);
-    setRemovedRows(new Set());
-    setStepsStatus("");
-    setDirty(false);
-  }
-
-  async function loadSteps() {
-    if (!recordingId) { setStepsStatus("Select a recording first."); return; }
-    setStepsStatus("Loading steps...");
-    try {
-      const res = await Api.get(`/api/recordings/${recordingId}/steps`);
-      const steps = res.steps || [];
-      setEditableSteps(steps);
-      setStepColumns(res.columns || []);
-      setRemovedRows(new Set());
-      setDirty(false);
-      setStepsStatus(steps.length
-        ? `Loaded ${steps.length} step(s). Edit any cell (including the locator, if self-healing couldn't fix a broken one), tick Remove for a step that shouldn't run, or Add Step to insert a new one, then Save Changes.`
-        : "This recording has no steps yet. Use Add Step to create one.");
-    } catch (e) {
-      setEditableSteps([]);
-      setStepsStatus("Failed to load steps: " + e.message);
-    }
-  }
-
-  function updateCell(idx, key, value) {
-    setEditableSteps((prev) => {
-      const next = prev.slice();
-      next[idx] = { ...next[idx], [key]: value };
-      return next;
-    });
-    setDirty(true);
-  }
-
-  function toggleRemoved(idx) {
-    setRemovedRows((prev) => {
-      const next = new Set(prev);
-      if (next.has(idx)) next.delete(idx); else next.add(idx);
-      return next;
-    });
-    setDirty(true);
-  }
-
-  function addStepRow() {
-    if (!stepColumns.length) return; // Load Steps first so we know the column shape
-    const maxStep = editableSteps.reduce((m, s) => Math.max(m, Number(s.Step_Number) || 0), 0);
-    const blank = {};
-    stepColumns.forEach((col) => { blank[col] = ""; });
-    blank.Step_Number = maxStep + 1;
-    blank.Action = "HOVER";
-    const last = editableSteps[editableSteps.length - 1];
-    if (last) {
-      blank.Page_URL = last.Page_URL || "";
-      blank.Page_Title = last.Page_Title || "";
-    }
-    setEditableSteps((prev) => [...prev, blank]);
-    setDirty(true);
-    setStepsStatus(`Added step ${blank.Step_Number} (defaulted to Action=HOVER) — fill in Element/Locator Type/Primary Locator, then Save Changes.`);
-  }
-
-  async function saveSteps() {
-    if (!recordingId || !editableSteps.length) return;
-    const stepsToSave = editableSteps.filter((_, idx) => !removedRows.has(idx));
-    if (!stepsToSave.length) { setStepsStatus("Can't save - every step is marked Remove. Un-tick at least one."); return; }
-    setStepsStatus("Saving...");
-    try {
-      await Api.put(`/api/recordings/${recordingId}/steps`, { steps: stepsToSave });
-      setEditableSteps(stepsToSave);
-      setRemovedRows(new Set());
-      setDirty(false);
-      setStepsStatus(`Saved. Execution will use these ${stepsToSave.length} step(s).`);
-    } catch (e) {
-      setStepsStatus("Failed to save: " + e.message);
-    }
-  }
-
-  function connectExecutionSocket(execId, recId) {
-    if (socketRef.current) socketRef.current.close();
-    const socket = new WebSocket(Api.wsUrl(`/ws/execution/${execId}`));
-    socket.onmessage = (msg) => {
-      const evt = JSON.parse(msg.data);
-      if (evt.type === "progress") {
-        const pct = Math.round((evt.step_number / Math.max(evt.total_steps, 1)) * 100);
-        setProgressPct(pct);
-        setProgressSummary(`Step ${evt.step_number} / ${evt.total_steps} — ${evt.status}`);
-        setCurrentStepText(`Action: ${evt.action}  |  Element: ${evt.element_name || "-"}  |  Locator: ${evt.locator_used || "-"}  |  Status: ${evt.status}`);
-      } else if (evt.type === "done") {
-        setProgressSummary(`Execution finished with status: ${evt.status}`);
-        setTerminateDisabled(true);
-        fetchExecutionResult(execId, recId);
-      } else if (evt.type === "error") {
-        setProgressSummary("Error: " + evt.message);
-        setTerminateDisabled(true);
-      }
-    };
-    socketRef.current = socket;
-  }
-
-  async function fetchExecutionResult(execId, recId) {
-    setTerminateDisabled(true);
-    try {
-      const result = await Api.get(`/api/executions/${execId}`);
-      if (result.status === "terminated") {
-        const s = result.summary && typeof result.summary.passed === "number" ? result.summary : null;
-        setProgressSummary(s
-          ? `Terminated by user: ${s.passed || 0} passed, ${s.failed || 0} failed, ${s.healed || 0} healed, ${s.skipped || 0} skipped before stopping.`
-          : "Execution terminated by user.");
-      } else if (result.summary) {
-        const s = result.summary;
-        setProgressSummary(`Completed: ${s.passed || 0} passed, ${s.failed || 0} failed, ${s.healed || 0} healed, ${s.skipped || 0} skipped.`);
-        // Auto-generate the downloadable report (visible on the Reports tab).
-        await Api.post(`/api/executions/${execId}/report?recording_id=${recId}`);
-      } else if (result.status === "error") {
-        setProgressSummary("Execution failed: " + (result.error || "unknown error"));
-      }
-    } catch (e) {
-      setProgressSummary("Failed to fetch execution result: " + e.message);
-    }
-  }
-
-  async function handleExecute() {
-    const node = remoteNode.trim();
-    let testData = {};
-    const raw = testDataRaw.trim();
-    if (raw) {
-      try { testData = JSON.parse(raw); } catch { window.alert("Test Data must be valid JSON"); return; }
-    }
-    if (!recordingId) { window.alert("Select a recording first."); return; }
-    storeRemoteNode(node);
-
-    setProgressSummary(node ? `Starting execution on ${node}...` : "Starting execution...");
-    setProgressPct(0);
-    setCurrentStepText("");
-
-    try {
-      const res = await Api.post("/api/execute", {
-        recording_id: recordingId, browser, test_data: testData,
-        ai_provider: aiProvider || null, run_via_behave: runViaBehave, remote_node_url: node,
-      });
-      setExecutionId(res.execution_id);
-      recordingIdForReportRef.current = recordingId;
-      setTerminateDisabled(false);
-      connectExecutionSocket(res.execution_id, recordingId);
-    } catch (e) {
-      setProgressSummary("Failed to start execution: " + e.message);
-    }
-  }
-
-  async function handleTerminate() {
-    if (!executionId) return;
-    setTerminateDisabled(true);
-    setProgressSummary("Stopping execution...");
-    try {
-      const res = await Api.post(`/api/executions/${executionId}/terminate`);
-      setProgressSummary(res.message || "Stop requested.");
-    } catch (e) {
-      setProgressSummary("Failed to stop execution: " + e.message);
-      setTerminateDisabled(false);
-    }
-  }
-
   return (
     <section>
-      <h1>Execute Recording</h1>
-      <div className="panel">
-        <div className="form-row">
-          <label>Application</label>
-          <select value={applicationFilter} onChange={(e) => handleApplicationFilterChange(e.target.value)}>
-            <option value={FILTER_ALL}>— All applications —</option>
-            {applications.map((a) => (
-              <option key={a.application_id} value={a.application_id}>{a.name}</option>
-            ))}
-            <option value={FILTER_UNTAGGED}>Untagged (no application set yet)</option>
-          </select>
-        </div>
-        <div className="form-row">
-          <label>Recording</label>
-          <select value={recordingId} onChange={(e) => { setRecordingId(e.target.value); resetStepsEditor(); }}>
-            <option value="">-- choose a recording --</option>
-            {filteredRecordings.map((r) => (
-              <option key={r.recording_id} value={r.recording_id}>{r.name} ({r.total_steps || 0} steps)</option>
-            ))}
-          </select>
-          {applicationFilter !== FILTER_ALL && !filteredRecordings.length && (
-            <p className="view-intro">No recordings are tagged with this application yet.</p>
-          )}
-        </div>
-        <div className="form-row">
-          <label>Browser</label>
-          <select value={browser} onChange={(e) => setBrowser(e.target.value)}>
-            <option value="edge">Edge</option>
-            <option value="chrome">Chrome</option>
-          </select>
-        </div>
-        <div className="form-row">
-          <label>Test Data (JSON, optional overrides)</label>
-          <textarea rows={4} value={testDataRaw} onChange={(e) => setTestDataRaw(e.target.value)}
-            placeholder='{"USERNAME_INPUT": "user02", "PASSWORD_INPUT": "secret"}' />
-        </div>
-        <div className="form-row">
-          <label>AI Provider Override (optional)</label>
-          <select value={aiProvider} onChange={(e) => setAiProvider(e.target.value)}>
-            <option value="">Use platform default</option>
-            <option value="azure_openai">Azure OpenAI</option>
-            <option value="claude">Claude</option>
-            <option value="deepseek">DeepSeek</option>
-            <option value="none">None (deterministic healing only)</option>
-          </select>
-        </div>
-        <div className="form-row">
-          <label>Remote Node URL (optional — execute on your own PC instead of the server&apos;s)</label>
-          <input
-            type="text"
-            value={remoteNode}
-            onChange={(e) => setRemoteNode(e.target.value)}
-            placeholder="http://192.168.1.42:9222 (CDP) or ws://192.168.1.42:... (Playwright server) — leave blank to execute on this server"
-          />
-        </div>
-        <div className="btn-row">
-          <button className="btn btn-primary" onClick={handleExecute}>Execute Recording</button>
-          <label className="checkbox-row">
-            <input type="checkbox" checked={runViaBehave} onChange={(e) => setRunViaBehave(e.target.checked)} />
-            Run via Behave instead of Excel executor
-          </label>
-        </div>
+      <h1>Recordings</h1>
+      <div className="form-row">
+        <label>Filter by Application</label>
+        <select value={applicationFilter} onChange={(e) => setApplicationFilter(e.target.value)}>
+          <option value={FILTER_ALL}>— All applications —</option>
+          {applications.map((a) => (
+            <option key={a.application_id} value={a.application_id}>{a.name}</option>
+          ))}
+          <option value={FILTER_UNTAGGED}>Untagged (no application set yet)</option>
+        </select>
       </div>
-
-      <h2>Review &amp; Edit Steps <span style={{ fontWeight: 400, fontSize: 12, color: "#6B7686" }}>(edit the Excel dataset before executing — e.g. fix a value the recorder missed)</span></h2>
-      <div className="panel">
-        <div className="btn-row">
-          <button className="btn" onClick={loadSteps}>Load Steps</button>
-          <button className="btn" onClick={addStepRow}>Add Step</button>
-          <button className="btn btn-primary" disabled={!dirty} onClick={saveSteps}>Save Changes</button>
-          <span className="status-line" style={{ margin: 0 }}>{stepsStatus}</span>
-        </div>
-        {editableSteps.length > 0 && (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Remove</th><th>Step</th>
-                  {STEPS_EDITABLE_COLUMNS.map((c) => <th key={c.key}>{c.label}</th>)}
-                </tr>
-              </thead>
-              <tbody>
-                {editableSteps.map((step, idx) => {
-                  const removed = removedRows.has(idx);
-                  return (
-                    <tr key={idx} style={removed ? { opacity: 0.4, textDecoration: "line-through" } : undefined}>
-                      <td>
-                        <input type="checkbox" checked={removed} onChange={() => toggleRemoved(idx)}
-                          title="Remove this step - it won't be executed" />
-                      </td>
-                      <td>{step.Step_Number}</td>
-                      {STEPS_EDITABLE_COLUMNS.map((c) => (
-                        <td key={c.key}>
-                          <input
-                            type="text"
-                            value={step[c.key] == null ? "" : step[c.key]}
-                            onChange={(e) => updateCell(idx, c.key, e.target.value)}
-                          />
-                        </td>
-                      ))}
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-
-      <h2>Live Execution</h2>
-      <div className="panel">
-        <div className="btn-row">
-          <button className="btn btn-danger" disabled={terminateDisabled} onClick={handleTerminate}>Terminate Execution</button>
-        </div>
-        <div className="status-line">{progressSummary}</div>
-        <div className="progress-bar-outer"><div className="progress-bar-inner" style={{ width: `${progressPct}%` }} /></div>
-        <div className="current-step">{currentStepText}</div>
-      </div>
+      <RecordingsTable recordings={filteredRecordings} withActions onChanged={refresh} />
     </section>
   );
 }
