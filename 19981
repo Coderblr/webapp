@@ -1,153 +1,91 @@
 """
-excel_store.py
+excel_executor.py
 
-Persistence for Layer B - the user execution recording dataset.
-
-    Excel <-> Pandas DataFrame <-> List[ActionRecord]
-
-This is intentionally the *only* place that knows the Excel column schema,
-so the executor, the recorder's artifact writer, and the self-healing
-"update Excel" step all share one implementation.
+Reads the execution.xlsx dataset (via storage/excel_store.py) and exposes
+it as an ordered list of plain-dict "step" rows for the executor loop.
+This is the top of the "Excel -> Pandas -> Selenium -> Execute action"
+pipeline described in spec section 2/19: the normal execution path never
+touches the full locator repository unless a locator fails.
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-import pandas as pd
+from backend.storage.excel_store import ExcelStore
+from backend.storage.models import parse_frame_path
 
-from backend.storage.models import ActionRecord, FramePath
-
-EXECUTION_COLUMNS = [
-    "Step_Number",
-    "Action",
-    "Page_URL",
-    "Page_Title",
-    "Element_Name",
-    "Element_Text",
-    "Element_Tag",
-    "Primary_Locator_Type",
-    "Primary_Locator",
-    "Fallback_Locator_1",
-    "Fallback_Locator_2",
-    "Fallback_Locator_3",
-    "Value",
-    "Test_Data_Key",
-    "Captured_As",
-    "Resolved_Variable",
-    "Frame_Path",
-    "Window_Context",
-    "Modal_Context",
-    "Wait_Condition",
-    "Select_Option_Text",
-    "Optional_Step",
-    "Expected_Result",
-    "Screenshot",
-    # BRD/SD change-detection columns (see backend/change_detection/) - all
-    # blank/"UNCHANGED" for a normal recorded step. A step whose target
-    # element a BRD/SD marked as removed gets Disabled="Y" so the executor
-    # skips it instantly with no locator attempt at all (distinct from
-    # Optional_Step, which still attempts the locator with a short wait
-    # before giving up) - see excel_executor._parse_disabled_flag() and
-    # Executor._run_step(). Change_Status/Change_Set_Id/Disabled_Reason are
-    # audit trail only and never read by the executor.
-    "Disabled",
-    "Disabled_Reason",
-    "Change_Status",
-    "Change_Set_Id",
-]
+_TRUTHY_OPTIONAL_VALUES = {"y", "yes", "true", "1", "optional"}
 
 
-class ExcelStore:
-    """Reads/writes the execution.xlsx dataset for a recording."""
+def _parse_optional_flag(value: Any) -> bool:
+    """A step is optional if its Optional_Step cell holds any of the usual
+    human-typed "yes" spellings - blank/"N"/"no"/"false"/"0" (and anything
+    else) means a normal, non-optional step, matching the existing
+    Excel-is-plain-text convention used by every other column here."""
+    return str(value).strip().lower() in _TRUTHY_OPTIONAL_VALUES
 
+
+def _parse_disabled_flag(value: Any) -> bool:
+    """Same "Y/yes/true/1" convention as Optional_Step, but a distinct
+    column/meaning: Disabled means change_detection determined (and the
+    user confirmed) that this step's element was REMOVED from the
+    application per a BRD/Solution Document update - the executor should
+    not even attempt the locator, not just give it a short timeout before
+    giving up (that's what Optional_Step is for). See
+    Executor._run_step()."""
+    return str(value).strip().lower() in _TRUTHY_OPTIONAL_VALUES
+
+
+class ExcelExecutor:
     def __init__(self, excel_path: Path):
         self.excel_path = excel_path
+        self.store = ExcelStore(excel_path)
 
-    # ------------------------------------------------------------------
-    def write(self, actions: List[ActionRecord]) -> None:
-        rows = [a.to_flat_row() for a in actions]
-        df = pd.DataFrame(rows, columns=EXECUTION_COLUMNS)
-        self.excel_path.parent.mkdir(parents=True, exist_ok=True)
-        with pd.ExcelWriter(self.excel_path, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Execution")
-            self._autosize(writer, df)
+    def load_steps(self) -> List[Dict[str, Any]]:
+        rows = self.store.read_rows()
+        steps = []
+        for row in rows:
+            steps.append({
+                "step_number": int(row.get("Step_Number", 0) or 0),
+                "action": row.get("Action", ""),
+                "page_url": row.get("Page_URL", ""),
+                "page_title": row.get("Page_Title", ""),
+                "element_name": row.get("Element_Name", ""),
+                "element_text": row.get("Element_Text", ""),
+                "element_tag": row.get("Element_Tag", ""),
+                "primary_locator_type": row.get("Primary_Locator_Type", ""),
+                "primary_locator": row.get("Primary_Locator", ""),
+                "fallback_locators": self._parse_fallbacks(row),
+                "value": row.get("Value", ""),
+                "test_data_key": row.get("Test_Data_Key", ""),
+                "captured_as": row.get("Captured_As", ""),
+                "resolved_var": row.get("Resolved_Variable", ""),
+                "frame_path": parse_frame_path(row.get("Frame_Path", "")),
+                "window_context": row.get("Window_Context", ""),
+                "modal_context": row.get("Modal_Context", ""),
+                "wait_condition": row.get("Wait_Condition", ""),
+                "select_option_text": row.get("Select_Option_Text", ""),
+                "optional": _parse_optional_flag(row.get("Optional_Step", "")),
+                "expected_result": row.get("Expected_Result", ""),
+                "screenshot": row.get("Screenshot", ""),
+                "disabled": _parse_disabled_flag(row.get("Disabled", "")),
+                "disabled_reason": row.get("Disabled_Reason", ""),
+                "change_status": row.get("Change_Status", "") or "UNCHANGED",
+                "change_set_id": row.get("Change_Set_Id", ""),
+            })
+        return steps
 
     @staticmethod
-    def _autosize(writer: pd.ExcelWriter, df: pd.DataFrame) -> None:
-        ws = writer.sheets["Execution"]
-        for i, col in enumerate(df.columns, start=1):
-            max_len = max([len(str(col))] + [len(str(v)) for v in df[col].astype(str).tolist()])
-            ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = min(max_len + 2, 60)
+    def _parse_fallbacks(row: Dict[str, Any]) -> List[Dict[str, str]]:
+        out = []
+        for col in ("Fallback_Locator_1", "Fallback_Locator_2", "Fallback_Locator_3"):
+            raw = row.get(col, "")
+            if raw and "::" in str(raw):
+                t, v = str(raw).split("::", 1)
+                if t and v:
+                    out.append({"type": t, "value": v})
+        return out
 
-    def read(self) -> pd.DataFrame:
-        if not self.excel_path.exists():
-            return pd.DataFrame(columns=EXECUTION_COLUMNS)
-        return pd.read_excel(self.excel_path, sheet_name="Execution", engine="openpyxl")
-
-    def read_rows(self) -> List[Dict[str, Any]]:
-        df = self.read()
-        return df.fillna("").to_dict(orient="records")
-
-    def update_locator(
-        self, step_number: int, new_locator_type: str, new_locator: str
-    ) -> bool:
-        """Used by the self-healing update cycle: once a healed locator is
-        validated it is written back into the Excel so future executions
-        are fast again."""
-        df = self.read()
-        if df.empty:
-            return False
-        mask = df["Step_Number"] == step_number
-        if not mask.any():
-            return False
-        df.loc[mask, "Primary_Locator_Type"] = new_locator_type
-        df.loc[mask, "Primary_Locator"] = new_locator
-        with pd.ExcelWriter(self.excel_path, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Execution")
-            self._autosize(writer, df)
-        return True
-
-    def update_row(self, step_number: int, updates: Dict[str, Any]) -> bool:
-        """Applies a partial edit (only the given columns) to one row -
-        used by the "edit before execution" UI so a user can fix a value
-        the recorder missed/mis-captured (spec: the Excel dataset is the
-        editable source of truth for the fast execution path) without
-        having to resend every column for every other row."""
-        df = self.read()
-        if df.empty:
-            return False
-        mask = df["Step_Number"] == step_number
-        if not mask.any():
-            return False
-        for col, val in updates.items():
-            if col not in EXECUTION_COLUMNS or col == "Step_Number":
-                continue
-            df.loc[mask, col] = val
-        with pd.ExcelWriter(self.excel_path, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Execution")
-            self._autosize(writer, df)
-        return True
-
-    def write_rows(self, rows: List[Dict[str, Any]]) -> None:
-        """Overwrites the whole sheet from already-flat row dicts (e.g. the
-        full edited table posted back by the "edit before execution" UI).
-        Unlike `write()` this does not go through ActionRecord - callers
-        are expected to have started from `read_rows()` output so the
-        column shape already matches."""
-        clean_rows = []
-        for row in rows:
-            clean_rows.append({col: row.get(col, "") for col in EXECUTION_COLUMNS})
-        df = pd.DataFrame(clean_rows, columns=EXECUTION_COLUMNS)
-        self.excel_path.parent.mkdir(parents=True, exist_ok=True)
-        with pd.ExcelWriter(self.excel_path, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Execution")
-            self._autosize(writer, df)
-
-    def append(self, action: ActionRecord) -> None:
-        rows = self.read_rows()
-        rows.append(action.to_flat_row())
-        df = pd.DataFrame(rows, columns=EXECUTION_COLUMNS)
-        with pd.ExcelWriter(self.excel_path, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Execution")
-            self._autosize(writer, df)
+    def update_locator(self, step_number: int, new_type: str, new_value: str) -> bool:
+        return self.store.update_locator(step_number, new_type, new_value)
