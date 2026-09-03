@@ -1,929 +1,696 @@
-"""
-recorder.py
+/*
+ * bridge.js
+ * ---------------------------------------------------------------------
+ * Injected into every document (top-level page AND every iframe the
+ * recorder descends into) via Selenium's execute_script. Defines a
+ * single window.__UA__ namespace that the Python side polls.
+ *
+ * This file is 100% generic: no selector, class name, id, or business
+ * term from any specific application is hardcoded. Every heuristic
+ * below is based on structural/semantic DOM characteristics (role,
+ * aria-*, tag, generic class-name *patterns*, computed style) so the
+ * same script works against any Angular / React / Vue / plain-JS /
+ * Bootstrap / jQuery / enterprise UI site.
+ *
+ * Safe to inject multiple times (idempotent) because everything is
+ * guarded behind `if (!window.__UA__)`.
+ * ---------------------------------------------------------------------
+ */
+(function () {
+  if (window.__UA__) {
+    return; // already initialized in this document/frame
+  }
 
-The recording orchestrator. Ties together dom_crawler, mutation_observer,
-event_listener, modal_detector, iframe_handler, shadow_dom, and
-locator_engine into the end-to-end manual-recording workflow described in
-the spec (section 4 / section 38):
+  const UA = {
+    eventQueue: [],
+    mutationQueue: [],
+    _observer: null,
+    _listenersAttached: false,
+    _seenSignatures: new Set(),
+  };
 
-  launch browser -> discover page -> crawl DOM -> store locators ->
-  start event capture -> [user interacts] -> record action -> capture
-  element/locator/test-data -> detect dynamic DOM -> detect modal/iframe ->
-  update locator repository -> update BDD artifacts -> ... -> stop ->
-  build Excel -> finalize artifacts -> save recording.
+  // ---- Cross-navigation event persistence ----------------------------
+  // A committed "change" event (e.g. a password field losing focus right
+  // before its form's Submit navigates the browser) can be queued here in
+  // JS memory and then never make it back to Python: the ~0.5s polling
+  // interval may not get a chance to drain the queue before the document
+  // is torn down by the navigation, silently losing that action's value
+  // (or, worse, letting a later action on the next page get logged in its
+  // place). To close that gap, stash any still-queued events into
+  // sessionStorage right before unload, and recover them into the fresh
+  // page's queue on injection - sessionStorage survives same-tab
+  // navigation (it does not survive a full external redirect to another
+  // origin, which is a page-storage limitation, not something JS can work
+  // around).
+  const PENDING_KEY = "__UA_pending_events__";
 
-Everything here is generic: the only application-specific input is the
-`target_url` supplied by the user at Start Recording time.
-"""
-from __future__ import annotations
-
-import logging
-import queue
-import threading
-import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
-
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Page
-
-from backend.generator.artifact_manager import ArtifactManager
-from backend.recorder import (
-    browser_factory,
-    dom_crawler,
-    event_listener,
-    iframe_handler,
-    js_bridge,
-    modal_detector,
-    mutation_observer,
-    shadow_dom,
-)
-from backend.recorder.browser_factory import PlaywrightSession
-from backend.storage.excel_store import ExcelStore
-from backend.storage.locator_store import LocatorRepository
-from backend.storage.metadata_store import MetadataStore
-from backend.storage.models import (
-    ActionRecord,
-    ActionType,
-    FramePath,
-    FrameRecord,
-    ModalRecord,
-    PageRecord,
-    RecordingMetadata,
-)
-from backend.storage.recording_store import RecordingPaths, RecordingStore
-
-logger = logging.getLogger("universal_automation.recorder")
-
-POLL_INTERVAL_SECONDS = 0.2
-MODAL_CHECK_EVERY_N_TICKS = 5
-
-# Why 0.2s (was 0.5s): every action queued in bridge.js's JS-side buffer
-# only survives until the NEXT poll drains it or the page unloads,
-# whichever comes first. On a login step whose "Continue"/"Login" click
-# triggers an immediate navigation (especially a genuine cross-ORIGIN
-# redirect, where bridge.js's sessionStorage-based recovery cannot
-# reach across - see bridge.js's PENDING_KEY comment), any event still
-# sitting in that buffer when the document unloads is lost for good.
-# Shrinking the poll interval shrinks that loss window; it cannot close
-# a genuine cross-origin gap (a browser security boundary, not
-# something JS/Python can override), but it meaningfully reduces how
-# often a same-tick click+redirect outruns the poller. MODAL_CHECK_EVERY_N_TICKS
-# is raised from 2 to 5 so the (unrelated, more expensive) modal-detection
-# scan still runs about as often in wall-clock time as before, rather than
-# 2.5x more frequently just because ticks got shorter.
-
-# A <form> firing its native "submit" event immediately after a button
-# inside it was clicked is the browser's own side-effect of that click, not
-# a second deliberate user action - without this guard, every Continue/
-# Login-style click on a real <form> got recorded TWICE (once as CLICK,
-# once as SUBMIT on the form a moment later), which both inflates the step
-# count and - worse - replays as two submissions of the same form during
-# execution (the second one hitting whatever the first submission already
-# navigated to, which is exactly the "duplicate SUBMIT after CLICK login"
-# failure pattern). 1000ms comfortably covers one recorder poll tick
-# (500ms) even if the click and its resulting submit land in two separate
-# drain() batches.
-SUBMIT_AFTER_CLICK_DEDUP_MS = 1000
-
-# Reported failure: a step whose target only appears/enables after the
-# target application does something slow (a report generating, an async
-# eligibility check, a heavy page render) replayed too fast and failed,
-# even though the user had no trouble during recording - they simply,
-# unconsciously, waited those few extra seconds before their next click.
-# EXPLICIT_WAIT_SECONDS/FALLBACK_WAIT_SECONDS already retry for a while at
-# execution time, but a genuinely slow screen can outlast that default, and
-# there was no way for the recorder to tell "the user is slow" apart from
-# "the app is slow" - until now: a real, human-perceptible gap between two
-# consecutive recorded actions (beyond ordinary between-click thinking
-# time) is recorded as this step's own explicit wait allowance, letting
-# replay budget at least as much time as it actually took when it was
-# recorded, without having to guess or hand-tune a timeout per step.
-# Reuses the existing (until now always-blank) Wait_Condition column
-# rather than adding a new one - it's stored as a plain seconds value,
-# e.g. "8.4", and Executor._run_step() extends this step's own timeout to
-# at least that many seconds before falling back to self-healing.
-RECORDED_PAUSE_THRESHOLD_MS = 4000
-MAX_RECORDED_EXPLICIT_WAIT_SECONDS = 60.0
-
-# Reported failure: recording a click on a radio/checkbox styled with the
-# real <input> hidden behind a label/icon (the common case - see
-# action_engine._check_or_uncheck()'s own docstring) produced TWO steps for
-# one physical click: bridge.js's document-level click listener fires on
-# whatever the user's cursor actually landed on (often that decorative
-# wrapper, not the input) and records a CLICK, and then the input's native
-# "change" event fires a moment later and records a CHECK/UNCHECK on the
-# real <input>. Only the second one is built to survive a hidden form
-# control (_check_or_uncheck()'s normal -> force=True -> direct-JS-state
-# fallback chain) - the first replays through the generic click() method,
-# which has no such state-aware retry, so a run could fail on that
-# redundant CLICK a step before ever reaching the CHECK that would have
-# worked fine. This is the exact same "browser's own side-effect of the
-# click, not a second deliberate action" situation as SUBMIT-after-CLICK
-# above, just resolved the other way around: there it's the earlier CLICK
-# that's the real action and the SUBMIT that's noise, so the SUBMIT gets
-# dropped; here it's the reverse - the CLICK is noise and the CHECK/UNCHECK
-# is the real, correctly-targeted action - so the preceding CLICK gets
-# popped instead once the CHECK/UNCHECK arrives.
-
-
-@dataclass
-class LiveEvent:
-    event_type: str
-    message: str
-    data: Dict[str, Any] = field(default_factory=dict)
-    timestamp: float = field(default_factory=time.time)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "event_type": self.event_type,
-            "message": self.message,
-            "data": self.data,
-            "timestamp": self.timestamp,
+  (function recoverPendingEvents() {
+    try {
+      const raw = window.sessionStorage.getItem(PENDING_KEY);
+      if (raw) {
+        window.sessionStorage.removeItem(PENDING_KEY);
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr) && arr.length) {
+          // recovered (older, pre-navigation) events go first so they
+          // drain - and get recorded - ahead of anything new on this page
+          UA.eventQueue = arr.concat(UA.eventQueue);
         }
+      }
+    } catch (e) { /* sessionStorage unavailable/blocked - nothing we can do */ }
+  })();
 
+  window.addEventListener("beforeunload", function () {
+    try {
+      if (UA.eventQueue.length) {
+        let existing = [];
+        const raw = window.sessionStorage.getItem(PENDING_KEY);
+        if (raw) {
+          try { existing = JSON.parse(raw) || []; } catch (e) { existing = []; }
+        }
+        window.sessionStorage.setItem(PENDING_KEY, JSON.stringify(existing.concat(UA.eventQueue)));
+      }
+    } catch (e) { /* ignore - best effort only */ }
+  }, true);
 
-class RecorderSession:
-    """One active manual-recording session for one recording_id."""
-
-    def __init__(
-        self, recording_id: str, name: str, target_url: str, browser: str = "chrome",
-        remote_node_url: Optional[str] = None, owner_user_id: str = "", owner_username: str = "",
-        application_id: str = "",
-    ):
-        self.recording_id = recording_id
-        self.name = name
-        self.target_url = target_url
-        self.browser = browser
-        # Which application (see backend/applications/application_store.py)
-        # this recording is tagged with - threaded through only so
-        # _finalize()'s fallback RecordingMetadata(...) branch below can
-        # preserve it, same reasoning as owner_user_id/owner_username just
-        # below: the metadata RecorderManager.start_recording() already
-        # wrote via RecordingStore.create() is normally what's on disk by
-        # the time _finalize() runs.
-        self.application_id = application_id
-        # Optional: record using a browser on someone else's PC (a
-        # WebDriver node they're running locally) instead of launching one
-        # on this machine - see browser_factory._create_remote(). None
-        # preserves the existing local-launch behavior exactly.
-        self.remote_node_url = remote_node_url
-        # Who started this recording (see backend/auth/) - threaded through
-        # only so _finalize()'s fallback RecordingMetadata(...) branch below
-        # can preserve it; the metadata RecorderManager.start_recording()
-        # already wrote via RecordingStore.create() is normally what's on
-        # disk by the time _finalize() runs, so this is a belt-and-braces
-        # fallback, not the primary path.
-        self.owner_user_id = owner_user_id
-        self.owner_username = owner_username
-
-        self.store = RecordingStore()
-        self.paths: RecordingPaths = self.store.paths(recording_id)
-        self.locator_repo = LocatorRepository(recording_id, self.paths)
-        self.artifact_manager = ArtifactManager(recording_id, self.name, self.paths)
-
-        # Playwright's sync API is single-threaded (see browser_factory.py's
-        # module docstring): self.session is created INSIDE _thread_main(),
-        # which runs entirely on self._thread, rather than in start() on the
-        # calling thread - every Playwright call this session makes,
-        # start() included, happens on that one dedicated thread.
-        self.session: Optional[PlaywrightSession] = None
-        self._thread: Optional[threading.Thread] = None
-        self._stop_flag = threading.Event()
-        self._paused = threading.Event()
-        # start() blocks on this until _thread_main() has either finished
-        # startup (browser launched, first page discovered) or hit an
-        # error - so callers get the same synchronous "recording started
-        # or raised" contract as before, even though setup now happens on
-        # a different thread than the one calling start().
-        self._ready_event = threading.Event()
-        self._startup_error: Optional[BaseException] = None
-
-        self.actions: List[ActionRecord] = []
-        self.events: "queue.Queue[LiveEvent]" = queue.Queue()
-
-        self._known_pages: Dict[str, PageRecord] = {}   # normalized_key -> PageRecord
-        self._known_frame_paths: List[FramePath] = [FramePath(path=[], nested_depth=0)]
-        self._seen_modal_sigs: set = set()
-        self._url_history: List[str] = []
-        self._known_browser_pages: List[Page] = []   # every browser tab/window (Playwright Page) seen so far
-        self._current_page: Optional[PageRecord] = None
-        self._tick = 0
-        self.status = "starting"
-
-        # Dedup state for the CLICK-triggers-native-SUBMIT pattern (see
-        # SUBMIT_AFTER_CLICK_DEDUP_MS above).
-        self._last_click_ts_ms: Optional[float] = None
-        # Pause-detection state for RECORDED_PAUSE_THRESHOLD_MS above -
-        # timestamp of the most recently RECORDED action (any type),
-        # regardless of whether it was popped by a dedup rule since.
-        self._last_action_ts_ms: Optional[float] = None
-
-        # Guarantees every element_name/test_data_key used across THIS
-        # recording is unique, even when the target app gives two (or
-        # three) genuinely different fields identical structural hints -
-        # e.g. a multi-step "enter ID -> Continue -> enter password ->
-        # Continue -> enter OTP" wizard where the username, password, and
-        # OTP inputs are all rendered by the same generic, unlabeled
-        # <input> component (no id/name/aria-label/placeholder for
-        # generate_element_name() to key off of), so every one of them
-        # would otherwise be named e.g. "input_input" and share the exact
-        # same test_data_key "{{INPUT_INPUT}}". Without this, a Test Data
-        # override meant only for the OTP step (e.g. a fixed/hardcoded UAT
-        # OTP the user always needs to type) would ALSO silently overwrite
-        # the username and password steps, since all three collide on one
-        # key - which is exactly the "hardcoded OTP value not applying
-        # correctly" failure mode. Keyed by (base_name, element_id) so the
-        # SAME physical field being interacted with again later (e.g.
-        # retyping a password after a validation error) keeps resolving to
-        # the same name instead of getting a new suffix every time.
-        self._name_assignments: Dict[tuple, str] = {}
-        self._claimed_names: set = set()
-
-        # Capture -> Store -> Reuse: correlates a "copy" action (the user
-        # grabbing a system-GENERATED value off the screen - an application
-        # ID, a reference number, a freshly-issued OTP) with any LATER
-        # action whose recorded value exactly matches it, so execution can
-        # re-read the value live and re-type it live instead of replaying
-        # a stale literal from this recording. Keyed by the copied text
-        # itself (not by element), same approach as _unique_element_name:
-        # (variable name) <-> (value it was captured from), scoped to this
-        # one recording.
-        self._captured_values: Dict[str, str] = {}   # copied text -> variable name
-        self._used_var_names: set = set()
-
-        # NAVIGATE_BACK is only ever genuinely true when the browser fired a
-        # real popstate event (an actual back/forward navigation). The old
-        # heuristic in _check_page_and_window_changes() inferred it from
-        # "have we seen this URL before in this recording", which also fires
-        # for perfectly ordinary FORWARD progress through an OAuth/SSO-style
-        # login that legitimately revisits a shared redirect/callback URL
-        # more than once (very common across a multi-step login wizard) -
-        # producing a spurious NAVIGATE_BACK row the user never triggered.
-        # This flag is set immediately before the popstate-triggered check
-        # and consumed (reset) by it, so only that one check - never the
-        # regular per-tick poll - can ever record NAVIGATE_BACK.
-        self._popstate_pending = False
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-    def start(self) -> None:
-        self.status = "starting"
-        self._stop_flag.clear()
-        self._paused.clear()
-        self._ready_event.clear()
-        self._thread = threading.Thread(target=self._thread_main, daemon=True)
-        self._thread.start()
-        # Block until _thread_main() has either finished startup or hit an
-        # error, so this method keeps its old synchronous "raises on
-        # failure to launch" contract for callers (the FastAPI endpoint
-        # that starts a recording).
-        self._ready_event.wait(timeout=60)
-        if self._startup_error is not None:
-            raise self._startup_error
-
-    def _thread_main(self) -> None:
-        """Owns the ENTIRE Playwright object graph for this recording -
-        launch, navigation, polling loop, and final cleanup all happen on
-        this one thread (see the module-level note on self.session)."""
-        try:
-            self.session = browser_factory.create_session(self.browser, remote_node_url=self.remote_node_url)
-            self.session.page.goto(self.target_url)
-            self._known_browser_pages = [self.session.page]
-            self._emit("status", f"Browser launched, navigating to {self.target_url}")
-
-            self._register_current_page(initial=True)
-            self._discover_all_frames_and_shadow()
-
-            event_listener.start(self.session.page)
-            mutation_observer.start(self.session.page)
-
-            self._record_open_url_action()
-            self.status = "recording"
-        except Exception as exc:  # pragma: no cover - defensive
-            self._startup_error = exc
-            self.status = "error"
-            self._ready_event.set()
-            if self.session:
-                self.session.close()
-            return
-
-        self._ready_event.set()
-        self._run_loop()
-
-        if self.session:
-            self.session.close()
-
-    def pause(self) -> None:
-        self._paused.set()
-        self.status = "paused"
-        self._emit("status", "Recording paused")
-
-    def resume(self) -> None:
-        self._paused.clear()
-        self.status = "recording"
-        self._emit("status", "Recording resumed")
-
-    def delete_action(self, step_number: int) -> bool:
-        """Removes one already-recorded action from this in-progress
-        recording (e.g. a transaction that failed and shouldn't be part of
-        the replayable test/Excel dataset) and immediately regenerates the
-        BDD artifacts so they never reflect the deleted step either.
-        Remaining steps are renumbered to stay contiguous (1..N), since any
-        action recorded from this point on is numbered off of
-        len(self.actions)+1 - without renumbering, deleting a step out of
-        the middle would produce a duplicate step number the next time the
-        user records something."""
-        idx = next((i for i, a in enumerate(self.actions) if a.step_number == step_number), None)
-        if idx is None:
-            return False
-        removed = self.actions.pop(idx)
-        for i, a in enumerate(self.actions, start=1):
-            a.step_number = i
-        self.artifact_manager.set_actions(self.actions)
-        label = f"{removed.action} on '{removed.element_name}'" if removed.element_name else str(removed.action)
-        self._emit(
-            "action_deleted",
-            f"Deleted step {step_number} ({label}). {len(self.actions)} step(s) remain.",
-            {"deleted_step_number": step_number, "remaining_steps": len(self.actions)},
-        )
-        return True
-
-    def stop(self) -> Dict[str, Any]:
-        self._stop_flag.set()
-        if self._thread:
-            # _thread_main() closes self.session itself, on its own thread,
-            # once _run_loop() notices _stop_flag and returns - joining here
-            # waits for that cleanup to actually finish rather than racing
-            # it (see the module-level note on Playwright's thread affinity).
-            self._thread.join(timeout=10)
-        self.status = "stopped"
-        self._finalize()
-        self._emit("status", "Recording stopped and saved")
-        return self._summary()
-
-    # ------------------------------------------------------------------
-    # Main polling loop
-    # ------------------------------------------------------------------
-    def _run_loop(self) -> None:
-        while not self._stop_flag.is_set():
-            if self._paused.is_set():
-                time.sleep(POLL_INTERVAL_SECONDS)
-                continue
-            try:
-                self._tick += 1
-                self._check_page_and_window_changes()
-                self._poll_context(FramePath(path=[], nested_depth=0))
-                for fp in list(self._known_frame_paths):
-                    if fp.path:
-                        self._poll_context(fp)
-                if self._tick % MODAL_CHECK_EVERY_N_TICKS == 0:
-                    self._check_modals(trigger_step=None, relative="before")
-            except PlaywrightError:
-                # transient navigation-related errors are expected; keep polling
-                pass
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.exception("Recorder loop error: %s", exc)
-            time.sleep(POLL_INTERVAL_SECONDS)
-
-    def _poll_context(self, frame_path: FramePath) -> None:
-        context = iframe_handler.resolve_frame(self.session.page, frame_path)
-        if context is None:
-            return
-        try:
-            js_bridge.inject(context)
-            event_listener.start(context)
-            mutation_observer.start(context)
-
-            for raw_mutation in mutation_observer.drain(context):
-                self._handle_mutation(raw_mutation, frame_path)
-
-            for raw_event in event_listener.drain(context):
-                self._handle_raw_event(raw_event, frame_path)
-        except PlaywrightError:
-            # The frame may have just been torn down by a navigation mid-
-            # poll - unlike Selenium's switch_to model, resolving a
-            # different (unrelated) Frame/Page object is unaffected, so
-            # there is nothing to "switch back" from here.
-            pass
-
-    @staticmethod
-    def _page_key(page: Page) -> str:
-        """A stable-for-this-process label for a Playwright Page, used
-        only as the informational `window_context` value on ActionRecord
-        (Playwright pages have no transferable string handle the way
-        Selenium's window_handles did, and a recorded handle was never
-        meaningfully replayable against a fresh session's pages anyway -
-        see playwright_executor.py's SWITCH_WINDOW handling)."""
-        return f"page_{id(page)}"
-
-    # ------------------------------------------------------------------
-    # Page / window change detection
-    # ------------------------------------------------------------------
-    def _check_page_and_window_changes(self) -> None:
-        pages = list(self.session.context.pages)
-        if len(pages) > len(self._known_browser_pages):
-            new_pages = [p for p in pages if p not in self._known_browser_pages]
-            for p in new_pages:
-                self._record_generic_action(ActionType.NEW_TAB, window_context=self._page_key(p))
-                self._emit("action", "New tab/window detected", {"handle": self._page_key(p)})
-            self._known_browser_pages = pages
-            # Follow the new page. Without this, polling keeps reading
-            # from the old page (e.g. a login page that spawns an SSO
-            # popup on submit) - so nothing the user does in the new one
-            # (finishing the login there, for instance) is ever captured.
-            # bring_to_front() is Playwright's own API for giving a
-            # specific tab real focus - the equivalent of Selenium's
-            # switch_to.window() + a follow-up JS window.focus() hack.
-            newest = new_pages[-1]
-            try:
-                self.session.page = newest
-                newest.bring_to_front()
-            except PlaywrightError:
-                pass
-            self._current_page = None  # force the page-registration path below to run for this new window
-        elif len(pages) < len(self._known_browser_pages):
-            closed = [p for p in self._known_browser_pages if p not in pages]
-            for p in closed:
-                self._record_generic_action(ActionType.CLOSE_TAB, window_context=self._page_key(p))
-                self._emit("action", "Tab/window closed", {"handle": self._page_key(p)})
-            self._known_browser_pages = pages
-            # If the page we were actively following was the one that just
-            # closed, our "current page" is now gone - follow whatever page
-            # is left instead of silently polling a closed page forever.
-            if self.session.page in closed and pages:
-                self.session.page = pages[-1]
-                self._current_page = None
-
-        try:
-            current_url = self.session.page.url
-        except PlaywrightError:
-            return
-
-        if self._current_page and current_url == self._current_page.url:
-            return
-
-        # URL changed -> could be a fresh navigation or a real back/forward.
-        # Only trust the URL-revisit heuristic when THIS check was triggered
-        # by an actual popstate event - see the comment on
-        # self._popstate_pending in __init__. A plain revisit detected by
-        # ordinary polling (no popstate involved) is regular forward
-        # progress - e.g. an SSO/redirect URL hit more than once - not a
-        # back navigation, and must not be recorded as one.
-        via_popstate = self._popstate_pending
-        self._popstate_pending = False
-        if via_popstate and current_url in self._url_history[:-1]:
-            self._record_generic_action(ActionType.NAVIGATE_BACK, page_url=current_url)
-            self._emit("action", "Navigate back detected", {"url": current_url})
-        elif self._url_history and current_url not in self._url_history:
-            pass  # regular forward navigation, will be logged as new page below
-
-        self._url_history.append(current_url)
-        self._register_current_page()
-        self._discover_all_frames_and_shadow()
-
-    def _register_current_page(self, initial: bool = False) -> None:
-        try:
-            url = self.session.page.url
-            title = self.session.page.title()
-        except PlaywrightError:
-            return
-        page = dom_crawler.make_page_record(url, title)
-        if page.normalized_key not in self._known_pages:
-            self._known_pages[page.normalized_key] = page
-            self.locator_repo.upsert_page(page)
-            self._emit("page_discovered", f"Page discovered: {title or url}", {"url": url, "title": title})
-        else:
-            page = self._known_pages[page.normalized_key]
-            page.last_seen_at = time.time()
-        self._current_page = page
-        if not self._url_history:
-            self._url_history.append(url)
-
-        elements = dom_crawler.crawl_current_context(self.session.page, page.page_id)
-        for el in elements:
-            self.locator_repo.upsert_element(el)
-        self._emit("crawl_complete", f"Crawled {len(elements)} elements on top document", {"count": len(elements)})
-        self.locator_repo.flush()
-
-    def _discover_all_frames_and_shadow(self) -> None:
-        if not self._current_page:
-            return
-        page = self._current_page
-
-        def on_frame(frame: FrameRecord) -> None:
-            self.locator_repo.upsert_frame(frame)
-            self._emit("frame_detected", f"Iframe detected (depth {frame.nested_depth})", frame.to_dict())
-            # track the frame path for later event polling
-            # (reconstructed fully in on_elements callback closure below)
-
-        collected_paths: List[FramePath] = []
-
-        def on_elements(elements) -> None:
-            for el in elements:
-                self.locator_repo.upsert_element(el)
-                if el.frame_path and el.frame_path.path and el.frame_path not in collected_paths:
-                    collected_paths.append(el.frame_path)
-            if elements:
-                self._emit("crawl_complete", f"Crawled {len(elements)} elements in nested context", {"count": len(elements)})
-
-        try:
-            iframe_handler.discover_frames(self.session.page, page, on_frame, on_elements)
-        except PlaywrightError:
-            pass
-
-        for fp in collected_paths:
-            if fp not in self._known_frame_paths:
-                self._known_frame_paths.append(fp)
-
-        try:
-            n = shadow_dom.discover(self.session.page, page, lambda els: [self.locator_repo.upsert_element(e) for e in els])
-            if n:
-                self._emit("shadow_dom_detected", f"Shadow DOM elements discovered: {n}", {"count": n})
-        except PlaywrightError:
-            pass
-
-        self.locator_repo.flush()
-
-    # ------------------------------------------------------------------
-    # Mutation handling (dynamic DOM)
-    # ------------------------------------------------------------------
-    def _handle_mutation(self, raw: Dict[str, Any], frame_path: FramePath) -> None:
-        info = raw.get("element")
-        if not info or not self._current_page:
-            return
-        event_page = self._resolve_page_for_event(raw)
-        if not event_page:
-            return
-        record = dom_crawler.to_element_record(info, event_page.page_id, frame_path=frame_path, dynamic=True)
-        self.locator_repo.upsert_element(record)
-        self._emit("element_discovered", f"Dynamic element discovered: <{record.tag}> {record.attributes.get('element_name','')}", {
-            "tag": record.tag, "component_type": record.component_type,
-        })
-
-    # ------------------------------------------------------------------
-    # Event -> Action handling
-    # ------------------------------------------------------------------
-    def _resolve_page_for_event(self, raw: Dict[str, Any]) -> Optional[PageRecord]:
-        """Events can be drained a poll tick (up to ~0.5s) after they
-        actually fired - worst case, after the browser has already
-        navigated to the next page (e.g. a password field's committed
-        "change" event, immediately followed by a form submit). If we
-        blindly attributed every drained event to whatever page is
-        "current" at drain time, that event's value would silently be
-        lost (never make it into an ActionRecord because it was queued
-        under the old, now-torn-down document) or - if bridge.js's
-        pending-event recovery already re-queued it on the new page -
-        get logged against the wrong page/step. Resolve the page the
-        event actually happened on from the URL it captured itself."""
-        raw_url = raw.get("url") or ""
-        if not raw_url:
-            return self._current_page
-        page = self._known_pages.get(dom_crawler.normalize_url(raw_url))
-        return page or self._current_page
-
-    def _unique_element_name(self, base_name: str, element_id: Optional[str]) -> str:
-        """Returns a name guaranteed unique within this recording for a
-        genuinely different field, while still returning the SAME name for
-        a repeat visit to the same physical field. See the comment on
-        self._name_assignments above for why this matters (OTP/password/
-        username fields on generic multi-step login wizards frequently
-        generate identical base names)."""
-        key = (base_name, element_id or "")
-        if key in self._name_assignments:
-            return self._name_assignments[key]
-        if base_name not in self._claimed_names:
-            assigned = base_name
-        else:
-            n = 2
-            while f"{base_name}_{n}" in self._claimed_names:
-                n += 1
-            assigned = f"{base_name}_{n}"
-        self._claimed_names.add(assigned)
-        self._name_assignments[key] = assigned
-        return assigned
-
-    # Words stripped from a copy source's label before it becomes a
-    # {{variable}} name, e.g. "Generated Application ID" -> "application_id".
-    _VAR_NAME_STOPWORDS = {
-        "generated", "generate", "new", "auto", "your", "the", "a", "an",
-        "current", "this", "field", "value", "display", "label", "output",
+  // ---- helpers -----------------------------------------------------
+  function safeAttr(el, name) {
+    try {
+      const v = el.getAttribute(name);
+      return v === null ? "" : v;
+    } catch (e) {
+      return "";
     }
+  }
 
-    def _derive_variable_name(self, element_record) -> str:
-        """LLM-free variable-name generator for a copy source element -
-        mirrors the heuristic used for element_name generation, but keeps
-        its own lowercase/underscore namespace so a {{variable}} placeholder
-        never collides with the existing {{ELEMENT_NAME}} Test Data key
-        convention (always upper-cased - see test_data_key above)."""
-        attrs = element_record.attributes if element_record else {}
-        base = (
-            attrs.get("aria_label") or attrs.get("aria-label") or attrs.get("placeholder")
-            or attrs.get("name") or (element_record.text if element_record else "")
-            or attrs.get("id") or (element_record.tag if element_record else "") or "value"
-        )
-        tokens = "".join(c if c.isalnum() else " " for c in str(base).lower()).split()
-        filtered = [t for t in tokens if t not in self._VAR_NAME_STOPWORDS]
-        tokens = filtered or tokens or ["value"]
-        name = "_".join(tokens)[:40].strip("_") or "value"
+  function isVisible(el) {
+    try {
+      const style = window.getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    } catch (e) {
+      return false;
+    }
+  }
 
-        candidate = name
-        n = 2
-        while candidate in self._used_var_names:
-            candidate = f"{name}_{n}"
-            n += 1
-        self._used_var_names.add(candidate)
-        return candidate
+  function isEnabled(el) {
+    return !(el.disabled === true || safeAttr(el, "aria-disabled") === "true");
+  }
 
-    def _handle_raw_event(self, raw: Dict[str, Any], frame_path: FramePath) -> None:
-        raw_type = raw.get("type")
-        if raw_type == "popstate":
-            self._popstate_pending = True
-            self._check_page_and_window_changes()
-            return
-
-        action_type = event_listener.to_action_type(raw_type)
-        if not action_type or not self._current_page:
-            return
-
-        # A form's native "submit" firing right after a button inside it
-        # was clicked is the browser's own side-effect of that click, not a
-        # second deliberate action - see SUBMIT_AFTER_CLICK_DEDUP_MS above.
-        if action_type == ActionType.SUBMIT and self.actions and self._last_click_ts_ms is not None:
-            last = self.actions[-1]
-            raw_ts = raw.get("timestamp")
-            if last.action == ActionType.CLICK and raw_ts is not None and (raw_ts - self._last_click_ts_ms) <= SUBMIT_AFTER_CLICK_DEDUP_MS:
-                return
-
-        # See the CHECK/UNCHECK-after-CLICK comment above SUBMIT_AFTER_CLICK_DEDUP_MS.
-        # Deliberately no element-identity check: the click's target is very
-        # often a DIFFERENT DOM node from the one the change event fires on
-        # (the decorative wrapper vs. the real input) - requiring them to
-        # match would defeat the fix in exactly the case it exists for.
-        if action_type in (ActionType.CHECK, ActionType.UNCHECK) and self.actions and self._last_click_ts_ms is not None:
-            last = self.actions[-1]
-            raw_ts = raw.get("timestamp")
-            if last.action == ActionType.CLICK and raw_ts is not None and (raw_ts - self._last_click_ts_ms) <= SUBMIT_AFTER_CLICK_DEDUP_MS:
-                self.actions.pop()
-
-        # See RECORDED_PAUSE_THRESHOLD_MS above: a real, human-perceptible
-        # gap since the last recorded action means the user was genuinely
-        # waiting on the app (not just ordinary between-click thinking
-        # time) - carry that forward as THIS step's own explicit wait
-        # allowance so replay isn't stuck with only the default timeout on
-        # a screen that's known to need longer.
-        raw_ts = raw.get("timestamp")
-        recorded_wait_seconds = 0.0
-        if raw_ts is not None and self._last_action_ts_ms is not None:
-            gap_ms = raw_ts - self._last_action_ts_ms
-            if gap_ms >= RECORDED_PAUSE_THRESHOLD_MS:
-                recorded_wait_seconds = min(gap_ms / 1000.0, MAX_RECORDED_EXPLICIT_WAIT_SECONDS)
-
-        event_page = self._resolve_page_for_event(raw)
-        if not event_page:
-            return
-
-        info = raw.get("element")
-        element_record = None
-        if info:
-            element_record = dom_crawler.to_element_record(info, event_page.page_id, frame_path=frame_path)
-            # Disambiguate BEFORE storing, so the locator repository (Layer
-            # A - Locator JSON download, self-healing lookups, reports) and
-            # this action's element_name/test_data_key (Layer B - Excel,
-            # Test Data overrides) always agree on the same name.
-            base_name = element_record.attributes.get("element_name", "field")
-            element_record.attributes["element_name"] = self._unique_element_name(base_name, element_record.element_id)
-            self.locator_repo.upsert_element(element_record)
-
-        if action_type == ActionType.CLICK:
-            self._last_click_ts_ms = raw.get("timestamp")
-
-        step_number = len(self.actions) + 1
-        value = raw.get("value", "") or raw.get("selected_text", "")
-        # For SELECT specifically, keep the visible option text ALONGSIDE
-        # `value` (which prefers the option's value attribute above) so
-        # replay can try both a value-attribute match and a label match -
-        # see models.py's ActionRecord.select_option_text and
-        # action_engine.select().
-        select_option_text = raw.get("selected_text", "") if action_type == ActionType.SELECT else ""
-        if action_type == ActionType.SCROLL:
-            # bridge.js's `scroll` listener fires on the window/document,
-            # never on a specific element (see its `element: null`) - a
-            # scroll has no "target" the way a click/type does, only a
-            # position. Without capturing that position here, this step's
-            # `value` stayed blank forever and replay could only ever do a
-            # generic, fixed-distance nudge - never actually reproducing
-            # the scroll the user performed. Encoded as "{x}:{y}" (window.
-            # scrollX:scrollY at the time), parsed back out in
-            # playwright_executor's SCROLL dispatch.
-            value = f"{raw.get('scroll_x', 0)}:{raw.get('scroll_y', 0)}"
-        test_data_key = None
-        display_value = value
-        # CAPTURE steps don't drive a typed/replayed input - their "value"
-        # is a live DOM read, so a Test Data override on them wouldn't mean
-        # anything (see execution/variable_store.py); skip assigning one.
-        if element_record and value and action_type != ActionType.CAPTURE:
-            elem_name = element_record.attributes.get("element_name", "field")
-            test_data_key = "{{" + elem_name.upper() + "}}"
-
-        # Capture -> Store -> Reuse correlation (see _derive_variable_name
-        # above and execution/variable_store.py for the execution side).
-        captured_as = None
-        resolved_var = None
-        if value:
-            if action_type == ActionType.CAPTURE:
-                captured_as = self._captured_values.get(value) or self._derive_variable_name(element_record)
-                self._captured_values[value] = captured_as
-            else:
-                existing = self._captured_values.get(value)
-                if existing:
-                    resolved_var = existing
-
-        best_locator = element_record.best_locator() if element_record else None
-        fallback_locators = []
-        if element_record:
-            others = [l for l in element_record.locators if l is not best_locator][:3]
-            fallback_locators = [{"type": l.strategy, "value": l.value} for l in others]
-
-        action = ActionRecord(
-            step_number=step_number,
-            action=action_type,
-            page_url=event_page.url,
-            page_title=event_page.title,
-            page_id=event_page.page_id,
-            element_id=element_record.element_id if element_record else None,
-            element_text=(element_record.text if element_record else "")[:120],
-            element_tag=element_record.tag if element_record else "",
-            element_name=element_record.attributes.get("element_name", "") if element_record else "",
-            primary_locator_type=best_locator.strategy if best_locator else "",
-            primary_locator=best_locator.value if best_locator else "",
-            fallback_locators=fallback_locators,
-            value=value,
-            test_data_key=test_data_key,
-            captured_as=captured_as,
-            resolved_var=resolved_var,
-            frame_path=frame_path if frame_path.path else None,
-            window_context=self._page_key(self.session.page) if self.session else "",
-            wait_condition=f"{recorded_wait_seconds:.1f}" if recorded_wait_seconds else "",
-            select_option_text=select_option_text,
-        )
-
-        self.actions.append(action)
-        self._emit("action_recorded", self._describe_action(action, display_value), action.to_dict())
-        if raw_ts is not None:
-            self._last_action_ts_ms = raw_ts
-
-        self._check_modals(trigger_step=step_number, relative="after", trigger_element_id=action.element_id)
-
-        self.artifact_manager.on_action(action, event_page)
-        self._emit("artifacts_updated", "Feature / Page Object / Step Definition updated", {"step": step_number})
-
-    def _record_open_url_action(self) -> None:
-        page = self._current_page
-        action = ActionRecord(
-            step_number=1,
-            action=ActionType.OPEN_URL,
-            page_url=self.target_url,
-            page_title=page.title if page else "",
-            page_id=page.page_id if page else "",
-            value=self.target_url,
-        )
-        self.actions.append(action)
-        self._emit("action_recorded", f"OPEN_URL {self.target_url}", action.to_dict())
-        self.artifact_manager.on_action(action, page)
-
-    def _record_generic_action(self, action_type: str, page_url: str = "", window_context: str = "") -> None:
-        step_number = len(self.actions) + 1
-        page = self._current_page
-        action = ActionRecord(
-            step_number=step_number,
-            action=action_type,
-            page_url=page_url or (page.url if page else ""),
-            page_title=page.title if page else "",
-            page_id=page.page_id if page else "",
-            window_context=window_context,
-        )
-        self.actions.append(action)
-        self.artifact_manager.on_action(action, page)
-
-    @staticmethod
-    def _describe_action(action: ActionRecord, display_value: str) -> str:
-        base = f"Step {action.step_number}: {action.action}"
-        if action.element_name:
-            base += f" on '{action.element_name}'"
-        if display_value:
-            base += f" = '{display_value}'"
-        return base
-
-    # ------------------------------------------------------------------
-    # Modal detection (before AND after actions)
-    # ------------------------------------------------------------------
-    def _check_modals(self, trigger_step: Optional[int], relative: str, trigger_element_id: Optional[str] = None) -> None:
-        if not self._current_page or not self.session:
-            return
-        try:
-            raw_modals = modal_detector.detect(self.session.page)
-        except PlaywrightError:
-            return
-        if not raw_modals:
-            return
-        new_raw = []
-        for raw in raw_modals:
-            sig = (raw.get("container") or {}).get("dom_signature", "")
-            if sig and sig in self._seen_modal_sigs:
-                continue
-            if sig:
-                self._seen_modal_sigs.add(sig)
-            new_raw.append(raw)
-        if not new_raw:
-            return
-
-        modal_records = modal_detector.to_modal_records(
-            new_raw, self._current_page.page_id, trigger_element_id, trigger_step, relative,
-        )
-        for m in modal_records:
-            self.locator_repo.upsert_modal(m)
-            self._emit("modal_detected", f"{m.modal_type.replace('_', ' ').title()} detected ({relative} action)", m.to_dict())
-        self.locator_repo.flush()
-
-    # ------------------------------------------------------------------
-    # Finalization
-    # ------------------------------------------------------------------
-    def _finalize(self) -> None:
-        self.locator_repo.flush()
-        ExcelStore(self.paths.execution_excel).write(self.actions)
-        self.artifact_manager.finalize(self.actions, list(self._known_pages.values()))
-
-        meta = self.store.load_metadata(self.recording_id) or RecordingMetadata(
-            recording_id=self.recording_id, name=self.name, target_url=self.target_url,
-            owner_user_id=self.owner_user_id, owner_username=self.owner_username,
-            application_id=self.application_id,
-        )
-        meta.status = "stopped"
-        meta.total_steps = len(self.actions)
-        meta.total_pages = len(self._known_pages)
-        meta.test_data_keys = sorted({a.test_data_key for a in self.actions if a.test_data_key})
-        meta.updated_at = time.time()
-        self.store.save_metadata(meta)
-        self._emit("excel_generated", "execution.xlsx written", {"rows": len(self.actions)})
-        self._emit("feature_generated", "BDD artifacts finalized", {})
-
-    def _summary(self) -> Dict[str, Any]:
-        return {
-            "recording_id": self.recording_id,
-            "status": self.status,
-            "total_steps": len(self.actions),
-            "total_pages": len(self._known_pages),
-            "locator_repository_stats": self.locator_repo.stats(),
+  function cssPath(el) {
+    if (!(el instanceof Element)) return "";
+    const path = [];
+    let node = el;
+    while (node && node.nodeType === Node.ELEMENT_NODE && path.length < 8) {
+      let selector = node.nodeName.toLowerCase();
+      if (node.id) {
+        selector += "#" + CSS.escape(node.id);
+        path.unshift(selector);
+        break;
+      } else {
+        let sibling = node;
+        let nth = 1;
+        while ((sibling = sibling.previousElementSibling)) {
+          if (sibling.nodeName.toLowerCase() === selector) nth++;
         }
+        selector += ":nth-of-type(" + nth + ")";
+      }
+      path.unshift(selector);
+      node = node.parentElement;
+    }
+    return path.join(" > ");
+  }
 
-    # ------------------------------------------------------------------
-    def _emit(self, event_type: str, message: str, data: Optional[Dict[str, Any]] = None) -> None:
-        evt = LiveEvent(event_type=event_type, message=message, data=data or {})
-        self.events.put(evt)
-        logger.info("[%s] %s", event_type, message)
+  function xpath(el) {
+    if (!(el instanceof Element)) return "";
+    if (el.id) return '//*[@id="' + el.id + '"]';
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === Node.ELEMENT_NODE) {
+      let index = 1;
+      let sibling = node.previousSibling;
+      while (sibling) {
+        if (sibling.nodeType === Node.ELEMENT_NODE && sibling.nodeName === node.nodeName) index++;
+        sibling = sibling.previousSibling;
+      }
+      parts.unshift(node.nodeName.toLowerCase() + "[" + index + "]");
+      node = node.parentElement;
+    }
+    return "/" + parts.join("/");
+  }
 
+  function domSignature(el) {
+    // A best-effort stable-ish fingerprint: tag + id/name/testid + class + position among siblings.
+    const tag = el.nodeName.toLowerCase();
+    const id = safeAttr(el, "id");
+    const testId = safeAttr(el, "data-testid") || safeAttr(el, "data-test-id") || safeAttr(el, "data-qa");
+    const name = safeAttr(el, "name");
+    const cls = (el.className && typeof el.className === "string") ? el.className.trim().split(/\s+/).slice(0, 3).join(".") : "";
+    let idx = 0;
+    if (el.parentElement) {
+      idx = Array.prototype.indexOf.call(el.parentElement.children, el);
+    }
+    return [tag, id, testId, name, cls, idx].join("|");
+  }
 
-class RecorderManager:
-    """Process-wide registry of active recording sessions."""
+  function collectDataAttrs(el) {
+    const out = {};
+    for (const attr of el.attributes || []) {
+      if (attr.name.startsWith("data-") || attr.name.startsWith("aria-")) {
+        out[attr.name] = attr.value;
+      }
+    }
+    return out;
+  }
 
-    _sessions: Dict[str, RecorderSession] = {}
-    _lock = threading.Lock()
+  function textOf(el) {
+    try {
+      let t = (el.innerText || el.textContent || "").trim();
+      if (!t) t = safeAttr(el, "value") || safeAttr(el, "placeholder") || safeAttr(el, "aria-label") || safeAttr(el, "title") || safeAttr(el, "alt");
+      return t.substring(0, 200);
+    } catch (e) {
+      return "";
+    }
+  }
 
-    @classmethod
-    def start_recording(
-        cls, name: str, target_url: str, browser: str = "chrome", remote_node_url: Optional[str] = None,
-        owner_user_id: str = "", owner_username: str = "", application_id: str = "",
-    ) -> RecorderSession:
-        store = RecordingStore()
-        meta = store.create(
-            name=name, target_url=target_url, browser=browser,
-            owner_user_id=owner_user_id, owner_username=owner_username, application_id=application_id,
-        )
-        session = RecorderSession(
-            meta.recording_id, name, target_url, browser, remote_node_url=remote_node_url,
-            owner_user_id=owner_user_id, owner_username=owner_username, application_id=application_id,
-        )
-        with cls._lock:
-            cls._sessions[meta.recording_id] = session
-        session.start()
-        return session
+  // Some apps (seen on a real banking dashboard: a grid of near-identical
+  // "product" cards, e.g. Gold Loan / Personal Loan / Home Loan) reuse the
+  // exact same id and class list across every visually-repeated tile -
+  // invalid HTML (ids must be unique), but it happens in the wild, and a
+  // locator built from that id/class combo silently resolves to whichever
+  // tile happens to come first in the DOM rather than the one actually
+  // recorded. build_locators() (Python side) has no live DOM access to
+  // detect this itself, so we check it here, at capture time, while we
+  // still have the real page in front of us, and hand the verdict along
+  // so the locator scoring can react to it.
+  function isUniqueSelectorOnPage(selector) {
+    if (!selector) return true;
+    try {
+      return document.querySelectorAll(selector).length <= 1;
+    } catch (e) {
+      return true; // malformed selector (unusual attribute chars, etc.) - don't penalize speculatively
+    }
+  }
 
-    @classmethod
-    def get(cls, recording_id: str) -> Optional[RecorderSession]:
-        return cls._sessions.get(recording_id)
+  // Climbs from el's PARENT upward (never el itself) looking for the
+  // closest ancestor whose own aggregated visible text is non-empty and
+  // short enough to plausibly BE a single distinguishing label (a card's
+  // title, a row's name, ...) rather than a whole section/page's worth of
+  // unrelated text. Used as a locator fallback for elements that carry no
+  // distinguishing text of their own - a decorative icon/image inside a
+  // clickable "tile" card is the most common real case: the click lands on
+  // the icon, but the CARD's title is what actually identifies which tile
+  // this is, and for a clickable-tile pattern (the whole card responds to
+  // a click, not just the icon) targeting that ancestor instead reaches
+  // the exact same outcome while actually distinguishing this tile from
+  // its look-alike siblings.
+  function nearestDistinguishingAncestor(el) {
+    try {
+      var node = el ? el.parentElement : null;
+      var depth = 0;
+      while (node && depth < 6) {
+        var t = (node.innerText || node.textContent || "").trim();
+        if (t && t.length <= 150) {
+          return { tag: node.nodeName.toLowerCase(), text: t };
+        }
+        node = node.parentElement;
+        depth++;
+      }
+    } catch (e) { /* ignore */ }
+    return null;
+  }
 
-    @classmethod
-    def stop_recording(cls, recording_id: str) -> Optional[Dict[str, Any]]:
-        session = cls._sessions.get(recording_id)
-        if not session:
-            return None
-        summary = session.stop()
-        with cls._lock:
-            cls._sessions.pop(recording_id, None)
-        return summary
+  // A plain attribute-value selector (`tag[attr='val']`) is only as good
+  // as it is UNIQUE - `input[placeholder='Search customers']` almost
+  // certainly is, but `button[type='button']` almost certainly is not
+  // (true of nearly every plain button in a form-heavy app). The Python
+  // side (locator_engine.py's attribute-based candidate) had no way to
+  // tell those two cases apart and trusted both equally, until a real
+  // failure showed two different recorded buttons - neither with an id,
+  // name, aria-label or visible text of its own, just an icon - both
+  // falling through to `type` and producing the IDENTICAL selector
+  // `button[type='button']`, which then silently resolved to whichever
+  // button happened to be first on the page at execution time. Checking
+  // uniqueness here, at capture time (the same isUniqueSelectorOnPage()
+  // already used for id/class/css_path below), lets locator_engine.py
+  // demote a non-unique one exactly like it already does for those.
+  function attributeSelectorUnique(tagName, attr, val) {
+    if (!val) return true;
+    try {
+      return isUniqueSelectorOnPage(tagName + "[" + attr + "='" + val.replace(/'/g, "\\'") + "']");
+    } catch (e) {
+      return true; // don't penalize speculatively on an unexpected value shape
+    }
+  }
 
-    @classmethod
-    def active_ids(cls) -> List[str]:
-        return list(cls._sessions.keys())
+  UA.getElementInfo = function (el) {
+    if (!el || !(el instanceof Element)) return null;
+    const rect = el.getBoundingClientRect();
+    const id = safeAttr(el, "id");
+    const classNameStr = (el.className && typeof el.className === "string") ? el.className : "";
+    const classList = classNameStr.trim().split(/\s+/).filter(Boolean);
+    const tagName = el.nodeName.toLowerCase();
+    const cssPathValue = cssPath(el);
+    const placeholderVal = safeAttr(el, "placeholder");
+    const titleVal = safeAttr(el, "title");
+    const altVal = safeAttr(el, "alt");
+    const typeVal = safeAttr(el, "type");
+    const nameVal = safeAttr(el, "name");
+    return {
+      tag: tagName,
+      id: id,
+      id_unique: id ? isUniqueSelectorOnPage("#" + CSS.escape(id)) : true,
+      name: nameVal,
+      // Reported failure: a recorded click on the real "Submit" button
+      // replayed onto a DIFFERENT, disabled button elsewhere on the page
+      // (a "lock/unlock" control) because both happened to share
+      // name="submit" - a bare By.NAME locator has no way to tell them
+      // apart and Playwright's `.first` silently picked whichever one
+      // came first in the DOM. Same uniqueness-check gap as the
+      // type/placeholder/title/alt attribute selectors above, just for
+      // `name` specifically (the radio/checkbox case, where every option
+      // in a group legitimately shares one `name` by design, is handled
+      // separately in locator_engine.py by qualifying with the option's
+      // own `value` attribute - this is for the non-grouped case).
+      name_unique: attributeSelectorUnique(tagName, "name", nameVal),
+      class_name: classNameStr,
+      class_combo_unique: classList.length
+        ? isUniqueSelectorOnPage(tagName + "." + classList.map(function (c) { return CSS.escape(c); }).join("."))
+        : true,
+      type: typeVal,
+      type_unique: attributeSelectorUnique(tagName, "type", typeVal),
+      value: (el.value !== undefined ? String(el.value).substring(0, 200) : ""),
+      text: textOf(el),
+      placeholder: placeholderVal,
+      placeholder_unique: attributeSelectorUnique(tagName, "placeholder", placeholderVal),
+      title: titleVal,
+      title_unique: attributeSelectorUnique(tagName, "title", titleVal),
+      alt: altVal,
+      alt_unique: attributeSelectorUnique(tagName, "alt", altVal),
+      role: safeAttr(el, "role"),
+      aria_label: safeAttr(el, "aria-label"),
+      aria_labelledby: safeAttr(el, "aria-labelledby"),
+      aria_describedby: safeAttr(el, "aria-describedby"),
+      data_attrs: collectDataAttrs(el),
+      href: safeAttr(el, "href"),
+      src: safeAttr(el, "src"),
+      for_attr: safeAttr(el, "for"),
+      autocomplete: safeAttr(el, "autocomplete"),
+      disabled: el.disabled === true || safeAttr(el, "aria-disabled") === "true",
+      readonly: el.readOnly === true,
+      checked: el.checked === true,
+      selected: el.selected === true,
+      visible: isVisible(el),
+      enabled: isEnabled(el),
+      bounding_box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+      parent_signature: el.parentElement ? domSignature(el.parentElement) : "",
+      dom_signature: domSignature(el),
+      css_path: cssPathValue,
+      // cssPath() stops climbing the instant it finds ANY ancestor with an
+      // id (see its own comment above) and anchors the whole selector on
+      // that id, WITHOUT checking whether that id is actually unique on
+      // the page - so a repeated-card grid where every tile shares one
+      // copy-pasted id (e.g. id="dashboardPersonalLoan" on every single
+      // product card, not just one) produced a selector that looked
+      // perfectly specific ("mat-card#dashboardPersonalLoan > img:nth-of-
+      // type(1)") but silently resolved to whichever tile came first in
+      // the DOM every time, regardless of which one was actually recorded.
+      // Checking the FINAL selector's own uniqueness (rather than trying
+      // to re-derive which id it used) catches this regardless of where
+      // in the path the non-unique id sits.
+      css_path_unique: cssPathValue ? isUniqueSelectorOnPage(cssPathValue) : true,
+      xpath: xpath(el),
+      link_text: el.nodeName.toLowerCase() === "a" ? textOf(el) : "",
+      container: nearestDistinguishingAncestor(el),
+    };
+  };
+
+  // ---- DOM crawling --------------------------------------------------
+  const INTERESTING_SELECTOR = [
+    "a", "button", "input", "select", "textarea", "option", "label",
+    "[role='button']", "[role='link']", "[role='checkbox']", "[role='radio']",
+    "[role='tab']", "[role='menuitem']", "[role='option']", "[role='switch']",
+    "[onclick]", "[data-testid]", "[data-test-id]", "[data-qa]",
+    "table", "tr", "td", "th", "ul", "li", "nav", "form",
+    "[contenteditable='true']", "iframe", "[role='dialog']", "dialog"
+  ].join(",");
+
+  UA.crawlDom = function (root) {
+    root = root || document;
+    const els = root.querySelectorAll(INTERESTING_SELECTOR);
+    const out = [];
+    els.forEach(function (el) {
+      const info = UA.getElementInfo(el);
+      if (info) out.push(info);
+    });
+    return out;
+  };
+
+  // ---- Event listening -------------------------------------------------
+  function pushEvent(type, el, extra) {
+    const info = UA.getElementInfo(el);
+    if (!info) return;
+    UA.eventQueue.push(Object.assign({
+      type: type,
+      element: info,
+      timestamp: Date.now(),
+      url: window.location.href,
+      title: document.title,
+    }, extra || {}));
+  }
+
+  // The source of a copy is whatever currently has selected text - either
+  // an <input>/<textarea>'s own selection range, or the page's live text
+  // selection (window.getSelection()) for a plain read-only display element
+  // (a <span>/<div> showing a system-generated ID, the most common real
+  // case). document.activeElement is the best-effort "source element" to
+  // attach the captured value to either way.
+  function selectedTextFrom(el) {
+    try {
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA") &&
+          typeof el.selectionStart === "number" && el.selectionStart !== el.selectionEnd) {
+        return el.value.substring(el.selectionStart, el.selectionEnd);
+      }
+      var sel = window.getSelection();
+      return sel ? sel.toString() : "";
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function recordCopy() {
+    var el = document.activeElement;
+    var text = selectedTextFrom(el);
+    if (!text) return;
+    pushEvent("copy", (el instanceof Element) ? el : document.body, { value: text });
+  }
+
+  // A click's real e.target is very often a decorative wrapper, not the
+  // functional element itself - an icon <svg>/<span> inside a button, or a
+  // <label>/wrapping <span> around a custom-styled radio/checkbox whose
+  // real <input> is visually hidden. Recording whatever raw node the click
+  // landed on is what produced two of this session's real production bugs:
+  // two icon-only buttons (no id/name/text of their own) both falling
+  // through every locator strategy to the same generic `button[type=
+  // 'button']` selector, and a custom-styled radio button whose click
+  // target (the label/span) and change target (the real input) are two
+  // different DOM nodes, needing a separate recorder.py dedup pass to
+  // reconcile after the fact. Resolving to the real interactive element
+  // HERE, before it's ever recorded, fixes both at the source instead of
+  // patching each symptom downstream - ported from a Selenium-based sister
+  // recorder (aitestrecorder) whose simpler click capture never had this
+  // class of bug in the first place, precisely because it always resolved
+  // to the real element up front.
+  var CLICKABLE_SELECTOR = [
+    "button", "a", "[role='button']", "[role='link']", "[role='checkbox']", "[role='radio']",
+    "[role='tab']", "[role='menuitem']", "[role='option']", "[role='switch']",
+    "input[type='submit']", "input[type='button']", "input[type='radio']", "input[type='checkbox']",
+    "label", "[onclick]", "select", "textarea", "input", "[contenteditable='true']",
+  ].join(",");
+
+  function resolveClickTarget(el) {
+    if (!el || !el.closest) return el;
+    var clickable = el.closest(CLICKABLE_SELECTOR) || el;
+    if (clickable.tagName && clickable.tagName.toLowerCase() === "label") {
+      var forId = clickable.getAttribute("for");
+      var resolved = forId ? document.getElementById(forId) : clickable.querySelector("input, select, textarea");
+      if (resolved) clickable = resolved;
+    }
+    return clickable;
+  }
+
+  UA.startEventListeners = function () {
+    if (UA._listenersAttached) return;
+    UA._listenersAttached = true;
+
+    document.addEventListener("click", function (e) {
+      pushEvent(e.detail === 2 ? "dblclick" : "click", resolveClickTarget(e.target));
+    }, true);
+
+    document.addEventListener("dblclick", function (e) {
+      pushEvent("dblclick", resolveClickTarget(e.target));
+    }, true);
+
+    document.addEventListener("contextmenu", function (e) {
+      pushEvent("contextmenu", resolveClickTarget(e.target));
+    }, true);
+
+    document.addEventListener("change", function (e) {
+      const el = e.target;
+      if (el && (el.tagName === "SELECT")) {
+        pushEvent("select", el, { value: el.value, selected_text: el.options[el.selectedIndex] ? el.options[el.selectedIndex].text : "" });
+      } else if (el && el.type === "checkbox") {
+        pushEvent(el.checked ? "check" : "uncheck", el);
+      } else if (el && el.type === "radio") {
+        pushEvent("check", el);
+      } else if (el && el.type === "file") {
+        // A file input's `.value` is ALWAYS a browser-redacted fake path
+        // (e.g. "C:\fakepath\invoice.pdf") for security reasons - the real
+        // path used during recording can never be read back via JS. Before
+        // this, a file upload fell into the generic INPUT branch below and
+        // got recorded as a plain TYPE step with that fake, non-functional
+        // value - looked like it "worked" during recording, then silently
+        // did nothing useful on replay (typing a fake path into a file
+        // input selects nothing). Recording this as its own UPLOAD action
+        // with an explicit placeholder makes it obvious, in Review & Edit
+        // Steps, that a real file path for THIS execution environment
+        // still needs to be filled in - failing loudly/clearly instead of
+        // silently.
+        var fileNames = (el.files && el.files.length)
+          ? Array.prototype.map.call(el.files, function (f) { return f.name; }).join(", ")
+          : "";
+        pushEvent("upload", el, {
+          value: fileNames ? ("PROVIDE_FILE_PATH (originally uploaded: " + fileNames + ")") : "PROVIDE_FILE_PATH",
+        });
+      } else if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) {
+        pushEvent("type", el, { value: el.value });
+      }
+    }, true);
+
+    document.addEventListener("input", function (e) {
+      const el = e.target;
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) {
+        pushEvent("typing", el, { value: el.value !== undefined ? el.value : el.innerText });
+      }
+    }, true);
+
+    document.addEventListener("submit", function (e) {
+      pushEvent("submit", e.target);
+    }, true);
+
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") {
+        pushEvent("press_enter", e.target, { key: "Enter" });
+      } else if (e.key === "Tab") {
+        pushEvent("press_tab", e.target, { key: "Tab" });
+      } else if (["Escape", "ArrowDown", "ArrowUp"].indexOf(e.key) === -1) {
+        // avoid noise from purely navigational keys; still track generic keypress
+        pushEvent("keydown", e.target, { key: e.key });
+      }
+    }, true);
+
+    // Capture -> Store -> Reuse: a value the app itself GENERATES fresh
+    // every run (an application ID, a reference number, a freshly-issued
+    // OTP) can't be replayed as a static recorded literal - it's different
+    // every execution. When the user copies such a value off the screen
+    // during recording (Ctrl+C / Edit > Copy - realistic tester behavior
+    // for a long generated ID they need to reuse a few screens later), that
+    // copy is what marks it as "this needs live re-capture, not a fixed
+    // value". The later paste/retype of that same value already gets
+    // captured normally by the existing "change" listener above (whatever
+    // ends up in the field's value, typed or pasted, fires change on blur
+    // the same way) - recorder.py correlates the two by matching value.
+    document.addEventListener("copy", recordCopy, true);
+    document.addEventListener("cut", recordCopy, true);
+
+    // NOTE: hover ("mouseover") capture is intentionally disabled. It was
+    // recording incidental mouse movement (the pointer passing over a
+    // background/overlay element on its way to the real target) as if it
+    // were a deliberate action, and even genuine hovers rarely replay
+    // reliably via Selenium (no real pointer movement, so hover-triggered
+    // CSS/JS states often never engage) - so hover steps were a frequent
+    // source of failures/timeouts that didn't reflect an actual problem
+    // with the recording or the target application. Click/type/select/etc.
+    // are unaffected; this only turns off the previous fully-generic
+    // mouseover -> "hover" action capture.
+
+    let scrollTimer = null;
+    window.addEventListener("scroll", function () {
+      clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(function () {
+        UA.eventQueue.push({
+          type: "scroll",
+          element: null,
+          scroll_x: window.scrollX,
+          scroll_y: window.scrollY,
+          timestamp: Date.now(),
+          url: window.location.href,
+          title: document.title,
+        });
+      }, 400);
+    }, true);
+  };
+
+  UA.drainEvents = function () {
+    const out = UA.eventQueue;
+    UA.eventQueue = [];
+    return out;
+  };
+
+  window.addEventListener("popstate", function () {
+    UA.eventQueue.push({
+      type: "popstate",
+      element: null,
+      timestamp: Date.now(),
+      url: window.location.href,
+      title: document.title,
+    });
+  }, true);
+
+  // ---- Mutation observing -------------------------------------------
+  UA.startMutationObserver = function () {
+    if (UA._observer) return;
+    UA._observer = new MutationObserver(function (mutations) {
+      mutations.forEach(function (m) {
+        m.addedNodes.forEach(function (node) {
+          if (node.nodeType !== Node.ELEMENT_NODE) return;
+          const sig = domSignature(node);
+          if (UA._seenSignatures.has(sig)) return;
+          UA._seenSignatures.add(sig);
+          const info = UA.getElementInfo(node);
+          if (info) {
+            UA.mutationQueue.push({ change: "added", element: info, timestamp: Date.now(), url: window.location.href });
+          }
+          // also scan descendants that are individually interesting
+          try {
+            node.querySelectorAll && node.querySelectorAll(INTERESTING_SELECTOR).forEach(function (child) {
+              const csig = domSignature(child);
+              if (UA._seenSignatures.has(csig)) return;
+              UA._seenSignatures.add(csig);
+              const cinfo = UA.getElementInfo(child);
+              if (cinfo) UA.mutationQueue.push({ change: "added", element: cinfo, timestamp: Date.now(), url: window.location.href });
+            });
+          } catch (e) { /* ignore */ }
+        });
+      });
+    });
+    UA._observer.observe(document.documentElement || document.body, { childList: true, subtree: true });
+  };
+
+  UA.drainMutations = function () {
+    const out = UA.mutationQueue;
+    UA.mutationQueue = [];
+    return out;
+  };
+
+  // ---- Modal / popup / overlay detection -----------------------------
+  const MODAL_SELECTORS = [
+    ".modal", ".modal-dialog", ".modal-content", "[role='dialog']", "[role='alertdialog']",
+    "dialog", "[aria-modal='true']", ".popup", ".overlay", ".toast", ".toast-container",
+    ".notification", ".snackbar", ".drawer", ".side-panel", ".sidepanel", ".dropdown-menu.show",
+    ".ant-modal", ".mat-dialog-container", ".MuiDialog-root", ".v-dialog", ".chakra-modal__content"
+  ];
+
+  function looksLikeOverlay(el) {
+    try {
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      const position = style.position;
+      const zIndex = parseInt(style.zIndex, 10) || 0;
+      const coversSignificantArea = rect.width > window.innerWidth * 0.25 && rect.height > window.innerHeight * 0.15;
+      return (position === "fixed" || position === "absolute") && zIndex >= 100 && coversSignificantArea && isVisible(el);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  UA.detectModals = function () {
+    const found = [];
+    const seen = new Set();
+
+    MODAL_SELECTORS.forEach(function (sel) {
+      try {
+        document.querySelectorAll(sel).forEach(function (el) {
+          if (!isVisible(el)) return;
+          const sig = domSignature(el);
+          if (seen.has(sig)) return;
+          seen.add(sig);
+          found.push({ container: UA.getElementInfo(el), detected_via: ["selector:" + sel] });
+        });
+      } catch (e) { /* invalid selector variant on this app, skip */ }
+    });
+
+    // structural heuristic pass over top-level fixed/absolute large elements
+    document.querySelectorAll("body > div, body > section").forEach(function (el) {
+      if (looksLikeOverlay(el)) {
+        const sig = domSignature(el);
+        if (seen.has(sig)) return;
+        seen.add(sig);
+        found.push({ container: UA.getElementInfo(el), detected_via: ["structural:overlay-heuristic"] });
+      }
+    });
+
+    return found.map(function (m) {
+      const children = [];
+      try {
+        const containerEl = document.querySelector(m.container.css_path) ||
+          (m.container.id ? document.getElementById(m.container.id) : null);
+        if (containerEl) {
+          containerEl.querySelectorAll(INTERESTING_SELECTOR).forEach(function (c) {
+            const info = UA.getElementInfo(c);
+            if (info) children.push(info);
+          });
+        }
+      } catch (e) { /* ignore */ }
+      m.children = children;
+      return m;
+    });
+  };
+
+  // ---- Shadow DOM detection (best-effort) -----------------------------
+  UA.detectShadowRoots = function (root, depth) {
+    root = root || document;
+    depth = depth || 0;
+    if (depth > 4) return [];
+    const out = [];
+    const all = root.querySelectorAll("*");
+    all.forEach(function (el) {
+      if (el.shadowRoot) {
+        const hostInfo = UA.getElementInfo(el);
+        const children = [];
+        try {
+          el.shadowRoot.querySelectorAll(INTERESTING_SELECTOR).forEach(function (c) {
+            const info = UA.getElementInfo(c);
+            if (info) children.push(info);
+          });
+        } catch (e) { /* closed shadow root or inaccessible */ }
+        out.push({ host: hostInfo, children: children });
+        // recurse into nested shadow roots
+        const nested = UA.detectShadowRoots(el.shadowRoot, depth + 1);
+        nested.forEach(function (n) { out.push(n); });
+      }
+    });
+    return out;
+  };
+
+  // ---- Frame enumeration (top-level only; Python drives recursion) ---
+  UA.getFrames = function () {
+    const frames = document.querySelectorAll("iframe, frame");
+    const out = [];
+    frames.forEach(function (f, idx) {
+      out.push({
+        index: idx,
+        css_path: cssPath(f),
+        id: safeAttr(f, "id"),
+        name: safeAttr(f, "name"),
+        src: safeAttr(f, "src"),
+        visible: isVisible(f),
+      });
+    });
+    return out;
+  };
+
+  window.__UA__ = UA;
+})();
