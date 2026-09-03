@@ -1,227 +1,313 @@
 """
-browser_factory.py
+locator_engine.py
 
-Creates (or connects to) a Playwright browser + context + page, shared by
-both the recorder (manual recording session) and the executor (replay).
+Pure-Python logic that turns a raw element-info dict (as produced by
+bridge.js's `getElementInfo`) into a ranked list of LocatorCandidate
+objects, plus a `component_type` classification and a generated
+human-friendly element name.
 
-IMPORTANT - Playwright's sync API is single-threaded: every Playwright
-call (launch, navigate, click, evaluate, ...) must happen on the same
-Python thread that started `sync_playwright()`. Calling Playwright objects
-from a different thread raises a greenlet/threading error, not a clean
-exception you can catch and ignore. Both callers of this module -
-RecorderSession's background polling thread, and Executor.run() (already
-invoked from ExecutionManager's own worker thread) - create their
-PlaywrightSession here and use it ENTIRELY within that one owning thread,
-including final cleanup via close(). Neither caller may hand the session
-to another thread, and Executor.terminate() (called from a different,
-request-handling thread - see executor.py) deliberately does not touch
-the Playwright objects directly for exactly this reason.
-
-Driver/browser binary resolution: unlike Selenium (which needed a
-matching chromedriver/msedgedriver binary, downloaded via webdriver-
-manager or pointed at manually), Playwright manages its own browser
-binaries - run `playwright install` once (see README section 4) and every
-supported browser is available with no separate driver management, no
-version-matching headaches, and no CHROME_DRIVER_PATH/EDGE_DRIVER_PATH
-settings to configure.
+This module has zero Selenium/webdriver dependency by design - it is
+pure data transformation, which makes it trivially unit-testable and
+reusable by both the recorder (building the repository) and the
+self-healing engine (scoring candidate replacements).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+import re
+from typing import Any, Dict, List
 
-from playwright.sync_api import Browser, BrowserContext, BrowserType, Page, Playwright, sync_playwright
+from backend.storage.models import LocatorCandidate, LocatorStrategy
 
-from backend.config import settings
-
-
-class RemoteNodeUnreachableError(RuntimeError):
-    pass
-
-
-@dataclass
-class PlaywrightSession:
-    """Owns the full Playwright object graph for one browser session -
-    must be created AND closed on the same thread (see module docstring).
-    `page` is the one active tab callers interact with; recorder.py tracks
-    additional tabs itself via `context.pages` as they open."""
-    playwright: Playwright
-    browser: Browser
-    context: BrowserContext
-    page: Page
-
-    def close(self) -> None:
-        """Best-effort, ignores errors - mirrors the old driver.quit()'s
-        "don't fail the caller just because cleanup hit a snag (browser
-        already crashed/closed)" behavior."""
-        for obj, method in ((self.context, "close"), (self.browser, "close"), (self.playwright, "stop")):
-            try:
-                getattr(obj, method)()
-            except Exception:
-                pass
+# Attribute/id patterns that look auto-generated / volatile (react `:r1a:`
+# style ids, uuid-like ids, ember###, ids with many digits, etc). Locators
+# built from these get penalized since they are unlikely to survive a
+# rebuild.
+_VOLATILE_ID_PATTERNS = [
+    re.compile(r"^:[a-z0-9]+:$", re.I),           # react useId() -> ":r0:"
+    re.compile(r"^[a-f0-9-]{20,}$", re.I),          # uuid-ish
+    re.compile(r"^ember\d+$", re.I),
+    re.compile(r"\d{4,}"),                          # long digit runs
+    re.compile(r"^(ng|mat|mui|css)-[a-z0-9]+$", re.I),
+]
 
 
-# Real browsers ignore a page's own `window.close()` call unless that tab
-# believes it was opened by another script (via window.open(), a
-# target="_blank" link, etc.) - which is why a human clicking around a
-# target application never notices anything when its JS calls this: on
-# an ordinary, manually-opened tab it's just silently a no-op. Every page
-# Playwright creates, though, is opened through the DevTools protocol,
-# which Chromium/Edge internally treats the same way as "opened by
-# script" - so on an automation-driven tab, that same window.close() call
-# actually succeeds and tears the tab down out from under the run. This
-# surfaces as a step failing with "Target page, context or browser has
-# been closed" - indistinguishable, from this app's side, from a genuine
-# crash, except that it reliably recurs at the exact same step on every
-# retry of the exact same recording (a real crash wouldn't). Overriding
-# window.close to a no-op via an init script (which Playwright re-applies
-# to every new document, including after navigations, unlike a one-off
-# page.evaluate()) neutralizes this at the source, regardless of which
-# target application or which step triggers it. This does NOT affect this
-# platform's own deliberate tab handling (CLOSE_TAB uses Playwright's own
-# page.close() via CDP, not in-page JS, so it's a completely separate
-# mechanism untouched by this).
-_NEUTRALIZE_WINDOW_CLOSE_SCRIPT = "window.close = () => {};"
+def _looks_volatile(value: str) -> bool:
+    if not value:
+        return True
+    return any(p.search(value) for p in _VOLATILE_ID_PATTERNS)
 
 
-def _harden_context_against_self_close(context: BrowserContext) -> None:
-    context.add_init_script(_NEUTRALIZE_WINDOW_CLOSE_SCRIPT)
+def _css_escape(value: str) -> str:
+    return re.sub(r"([ #.:\[\]()\"'])", r"\\\1", value)
 
 
-def _resolve_browser_type(pw: Playwright, browser: str) -> BrowserType:
-    b = (browser or "chrome").lower()
-    if b == "firefox":
-        return pw.firefox
-    if b in ("webkit", "safari"):
-        return pw.webkit
-    # "chrome" and "edge" both run on Chromium under Playwright - the
-    # bundled Chromium build is used for both by default (no separate
-    # driver/binary to install or version-match). Set PLAYWRIGHT_CHANNEL
-    # (e.g. "msedge" or "chrome") in .env if you specifically need the
-    # real installed browser binary instead of Playwright's bundled one.
-    return pw.chromium
+def classify_component(info: Dict[str, Any]) -> str:
+    tag = (info.get("tag") or "").lower()
+    role = (info.get("role") or "").lower()
+    type_attr = (info.get("type") or "").lower()
+
+    if tag == "select" or role == "listbox":
+        return "dropdown"
+    if tag == "input":
+        if type_attr in ("checkbox",):
+            return "checkbox"
+        if type_attr in ("radio",):
+            return "radio"
+        if type_attr in ("file",):
+            return "file_upload"
+        if type_attr in ("submit", "button"):
+            return "button"
+        return "input"
+    if tag == "textarea":
+        return "input"
+    if tag in ("button",) or role == "button":
+        return "button"
+    if tag == "a" or role == "link":
+        return "link"
+    if tag == "table":
+        return "table"
+    if tag in ("tr", "td", "th"):
+        return "table_cell"
+    if tag in ("ul", "ol", "li") or role == "listitem":
+        return "list_item"
+    if role in ("tab",):
+        return "tab"
+    if role in ("menuitem",):
+        return "menu_item"
+    if tag == "iframe":
+        return "frame"
+    if role in ("dialog", "alertdialog") or tag == "dialog":
+        return "dialog"
+    if info.get("contenteditable"):
+        return "rich_text"
+    return "element"
 
 
-def create_session(
-    browser: str = None,
-    headless: bool = None,
-    remote_node_url: Optional[str] = None,
-) -> PlaywrightSession:
-    """Launches (or connects to) a browser and returns a ready-to-use
-    PlaywrightSession. Must be called on the thread that will go on to use
-    it - see the module docstring."""
-    browser = (browser or settings.DEFAULT_BROWSER).lower()
-    headless = settings.BROWSER_HEADLESS if headless is None else headless
-
-    pw = sync_playwright().start()
-    browser_type = _resolve_browser_type(pw, browser)
-
-    if remote_node_url:
-        return _connect_remote(pw, browser_type, remote_node_url)
-
-    launch_kwargs = {"headless": headless, "args": ["--disable-notifications", "--disable-popup-blocking"]}
-    if settings.PLAYWRIGHT_CHANNEL:
-        launch_kwargs["channel"] = settings.PLAYWRIGHT_CHANNEL
-    elif browser == "edge":
-        launch_kwargs["channel"] = "msedge"
-
-    # Reported symptom: recording and replay both open a visibly small
-    # browser window. `viewport=None` below (kept from before) only stops
-    # Playwright from clamping the CONTENT area to its own fixed 1280x720
-    # default on top of whatever window size the browser actually opened
-    # at - it does nothing to make that OS-level window itself large in
-    # the first place, despite the comment that used to be here claiming
-    # it was "the closest equivalent of Selenium's --start-maximized". A
-    # real --start-maximized-equivalent flag has to be passed at launch.
-    # Only relevant for a headed browser (headless has no real window to
-    # size) and differs per engine - Chromium takes a genuine
-    # --start-maximized flag; Firefox has no such flag but does honor
-    # -width/-height, which combined with viewport=None gets it just as
-    # large. WebKit has neither and is only ever used here for
-    # cross-engine spot-checks, not everyday recording/execution.
-    if not headless:
-        if browser_type is pw.chromium:
-            launch_kwargs["args"].append("--start-maximized")
-        elif browser_type is pw.firefox:
-            launch_kwargs["args"].extend(["-width", "1920", "-height", "1080"])
-
-    # A second, separate bug in the same "small window" symptom, easy to
-    # miss because it looks like it should work: passing viewport=None to
-    # new_context() below (which is what this used to do) does NOT reach
-    # Playwright's server at all. The Python bindings' locals_to_params()
-    # helper strips every argument whose value is exactly None before
-    # sending the call over the wire - so `new_context(viewport=None)` and
-    # `new_context()` produce the byte-for-byte identical request. Once
-    # neither `viewport` nor `noDefaultViewport` is present in that
-    # request, Playwright's own server-side default kicks in
-    # unconditionally: `if (!options.viewport && !options.noDefaultViewport)
-    # options.viewport = {width: 1280, height: 720}` (see
-    # driver/package/lib/server/browserContext.js). The end result: even
-    # with --start-maximized correctly maximizing the actual OS window
-    # above, the PAGE CONTENT inside it was still being force-rendered into
-    # a fixed 1280x720 box - which is exactly what "the browser opens
-    # half-screen" looks like on any monitor larger than that. The real,
-    # working flag is no_viewport=True (see below) - an explicit True
-    # survives locals_to_params() and actually sets noDefaultViewport.
-    try:
-        b = browser_type.launch(**launch_kwargs)
-    except Exception:
-        # Most likely cause: the requested channel (a real installed
-        # browser binary) isn't present on this machine - fall back to
-        # Playwright's own bundled build rather than failing outright.
-        launch_kwargs.pop("channel", None)
-        b = browser_type.launch(**launch_kwargs)
-
-    # no_viewport=True (NOT viewport=None - see the note above try/except
-    # for why that looked plausible but silently did nothing) lets the
-    # actual (now maximized/full-size) browser window's size drive content
-    # size instead of Playwright's default fixed 1280x720 viewport.
-    context = b.new_context(no_viewport=True)
-    _harden_context_against_self_close(context)
-    page = context.new_page()
-    return PlaywrightSession(playwright=pw, browser=b, context=context, page=page)
+def generate_element_name(info: Dict[str, Any], component_type: str) -> str:
+    """Human-friendly, generic name for use in Page Objects / reports -
+    never derived from business vocabulary, only from structural hints."""
+    candidates = [
+        info.get("data_attrs", {}).get("data-testid"),
+        info.get("id"),
+        info.get("name"),
+        info.get("aria_label"),
+        info.get("placeholder"),
+        info.get("text"),
+    ]
+    base = next((c for c in candidates if c and not _looks_volatile(c)), None)
+    if not base:
+        base = component_type
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", str(base)).strip("_").lower()
+    slug = slug[:40] if slug else component_type
+    return f"{slug or component_type}_{component_type}"
 
 
-def _connect_remote(pw: Playwright, browser_type: BrowserType, remote_node_url: str) -> PlaywrightSession:
-    """Connects to a browser already running on someone else's PC instead
-    of launching one locally - lets multiple people share one central
-    instance of this platform while each person's recording/execution
-    runs in their own local browser (see the README's "remote browser
-    sessions" section).
+def build_locators(info: Dict[str, Any]) -> List[LocatorCandidate]:
+    """Generate every viable locator strategy for an element, each scored."""
+    candidates: List[LocatorCandidate] = []
+    tag = info.get("tag", "*")
+    data_attrs = info.get("data_attrs", {}) or {}
 
-    NOTE for anyone who used this feature under the old Selenium version:
-    the endpoint you point this at has CHANGED. Selenium connected to a
-    bare chromedriver/msedgedriver binary (or a Selenium Grid node)
-    speaking the WebDriver wire protocol. Playwright has no such protocol;
-    it instead connects either to Chromium's own DevTools Protocol (CDP)
-    endpoint (launch Chrome/Chromium on their machine with
-    `--remote-debugging-port=<port>`, reachable as
-    `http://<their-ip>:<port>`) or to a `playwright run-server` endpoint
-    (a `ws://` / `wss://` URL). A `ws://`/`wss://` URL is treated as a
-    Playwright server endpoint; anything else is treated as a CDP
-    endpoint.
-    """
-    try:
-        if remote_node_url.startswith(("ws://", "wss://")):
-            b = browser_type.connect(remote_node_url)
+    # data-testid / data-test-id / data-qa -> highest reliability
+    for key in ("data-testid", "data-test-id", "data-qa"):
+        if data_attrs.get(key):
+            candidates.append(LocatorCandidate(
+                strategy=LocatorStrategy.DATA_TESTID,
+                value=f"[{key}='{data_attrs[key]}']",
+            ))
+
+    elem_id = info.get("id")
+    if elem_id:
+        if info.get("id_unique") is False:
+            # More than one element on the live page shared this exact id
+            # at capture time (invalid HTML, but real apps do this - e.g. a
+            # grid of "product" cards all wired to the same id instead of
+            # one per item). By.ID would silently resolve to whichever one
+            # happens to be first in the DOM, not the one actually
+            # recorded - so this is scored well below a genuinely
+            # distinguishing candidate (e.g. TEXT) rather than treated as
+            # the near-certain match a unique id would be.
+            candidates.append(LocatorCandidate(strategy=LocatorStrategy.ID, value=elem_id, reliability_score=0.2))
         else:
-            b = browser_type.connect_over_cdp(remote_node_url)
-    except Exception as exc:
-        pw.stop()
-        raise RemoteNodeUnreachableError(
-            f"Could not reach the remote browser endpoint '{remote_node_url}'. Under Playwright this must "
-            "be a Chromium DevTools Protocol endpoint (launch Chrome/Chromium there with "
-            "--remote-debugging-port=<port>, reachable as http://<their-ip>:<port>) or a `playwright "
-            "run-server` ws:// endpoint - NOT a chromedriver/msedgedriver binary, which is what the old "
-            f"Selenium version of this platform used. Original error: {exc}"
-        ) from exc
+            score_adjust = -0.35 if _looks_volatile(elem_id) else 0.0
+            candidates.append(LocatorCandidate(
+                strategy=LocatorStrategy.ID,
+                value=elem_id,
+                reliability_score=max(0.1, 0.95 + score_adjust),
+            ))
 
-    context = b.contexts[0] if b.contexts else b.new_context(no_viewport=True)
-    # Applied unconditionally, whether this context was freshly created or
-    # is a pre-existing one reused from the remote browser - a context
-    # that already had pages open before we connected could just as easily
-    # be carrying the same self-close vulnerability, and add_init_script()
-    # is harmless to call again if it somehow already had it.
-    _harden_context_against_self_close(context)
-    page = context.pages[0] if context.pages else context.new_page()
-    return PlaywrightSession(playwright=pw, browser=b, context=context, page=page)
+    name = info.get("name")
+    type_attr = (info.get("type") or "").lower()
+    if name:
+        if type_attr in ("radio", "checkbox") and info.get("value"):
+            # A <input type="radio">/<input type="checkbox">'s `name`
+            # attribute is shared by every option in its group by design
+            # (that's literally how the browser groups them for mutual
+            # exclusion) - a bare By.NAME locator can never tell two
+            # options apart, so Selenium silently resolves it to whichever
+            # option happens to come first in the DOM. That's exactly how
+            # a recorded click on a "No" radio replayed as "Yes": both
+            # options share one `name`, so the un-qualified NAME locator
+            # always landed on the first (Yes) option regardless of which
+            # one was actually recorded. Qualifying the locator with the
+            # option's own `value` attribute (required/meaningful on every
+            # standards-compliant radio/checkbox) makes it target that
+            # specific option, not just the group.
+            candidates.append(LocatorCandidate(
+                strategy=LocatorStrategy.CSS,
+                value=f"{tag}[name='{_css_escape(name)}'][value='{_css_escape(str(info['value']))}']",
+                reliability_score=0.8,
+            ))
+        elif info.get("name_unique") is False:
+            # Reported failure: a recorded click on the real "Submit"
+            # button replayed onto an unrelated, disabled "lock/unlock"
+            # button elsewhere on the page - both happened to share
+            # name="submit", so the un-qualified NAME locator's `.first`
+            # silently landed on whichever one came first in the DOM, not
+            # the one actually recorded. Same "no uniqueness check trusted
+            # a hopelessly generic selector" bug class as the id/attribute
+            # candidates above - demoted well below a genuinely
+            # distinguishing candidate rather than trusted at NAME's
+            # normally-high 0.85 base score.
+            candidates.append(LocatorCandidate(strategy=LocatorStrategy.NAME, value=name, reliability_score=0.2))
+        else:
+            candidates.append(LocatorCandidate(strategy=LocatorStrategy.NAME, value=name))
+
+    # accessibility-based
+    aria_label = info.get("aria_label")
+    role = info.get("role")
+    if aria_label:
+        candidates.append(LocatorCandidate(
+            strategy=LocatorStrategy.ACCESSIBILITY,
+            value=f"[aria-label='{aria_label}']" + (f"[role='{role}']" if role else ""),
+        ))
+    elif role:
+        candidates.append(LocatorCandidate(strategy=LocatorStrategy.ACCESSIBILITY, value=f"[role='{role}']"))
+
+    # attribute-based (placeholder, title, alt, type+name combos)
+    #
+    # Reported failure: two DIFFERENT recorded buttons ("Permanent
+    # Correspondence Address" and "Business Address", neither carrying an
+    # id, name, aria-label, or its own visible text - just an icon) both
+    # fell through every other candidate above and landed here on `type`,
+    # producing the IDENTICAL locator `button[type='button']` for both.
+    # Every plain <button type="button"> on the page matches that selector,
+    # so at execution time `.first` silently resolved BOTH steps to
+    # whichever one happened to come first in the DOM - a completely
+    # unrelated, currently-disabled button - not the one actually recorded.
+    # Unlike the id/class-combo/css_path candidates above, this one had NO
+    # uniqueness check at all, so a hopelessly generic selector like
+    # `button[type='button']` (true of nearly every button in a form-heavy
+    # app) was trusted exactly as much as a genuinely distinguishing
+    # `input[placeholder='Search customers']` would be. bridge.js now
+    # reports, per attribute, whether `{tag}[{attr}='{val}']` was actually
+    # unique on the live page at capture time (the same
+    # isUniqueSelectorOnPage() used for id/class/css_path) - demote hard
+    # when it wasn't, so a non-unique attribute selector falls below the
+    # container/text-based fallback below instead of masking it.
+    for attr in ("placeholder", "title", "alt", "type"):
+        val = info.get(attr)
+        if val:
+            is_unique = info.get(f"{attr}_unique")
+            candidates.append(LocatorCandidate(
+                strategy=LocatorStrategy.ATTRIBUTE,
+                value=f"{tag}[{attr}='{val}']",
+                reliability_score=0.2 if is_unique is False else 0.0,
+            ))
+            break  # one attribute-based candidate is usually enough noise-wise
+
+    # text-based / link text
+    text = (info.get("text") or "").strip()
+    if text and len(text) <= 80:
+        if tag == "a":
+            candidates.append(LocatorCandidate(strategy=LocatorStrategy.LINK_TEXT, value=text))
+            candidates.append(LocatorCandidate(strategy=LocatorStrategy.PARTIAL_LINK_TEXT, value=text[:30]))
+        else:
+            # normalize-space(.) (the element's full aggregated string
+            # value, descendants included) rather than normalize-space
+            # (text()) (direct text-node children ONLY) - a container
+            # element whose visible label lives in a nested child (e.g. a
+            # <mat-card> wrapping a <mat-card-title>Personal Loan</...>)
+            # has no direct text node of its own, so text() would never
+            # match it at all even though the card's own visible text is
+            # exactly what makes it unique among its look-alike siblings.
+            candidates.append(LocatorCandidate(
+                strategy=LocatorStrategy.TEXT,
+                value=f"//{tag}[normalize-space(.)=\"{text}\"]",
+            ))
+
+    # stable-ish CSS via class names, filtering volatile-looking classes
+    class_name = (info.get("class_name") or "").strip()
+    if class_name:
+        classes = [c for c in class_name.split() if c and not _looks_volatile(c)]
+        if classes:
+            css = tag + "." + ".".join(_css_escape(c) for c in classes[:3])
+            if info.get("class_combo_unique") is False:
+                # This element's full tag+class combination matched more
+                # than one element on the live page (the same "repeated
+                # tile" situation as the id check above - e.g. every card
+                # in a product grid sharing identical styling classes).
+                # A selector built from any subset of these classes can't
+                # be trusted to pick out just this one instance either.
+                candidates.append(LocatorCandidate(strategy=LocatorStrategy.CSS, value=css, reliability_score=0.25))
+            else:
+                candidates.append(LocatorCandidate(strategy=LocatorStrategy.CSS, value=css))
+
+    # css_path / xpath from the browser (always available fallback)
+    if info.get("css_path"):
+        if info.get("css_path_unique") is False:
+            # cssPath() (bridge.js) anchors on the FIRST ancestor id it
+            # finds while climbing up, without checking whether that id is
+            # actually unique on the page - so this selector can look
+            # perfectly specific (tag#id > child:nth-of-type(n)) while
+            # still resolving to whichever look-alike tile happens to come
+            # first in the DOM (the same repeated-card-grid problem as the
+            # id/class-combo checks above, just reached through a
+            # different candidate). Demoted the same way.
+            candidates.append(LocatorCandidate(strategy=LocatorStrategy.CSS, value=info["css_path"], reliability_score=0.2))
+        else:
+            candidates.append(LocatorCandidate(strategy=LocatorStrategy.CSS, value=info["css_path"], reliability_score=0.5))
+    if info.get("xpath"):
+        candidates.append(LocatorCandidate(strategy=LocatorStrategy.XPATH, value=info["xpath"]))
+
+    # Container/ancestor text fallback: when the clicked element carries no
+    # distinguishing text of its own at all (a decorative icon/image inside
+    # a clickable "tile" card is the most common real case - see
+    # nearestDistinguishingAncestor() in bridge.js), every OTHER candidate
+    # for it either falls back to a shared, non-unique id/class (a repeated
+    # card grid) or a raw DOM-position path that's fragile across a
+    # rebuild. If the nearest ancestor carrying visible text is short/
+    # specific enough to plausibly BE this tile's own label (e.g. a
+    # <mat-card> whose title says "Auto Loan"), target THAT ancestor
+    # instead - for a clickable-tile UI pattern (the whole card, not just
+    # the icon, responds to a click) this reaches the identical outcome
+    # while actually distinguishing this tile from its look-alike siblings.
+    container = info.get("container") or {}
+    container_text = (container.get("text") or "").strip()
+    container_tag = container.get("tag")
+    if not text and container_text and container_tag and len(container_text) <= 150:
+        candidates.append(LocatorCandidate(
+            strategy=LocatorStrategy.TEXT,
+            value=f'//{container_tag}[normalize-space(.)="{container_text}"]',
+            reliability_score=0.5,
+        ))
+
+    # relative xpath: tag + partial text/attr, more resilient than absolute xpath
+    if text and len(text) <= 80:
+        candidates.append(LocatorCandidate(
+            strategy=LocatorStrategy.RELATIVE_XPATH,
+            value=f"//{tag}[contains(normalize-space(.), \"{text[:40]}\")]",
+        ))
+
+    # de-dup by (strategy, value)
+    seen = set()
+    unique: List[LocatorCandidate] = []
+    for c in candidates:
+        key = (c.strategy, c.value)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(c)
+
+    unique.sort(key=lambda c: c.reliability_score, reverse=True)
+    return unique
