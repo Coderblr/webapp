@@ -1,11 +1,98 @@
-# Fixed pause applied after every click/double-click/right-click during
-# execution (see ActionEngine.click()/double_click()/right_click()),
-# on top of whatever Playwright's own actionability retries already
-# took. Real target apps (esp. ones talking to a slow backend) can take
-# a moment AFTER a click before the resulting nav/re-render/toast is
-# actually settled - a step that fires immediately can outrun that,
-# hitting an element that's mid-transition or not yet updated. This is
-# a blunt, deliberately simple fix: give the app a fixed window to
-# catch up before the NEXT step's locator gets resolved, rather than
-# something adaptive. Set to "0" to disable entirely.
-POST_CLICK_WAIT_SECONDS: float = float(os.getenv("POST_CLICK_WAIT_SECONDS", "3"))
+"""
+js_bridge.py
+
+Loads bridge.js and provides a thin, reusable helper for injecting it into
+a Playwright browsing context and invoking its functions.
+
+Every recorder submodule (dom_crawler, mutation_observer, event_listener,
+modal_detector, shadow_dom) goes through this helper rather than each
+re-implementing script injection. `context` here is deliberately typed
+loosely (Page | Frame) - Playwright's Page and Frame objects both expose
+the same `.evaluate()` method, so a single call() implementation works
+identically whether the caller is talking to the top-level document or a
+specific iframe's Frame object (see iframe_handler.py, which resolves
+"which Frame/Page to act on" for a given FramePath rather than mutating
+any shared "current context" the way Selenium's switch_to did).
+"""
+from __future__ import annotations
+
+import concurrent.futures
+from pathlib import Path
+from typing import Any, Optional, Union
+
+from playwright.sync_api import Frame, Page
+
+_JS_PATH = Path(__file__).parent / "js" / "bridge.js"
+_BRIDGE_SOURCE = _JS_PATH.read_text(encoding="utf-8")
+
+EvaluationContext = Union[Page, Frame]
+
+# Used only when a caller passes timeout_seconds to call()/inject() (see
+# self_healer.py's Stage 4 use, and HEALING_DOM_CRAWL_TIMEOUT_SECONDS in
+# config.py) - Playwright's evaluate() has no timeout parameter of its
+# own, so bounding a call means running it on a separate thread and
+# abandoning the wait via Future.result(timeout=...) if it takes too
+# long. One shared, lazily-created pool: these calls are rare (healing
+# only, not normal recording/execution) so a few workers are plenty and
+# this avoids spinning up a new thread per call.
+_bounded_call_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+
+def _get_bounded_call_pool() -> concurrent.futures.ThreadPoolExecutor:
+    global _bounded_call_pool
+    if _bounded_call_pool is None:
+        _bounded_call_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="ua-js-bridge")
+    return _bounded_call_pool
+
+
+def inject(context: EvaluationContext, timeout_seconds: Optional[float] = None) -> None:
+    """Idempotently install window.__UA__ into the given context.
+    bridge.js itself guards against double-initialization, so re-running
+    this on every call (matching the old Selenium behavior exactly) is
+    safe and cheap.
+
+    timeout_seconds: if given, bounds how long this call is allowed to
+    take (see module-level comment above on why/how). None (the default)
+    preserves the original unbounded behavior for every existing caller
+    (recording, normal execution) - only self-healing's DOM crawl passes
+    this."""
+    if timeout_seconds is None:
+        context.evaluate(_BRIDGE_SOURCE)
+        return
+    future = _get_bounded_call_pool().submit(context.evaluate, _BRIDGE_SOURCE)
+    try:
+        future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError as exc:
+        raise TimeoutError(
+            f"context.evaluate() (bridge injection) did not respond within {timeout_seconds}s - "
+            "the page appears unresponsive, not merely missing the element."
+        ) from exc
+
+
+def call(context: EvaluationContext, expression: str, timeout_seconds: Optional[float] = None) -> Any:
+    """Ensure the bridge is present, then evaluate a `window.__UA__....`
+    expression and return its value. `expression` should be valid JS that
+    ends in a `return`-able value, e.g. 'return window.__UA__.crawlDom();'
+    - matching the exact calling convention every recorder submodule
+    already uses. Playwright's evaluate() (unlike Selenium's
+    execute_script()) does not implicitly wrap a bare script string in a
+    function body, so this wraps `expression` in an IIFE itself to get
+    the same "return works, top-level statements work" behavior every
+    caller was already written against.
+
+    timeout_seconds: see inject() above - bounds both the injection AND
+    the expression evaluation, each independently, so a slow/unresponsive
+    page can't consume more than roughly 2x this value total.
+    """
+    inject(context, timeout_seconds=timeout_seconds)
+    script = f"() => {{ {expression} }}"
+    if timeout_seconds is None:
+        return context.evaluate(script)
+    future = _get_bounded_call_pool().submit(context.evaluate, script)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError as exc:
+        raise TimeoutError(
+            f"context.evaluate() did not respond within {timeout_seconds}s - "
+            "the page appears unresponsive, not merely missing the element."
+        ) from exc
