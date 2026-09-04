@@ -1,132 +1,65 @@
 """
-dom_crawler.py
+js_bridge.py
 
-Crawls the DOM of the *current* Selenium browsing context (caller is
-responsible for having already switched into the right frame) and turns
-the raw element-info dicts from bridge.js into ElementRecord objects with
-locators pre-computed via locator_engine.
+Loads bridge.js and provides a thin, reusable helper for injecting it into
+a Playwright browsing context and invoking its functions.
 
-Whenever a page is opened or a significant DOM change occurs, the recorder
-calls `crawl_current_context` again - this module does not cache anything
-itself; caching/dedup lives in the LocatorRepository (upsert by
-dom_signature-derived element_id).
+Every recorder submodule (dom_crawler, mutation_observer, event_listener,
+modal_detector, shadow_dom) goes through this helper rather than each
+re-implementing script injection. `context` here is deliberately typed
+loosely (Page | Frame) - Playwright's Page and Frame objects both expose
+the same `.evaluate()` method, so a single call() implementation works
+identically whether the caller is talking to the top-level document or a
+specific iframe's Frame object (see iframe_handler.py, which resolves
+"which Frame/Page to act on" for a given FramePath rather than mutating
+any shared "current context" the way Selenium's switch_to did).
 """
 from __future__ import annotations
 
-import hashlib
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Optional, Union
 
-from backend.recorder import js_bridge
-from backend.recorder.js_bridge import EvaluationContext
-from backend.recorder.locator_engine import build_locators, classify_component, generate_element_name
-from backend.storage.models import ElementRecord, FramePath, PageRecord, ShadowPath, new_id
+from playwright.sync_api import Frame, Page
 
+_JS_PATH = Path(__file__).parent / "js" / "bridge.js"
+_BRIDGE_SOURCE = _JS_PATH.read_text(encoding="utf-8")
 
-def _stable_element_id(page_id: str, dom_signature: str) -> str:
-    h = hashlib.sha1(f"{page_id}:{dom_signature}".encode("utf-8")).hexdigest()[:16]
-    return f"el_{h}"
+EvaluationContext = Union[Page, Frame]
 
 
-def crawl_current_context(
-    context: EvaluationContext,
-    page_id: str,
-    frame_path: Optional[FramePath] = None,
-    dynamic: bool = False,
-) -> List[ElementRecord]:
-    """Crawl every interesting element in the given Page/Frame."""
-    raw_elements: List[Dict[str, Any]] = js_bridge.call(context, "return window.__UA__.crawlDom();") or []
-    records: List[ElementRecord] = []
-    for info in raw_elements:
-        record = to_element_record(info, page_id, frame_path=frame_path, dynamic=dynamic)
-        records.append(record)
-    return records
+def inject(context: EvaluationContext) -> None:
+    """Idempotently install window.__UA__ into the given context.
+    bridge.js itself guards against double-initialization, so re-running
+    this on every call (matching the old Selenium behavior exactly) is
+    safe and cheap."""
+    context.evaluate(_BRIDGE_SOURCE)
 
 
-def crawl_shadow_roots(context: EvaluationContext, page_id: str, frame_path: Optional[FramePath] = None) -> List[ElementRecord]:
-    """Best-effort Shadow DOM crawl - see shadow_dom.py for the higher-level
-    wrapper; this helper turns raw shadow host/children info into records."""
-    raw = js_bridge.call(context, "return window.__UA__.detectShadowRoots();") or []
-    records: List[ElementRecord] = []
-    for entry in raw:
-        host = entry.get("host") or {}
-        host_selector = host.get("css_path") or host.get("id") or ""
-        for child_info in entry.get("children", []):
-            shadow_path = ShadowPath(hosts=[host_selector], final_selector=child_info.get("css_path", ""))
-            record = to_element_record(child_info, page_id, frame_path=frame_path, shadow_path=shadow_path)
-            records.append(record)
-    return records
+def call(context: EvaluationContext, expression: str, timeout_seconds: Optional[float] = None) -> Any:
+    """Ensure the bridge is present, then evaluate a `window.__UA__....`
+    expression and return its value. `expression` should be valid JS that
+    ends in a `return`-able value, e.g. 'return window.__UA__.crawlDom();'
+    - matching the exact calling convention every recorder submodule
+    already uses. Playwright's evaluate() (unlike Selenium's
+    execute_script()) does not implicitly wrap a bare script string in a
+    function body, so this wraps `expression` in an IIFE itself to get
+    the same "return works, top-level statements work" behavior every
+    caller was already written against.
 
-
-def to_element_record(
-    info: Dict[str, Any],
-    page_id: str,
-    frame_path: Optional[FramePath] = None,
-    shadow_path: Optional[ShadowPath] = None,
-    dynamic: bool = False,
-) -> ElementRecord:
-    component_type = classify_component(info)
-    # dom_signature alone (tag/id/name/class + index among the element's OWN
-    # immediate parent's children - see bridge.js's domSignature()) is only a
-    # single-level fingerprint. That collides for a very common real-world
-    # pattern: several structurally-identical elements that each sit alone
-    # inside their own individually-positioned wrapper (e.g. a segmented
-    # 4-box OTP field, each <input> the sole child of its own <div> box) -
-    # every box then reports the same tag/no-id/no-name/shared-class/idx=0,
-    # so they'd all hash to the same element_id and collapse into "the same
-    # field" for naming/dedup purposes, silently merging what should be 4
-    # distinct recorded steps under one element_name/test_data_key. css_path
-    # already walks multiple ancestor levels (up to 8) and so captures the
-    # positional difference between each box's wrapper - mixing it in here
-    # keeps the "same physical element revisited" case working (its css_path
-    # is unchanged across visits) while fixing the sibling-collision case.
-    element_id = _stable_element_id(
-        page_id,
-        info.get("dom_signature", "") + "|" + info.get("css_path", "") + (shadow_path.final_selector if shadow_path else ""),
-    )
-    locators = build_locators(info)
-    element_name = generate_element_name(info, component_type)
-
-    return ElementRecord(
-        element_id=element_id,
-        page_id=page_id,
-        dom_signature=info.get("dom_signature", ""),
-        tag=info.get("tag", ""),
-        attributes={
-            "id": info.get("id", ""),
-            "name": info.get("name", ""),
-            "class": info.get("class_name", ""),
-            "type": info.get("type", ""),
-            "value": info.get("value", ""),
-            "placeholder": info.get("placeholder", ""),
-            "title": info.get("title", ""),
-            "href": info.get("href", ""),
-            "src": info.get("src", ""),
-            "alt": info.get("alt", ""),
-            "for": info.get("for_attr", ""),
-            "autocomplete": info.get("autocomplete", ""),
-            **(info.get("data_attrs", {}) or {}),
-            "element_name": element_name,
-        },
-        text=info.get("text", ""),
-        role=info.get("role", ""),
-        visible=bool(info.get("visible", True)),
-        enabled=bool(info.get("enabled", True)),
-        interactable=bool(info.get("visible", True)) and bool(info.get("enabled", True)),
-        bounding_box=info.get("bounding_box", {}) or {},
-        parent_signature=info.get("parent_signature", ""),
-        locators=locators,
-        frame_path=frame_path,
-        shadow_path=shadow_path,
-        component_type=component_type,
-        dynamic=dynamic,
-    )
-
-
-def normalize_url(url: str) -> str:
-    return (url or "").split("?")[0].rstrip("/")
-
-
-def make_page_record(url: str, title: str) -> PageRecord:
-    normalized = normalize_url(url)
-    page_id = "page_" + hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
-    return PageRecord(page_id=page_id, url=url, title=title, normalized_key=normalized)
+    timeout_seconds: accepted for backward compatibility with callers
+    that pass it (self_healer.py's Stage 4), but NOT implemented as an
+    actual bound anymore - a previous version of this function ran
+    evaluate() on a separate worker thread with Future.result(timeout=...)
+    to enforce this, but Playwright's SYNC API is pinned to a single
+    OS thread/greenlet per browser connection: calling any Page/Frame/
+    Locator method from a different thread raises "Cannot switch to a
+    different thread", which is exactly what broke self-healing here.
+    There is no safe way to bound a hung evaluate() call without genuine
+    async cancellation support, which the sync API doesn't offer. See
+    HEALING_DOM_CRAWL_TIMEOUT_SECONDS's comment in config.py and
+    self_healer.py's pre-check for how the unresponsive-page problem is
+    actually addressed now (skipping the crawl when the browser is
+    already known disconnected, rather than trying to bound a call that
+    can't safely be bounded)."""
+    inject(context)
+    return context.evaluate(f"() => {{ {expression} }}")
