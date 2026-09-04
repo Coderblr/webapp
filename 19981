@@ -1,696 +1,679 @@
-/*
- * bridge.js
- * ---------------------------------------------------------------------
- * Injected into every document (top-level page AND every iframe the
- * recorder descends into) via Selenium's execute_script. Defines a
- * single window.__UA__ namespace that the Python side polls.
- *
- * This file is 100% generic: no selector, class name, id, or business
- * term from any specific application is hardcoded. Every heuristic
- * below is based on structural/semantic DOM characteristics (role,
- * aria-*, tag, generic class-name *patterns*, computed style) so the
- * same script works against any Angular / React / Vue / plain-JS /
- * Bootstrap / jQuery / enterprise UI site.
- *
- * Safe to inject multiple times (idempotent) because everything is
- * guarded behind `if (!window.__UA__)`.
- * ---------------------------------------------------------------------
- */
-(function () {
-  if (window.__UA__) {
-    return; // already initialized in this document/frame
-  }
+"""
+executor.py
 
-  const UA = {
-    eventQueue: [],
-    mutationQueue: [],
-    _observer: null,
-    _listenersAttached: false,
-    _seenSignatures: new Set(),
-  };
+Top-level Excel-driven execution orchestrator (spec sections 19, 36,
+39). This is the "fast path" entry point the FastAPI backend calls when
+the user hits "Execute Recording":
 
-  // ---- Cross-navigation event persistence ----------------------------
-  // A committed "change" event (e.g. a password field losing focus right
-  // before its form's Submit navigates the browser) can be queued here in
-  // JS memory and then never make it back to Python: the ~0.5s polling
-  // interval may not get a chance to drain the queue before the document
-  // is torn down by the navigation, silently losing that action's value
-  // (or, worse, letting a later action on the next page get logged in its
-  // place). To close that gap, stash any still-queued events into
-  // sessionStorage right before unload, and recover them into the fresh
-  // page's queue on injection - sessionStorage survives same-tab
-  // navigation (it does not survive a full external redirect to another
-  // origin, which is a page-storage limitation, not something JS can work
-  // around).
-  const PENDING_KEY = "__UA_pending_events__";
+    Excel -> Pandas -> stored locator -> Selenium -> action
+                              |
+                        (on failure)
+                              v
+                     fallback locators -> locator repository ->
+                     DOM analysis -> AI self-healing -> validate ->
+                     update repository + Excel -> continue
 
-  (function recoverPendingEvents() {
-    try {
-      const raw = window.sessionStorage.getItem(PENDING_KEY);
-      if (raw) {
-        window.sessionStorage.removeItem(PENDING_KEY);
-        const arr = JSON.parse(raw);
-        if (Array.isArray(arr) && arr.length) {
-          // recovered (older, pre-navigation) events go first so they
-          // drain - and get recorded - ahead of anything new on this page
-          UA.eventQueue = arr.concat(UA.eventQueue);
+AI is never invoked on a normal passing step - only self_healer.heal()
+(called after Stage 1/2 already failed) may reach into LangChain, keeping
+the "no AI call for every action" performance requirement intact.
+"""
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+from playwright.sync_api import Error as PlaywrightError
+
+from backend.config import settings
+from backend.execution import playwright_executor
+from backend.execution.action_engine import ActionEngine
+from backend.execution.excel_executor import ExcelExecutor
+from backend.execution.variable_store import VariableStore
+from backend.healing import self_healer
+from backend.recorder import browser_factory
+from backend.recorder.browser_factory import PlaywrightSession
+from backend.storage.excel_store import ExcelStore
+from backend.storage.locator_store import LocatorRepository
+from backend.storage.metadata_store import MetadataStore
+from backend.storage.models import ActionType, ExecutionSummary, StepResult, new_id
+from backend.storage.recording_store import RecordingPaths, RecordingStore
+
+logger = logging.getLogger("universal_automation.executor")
+
+ProgressCallback = Callable[[Dict[str, Any]], None]
+
+
+def resolve_step_value(step: Dict[str, Any], test_data_overrides: Dict[str, str], variable_store: VariableStore) -> str:
+    """Decides what value a step actually types/uses, in order of
+    precedence: an explicit Test Data override (by Test_Data_Key or
+    Element_Name) always wins if present; otherwise, if this step was
+    correlated to an earlier CAPTURE in the SAME run (Capture -> Store ->
+    Reuse - see recorder.py and variable_store.py), use the live value
+    captured earlier THIS run; otherwise fall back to the literal value
+    that was recorded. A pure function (no Selenium/self access) so the
+    precedence logic can be unit-tested without a browser."""
+    value = step.get("value", "")
+    key = step.get("test_data_key") or ""
+    clean_key = key.strip("{}").strip() if key else ""
+    if clean_key and clean_key in test_data_overrides:
+        return test_data_overrides[clean_key]
+    if step.get("element_name") in test_data_overrides:
+        return test_data_overrides[step["element_name"]]
+    resolved_var = step.get("resolved_var") or ""
+    if resolved_var and variable_store.has(resolved_var):
+        return variable_store.get(resolved_var, value)
+    return value
+
+
+class Executor:
+    def __init__(
+        self,
+        recording_id: str,
+        browser: Optional[str] = None,
+        test_data_overrides: Optional[Dict[str, str]] = None,
+        ai_provider: Optional[str] = None,
+        screenshot_on_every_step: bool = False,
+        cancel_event: Optional[threading.Event] = None,
+        remote_node_url: Optional[str] = None,
+        only_step_numbers: Optional[List[int]] = None,
+    ):
+        self.recording_id = recording_id
+        self.store = RecordingStore()
+        self.paths: RecordingPaths = self.store.paths(recording_id)
+        self.meta = self.store.load_metadata(recording_id)
+        self.browser = browser or (self.meta.browser if self.meta else "chrome")
+        self.test_data_overrides = test_data_overrides or {}
+        self.ai_provider = ai_provider
+        self.screenshot_on_every_step = screenshot_on_every_step
+        # Optional: drive a browser already running on someone else's PC
+        # instead of launching one locally - see
+        # browser_factory._connect_remote(). None preserves the existing
+        # local-launch behavior exactly.
+        self.remote_node_url = remote_node_url
+        # Restricts this run to only the given step numbers - e.g. "just the
+        # steps a BRD/Solution Document change just added or disabled",
+        # rather than the whole transaction from the top. None (the
+        # default) runs every step, exactly as before this existed. See
+        # change_detection/change_applier.py, which records the affected
+        # step numbers for each change-set so the UI can pass them back
+        # here without the user needing to remember/re-select them by hand.
+        self.only_step_numbers = set(only_step_numbers) if only_step_numbers else None
+        # Cooperative cancellation flag for the "Terminate Execution" button
+        # (spec-adjacent addition: let the user stop a run mid-flight
+        # instead of waiting for it to finish or fail on its own). Checked
+        # between steps in run(); ExecutionManager.terminate() additionally
+        # force-quits the driver so a step currently blocked in a Selenium
+        # wait fails immediately instead of running out its full timeout.
+        self.cancel_event = cancel_event
+
+        self.locator_repo = LocatorRepository(recording_id, self.paths)
+        self.excel_executor = ExcelExecutor(self.paths.execution_excel)
+        # Capture -> Store -> Reuse: one store per run, so a CAPTURE step's
+        # live-read value is available to every LATER step in THIS run, but
+        # never leaks into a different execution - see variable_store.py.
+        self.variable_store = VariableStore()
+
+        # Playwright's sync API is single-threaded (see browser_factory.py's
+        # module docstring): self.session is created inside run(), which is
+        # always invoked from ExecutionManager's own dedicated worker
+        # thread, and every Playwright call this Executor makes happens on
+        # that same thread. terminate() (called from a DIFFERENT thread -
+        # the API/request thread) deliberately never touches self.session
+        # directly for exactly this reason - see terminate()'s docstring.
+        self.session: Optional[PlaywrightSession] = None
+        self.engine: Optional[ActionEngine] = None
+        # Set once the browser session is confirmed gone (crashed/closed
+        # mid-run). Once True, remaining steps are skipped immediately
+        # instead of being run through the fallback-locator + self-healing
+        # pipeline against a session that can no longer respond.
+        self._session_dead = False
+        # Set once the user has clicked "Terminate Execution". Distinct from
+        # _session_dead so the skip message/summary can say what actually
+        # happened, even though the two short-circuit the same way.
+        self._terminated = False
+
+    def run(self, on_progress: Optional[ProgressCallback] = None) -> ExecutionSummary:
+        steps = self.excel_executor.load_steps()
+        if self.only_step_numbers is not None:
+            steps = [s for s in steps if s["step_number"] in self.only_step_numbers]
+        summary = ExecutionSummary(
+            execution_id=new_id("exec_"),
+            recording_id=self.recording_id,
+            recording_name=self.meta.name if self.meta else self.recording_id,
+            target_url=self.meta.target_url if self.meta else "",
+            browser=self.browser,
+            start_time=time.time(),
+            total_steps=len(steps),
+        )
+
+        self.session = browser_factory.create_session(self.browser, remote_node_url=self.remote_node_url)
+        self.engine = ActionEngine(self.session.page)
+
+        # Navigation only ever happens via an explicit OPEN_URL step's own
+        # page.goto() (see playwright_executor.execute_with_fallbacks) -
+        # every other step just assumes the browser is already on the
+        # right page from earlier in the flow. A normal full run always
+        # starts with OPEN_URL, so this is never needed there - but a
+        # scoped only_step_numbers run (see change_detection/) can easily
+        # start from a step in the MIDDLE of a transaction, whose OPEN_URL
+        # got filtered out. Without an explicit navigation here, the
+        # browser would sit on a blank page and every step would fail for
+        # a reason that has nothing to do with the change being tested.
+        if self.only_step_numbers is not None and steps and steps[0]["action"] != ActionType.OPEN_URL:
+            try:
+                self.session.page.goto(steps[0]["page_url"], wait_until="domcontentloaded")
+            except PlaywrightError as exc:
+                logger.warning(
+                    "Scoped run's implicit navigation to %s failed (%s); continuing anyway - "
+                    "the first step will surface its own failure if the page truly isn't reachable.",
+                    steps[0]["page_url"], exc,
+                )
+
+        self.paths.screenshots_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            for step in steps:
+                if self.cancel_event is not None and self.cancel_event.is_set():
+                    self._terminated = True
+                try:
+                    result = self._run_step(step)
+                except Exception as exc:  # pragma: no cover - defensive
+                    # Most likely cause: the browser crashed/closed mid-step,
+                    # raising a raw connection error that isn't a
+                    # PlaywrightError subclass (so try_locator's own
+                    # exception handling didn't catch it). Treat it the same
+                    # as a lost session rather than letting one exception
+                    # abort the whole run with no summary.
+                    self._session_dead = True
+                    logger.warning("Step %s raised an unexpected error (%s); treating the session as lost.", step.get("step_number"), exc)
+                    result = StepResult(
+                        step_number=step.get("step_number", 0),
+                        action=step.get("action", ""),
+                        page_url=step.get("page_url", ""),
+                        element_name=step.get("element_name", ""),
+                        locator_used="",
+                        locator_strategy="",
+                        input_data=str(step.get("value", "")),
+                        expected_result=step.get("expected_result", ""),
+                        actual_result="Execution terminated by user" if self._terminated else f"Unexpected error: {exc}",
+                        execution_time_ms=0.0,
+                        status="SKIP" if self._terminated else "FAIL",
+                        error=str(exc),
+                    )
+                summary.step_results.append(result.to_dict())
+                if result.status == "PASS":
+                    summary.passed += 1
+                elif result.status == "HEALED":
+                    summary.passed += 1
+                    summary.healed += 1
+                elif result.status == "SKIP":
+                    summary.skipped += 1
+                else:
+                    summary.failed += 1
+                if on_progress:
+                    on_progress({
+                        "step_number": step["step_number"],
+                        "total_steps": len(steps),
+                        "status": result.status,
+                        "action": step["action"],
+                        "element_name": step.get("element_name", ""),
+                        "locator_used": result.locator_used,
+                    })
+        finally:
+            summary.end_time = time.time()
+            if self.session:
+                self.session.close()
+
+        self.locator_repo.flush()
+        MetadataStore.record_execution(summary.to_dict())
+        if self.meta:
+            self.meta.total_executions += 1
+            self.meta.last_execution_at = summary.end_time
+            self.store.save_metadata(self.meta)
+
+        return summary
+
+    # ------------------------------------------------------------------
+    def _run_step(self, step: Dict[str, Any]) -> StepResult:
+        start = time.time()
+        step_number = step["step_number"]
+
+        # Once the browser session is known dead OR the user has clicked
+        # Terminate Execution, every remaining step is a fast, no-op SKIP -
+        # don't touch the driver, don't self-heal, don't screenshot. Avoids
+        # the "60+ failed heal attempts in 2.7 seconds" cascade when the
+        # browser crashes/closes mid-run, and makes Terminate take effect
+        # immediately for every step still queued up.
+        if self._session_dead or self._terminated:
+            reason = "browser session was lost earlier in this run" if self._session_dead else "execution was terminated by the user"
+            return StepResult(
+                step_number=step_number,
+                action=step.get("action", ""),
+                page_url=step.get("page_url", ""),
+                element_name=step.get("element_name", ""),
+                locator_used="",
+                locator_strategy="",
+                input_data=str(step.get("value", "")),
+                expected_result=step.get("expected_result", ""),
+                actual_result=f"Skipped - {reason}",
+                execution_time_ms=0.0,
+                status="SKIP",
+                error="Browser session lost" if self._session_dead else "Terminated by user",
+            )
+
+        # A step whose Disabled cell is set means change_detection
+        # determined (and the user confirmed) that this step's target
+        # element was REMOVED from the application per a BRD/Solution
+        # Document update - see backend/change_detection/change_applier.py.
+        # Unlike an optional step (which still attempts the locator with a
+        # short timeout before giving up), a disabled step is skipped
+        # instantly: no locator attempt, no wait, no self-healing, no
+        # screenshot. It reports SKIP, same as an optional step, since it
+        # didn't count as a real failure either.
+        if step.get("disabled"):
+            reason = step.get("disabled_reason") or "Removed per a BRD/Solution Document change"
+            return StepResult(
+                step_number=step_number,
+                action=step.get("action", ""),
+                page_url=step.get("page_url", ""),
+                element_name=step.get("element_name", ""),
+                locator_used="",
+                locator_strategy="",
+                input_data=str(step.get("value", "")),
+                expected_result=step.get("expected_result", ""),
+                actual_result=f"Skipped - step disabled ({reason})",
+                execution_time_ms=round((time.time() - start) * 1000, 1),
+                status="SKIP",
+                error="",
+            )
+
+        # Decide the value this step actually uses (spec section 26's Test
+        # Data overrides take precedence, then a live Capture -> Store ->
+        # Reuse value from earlier in THIS run, then the recorded literal -
+        # see resolve_step_value() above).
+        value = resolve_step_value(step, self.test_data_overrides, self.variable_store)
+        step = {**step, "value": value}
+
+        # A step marked optional (see excel_executor._parse_optional_flag)
+        # is expected to sometimes have nothing to find - give it a short
+        # wait instead of the full EXPLICIT_WAIT_SECONDS so a run full of
+        # conditional/data-dependent steps doesn't spend minutes waiting
+        # out timeouts for elements that were never going to appear.
+        # Restored in the `finally` below regardless of outcome, so no
+        # later step in this run is ever affected by it.
+        is_optional = bool(step.get("optional"))
+        original_engine_timeout = self.engine.timeout
+        if is_optional:
+            self.engine.timeout = min(original_engine_timeout, settings.OPTIONAL_STEP_WAIT_SECONDS)
+        else:
+            # Recorder-observed pause (see recorder.py's
+            # RECORDED_PAUSE_THRESHOLD_MS): a real, human-perceptible gap
+            # before this step was recorded means the target application
+            # itself took that long to become ready last time (a report
+            # generating, an async eligibility check, a heavy render) - not
+            # that the user was slow. Reused from the Wait_Condition column
+            # (a plain seconds value, e.g. "8.4"; blank/non-numeric for
+            # every ordinary step, which leaves this step's timeout
+            # untouched). Only ever RAISES the timeout for this one step,
+            # never lowers it below the configured default.
+            recorded_wait = step.get("wait_condition")
+            if recorded_wait:
+                try:
+                    recorded_wait_seconds = float(recorded_wait)
+                except (TypeError, ValueError):
+                    recorded_wait_seconds = 0.0
+                if recorded_wait_seconds > original_engine_timeout:
+                    self.engine.timeout = recorded_wait_seconds
+        try:
+            outcome = playwright_executor.execute_with_fallbacks(self.engine, self.session, step)
+        finally:
+            self.engine.timeout = original_engine_timeout
+        status = "PASS"
+        error = outcome.get("error", "")
+        locator_used = f"{outcome.get('locator_type','')}::{outcome.get('locator_value','')}"
+        healing_event_dict = None
+        # Set below whenever a CAPTURE step succeeds (either on the first
+        # attempt or after healing) - carries the live value actually read
+        # off the page THIS run, for both variable_store.store() and the
+        # StepResult's actual_result message at the end of this method.
+        captured_this_run: Optional[str] = None
+
+        # Capture -> Store -> Reuse: on a successful CAPTURE step, stash the
+        # value that was actually read live off the page so any later step
+        # in THIS run whose resolved_var names the same variable picks it
+        # up via resolve_step_value() above, instead of replaying whatever
+        # literal value happened to be recorded originally.
+        if outcome.get("success") and step.get("action") == ActionType.CAPTURE and step.get("captured_as"):
+            captured_this_run = step.get("_captured_value", "")
+            self.variable_store.store(step["captured_as"], captured_this_run)
+
+        if not outcome["success"]:
+            # NOTE: this used to be `self._is_dead_session_error(error) or
+            # not self._session_alive()`. That OR let a plain substring
+            # match on the error TEXT alone ("has been closed", "Target
+            # closed", ...) declare the whole session dead and abort every
+            # remaining step - short-circuiting before self._session_alive()
+            # (a real Browser.is_connected() check) ever ran. The bug: a
+            # click whose own side effect is a page navigation (logging in,
+            # submitting a form, following a link) very often makes
+            # Playwright's click() throw exactly that wording when the
+            # navigation destroys the old document's execution context
+            # mid-actionability-check - even though the click already
+            # succeeded and the browser is perfectly alive on the next
+            # page. That false positive was killing entire runs at the
+            # first navigating click, every time (see the reported
+            # "fails every time, always around the login step" symptom).
+            # self._session_alive() (a real Browser.is_connected() check)
+            # is now the sole, authoritative signal for "is the session
+            # actually dead" - see the note above.
+            if not self._session_alive():
+                self._session_dead = True
+                status = "FAIL"
+                error = (
+                    "Browser session lost (the browser was closed or crashed mid-execution). "
+                    "Remaining steps were skipped. If browsers fail to launch at all, make sure "
+                    "`playwright install` has been run in this environment."
+                )
+                logger.error("Step %s: %s Original error: %s", step_number, error, outcome.get("error", ""))
+            elif is_optional:
+                # No self-healing/AI - this is precisely the case optional
+                # steps exist for: the element is expected to sometimes be
+                # legitimately absent (a conditional table row, one branch
+                # of a maker-checker flow), so searching harder for it
+                # would just waste time chasing something that was never
+                # going to be found. Reported as SKIP (doesn't count
+                # against pass rate the way FAIL does) rather than PASS,
+                # since the step genuinely didn't run.
+                status = "SKIP"
+                error = (
+                    f"Optional step skipped - element not found within "
+                    f"{settings.OPTIONAL_STEP_WAIT_SECONDS:.0f}s. Marked "
+                    "Optional_Step, so no self-healing was attempted; this is "
+                    "expected when this step's element doesn't apply to "
+                    f"every run. Original error: {error}"
+                )
+            else:
+                try:
+                    heal_result = self_healer.heal(self.session, self.engine, step, self.locator_repo, self.ai_provider)
+                except PlaywrightError as exc:
+                    # Same fix as _run_step()'s main check above: trust the
+                    # real Browser.is_connected() probe, not a substring
+                    # match on the exception text (see the NOTE up there).
+                    if not self._session_alive():
+                        self._session_dead = True
+                    else:
+                        logger.warning("Self-healing aborted for step %s due to a Playwright error: %s", step_number, exc)
+                    heal_result = {"success": False}
+
+                if self._session_dead:
+                    status = "FAIL"
+                    error = (
+                        "Browser session lost during self-healing (the browser was closed or "
+                        "crashed mid-execution). Remaining steps were skipped."
+                    )
+                else:
+                    event = self_healer.make_event(
+                        step_number, step.get("page_url", ""),
+                        step.get("primary_locator_type", ""), step.get("primary_locator", ""),
+                        heal_result,
+                    )
+                    # HealingEvent itself carries no recording_id (it's a
+                    # generic Layer-A/B concept - see backend/storage/models.py) -
+                    # stamp it on here, at the one place healing events are
+                    # actually recorded, so backend/app.py's
+                    # list_healing_events() can scope "whose healing events
+                    # are these" the same way it scopes executions, by
+                    # recording ownership rather than a separate field.
+                    MetadataStore.record_healing_event({**event.to_dict(), "recording_id": self.recording_id})
+                    healing_event_dict = event.to_dict()
+
+                    if heal_result["success"]:
+                        retry_step = {**step, "primary_locator_type": heal_result["new_locator_type"], "primary_locator": heal_result["new_locator"], "fallback_locators": []}
+                        retry_outcome = playwright_executor.execute_with_fallbacks(self.engine, self.session, retry_step)
+                        if retry_outcome["success"]:
+                            status = "HEALED"
+                            locator_used = f"{heal_result['new_locator_type']}::{heal_result['new_locator']}"
+                            # Self-Healing Update Cycle (spec section 21): persist
+                            # the healed locator so future executions are fast again.
+                            self.excel_executor.update_locator(step_number, heal_result["new_locator_type"], heal_result["new_locator"])
+                            error = ""
+                            # Same Capture -> Store -> Reuse bookkeeping as the
+                            # plain-PASS case above, but reading from retry_step
+                            # (a separate dict) since that's what actually ran.
+                            if step.get("action") == ActionType.CAPTURE and step.get("captured_as"):
+                                captured_this_run = retry_step.get("_captured_value", "")
+                                self.variable_store.store(step["captured_as"], captured_this_run)
+                        else:
+                            status = "FAIL"
+                            error = retry_outcome.get("error", error)
+                            # Same fix as above: verify with the real
+                            # is_connected() probe instead of trusting the
+                            # error text alone.
+                            if not self._session_alive():
+                                self._session_dead = True
+                    else:
+                        status = "FAIL"
+
+        screenshot_path = ""
+        if (status == "FAIL" or status == "HEALED" or self.screenshot_on_every_step) and not self._session_dead:
+            screenshot_path = self._capture_screenshot(step_number, status)
+
+        elapsed_ms = round((time.time() - start) * 1000, 1)
+        # For a successful CAPTURE step, report what was actually read live
+        # off the page this run (captured_this_run, set above) - not the
+        # (necessarily stale) value that happened to be recorded originally -
+        # so the report/Excel reflect reality rather than a leftover
+        # recording-time literal.
+        actual_result = "OK" if status in ("PASS", "HEALED") else error
+        if status in ("PASS", "HEALED") and step.get("action") == ActionType.CAPTURE and step.get("captured_as"):
+            actual_result = f"Captured '{captured_this_run or ''}' as {{{{{step['captured_as']}}}}}"
+        return StepResult(
+            step_number=step_number,
+            action=step.get("action", ""),
+            page_url=step.get("page_url", ""),
+            element_name=step.get("element_name", ""),
+            locator_used=locator_used,
+            locator_strategy=outcome.get("locator_type", "") if status == "PASS" else (healing_event_dict or {}).get("new_locator_type", ""),
+            input_data=str(step.get("value", "")),
+            expected_result=step.get("expected_result", ""),
+            actual_result=actual_result,
+            execution_time_ms=elapsed_ms,
+            status=status,
+            screenshot=screenshot_path,
+            error=error,
+            healing_event=healing_event_dict,
+        )
+
+    def terminate(self) -> None:
+        """Called from the API/request thread (NOT the worker thread this
+        Executor is running on) when the user clicks Terminate Execution.
+
+        Deliberately does NOT touch self.session/self.engine/Playwright in
+        any way. Playwright's sync API is single-threaded (see
+        browser_factory.py's module docstring) - every Playwright object
+        here belongs to the worker thread running run(), and calling into
+        it from this (different) thread is unsafe, unlike Selenium's
+        WebDriver, which the old version of this method force-quit
+        cross-thread to make an in-flight blocked call fail immediately.
+
+        Setting these flags alone means Terminate takes effect at the next
+        checkpoint - either before the next step starts, or when the
+        CURRENT step's own Playwright timeout elapses if one is already
+        in-flight - rather than interrupting a blocked call instantly.
+        That's a real, honest trade-off versus the old Selenium behavior,
+        made for thread-safety; in practice it means Terminate takes effect
+        within, worst case, one step's own timeout (a few seconds), not an
+        indefinite wait."""
+        self._terminated = True
+        if self.cancel_event is not None:
+            self.cancel_event.set()
+
+    def _capture_screenshot(self, step_number: int, status: str) -> str:
+        try:
+            filename = f"step_{step_number}_{status}.png"
+            path = self.paths.screenshots_dir / filename
+            self.session.page.screenshot(path=str(path))
+            return str(path)
+        except PlaywrightError as exc:
+            # Same fix as above: verify with the real is_connected() probe
+            # instead of trusting the error text alone.
+            if not self._session_alive():
+                self._session_dead = True
+            return ""
+        except Exception:
+            return ""
+
+    # Substrings Playwright uses across its own exception messages when the
+    # browser/context/page is already gone (closed or crashed) - there is no
+    # single dedicated exception subclass to catch across every Playwright
+    # version this pins against, so a substring check (same pattern the old
+    # Selenium version used for "InvalidSessionIdException") is the reliable
+    # option. playwright_executor.py stringifies exceptions as
+    # "ExceptionClassName: message", so this works against that format too.
+    _DEAD_SESSION_MARKERS = (
+        "has been closed", "Target closed", "Target page, context or browser has been closed",
+        "Connection closed", "Browser has been closed",
+    )
+
+    @classmethod
+    def _is_dead_session_error(cls, error: str) -> bool:
+        """Distinguishes a truly-dead browser session (whole run should
+        stop) from a narrower, recoverable error (e.g. a single closed tab
+        when others remain open)."""
+        err = error or ""
+        return any(marker in err for marker in cls._DEAD_SESSION_MARKERS)
+
+    def _session_alive(self) -> bool:
+        """Cheap liveness probe used once a step has already failed, to
+        catch cases where the session died via a path whose error message
+        didn't match _DEAD_SESSION_MARKERS. Browser.is_connected() is a
+        purpose-built Playwright API for exactly this check."""
+        if not self.session:
+            return False
+        try:
+            return self.session.browser.is_connected()
+        except Exception:
+            return False
+
+
+class ExecutionManager:
+    """Process-wide registry of in-flight/completed executions, so the
+    FastAPI layer can kick off a run in a background thread and let the
+    frontend poll/stream progress via WebSocket without blocking the
+    HTTP request."""
+
+    _executions: Dict[str, Dict[str, Any]] = {}
+    _lock = None
+
+    @classmethod
+    def _ensure_lock(cls):
+        if cls._lock is None:
+            import threading
+            cls._lock = threading.Lock()
+        return cls._lock
+
+    @classmethod
+    def start(
+        cls,
+        recording_id: str,
+        browser: Optional[str] = None,
+        test_data: Optional[Dict[str, str]] = None,
+        ai_provider: Optional[str] = None,
+        run_via_behave: bool = False,
+        remote_node_url: Optional[str] = None,
+        only_step_numbers: Optional[List[int]] = None,
+        owner_user_id: str = "",
+    ) -> str:
+        import queue
+
+        execution_id = new_id("run_")
+        progress_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+        cancel_event = threading.Event()
+        # "executor" (Excel path) / "behave_process" (Behave path) are
+        # filled in by _worker once the run actually starts, so terminate()
+        # has something concrete to act on regardless of which path this
+        # execution took. recording_id/owner_user_id let the FastAPI layer
+        # (backend/app.py) check "does the caller own the recording this
+        # execution belongs to" without needing a separate lookup table -
+        # see _can_access_recording()/its execution-scoped equivalent there.
+        state = {
+            "status": "running", "queue": progress_queue, "summary": None, "error": None,
+            "cancel_event": cancel_event, "executor": None, "behave_process": None,
+            "terminate_requested": False, "recording_id": recording_id, "owner_user_id": owner_user_id,
         }
-      }
-    } catch (e) { /* sessionStorage unavailable/blocked - nothing we can do */ }
-  })();
+        with cls._ensure_lock():
+            cls._executions[execution_id] = state
 
-  window.addEventListener("beforeunload", function () {
-    try {
-      if (UA.eventQueue.length) {
-        let existing = [];
-        const raw = window.sessionStorage.getItem(PENDING_KEY);
-        if (raw) {
-          try { existing = JSON.parse(raw) || []; } catch (e) { existing = []; }
-        }
-        window.sessionStorage.setItem(PENDING_KEY, JSON.stringify(existing.concat(UA.eventQueue)));
-      }
-    } catch (e) { /* ignore - best effort only */ }
-  }, true);
+        def _worker():
+            try:
+                if run_via_behave:
+                    from backend.execution.behave_executor import run_behave
 
-  // ---- helpers -----------------------------------------------------
-  function safeAttr(el, name) {
-    try {
-      const v = el.getAttribute(name);
-      return v === null ? "" : v;
-    } catch (e) {
-      return "";
-    }
-  }
+                    def _on_process_started(proc) -> None:
+                        state["behave_process"] = proc
 
-  function isVisible(el) {
-    try {
-      const style = window.getComputedStyle(el);
-      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
-        return false;
-      }
-      const rect = el.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0;
-    } catch (e) {
-      return false;
-    }
-  }
+                    result = run_behave(
+                        recording_id, browser or "chrome", test_data,
+                        on_process_started=_on_process_started, cancel_event=cancel_event,
+                        remote_node_url=remote_node_url,
+                    )
+                    state["summary"] = result
+                else:
+                    executor = Executor(
+                        recording_id, browser=browser, test_data_overrides=test_data,
+                        ai_provider=ai_provider, cancel_event=cancel_event,
+                        remote_node_url=remote_node_url, only_step_numbers=only_step_numbers,
+                    )
+                    state["executor"] = executor
 
-  function isEnabled(el) {
-    return !(el.disabled === true || safeAttr(el, "aria-disabled") === "true");
-  }
+                    def on_progress(evt: Dict[str, Any]) -> None:
+                        progress_queue.put({"type": "progress", **evt})
 
-  function cssPath(el) {
-    if (!(el instanceof Element)) return "";
-    const path = [];
-    let node = el;
-    while (node && node.nodeType === Node.ELEMENT_NODE && path.length < 8) {
-      let selector = node.nodeName.toLowerCase();
-      if (node.id) {
-        selector += "#" + CSS.escape(node.id);
-        path.unshift(selector);
-        break;
-      } else {
-        let sibling = node;
-        let nth = 1;
-        while ((sibling = sibling.previousElementSibling)) {
-          if (sibling.nodeName.toLowerCase() === selector) nth++;
-        }
-        selector += ":nth-of-type(" + nth + ")";
-      }
-      path.unshift(selector);
-      node = node.parentElement;
-    }
-    return path.join(" > ");
-  }
+                    summary = executor.run(on_progress=on_progress)
+                    state["summary"] = summary.to_dict()
+                state["status"] = "terminated" if state["terminate_requested"] else "completed"
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.exception("Execution %s failed: %s", execution_id, exc)
+                state["status"] = "terminated" if state["terminate_requested"] else "error"
+                state["error"] = str(exc)
+            finally:
+                progress_queue.put({"type": "done", "status": state["status"]})
 
-  function xpath(el) {
-    if (!(el instanceof Element)) return "";
-    if (el.id) return '//*[@id="' + el.id + '"]';
-    const parts = [];
-    let node = el;
-    while (node && node.nodeType === Node.ELEMENT_NODE) {
-      let index = 1;
-      let sibling = node.previousSibling;
-      while (sibling) {
-        if (sibling.nodeType === Node.ELEMENT_NODE && sibling.nodeName === node.nodeName) index++;
-        sibling = sibling.previousSibling;
-      }
-      parts.unshift(node.nodeName.toLowerCase() + "[" + index + "]");
-      node = node.parentElement;
-    }
-    return "/" + parts.join("/");
-  }
+        thread = threading.Thread(target=_worker, daemon=True)
+        state["thread"] = thread
+        thread.start()
+        return execution_id
 
-  function domSignature(el) {
-    // A best-effort stable-ish fingerprint: tag + id/name/testid + class + position among siblings.
-    const tag = el.nodeName.toLowerCase();
-    const id = safeAttr(el, "id");
-    const testId = safeAttr(el, "data-testid") || safeAttr(el, "data-test-id") || safeAttr(el, "data-qa");
-    const name = safeAttr(el, "name");
-    const cls = (el.className && typeof el.className === "string") ? el.className.trim().split(/\s+/).slice(0, 3).join(".") : "";
-    let idx = 0;
-    if (el.parentElement) {
-      idx = Array.prototype.indexOf.call(el.parentElement.children, el);
-    }
-    return [tag, id, testId, name, cls, idx].join("|");
-  }
+    @classmethod
+    def get(cls, execution_id: str) -> Optional[Dict[str, Any]]:
+        return cls._executions.get(execution_id)
 
-  function collectDataAttrs(el) {
-    const out = {};
-    for (const attr of el.attributes || []) {
-      if (attr.name.startsWith("data-") || attr.name.startsWith("aria-")) {
-        out[attr.name] = attr.value;
-      }
-    }
-    return out;
-  }
-
-  function textOf(el) {
-    try {
-      let t = (el.innerText || el.textContent || "").trim();
-      if (!t) t = safeAttr(el, "value") || safeAttr(el, "placeholder") || safeAttr(el, "aria-label") || safeAttr(el, "title") || safeAttr(el, "alt");
-      return t.substring(0, 200);
-    } catch (e) {
-      return "";
-    }
-  }
-
-  // Some apps (seen on a real banking dashboard: a grid of near-identical
-  // "product" cards, e.g. Gold Loan / Personal Loan / Home Loan) reuse the
-  // exact same id and class list across every visually-repeated tile -
-  // invalid HTML (ids must be unique), but it happens in the wild, and a
-  // locator built from that id/class combo silently resolves to whichever
-  // tile happens to come first in the DOM rather than the one actually
-  // recorded. build_locators() (Python side) has no live DOM access to
-  // detect this itself, so we check it here, at capture time, while we
-  // still have the real page in front of us, and hand the verdict along
-  // so the locator scoring can react to it.
-  function isUniqueSelectorOnPage(selector) {
-    if (!selector) return true;
-    try {
-      return document.querySelectorAll(selector).length <= 1;
-    } catch (e) {
-      return true; // malformed selector (unusual attribute chars, etc.) - don't penalize speculatively
-    }
-  }
-
-  // Climbs from el's PARENT upward (never el itself) looking for the
-  // closest ancestor whose own aggregated visible text is non-empty and
-  // short enough to plausibly BE a single distinguishing label (a card's
-  // title, a row's name, ...) rather than a whole section/page's worth of
-  // unrelated text. Used as a locator fallback for elements that carry no
-  // distinguishing text of their own - a decorative icon/image inside a
-  // clickable "tile" card is the most common real case: the click lands on
-  // the icon, but the CARD's title is what actually identifies which tile
-  // this is, and for a clickable-tile pattern (the whole card responds to
-  // a click, not just the icon) targeting that ancestor instead reaches
-  // the exact same outcome while actually distinguishing this tile from
-  // its look-alike siblings.
-  function nearestDistinguishingAncestor(el) {
-    try {
-      var node = el ? el.parentElement : null;
-      var depth = 0;
-      while (node && depth < 6) {
-        var t = (node.innerText || node.textContent || "").trim();
-        if (t && t.length <= 150) {
-          return { tag: node.nodeName.toLowerCase(), text: t };
-        }
-        node = node.parentElement;
-        depth++;
-      }
-    } catch (e) { /* ignore */ }
-    return null;
-  }
-
-  // A plain attribute-value selector (`tag[attr='val']`) is only as good
-  // as it is UNIQUE - `input[placeholder='Search customers']` almost
-  // certainly is, but `button[type='button']` almost certainly is not
-  // (true of nearly every plain button in a form-heavy app). The Python
-  // side (locator_engine.py's attribute-based candidate) had no way to
-  // tell those two cases apart and trusted both equally, until a real
-  // failure showed two different recorded buttons - neither with an id,
-  // name, aria-label or visible text of its own, just an icon - both
-  // falling through to `type` and producing the IDENTICAL selector
-  // `button[type='button']`, which then silently resolved to whichever
-  // button happened to be first on the page at execution time. Checking
-  // uniqueness here, at capture time (the same isUniqueSelectorOnPage()
-  // already used for id/class/css_path below), lets locator_engine.py
-  // demote a non-unique one exactly like it already does for those.
-  function attributeSelectorUnique(tagName, attr, val) {
-    if (!val) return true;
-    try {
-      return isUniqueSelectorOnPage(tagName + "[" + attr + "='" + val.replace(/'/g, "\\'") + "']");
-    } catch (e) {
-      return true; // don't penalize speculatively on an unexpected value shape
-    }
-  }
-
-  UA.getElementInfo = function (el) {
-    if (!el || !(el instanceof Element)) return null;
-    const rect = el.getBoundingClientRect();
-    const id = safeAttr(el, "id");
-    const classNameStr = (el.className && typeof el.className === "string") ? el.className : "";
-    const classList = classNameStr.trim().split(/\s+/).filter(Boolean);
-    const tagName = el.nodeName.toLowerCase();
-    const cssPathValue = cssPath(el);
-    const placeholderVal = safeAttr(el, "placeholder");
-    const titleVal = safeAttr(el, "title");
-    const altVal = safeAttr(el, "alt");
-    const typeVal = safeAttr(el, "type");
-    const nameVal = safeAttr(el, "name");
-    return {
-      tag: tagName,
-      id: id,
-      id_unique: id ? isUniqueSelectorOnPage("#" + CSS.escape(id)) : true,
-      name: nameVal,
-      // Reported failure: a recorded click on the real "Submit" button
-      // replayed onto a DIFFERENT, disabled button elsewhere on the page
-      // (a "lock/unlock" control) because both happened to share
-      // name="submit" - a bare By.NAME locator has no way to tell them
-      // apart and Playwright's `.first` silently picked whichever one
-      // came first in the DOM. Same uniqueness-check gap as the
-      // type/placeholder/title/alt attribute selectors above, just for
-      // `name` specifically (the radio/checkbox case, where every option
-      // in a group legitimately shares one `name` by design, is handled
-      // separately in locator_engine.py by qualifying with the option's
-      // own `value` attribute - this is for the non-grouped case).
-      name_unique: attributeSelectorUnique(tagName, "name", nameVal),
-      class_name: classNameStr,
-      class_combo_unique: classList.length
-        ? isUniqueSelectorOnPage(tagName + "." + classList.map(function (c) { return CSS.escape(c); }).join("."))
-        : true,
-      type: typeVal,
-      type_unique: attributeSelectorUnique(tagName, "type", typeVal),
-      value: (el.value !== undefined ? String(el.value).substring(0, 200) : ""),
-      text: textOf(el),
-      placeholder: placeholderVal,
-      placeholder_unique: attributeSelectorUnique(tagName, "placeholder", placeholderVal),
-      title: titleVal,
-      title_unique: attributeSelectorUnique(tagName, "title", titleVal),
-      alt: altVal,
-      alt_unique: attributeSelectorUnique(tagName, "alt", altVal),
-      role: safeAttr(el, "role"),
-      aria_label: safeAttr(el, "aria-label"),
-      aria_labelledby: safeAttr(el, "aria-labelledby"),
-      aria_describedby: safeAttr(el, "aria-describedby"),
-      data_attrs: collectDataAttrs(el),
-      href: safeAttr(el, "href"),
-      src: safeAttr(el, "src"),
-      for_attr: safeAttr(el, "for"),
-      autocomplete: safeAttr(el, "autocomplete"),
-      disabled: el.disabled === true || safeAttr(el, "aria-disabled") === "true",
-      readonly: el.readOnly === true,
-      checked: el.checked === true,
-      selected: el.selected === true,
-      visible: isVisible(el),
-      enabled: isEnabled(el),
-      bounding_box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-      parent_signature: el.parentElement ? domSignature(el.parentElement) : "",
-      dom_signature: domSignature(el),
-      css_path: cssPathValue,
-      // cssPath() stops climbing the instant it finds ANY ancestor with an
-      // id (see its own comment above) and anchors the whole selector on
-      // that id, WITHOUT checking whether that id is actually unique on
-      // the page - so a repeated-card grid where every tile shares one
-      // copy-pasted id (e.g. id="dashboardPersonalLoan" on every single
-      // product card, not just one) produced a selector that looked
-      // perfectly specific ("mat-card#dashboardPersonalLoan > img:nth-of-
-      // type(1)") but silently resolved to whichever tile came first in
-      // the DOM every time, regardless of which one was actually recorded.
-      // Checking the FINAL selector's own uniqueness (rather than trying
-      // to re-derive which id it used) catches this regardless of where
-      // in the path the non-unique id sits.
-      css_path_unique: cssPathValue ? isUniqueSelectorOnPage(cssPathValue) : true,
-      xpath: xpath(el),
-      link_text: el.nodeName.toLowerCase() === "a" ? textOf(el) : "",
-      container: nearestDistinguishingAncestor(el),
-    };
-  };
-
-  // ---- DOM crawling --------------------------------------------------
-  const INTERESTING_SELECTOR = [
-    "a", "button", "input", "select", "textarea", "option", "label",
-    "[role='button']", "[role='link']", "[role='checkbox']", "[role='radio']",
-    "[role='tab']", "[role='menuitem']", "[role='option']", "[role='switch']",
-    "[onclick]", "[data-testid]", "[data-test-id]", "[data-qa]",
-    "table", "tr", "td", "th", "ul", "li", "nav", "form",
-    "[contenteditable='true']", "iframe", "[role='dialog']", "dialog"
-  ].join(",");
-
-  UA.crawlDom = function (root) {
-    root = root || document;
-    const els = root.querySelectorAll(INTERESTING_SELECTOR);
-    const out = [];
-    els.forEach(function (el) {
-      const info = UA.getElementInfo(el);
-      if (info) out.push(info);
-    });
-    return out;
-  };
-
-  // ---- Event listening -------------------------------------------------
-  function pushEvent(type, el, extra) {
-    const info = UA.getElementInfo(el);
-    if (!info) return;
-    UA.eventQueue.push(Object.assign({
-      type: type,
-      element: info,
-      timestamp: Date.now(),
-      url: window.location.href,
-      title: document.title,
-    }, extra || {}));
-  }
-
-  // The source of a copy is whatever currently has selected text - either
-  // an <input>/<textarea>'s own selection range, or the page's live text
-  // selection (window.getSelection()) for a plain read-only display element
-  // (a <span>/<div> showing a system-generated ID, the most common real
-  // case). document.activeElement is the best-effort "source element" to
-  // attach the captured value to either way.
-  function selectedTextFrom(el) {
-    try {
-      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA") &&
-          typeof el.selectionStart === "number" && el.selectionStart !== el.selectionEnd) {
-        return el.value.substring(el.selectionStart, el.selectionEnd);
-      }
-      var sel = window.getSelection();
-      return sel ? sel.toString() : "";
-    } catch (e) {
-      return "";
-    }
-  }
-
-  function recordCopy() {
-    var el = document.activeElement;
-    var text = selectedTextFrom(el);
-    if (!text) return;
-    pushEvent("copy", (el instanceof Element) ? el : document.body, { value: text });
-  }
-
-  // A click's real e.target is very often a decorative wrapper, not the
-  // functional element itself - an icon <svg>/<span> inside a button, or a
-  // <label>/wrapping <span> around a custom-styled radio/checkbox whose
-  // real <input> is visually hidden. Recording whatever raw node the click
-  // landed on is what produced two of this session's real production bugs:
-  // two icon-only buttons (no id/name/text of their own) both falling
-  // through every locator strategy to the same generic `button[type=
-  // 'button']` selector, and a custom-styled radio button whose click
-  // target (the label/span) and change target (the real input) are two
-  // different DOM nodes, needing a separate recorder.py dedup pass to
-  // reconcile after the fact. Resolving to the real interactive element
-  // HERE, before it's ever recorded, fixes both at the source instead of
-  // patching each symptom downstream - ported from a Selenium-based sister
-  // recorder (aitestrecorder) whose simpler click capture never had this
-  // class of bug in the first place, precisely because it always resolved
-  // to the real element up front.
-  var CLICKABLE_SELECTOR = [
-    "button", "a", "[role='button']", "[role='link']", "[role='checkbox']", "[role='radio']",
-    "[role='tab']", "[role='menuitem']", "[role='option']", "[role='switch']",
-    "input[type='submit']", "input[type='button']", "input[type='radio']", "input[type='checkbox']",
-    "label", "[onclick]", "select", "textarea", "input", "[contenteditable='true']",
-  ].join(",");
-
-  function resolveClickTarget(el) {
-    if (!el || !el.closest) return el;
-    var clickable = el.closest(CLICKABLE_SELECTOR) || el;
-    if (clickable.tagName && clickable.tagName.toLowerCase() === "label") {
-      var forId = clickable.getAttribute("for");
-      var resolved = forId ? document.getElementById(forId) : clickable.querySelector("input, select, textarea");
-      if (resolved) clickable = resolved;
-    }
-    return clickable;
-  }
-
-  UA.startEventListeners = function () {
-    if (UA._listenersAttached) return;
-    UA._listenersAttached = true;
-
-    document.addEventListener("click", function (e) {
-      pushEvent(e.detail === 2 ? "dblclick" : "click", resolveClickTarget(e.target));
-    }, true);
-
-    document.addEventListener("dblclick", function (e) {
-      pushEvent("dblclick", resolveClickTarget(e.target));
-    }, true);
-
-    document.addEventListener("contextmenu", function (e) {
-      pushEvent("contextmenu", resolveClickTarget(e.target));
-    }, true);
-
-    document.addEventListener("change", function (e) {
-      const el = e.target;
-      if (el && (el.tagName === "SELECT")) {
-        pushEvent("select", el, { value: el.value, selected_text: el.options[el.selectedIndex] ? el.options[el.selectedIndex].text : "" });
-      } else if (el && el.type === "checkbox") {
-        pushEvent(el.checked ? "check" : "uncheck", el);
-      } else if (el && el.type === "radio") {
-        pushEvent("check", el);
-      } else if (el && el.type === "file") {
-        // A file input's `.value` is ALWAYS a browser-redacted fake path
-        // (e.g. "C:\fakepath\invoice.pdf") for security reasons - the real
-        // path used during recording can never be read back via JS. Before
-        // this, a file upload fell into the generic INPUT branch below and
-        // got recorded as a plain TYPE step with that fake, non-functional
-        // value - looked like it "worked" during recording, then silently
-        // did nothing useful on replay (typing a fake path into a file
-        // input selects nothing). Recording this as its own UPLOAD action
-        // with an explicit placeholder makes it obvious, in Review & Edit
-        // Steps, that a real file path for THIS execution environment
-        // still needs to be filled in - failing loudly/clearly instead of
-        // silently.
-        var fileNames = (el.files && el.files.length)
-          ? Array.prototype.map.call(el.files, function (f) { return f.name; }).join(", ")
-          : "";
-        pushEvent("upload", el, {
-          value: fileNames ? ("PROVIDE_FILE_PATH (originally uploaded: " + fileNames + ")") : "PROVIDE_FILE_PATH",
-        });
-      } else if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) {
-        pushEvent("type", el, { value: el.value });
-      }
-    }, true);
-
-    document.addEventListener("input", function (e) {
-      const el = e.target;
-      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) {
-        pushEvent("typing", el, { value: el.value !== undefined ? el.value : el.innerText });
-      }
-    }, true);
-
-    document.addEventListener("submit", function (e) {
-      pushEvent("submit", e.target);
-    }, true);
-
-    document.addEventListener("keydown", function (e) {
-      if (e.key === "Enter") {
-        pushEvent("press_enter", e.target, { key: "Enter" });
-      } else if (e.key === "Tab") {
-        pushEvent("press_tab", e.target, { key: "Tab" });
-      } else if (["Escape", "ArrowDown", "ArrowUp"].indexOf(e.key) === -1) {
-        // avoid noise from purely navigational keys; still track generic keypress
-        pushEvent("keydown", e.target, { key: e.key });
-      }
-    }, true);
-
-    // Capture -> Store -> Reuse: a value the app itself GENERATES fresh
-    // every run (an application ID, a reference number, a freshly-issued
-    // OTP) can't be replayed as a static recorded literal - it's different
-    // every execution. When the user copies such a value off the screen
-    // during recording (Ctrl+C / Edit > Copy - realistic tester behavior
-    // for a long generated ID they need to reuse a few screens later), that
-    // copy is what marks it as "this needs live re-capture, not a fixed
-    // value". The later paste/retype of that same value already gets
-    // captured normally by the existing "change" listener above (whatever
-    // ends up in the field's value, typed or pasted, fires change on blur
-    // the same way) - recorder.py correlates the two by matching value.
-    document.addEventListener("copy", recordCopy, true);
-    document.addEventListener("cut", recordCopy, true);
-
-    // NOTE: hover ("mouseover") capture is intentionally disabled. It was
-    // recording incidental mouse movement (the pointer passing over a
-    // background/overlay element on its way to the real target) as if it
-    // were a deliberate action, and even genuine hovers rarely replay
-    // reliably via Selenium (no real pointer movement, so hover-triggered
-    // CSS/JS states often never engage) - so hover steps were a frequent
-    // source of failures/timeouts that didn't reflect an actual problem
-    // with the recording or the target application. Click/type/select/etc.
-    // are unaffected; this only turns off the previous fully-generic
-    // mouseover -> "hover" action capture.
-
-    let scrollTimer = null;
-    window.addEventListener("scroll", function () {
-      clearTimeout(scrollTimer);
-      scrollTimer = setTimeout(function () {
-        UA.eventQueue.push({
-          type: "scroll",
-          element: null,
-          scroll_x: window.scrollX,
-          scroll_y: window.scrollY,
-          timestamp: Date.now(),
-          url: window.location.href,
-          title: document.title,
-        });
-      }, 400);
-    }, true);
-  };
-
-  UA.drainEvents = function () {
-    const out = UA.eventQueue;
-    UA.eventQueue = [];
-    return out;
-  };
-
-  window.addEventListener("popstate", function () {
-    UA.eventQueue.push({
-      type: "popstate",
-      element: null,
-      timestamp: Date.now(),
-      url: window.location.href,
-      title: document.title,
-    });
-  }, true);
-
-  // ---- Mutation observing -------------------------------------------
-  UA.startMutationObserver = function () {
-    if (UA._observer) return;
-    UA._observer = new MutationObserver(function (mutations) {
-      mutations.forEach(function (m) {
-        m.addedNodes.forEach(function (node) {
-          if (node.nodeType !== Node.ELEMENT_NODE) return;
-          const sig = domSignature(node);
-          if (UA._seenSignatures.has(sig)) return;
-          UA._seenSignatures.add(sig);
-          const info = UA.getElementInfo(node);
-          if (info) {
-            UA.mutationQueue.push({ change: "added", element: info, timestamp: Date.now(), url: window.location.href });
-          }
-          // also scan descendants that are individually interesting
-          try {
-            node.querySelectorAll && node.querySelectorAll(INTERESTING_SELECTOR).forEach(function (child) {
-              const csig = domSignature(child);
-              if (UA._seenSignatures.has(csig)) return;
-              UA._seenSignatures.add(csig);
-              const cinfo = UA.getElementInfo(child);
-              if (cinfo) UA.mutationQueue.push({ change: "added", element: cinfo, timestamp: Date.now(), url: window.location.href });
-            });
-          } catch (e) { /* ignore */ }
-        });
-      });
-    });
-    UA._observer.observe(document.documentElement || document.body, { childList: true, subtree: true });
-  };
-
-  UA.drainMutations = function () {
-    const out = UA.mutationQueue;
-    UA.mutationQueue = [];
-    return out;
-  };
-
-  // ---- Modal / popup / overlay detection -----------------------------
-  const MODAL_SELECTORS = [
-    ".modal", ".modal-dialog", ".modal-content", "[role='dialog']", "[role='alertdialog']",
-    "dialog", "[aria-modal='true']", ".popup", ".overlay", ".toast", ".toast-container",
-    ".notification", ".snackbar", ".drawer", ".side-panel", ".sidepanel", ".dropdown-menu.show",
-    ".ant-modal", ".mat-dialog-container", ".MuiDialog-root", ".v-dialog", ".chakra-modal__content"
-  ];
-
-  function looksLikeOverlay(el) {
-    try {
-      const style = window.getComputedStyle(el);
-      const rect = el.getBoundingClientRect();
-      const position = style.position;
-      const zIndex = parseInt(style.zIndex, 10) || 0;
-      const coversSignificantArea = rect.width > window.innerWidth * 0.25 && rect.height > window.innerHeight * 0.15;
-      return (position === "fixed" || position === "absolute") && zIndex >= 100 && coversSignificantArea && isVisible(el);
-    } catch (e) {
-      return false;
-    }
-  }
-
-  UA.detectModals = function () {
-    const found = [];
-    const seen = new Set();
-
-    MODAL_SELECTORS.forEach(function (sel) {
-      try {
-        document.querySelectorAll(sel).forEach(function (el) {
-          if (!isVisible(el)) return;
-          const sig = domSignature(el);
-          if (seen.has(sig)) return;
-          seen.add(sig);
-          found.push({ container: UA.getElementInfo(el), detected_via: ["selector:" + sel] });
-        });
-      } catch (e) { /* invalid selector variant on this app, skip */ }
-    });
-
-    // structural heuristic pass over top-level fixed/absolute large elements
-    document.querySelectorAll("body > div, body > section").forEach(function (el) {
-      if (looksLikeOverlay(el)) {
-        const sig = domSignature(el);
-        if (seen.has(sig)) return;
-        seen.add(sig);
-        found.push({ container: UA.getElementInfo(el), detected_via: ["structural:overlay-heuristic"] });
-      }
-    });
-
-    return found.map(function (m) {
-      const children = [];
-      try {
-        const containerEl = document.querySelector(m.container.css_path) ||
-          (m.container.id ? document.getElementById(m.container.id) : null);
-        if (containerEl) {
-          containerEl.querySelectorAll(INTERESTING_SELECTOR).forEach(function (c) {
-            const info = UA.getElementInfo(c);
-            if (info) children.push(info);
-          });
-        }
-      } catch (e) { /* ignore */ }
-      m.children = children;
-      return m;
-    });
-  };
-
-  // ---- Shadow DOM detection (best-effort) -----------------------------
-  UA.detectShadowRoots = function (root, depth) {
-    root = root || document;
-    depth = depth || 0;
-    if (depth > 4) return [];
-    const out = [];
-    const all = root.querySelectorAll("*");
-    all.forEach(function (el) {
-      if (el.shadowRoot) {
-        const hostInfo = UA.getElementInfo(el);
-        const children = [];
-        try {
-          el.shadowRoot.querySelectorAll(INTERESTING_SELECTOR).forEach(function (c) {
-            const info = UA.getElementInfo(c);
-            if (info) children.push(info);
-          });
-        } catch (e) { /* closed shadow root or inaccessible */ }
-        out.push({ host: hostInfo, children: children });
-        // recurse into nested shadow roots
-        const nested = UA.detectShadowRoots(el.shadowRoot, depth + 1);
-        nested.forEach(function (n) { out.push(n); });
-      }
-    });
-    return out;
-  };
-
-  // ---- Frame enumeration (top-level only; Python drives recursion) ---
-  UA.getFrames = function () {
-    const frames = document.querySelectorAll("iframe, frame");
-    const out = [];
-    frames.forEach(function (f, idx) {
-      out.push({
-        index: idx,
-        css_path: cssPath(f),
-        id: safeAttr(f, "id"),
-        name: safeAttr(f, "name"),
-        src: safeAttr(f, "src"),
-        visible: isVisible(f),
-      });
-    });
-    return out;
-  };
-
-  window.__UA__ = UA;
-})();
+    @classmethod
+    def terminate(cls, execution_id: str) -> bool:
+        """Stops a running execution as soon as possible (spec-adjacent
+        addition: "Terminate Execution" button). Works for both the Excel
+        fast path (force-quits the driver so any in-flight Selenium wait
+        fails immediately) and the Behave path (terminates the `behave`
+        subprocess). Returns False if the execution isn't found; returns
+        True if a stop signal was sent, even if the run happens to finish
+        on its own a moment later anyway."""
+        state = cls._executions.get(execution_id)
+        if not state:
+            return False
+        state["terminate_requested"] = True
+        cancel_event = state.get("cancel_event")
+        if cancel_event is not None:
+            cancel_event.set()
+        executor = state.get("executor")
+        if executor is not None:
+            executor.terminate()
+        proc = state.get("behave_process")
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        return True
