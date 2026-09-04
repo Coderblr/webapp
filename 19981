@@ -1,366 +1,221 @@
 """
-action_engine.py
+self_healer.py
 
-The single place that knows how to translate a generic action
-(click/type/select/...) plus a resolved locator into real Playwright
-calls. Both the Excel-driven executor and every generated Page Object
-(via generator/base_page.py) go through this class, which is what keeps
-the platform's "generic action abstraction" principle real: we do not
-generate a bespoke function per recorded click - we generate data
-(locators, element names) and call these shared methods.
+Orchestrates Self-Healing Stages 3-7 (spec sections 20-21), invoked by the
+executor only after Stages 1-2 (primary + fallback locators, handled in
+execution/selenium_executor.py) have already failed:
 
-Every method takes an explicit `context` (a Playwright Page or Frame -
-see recorder/iframe_handler.py's resolve_frame()) rather than assuming a
-single shared "current frame", plus a (strategy, value) locator pair from
-the recorded/healed locator. Playwright's Locators are lazy - `context.
-locator(selector)` doesn't touch the page at all until an action is
-actually performed on it, and is automatically re-queried fresh on every
-call - which is what eliminates the whole StaleElementReferenceException
-class of bug Selenium was prone to (a WebElement handle going stale the
-moment the DOM re-rendered under it).
+  Stage 3: search the locator repository for same-page candidates
+  Stage 4: crawl + rank the live DOM (deterministic similarity)
+  Stage 5: AI-assisted candidate identification (LangChain + configurable
+           provider) when deterministic confidence is inconclusive
+  Stage 6: validate the winning candidate by actually resolving it in the
+           browser (never trust the score alone)
+  Stage 7: only return a healed locator if confidence clears the
+           configured threshold; the caller (executor) then updates the
+           locator repository AND the Excel file (spec section 21).
 
-Compared to the old Selenium version, several things this module used to
-do by hand are now built into Playwright itself and have been dropped
-rather than ported 1:1:
-  - _ensure_in_view()/scrollIntoView before every action - Playwright's
-    own actionability checks already scroll an element into view before
-    interacting with it.
-  - The 3-attempt real-click retry loop - Playwright's click() already
-    retries its own actionability checks (visible, stable, enabled,
-    receives-events) internally up to its timeout, which is what the old
-    retry loop was hand-rolling around Selenium's ElementClickIntercepted-
-    Exception.
-  - is_selected() checks before check()/uncheck() - Playwright's check()/
-    uncheck() are already idempotent no-ops if the box is already in the
-    requested state.
+Every attempt - successful or not - should be logged by the caller into
+HealingEvent / metadata_store so the dashboard's "Self-Healed" counters
+and the report's failure/healing sections stay accurate.
 """
 from __future__ import annotations
 
 import logging
-from typing import Optional, Union
+import time
+from typing import Any, Dict, Optional
 
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Frame, Page
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-
+from backend.ai import langchain_agent
+from backend.ai.prompt_templates import LOCATOR_RECOVERY_SYSTEM_PROMPT, locator_recovery_prompt
 from backend.config import settings
+from backend.execution import playwright_executor
+from backend.execution.action_engine import ActionEngine
+from backend.healing import locator_matcher
+from backend.recorder.browser_factory import PlaywrightSession
+from backend.storage.locator_store import LocatorRepository
+from backend.storage.models import HealingEvent, new_id
 
-logger = logging.getLogger("universal_automation.action_engine")
-
-EvaluationContext = Union[Page, Frame]
-
-# Our generic LocatorStrategy vocabulary -> a Playwright selector-engine
-# string. Playwright has no separate "By.ID"/"By.NAME" concept the way
-# Selenium did - everything is expressed as one selector string, so this
-# replaces the old by_for()/STRATEGY_TO_BY dict entirely.
-_KEY_ALIASES = {"ENTER": "Enter", "TAB": "Tab", "ESCAPE": "Escape", "ESC": "Escape", "SPACE": "Space", "BACKSPACE": "Backspace"}
+logger = logging.getLogger("universal_automation.self_healer")
 
 
-def selector_for(strategy: str, value: str) -> str:
-    s = (strategy or "CSS").upper()
-    if s == "ID":
-        # An attribute selector (rather than a bare `#id` CSS id selector)
-        # sidesteps CSS identifier-escaping entirely - real ids seen in
-        # the wild often start with a digit or contain characters (colons,
-        # dots) that aren't valid in a bare `#id` selector without manual
-        # escaping.
-        return f'[id="{value}"]'
-    if s == "NAME":
-        return f'[name="{value}"]'
-    if s in ("XPATH", "RELATIVE_XPATH", "TEXT"):
-        # locator_engine.py already builds TEXT/RELATIVE_XPATH candidates
-        # as XPath strings (e.g. `//tag[normalize-space(.)="..."]`).
-        return value if value.startswith("xpath=") else f"xpath={value}"
-    if s == "LINK_TEXT":
-        return f'text="{value}"'  # quoted = exact match in Playwright's text engine
-    if s == "PARTIAL_LINK_TEXT":
-        return f"text={value}"  # unquoted = substring, case-insensitive
-    # CSS, DATA_TESTID, ACCESSIBILITY, ATTRIBUTE, SHADOW_PATH already
-    # produce full, valid CSS selector strings from locator_engine.py -
-    # pass through unchanged. Playwright's CSS engine also automatically
-    # pierces open shadow roots, which Selenium could never do without
-    # manual JS traversal (see recorder/shadow_dom.py).
-    return value
+def heal(
+    session: PlaywrightSession,
+    engine: ActionEngine,
+    step: Dict[str, Any],
+    locator_repo: Optional[LocatorRepository],
+    ai_provider: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Attempt to recover a working locator for a failed step.
 
+    Returns a dict:
+        {
+          "success": bool,
+          "new_locator_type": str,
+          "new_locator": str,
+          "confidence": float,
+          "healing_method": str,
+          "reason": str,
+        }
 
-def _resolve_key(key: str) -> str:
-    return _KEY_ALIASES.get((key or "").upper(), key)
-
-
-class ActionEngine:
-    """Generic Playwright action executor. Stateless with respect to any
-    particular application - every method takes an explicit context plus
-    a (strategy, value) locator."""
-
-    def __init__(self, page: Page, timeout: Optional[float] = None):
-        self.page = page
-        self.timeout = timeout or settings.EXPLICIT_WAIT_SECONDS
-
-    @property
-    def _timeout_ms(self) -> float:
-        return self.timeout * 1000
-
-    def _locator(self, context: Optional[EvaluationContext], strategy: str, value: str):
-        ctx = context if context is not None else self.page
-        return ctx.locator(selector_for(strategy, value)).first
-
-    # ------------------------------------------------------------------
-    def click(self, context: Optional[EvaluationContext], strategy: str, value: str) -> None:
-        """A genuine click, going through Playwright's real input
-        pipeline (its own actionability checks already retry through
-        transient overlays/animations up to `timeout`). Only if that
-        fails outright does this fall back to dispatching a full
-        synthetic pointer/mouse event sequence - not just a bare
-        `element.click()` (which fires ONE "click" event and nothing
-        else; a component wired to mousedown/pointerdown instead would
-        silently do nothing in response - the "locator's right, nothing
-        errors, button just doesn't respond" failure mode). That
-        fallback is still technically `event.isTrusted === false`; a
-        handful of security-conscious apps deliberately ignore untrusted
-        events, in which case no client-side event simulation can help -
-        see the README's Interaction robustness section.
-        """
-        loc = self._locator(context, strategy, value)
-        try:
-            loc.click(timeout=self._timeout_ms)
-            return
-        except PlaywrightError as exc:
-            # Distinguish "the click itself just failed" (worth retrying via
-            # a synthetic event sequence below) from "the page/tab this
-            # click was waiting on is now actually gone" - most commonly a
-            # navigation that raced the click's own actionability wait (the
-            # target application logged the session out, redirected to a
-            # logout/session-timeout page, or otherwise tore the tab down)
-            # while this call was still waiting on it. Dispatching synthetic
-            # events at a locator bound to a page that no longer exists
-            # cannot possibly succeed - it would only raise a second, more
-            # confusing error a moment later - and this step's real-world
-            # outcome is genuinely unknown at this point, so it must be
-            # reported as a failure, never guessed at as a success. Letting
-            # the original exception (TargetClosedError, etc.) propagate
-            # here - rather than swallowing it - is what lets the executor's
-            # own dead-session detection (see executor.py's
-            # _is_dead_session_error()/_session_alive()) recognize this
-            # immediately and skip every remaining step instead of each one
-            # separately re-discovering the same dead session.
-            page_gone = False
-            try:
-                page_gone = self.page.is_closed()
-            except Exception:
-                page_gone = False
-            if page_gone:
-                logger.warning(
-                    "click(): the page was closed/navigated away while waiting to click "
-                    "%s::%s - most likely the target application ended the session (logout, "
-                    "redirect, or an idle/session timeout) while this step was still waiting, "
-                    "not a locator problem. Not attempting a synthetic fallback against a page "
-                    "that's already gone. Original error: %s", strategy, value, exc,
-                )
-                raise
-            logger.warning("click(): real click failed (%s) - falling back to a synthetic pointer/mouse event sequence.", exc)
-        for evt in ("pointerdown", "mousedown", "pointerup", "mouseup", "click"):
-            loc.dispatch_event(evt)
-
-    def double_click(self, context: Optional[EvaluationContext], strategy: str, value: str) -> None:
-        self._locator(context, strategy, value).dblclick(timeout=self._timeout_ms)
-
-    def right_click(self, context: Optional[EvaluationContext], strategy: str, value: str) -> None:
-        self._locator(context, strategy, value).click(button="right", timeout=self._timeout_ms)
-
-    def type(self, context: Optional[EvaluationContext], strategy: str, value: str, text: str, clear_first: bool = True) -> None:
-        loc = self._locator(context, strategy, value)
-        loc.wait_for(state="visible", timeout=self._timeout_ms)
-        if clear_first:
-            try:
-                loc.fill("", timeout=self._timeout_ms)
-            except PlaywrightError:
-                pass
-        loc.press_sequentially(text, timeout=self._timeout_ms)
-        self._verify_typed_value(loc, text)
-
-    def _verify_typed_value(self, loc, text: str) -> None:
-        """Segmented/auto-advancing inputs (the most common real case:
-        4-6 separate single-digit OTP/PIN boxes) are almost always
-        React/Angular "controlled" fields - the app's own JS re-validates
-        and can shift focus to the next box on every keystroke, racing
-        against press_sequentially() and occasionally dropping or
-        overwriting a character. One quick, cheap re-check (and a single
-        retry if it doesn't match) closes that race without slowing down
-        the much more common case where nothing needed retrying."""
-        if not text:
-            return
-        try:
-            actual = loc.input_value(timeout=1000)
-        except PlaywrightError:
-            return  # can't verify (e.g. not a value-bearing element) - not worth failing the step over
-        if actual == text:
-            return
-        try:
-            loc.fill("")
-        except PlaywrightError:
-            pass
-        loc.press_sequentially(text)
-
-    def read_current_text(self, context: Optional[EvaluationContext], strategy: str, value: str) -> str:
-        """Reads the CURRENT live value out of an element for the
-        Capture -> Store -> Reuse variable pipeline (see
-        execution/variable_store.py). Prefers the DOM `value` (inputs/
-        textareas), falling back to visible text for a read-only display
-        element (a <span>/<div> showing a system-generated ID) - this is
-        what lets a value the app regenerates fresh on every run be
-        re-captured live during THIS execution instead of replaying
-        whatever was recorded, which would be stale by definition."""
-        loc = self._locator(context, strategy, value)
-        loc.wait_for(state="attached", timeout=self._timeout_ms)
-        text = ""
-        try:
-            text = loc.input_value(timeout=1000) or ""
-        except PlaywrightError:
-            text = ""
-        if not text:
-            try:
-                text = loc.text_content(timeout=1000) or ""
-            except PlaywrightError:
-                text = ""
-        return text
-
-    def clear(self, context: Optional[EvaluationContext], strategy: str, value: str) -> None:
-        self._locator(context, strategy, value).fill("", timeout=self._timeout_ms)
-
-    def select(self, context: Optional[EvaluationContext], strategy: str, value: str, option_text: Optional[str] = None, option_value: Optional[str] = None) -> None:
-        """Recorded <select> steps carry TWO pieces of the chosen option -
-        see models.py's ActionRecord.select_option_text: `option_value`
-        (the option's `value` attribute, preferred at capture time) and
-        `option_text` (its visible label). Real-world `<option value="X">
-        Visible Label</option>` elements very often have X != Visible
-        Label, so a replay that only ever tries one of the two silently/
-        reliably fails whenever the app under test uses distinct codes vs.
-        display text (the common enterprise case) - mirrors the same
-        "no fallback across candidates" bug class already fixed for
-        locators elsewhere in this module. Try the value-attribute match
-        first (it's the more stable of the two - display text is more
-        likely to get relabelled), then the label match, so either one
-        succeeding is enough.
-        """
-        loc = self._locator(context, strategy, value)
-        attempts = []
-        if option_value:
-            attempts.append(("value", option_value))
-        if option_text and option_text != option_value:
-            attempts.append(("label", option_text))
-        elif option_value:
-            # No distinct label available (old recordings made before
-            # select_option_text existed only ever populate option_value -
-            # which, for an option with no value attribute at capture
-            # time, is actually the visible text) - retry the same string
-            # as a label match rather than giving up after one attempt.
-            attempts.append(("label", option_value))
-        if not attempts and option_text:
-            attempts.append(("label", option_text))
-
-        last_exc: Optional[Exception] = None
-        for kind, val in attempts:
-            try:
-                if kind == "value":
-                    loc.select_option(value=val, timeout=self._timeout_ms)
-                else:
-                    loc.select_option(label=val, timeout=self._timeout_ms)
-                return
-            except PlaywrightError as exc:
-                last_exc = exc
-                continue
-        if last_exc is not None:
-            raise last_exc
-
-    def check(self, context: Optional[EvaluationContext], strategy: str, value: str) -> None:
-        self._check_or_uncheck(context, strategy, value, checked=True)
-
-    def uncheck(self, context: Optional[EvaluationContext], strategy: str, value: str) -> None:
-        self._check_or_uncheck(context, strategy, value, checked=False)
-
-    def _check_or_uncheck(self, context: Optional[EvaluationContext], strategy: str, value: str, checked: bool) -> None:
-        """Radio buttons (recorded as CHECK - see bridge.js's `change`
-        listener) are overwhelmingly rendered with the real `<input
-        type="radio">` visually hidden (opacity:0, clipped, or positioned
-        off-screen) behind a custom-styled `<span>`/`<label>` the user
-        actually sees and clicks - kept in the DOM, not `display:none`,
-        specifically so it stays focusable/clickable for accessibility. A
-        real user's click always lands on and toggles that real input
-        regardless of how it's styled, which is exactly why this records
-        fine. Playwright's `.check()`/`.uncheck()` require the target to
-        pass an actionability check that includes being visible, though -
-        so a plain call here failed outright on precisely the elements
-        real users click every day, with no retry at all (unlike click(),
-        which already falls back for the same class of problem - see its
-        docstring above).
-
-        Three tiers, cheapest/safest first:
-          1. A normal check()/uncheck() - respects current state, already
-             a no-op if the element is already in the target state.
-          2. The same call with force=True - still state-aware and still
-             idempotent, just skips the visibility/stability actionability
-             checks that reject a genuinely-clickable-but-hidden input.
-          3. Last resort: set `.checked` directly via JS and fire
-             input/change (the same events bridge.js itself listens for)
-             so any React/Vue/Angular state bound to those events still
-             updates. This sets the exact target state explicitly rather
-             than toggling, so - unlike a raw synthetic click - it can't
-             land in the wrong state regardless of what the element's
-             current state was.
-        """
-        loc = self._locator(context, strategy, value)
-        method = "check" if checked else "uncheck"
-        try:
-            getattr(loc, method)(timeout=self._timeout_ms)
-            return
-        except PlaywrightError as exc:
-            logger.warning("%s(): real %s failed (%s) - retrying with force=True (common cause: a custom-styled radio/checkbox with a visually hidden native input).", method, method, exc)
-        try:
-            getattr(loc, method)(timeout=self._timeout_ms, force=True)
-            return
-        except PlaywrightError as exc:
-            logger.warning("%s(): force=True also failed (%s) - falling back to setting the DOM state directly.", method, exc)
-        loc.evaluate(
-            "(el, checked) => { if (el.checked !== checked) { el.checked = checked; el.dispatchEvent(new Event('input', {bubbles: true})); el.dispatchEvent(new Event('change', {bubbles: true})); } }",
-            checked,
+    `reason` is set to the literal string "session_lost" (instead of the
+    usual human-readable explanation) whenever the browser session itself
+    turns out to be gone - see the module-level _is_dead_session() check
+    below. The caller (executor.py) relies on this exact value to set its
+    own _session_dead flag and skip every remaining step immediately,
+    rather than letting each one separately rediscover the same dead
+    session through a full, doomed run of Stages 3-7.
+    """
+    if _page_already_gone(session):
+        logger.warning(
+            "Self-healing skipped for step %s: the browser page is already closed/gone - "
+            "not attempting any recovery stage against a session that can't respond.",
+            step.get("step_number"),
         )
+        return _result(False, "", "", 0.0, "none", "session_lost")
 
-    def hover(self, context: Optional[EvaluationContext], strategy: str, value: str) -> None:
-        self._locator(context, strategy, value).hover(timeout=self._timeout_ms)
+    page_url = step.get("page_url", "")
+    page_id = _page_id_from_url(page_url)
+    old_signature = {
+        "element_tag": step.get("element_tag", ""),
+        "element_text": step.get("element_text", ""),
+        "attributes": {"name": step.get("element_name", "")},
+        "component_type": "",
+    }
 
-    def scroll_to(self, context: Optional[EvaluationContext], strategy: str, value: str) -> None:
-        self._locator(context, strategy, value).scroll_into_view_if_needed(timeout=self._timeout_ms)
+    # ---- Stage 3: locator repository search -----------------------
+    if locator_repo:
+        repo_candidates = locator_repo.find_candidates(page_id=page_id, limit=settings.HEALING_MAX_CANDIDATES)
+        if repo_candidates:
+            from backend.healing.candidate_ranker import rank_candidates
+            ranked = rank_candidates(old_signature, repo_candidates, top_n=3)
+            if ranked and ranked[0].score >= settings.HEALING_CONFIDENCE_THRESHOLD:
+                winner = ranked[0]
+                loc = locator_matcher.candidate_to_locator(winner.element)
+                validated = _validate(session, engine, step, loc.strategy, loc.value)
+                if validated:
+                    return _result(True, loc.strategy, loc.value, winner.score, "repository", "; ".join(winner.reasons))
 
-    def press_key(self, context: Optional[EvaluationContext], strategy: str, value: str, key: str) -> None:
-        self._locator(context, strategy, value).press(_resolve_key(key), timeout=self._timeout_ms)
-
-    def submit(self, context: Optional[EvaluationContext], strategy: str, value: str) -> None:
-        loc = self._locator(context, strategy, value)
-        try:
-            loc.evaluate(
-                "el => { if (el.form) { el.form.requestSubmit ? el.form.requestSubmit() : el.form.submit(); } "
-                "else { el.click(); } }",
-                timeout=self._timeout_ms,
+    # ---- Stage 4: live DOM similarity -------------------------------
+    try:
+        ranked_dom = locator_matcher.best_match(old_signature, session.page, page_id, settings.HEALING_MAX_CANDIDATES)
+    except Exception as exc:
+        if _is_dead_session(exc):
+            logger.warning(
+                "Self-healing aborted for step %s: the browser session is gone (%s) - not "
+                "attempting Stage 5/6/7 against a page that can no longer respond.",
+                step.get("step_number"), exc,
             )
-        except PlaywrightError:
-            loc.click(timeout=self._timeout_ms)
+            return _result(False, "", "", 0.0, "none", "session_lost")
+        logger.warning("DOM crawl during healing failed: %s", exc)
+        ranked_dom = []
 
-    def upload(self, context: Optional[EvaluationContext], strategy: str, value: str, file_path: str) -> None:
-        # Playwright's set_input_files() is native support for file
-        # inputs - it works even on inputs hidden via CSS (a common
-        # pattern for custom-styled upload buttons), which Selenium's
-        # send_keys()-onto-the-input hack could not reliably do.
-        self._locator(context, strategy, value).set_input_files(file_path, timeout=self._timeout_ms)
+    if ranked_dom and ranked_dom[0].score >= settings.HEALING_CONFIDENCE_THRESHOLD:
+        winner = ranked_dom[0]
+        loc = locator_matcher.candidate_to_locator(winner.element)
+        validated = _validate(session, engine, step, loc.strategy, loc.value)
+        if validated:
+            return _result(True, loc.strategy, loc.value, winner.score, "dom_similarity", "; ".join(winner.reasons))
 
-    def navigate_back(self, page: Optional[Page] = None) -> None:
-        (page or self.page).go_back()
-
-    def navigate_forward(self, page: Optional[Page] = None) -> None:
-        (page or self.page).go_forward()
-
-    def is_present(self, context: Optional[EvaluationContext], strategy: str, value: str, timeout: float = 2.0) -> bool:
+    # ---- Stage 5: AI-assisted recovery ------------------------------
+    if ranked_dom and langchain_agent.is_provider_available(ai_provider):
         try:
-            self._locator(context, strategy, value).wait_for(state="attached", timeout=timeout * 1000)
-            return True
-        except PlaywrightTimeoutError:
-            return False
+            candidates_payload = [
+                {"index": i, **{k: c.element.get(k) for k in ("tag", "text", "role", "attributes", "component_type")}}
+                for i, c in enumerate(ranked_dom)
+            ]
+            response = langchain_agent.ask_json(
+                LOCATOR_RECOVERY_SYSTEM_PROMPT,
+                locator_recovery_prompt(
+                    step.get("primary_locator_type", ""), step.get("primary_locator", ""),
+                    old_signature, candidates_payload, page_url,
+                ),
+                provider=ai_provider,
+            )
+            idx = response.get("candidate_index", -1)
+            ai_confidence = float(response.get("confidence", 0))
+            if 0 <= idx < len(ranked_dom) and ai_confidence >= settings.HEALING_CONFIDENCE_THRESHOLD:
+                winner = ranked_dom[idx]
+                loc = locator_matcher.candidate_to_locator(winner.element)
+                validated = _validate(session, engine, step, loc.strategy, loc.value)
+                if validated:
+                    return _result(True, loc.strategy, loc.value, ai_confidence, "ai_semantic", response.get("reasoning", ""))
+        except langchain_agent.AIUnavailableError as exc:
+            logger.info("AI healing stage skipped: %s", exc)
+        except Exception as exc:
+            logger.warning("AI healing stage failed: %s", exc)
+
+    # ---- Stage 7: nothing cleared the confidence bar ----------------
+    best_score = ranked_dom[0].score if ranked_dom else 0.0
+    return _result(False, "", "", best_score, "none", "No candidate met the confidence threshold")
+
+
+def _validate(session: PlaywrightSession, engine: ActionEngine, step: Dict[str, Any], locator_type: str, locator_value: str) -> bool:
+    """Stage 6: never trust a score alone - confirm the candidate actually
+    resolves to a present element in the live DOM before healing."""
+    if not locator_value:
+        return False
+    try:
+        context = playwright_executor.resolve_frame(session, step)
+        return engine.is_present(context, locator_type, locator_value, timeout=3.0)
+    except Exception:
+        return False
+
+
+def _page_id_from_url(url: str) -> str:
+    import hashlib
+    normalized = (url or "").split("?")[0].rstrip("/")
+    return "page_" + hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+# Kept as its own copy rather than imported from executor.py's
+# Executor._is_dead_session_error (a classmethod on an unrelated class, and
+# importing execution.executor from here would risk a backend.execution <->
+# backend.healing import cycle since executor.py already imports this
+# module). Same substrings, same reasoning: no single Playwright exception
+# subclass covers "browser/context/page is already gone" across every
+# version this pins against, so a substring check is the reliable option.
+_DEAD_SESSION_MARKERS = ("has been closed", "Target closed", "Connection closed", "Browser has been closed")
+
+
+def _is_dead_session(exc: BaseException) -> bool:
+    text = str(exc)
+    return any(marker in text for marker in _DEAD_SESSION_MARKERS)
+
+
+def _page_already_gone(session: PlaywrightSession) -> bool:
+    """Cheap up-front check so heal() can skip Stages 3-7 entirely when the
+    session is already known dead, instead of discovering that fact partway
+    through (Stage 3's repository search doesn't touch the page at all, so
+    it would otherwise run for nothing) - see heal()'s docstring."""
+    try:
+        return session.page.is_closed()
+    except Exception:
+        return False
+
+
+def _result(success: bool, locator_type: str, locator_value: str, confidence: float, method: str, reason: str) -> Dict[str, Any]:
+    return {
+        "success": success,
+        "new_locator_type": locator_type,
+        "new_locator": locator_value,
+        "confidence": round(confidence, 3),
+        "healing_method": method,
+        "reason": reason,
+    }
+
+
+def make_event(step_number: int, page_url: str, old_type: str, old_value: str, result: Dict[str, Any]) -> HealingEvent:
+    return HealingEvent(
+        healing_id=new_id("heal_"),
+        step_number=step_number,
+        page_url=page_url,
+        old_locator_type=old_type,
+        old_locator=old_value,
+        new_locator_type=result.get("new_locator_type", ""),
+        new_locator=result.get("new_locator", ""),
+        confidence=result.get("confidence", 0.0),
+        healing_method=result.get("healing_method", ""),
+        reason=result.get("reason", ""),
+        timestamp=time.time(),
+        applied=result.get("success", False),
+    )
