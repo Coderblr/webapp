@@ -1,549 +1,404 @@
 """
-Shared data models for the platform.
+action_engine.py
 
-These dataclasses are the contract every other module (recorder, generator,
-execution, healing, reporting) builds on. Keeping them centralized is what
-lets Layer A (locator repository) and Layer B (execution dataset) stay
-logically separate while still referencing the same underlying concepts.
+The single place that knows how to translate a generic action
+(click/type/select/...) plus a resolved locator into real Playwright
+calls. Both the Excel-driven executor and every generated Page Object
+(via generator/base_page.py) go through this class, which is what keeps
+the platform's "generic action abstraction" principle real: we do not
+generate a bespoke function per recorded click - we generate data
+(locators, element names) and call these shared methods.
 
-Nothing here is application-specific: no field is named after a business
-concept (no "account_number", no "login_button"). Everything is generic
-DOM/action vocabulary.
+Every method takes an explicit `context` (a Playwright Page or Frame -
+see recorder/iframe_handler.py's resolve_frame()) rather than assuming a
+single shared "current frame", plus a (strategy, value) locator pair from
+the recorded/healed locator. Playwright's Locators are lazy - `context.
+locator(selector)` doesn't touch the page at all until an action is
+actually performed on it, and is automatically re-queried fresh on every
+call - which is what eliminates the whole StaleElementReferenceException
+class of bug Selenium was prone to (a WebElement handle going stale the
+moment the DOM re-rendered under it).
+
+Compared to the old Selenium version, several things this module used to
+do by hand are now built into Playwright itself and have been dropped
+rather than ported 1:1:
+  - _ensure_in_view()/scrollIntoView before every action - Playwright's
+    own actionability checks already scroll an element into view before
+    interacting with it.
+  - The 3-attempt real-click retry loop - Playwright's click() already
+    retries its own actionability checks (visible, stable, enabled,
+    receives-events) internally up to its timeout, which is what the old
+    retry loop was hand-rolling around Selenium's ElementClickIntercepted-
+    Exception.
+  - is_selected() checks before check()/uncheck() - Playwright's check()/
+    uncheck() are already idempotent no-ops if the box is already in the
+    requested state.
 """
 from __future__ import annotations
 
+import logging
 import time
-import uuid
-from dataclasses import dataclass, field, asdict
-from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Optional, Union
+
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import Frame, Page
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+from backend.config import settings
+
+logger = logging.getLogger("universal_automation.action_engine")
+
+EvaluationContext = Union[Page, Frame]
+
+# Our generic LocatorStrategy vocabulary -> a Playwright selector-engine
+# string. Playwright has no separate "By.ID"/"By.NAME" concept the way
+# Selenium did - everything is expressed as one selector string, so this
+# replaces the old by_for()/STRATEGY_TO_BY dict entirely.
+_KEY_ALIASES = {"ENTER": "Enter", "TAB": "Tab", "ESCAPE": "Escape", "ESC": "Escape", "SPACE": "Space", "BACKSPACE": "Backspace"}
 
 
-def new_id(prefix: str = "") -> str:
-    suffix = uuid.uuid4().hex[:12]
-    return f"{prefix}{suffix}" if prefix else suffix
+def selector_for(strategy: str, value: str) -> str:
+    s = (strategy or "CSS").upper()
+    if s == "ID":
+        # An attribute selector (rather than a bare `#id` CSS id selector)
+        # sidesteps CSS identifier-escaping entirely - real ids seen in
+        # the wild often start with a digit or contain characters (colons,
+        # dots) that aren't valid in a bare `#id` selector without manual
+        # escaping.
+        return f'[id="{value}"]'
+    if s == "NAME":
+        return f'[name="{value}"]'
+    if s in ("XPATH", "RELATIVE_XPATH", "TEXT"):
+        # locator_engine.py already builds TEXT/RELATIVE_XPATH candidates
+        # as XPath strings (e.g. `//tag[normalize-space(.)="..."]`).
+        return value if value.startswith("xpath=") else f"xpath={value}"
+    if s == "LINK_TEXT":
+        return f'text="{value}"'  # quoted = exact match in Playwright's text engine
+    if s == "PARTIAL_LINK_TEXT":
+        return f"text={value}"  # unquoted = substring, case-insensitive
+    # CSS, DATA_TESTID, ACCESSIBILITY, ATTRIBUTE, SHADOW_PATH already
+    # produce full, valid CSS selector strings from locator_engine.py -
+    # pass through unchanged. Playwright's CSS engine also automatically
+    # pierces open shadow roots, which Selenium could never do without
+    # manual JS traversal (see recorder/shadow_dom.py).
+    return value
 
 
-def now_ts() -> float:
-    return time.time()
+def _resolve_key(key: str) -> str:
+    return _KEY_ALIASES.get((key or "").upper(), key)
 
 
-# --------------------------------------------------------------------------
-# Action vocabulary (Layer B - user execution recording)
-class StrValueEnum(str, Enum):
-    """Base for every (str, Enum) in this module. Plain `class X(str, Enum)`
-    still uses Enum.__str__ by default (-> "ActionType.CLICK" instead of
-    "CLICK"), which silently corrupts anything that interpolates a member
-    into an f-string/format spec (Excel cells, generated code, report
-    text). Overriding __str__ to return the value fixes str(), f-strings,
-    and format-spec interpolation all at once, while asdict()/json.dumps
-    already worked correctly (they serialize str subclasses by value)."""
+class ActionEngine:
+    """Generic Playwright action executor. Stateless with respect to any
+    particular application - every method takes an explicit context plus
+    a (strategy, value) locator."""
 
-    def __str__(self) -> str:  # pragma: no cover - trivial
-        return str(self.value)
-
-
-# --------------------------------------------------------------------------
-class ActionType(StrValueEnum):
-    OPEN_URL = "OPEN_URL"
-    CLICK = "CLICK"
-    DOUBLE_CLICK = "DOUBLE_CLICK"
-    RIGHT_CLICK = "RIGHT_CLICK"
-    TYPE = "TYPE"
-    CLEAR = "CLEAR"
-    SELECT = "SELECT"
-    CHECK = "CHECK"
-    UNCHECK = "UNCHECK"
-    HOVER = "HOVER"
-    SCROLL = "SCROLL"
-    PRESS_KEY = "PRESS_KEY"
-    PRESS_ENTER = "PRESS_ENTER"
-    PRESS_TAB = "PRESS_TAB"
-    WAIT = "WAIT"
-    SUBMIT = "SUBMIT"
-    UPLOAD = "UPLOAD"
-    SWITCH_FRAME = "SWITCH_FRAME"
-    SWITCH_WINDOW = "SWITCH_WINDOW"
-    NEW_TAB = "NEW_TAB"
-    CLOSE_TAB = "CLOSE_TAB"
-    NAVIGATE_BACK = "NAVIGATE_BACK"
-    NAVIGATE_FORWARD = "NAVIGATE_FORWARD"
-    CAPTURE = "CAPTURE"               # reads an element's CURRENT live value/text into a {{variable}}
-                                       # for later reuse - see Capture -> Store -> Reuse in recorder.py
-
-
-class LocatorStrategy(StrValueEnum):
-    ID = "ID"
-    NAME = "NAME"
-    CSS = "CSS"
-    XPATH = "XPATH"
-    RELATIVE_XPATH = "RELATIVE_XPATH"
-    LINK_TEXT = "LINK_TEXT"
-    PARTIAL_LINK_TEXT = "PARTIAL_LINK_TEXT"
-    ACCESSIBILITY = "ACCESSIBILITY"       # aria-label / role based
-    TEXT = "TEXT"                         # visible text based
-    DATA_TESTID = "DATA_TESTID"
-    ATTRIBUTE = "ATTRIBUTE"               # generic data-* / custom attribute
-    SHADOW_PATH = "SHADOW_PATH"           # shadow DOM traversal path
-
-
-class ReliabilityLevel(StrValueEnum):
-    HIGH = "HIGH"
-    MEDIUM_HIGH = "MEDIUM_HIGH"
-    MEDIUM = "MEDIUM"
-    LOW = "LOW"
-
-
-# Base reliability weight per strategy - used by locator_engine to score.
-STRATEGY_BASE_RELIABILITY: Dict[str, float] = {
-    LocatorStrategy.DATA_TESTID: 0.97,
-    LocatorStrategy.ID: 0.95,
-    LocatorStrategy.NAME: 0.85,
-    LocatorStrategy.ACCESSIBILITY: 0.80,
-    LocatorStrategy.CSS: 0.70,
-    LocatorStrategy.LINK_TEXT: 0.65,
-    LocatorStrategy.ATTRIBUTE: 0.60,
-    LocatorStrategy.TEXT: 0.55,
-    LocatorStrategy.PARTIAL_LINK_TEXT: 0.50,
-    LocatorStrategy.RELATIVE_XPATH: 0.45,
-    LocatorStrategy.XPATH: 0.30,
-    LocatorStrategy.SHADOW_PATH: 0.40,
-}
-
-
-def reliability_level(score: float) -> str:
-    if score >= 0.85:
-        return ReliabilityLevel.HIGH
-    if score >= 0.65:
-        return ReliabilityLevel.MEDIUM_HIGH
-    if score >= 0.45:
-        return ReliabilityLevel.MEDIUM
-    return ReliabilityLevel.LOW
-
-
-# --------------------------------------------------------------------------
-# Layer A: Locator / DOM knowledge repository models
-# --------------------------------------------------------------------------
-@dataclass
-class LocatorCandidate:
-    strategy: str
-    value: str
-    reliability_score: float = 0.0
-    reliability_level: str = ReliabilityLevel.LOW
-
-    def __post_init__(self):
-        # Normalize to a plain string value even if a LocatorStrategy enum
-        # member was passed in - `class X(str, Enum)` members still use
-        # Enum.__str__ (-> "LocatorStrategy.ID") unless coerced explicitly,
-        # which would otherwise leak into Excel cells, JSON, and generated
-        # Page Object locator dicts.
-        if isinstance(self.strategy, LocatorStrategy):
-            self.strategy = self.strategy.value
-        else:
-            self.strategy = str(self.strategy)
-
-        if not self.reliability_score:
-            self.reliability_score = STRATEGY_BASE_RELIABILITY.get(self.strategy, 0.4)
-        level = reliability_level(self.reliability_score)
-        self.reliability_level = level.value if isinstance(level, ReliabilityLevel) else str(level)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class FramePath:
-    """Describes the full iframe nesting path required to reach an element."""
-    path: List[Dict[str, Any]] = field(default_factory=list)  # each: {frame_locator, frame_index, id, name}
-    nested_depth: int = 0
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+    def __init__(self, page: Page, timeout: Optional[float] = None):
+        self.page = page
+        self.timeout = timeout or settings.EXPLICIT_WAIT_SECONDS
 
     @property
-    def is_top_level(self) -> bool:
-        return self.nested_depth == 0 or not self.path
+    def _timeout_ms(self) -> float:
+        return self.timeout * 1000
 
+    def _locator(self, context: Optional[EvaluationContext], strategy: str, value: str):
+        ctx = context if context is not None else self.page
+        return ctx.locator(selector_for(strategy, value)).first
 
-@dataclass
-class ShadowPath:
-    """Describes a shadow DOM traversal path (list of host selectors)."""
-    hosts: List[str] = field(default_factory=list)
-    final_selector: str = ""
+    # ------------------------------------------------------------------
+    def click(self, context: Optional[EvaluationContext], strategy: str, value: str) -> None:
+        """A genuine click, going through Playwright's real input
+        pipeline (its own actionability checks already retry through
+        transient overlays/animations up to `timeout`). Only if that
+        fails outright does this fall back to dispatching a full
+        synthetic pointer/mouse event sequence - not just a bare
+        `element.click()` (which fires ONE "click" event and nothing
+        else; a component wired to mousedown/pointerdown instead would
+        silently do nothing in response - the "locator's right, nothing
+        errors, button just doesn't respond" failure mode). That
+        fallback is still technically `event.isTrusted === false`; a
+        handful of security-conscious apps deliberately ignore untrusted
+        events, in which case no client-side event simulation can help -
+        see the README's Interaction robustness section.
+        """
+        loc = self._locator(context, strategy, value)
+        # Page and Frame (EvaluationContext's two possible types) both
+        # expose `.url` directly, so this checks the actual frame the
+        # click happened in - not necessarily the top-level page - for
+        # whether IT navigated, which is what matters for an in-iframe
+        # click.
+        nav_ctx = context if context is not None else self.page
+        try:
+            url_before = nav_ctx.url
+        except PlaywrightError:
+            url_before = None
+        try:
+            loc.click(timeout=self._timeout_ms)
+            self._wait_after_click()
+            return
+        except PlaywrightError as exc:
+            # A click whose own side effect is a page navigation (login,
+            # form submit, a nav link) very often makes Playwright's
+            # click() throw right here - not because the click failed, but
+            # because the navigation destroys the old document's execution
+            # context while click() is still doing its post-action
+            # "wait for stable" bookkeeping. The click was already
+            # delivered. If we can see the page has in fact moved on since
+            # url_before, treat this as success instead of falling through
+            # to retry a synthetic event sequence against a now-stale
+            # locator, which can only fail (the element it pointed to no
+            # longer exists) - and whose failure wording
+            # ("Target page, context or browser has been closed") used to
+            # get misread by executor.py as the whole browser session
+            # having died, aborting the entire remaining run over what was
+            # actually a successful step. See executor.py's
+            # _session_alive()-based fix for the other half of this.
+            navigated = False
+            url_after = None
+            if url_before is not None:
+                try:
+                    # Prefer re-reading the SAME context that failed - if
+                    # it's still alive and simply moved on, this is the
+                    # most direct evidence.
+                    url_after = nav_ctx.url
+                    navigated = url_after != url_before
+                except PlaywrightError:
+                    # The frame itself is gone (the common case for a
+                    # top-level navigation destroying it) - fall back to
+                    # the owning page's url as the best available signal
+                    # that something moved on rather than crashed.
+                    try:
+                        url_after = self.page.url
+                        navigated = True  # nav_ctx being gone at all is itself the signal here
+                    except PlaywrightError:
+                        navigated = False
+            if navigated:
+                logger.info(
+                    "click(): real click failed (%s) but the page navigated to %s in the meantime - "
+                    "treating the click as successful rather than retrying against a stale locator.",
+                    exc, url_after,
+                )
+                self._wait_after_click()
+                return
+            logger.warning("click(): real click failed (%s) - falling back to a synthetic pointer/mouse event sequence.", exc)
+        for evt in ("pointerdown", "mousedown", "pointerup", "mouseup", "click"):
+            loc.dispatch_event(evt)
+        self._wait_after_click()
 
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+    def _wait_after_click(self) -> None:
+        """Fixed pause applied after every successful click/double-click/
+        right-click (see POST_CLICK_WAIT_SECONDS in config.py) - on top of
+        whatever wait Playwright's own actionability retries already
+        consumed. Deliberately unconditional (no "only if X happened"
+        logic): the app may need this window whether or not a navigation
+        occurred, and keeping this dumb/predictable is easier to reason
+        about than trying to guess when it's needed."""
+        wait_s = settings.POST_CLICK_WAIT_SECONDS
+        if wait_s > 0:
+            time.sleep(wait_s)
 
-    @property
-    def is_shadow(self) -> bool:
-        return bool(self.hosts)
+    def double_click(self, context: Optional[EvaluationContext], strategy: str, value: str) -> None:
+        self._locator(context, strategy, value).dblclick(timeout=self._timeout_ms)
+        self._wait_after_click()
 
+    def right_click(self, context: Optional[EvaluationContext], strategy: str, value: str) -> None:
+        self._locator(context, strategy, value).click(button="right", timeout=self._timeout_ms)
+        self._wait_after_click()
 
-@dataclass
-class ElementRecord:
-    element_id: str
-    page_id: str
-    dom_signature: str
-    tag: str
-    attributes: Dict[str, Any] = field(default_factory=dict)
-    text: str = ""
-    role: str = ""
-    visible: bool = True
-    enabled: bool = True
-    interactable: bool = True
-    bounding_box: Dict[str, float] = field(default_factory=dict)
-    parent_signature: str = ""
-    child_signatures: List[str] = field(default_factory=list)
-    locators: List[LocatorCandidate] = field(default_factory=list)
-    frame_path: Optional[FramePath] = None
-    shadow_path: Optional[ShadowPath] = None
-    component_type: str = ""       # e.g. "input", "button", "dropdown", "table_row" (structural, not business)
-    discovered_at: float = field(default_factory=now_ts)
-    last_seen_at: float = field(default_factory=now_ts)
-    dynamic: bool = False          # discovered via mutation observer after initial crawl
+    def type(self, context: Optional[EvaluationContext], strategy: str, value: str, text: str, clear_first: bool = True) -> None:
+        loc = self._locator(context, strategy, value)
+        loc.wait_for(state="visible", timeout=self._timeout_ms)
+        if clear_first:
+            try:
+                loc.fill("", timeout=self._timeout_ms)
+            except PlaywrightError:
+                pass
+        loc.press_sequentially(text, timeout=self._timeout_ms)
+        self._verify_typed_value(loc, text)
 
-    def best_locator(self) -> Optional[LocatorCandidate]:
-        if not self.locators:
-            return None
-        return max(self.locators, key=lambda l: l.reliability_score)
+    def _verify_typed_value(self, loc, text: str) -> None:
+        """Segmented/auto-advancing inputs (the most common real case:
+        4-6 separate single-digit OTP/PIN boxes) are almost always
+        React/Angular "controlled" fields - the app's own JS re-validates
+        and can shift focus to the next box on every keystroke, racing
+        against press_sequentially() and occasionally dropping or
+        overwriting a character. One quick, cheap re-check (and a single
+        retry if it doesn't match) closes that race without slowing down
+        the much more common case where nothing needed retrying."""
+        if not text:
+            return
+        try:
+            actual = loc.input_value(timeout=1000)
+        except PlaywrightError:
+            return  # can't verify (e.g. not a value-bearing element) - not worth failing the step over
+        if actual == text:
+            return
+        try:
+            loc.fill("")
+        except PlaywrightError:
+            pass
+        loc.press_sequentially(text)
 
-    def to_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
-        return d
+    def read_current_text(self, context: Optional[EvaluationContext], strategy: str, value: str) -> str:
+        """Reads the CURRENT live value out of an element for the
+        Capture -> Store -> Reuse variable pipeline (see
+        execution/variable_store.py). Prefers the DOM `value` (inputs/
+        textareas), falling back to visible text for a read-only display
+        element (a <span>/<div> showing a system-generated ID) - this is
+        what lets a value the app regenerates fresh on every run be
+        re-captured live during THIS execution instead of replaying
+        whatever was recorded, which would be stale by definition."""
+        loc = self._locator(context, strategy, value)
+        loc.wait_for(state="attached", timeout=self._timeout_ms)
+        text = ""
+        try:
+            text = loc.input_value(timeout=1000) or ""
+        except PlaywrightError:
+            text = ""
+        if not text:
+            try:
+                text = loc.text_content(timeout=1000) or ""
+            except PlaywrightError:
+                text = ""
+        return text
 
+    def clear(self, context: Optional[EvaluationContext], strategy: str, value: str) -> None:
+        self._locator(context, strategy, value).fill("", timeout=self._timeout_ms)
 
-@dataclass
-class ModalRecord:
-    modal_id: str
-    page_id: str
-    container_signature: str
-    modal_type: str  # modal | popup | overlay | toast | dialog | side_panel | dropdown_overlay
-    trigger_element_id: Optional[str] = None
-    trigger_action_step: Optional[int] = None
-    appeared_relative_to_action: str = "after"  # "before" | "after"
-    child_element_ids: List[str] = field(default_factory=list)
-    detected_via: List[str] = field(default_factory=list)  # which heuristics matched
-    frame_path: Optional[FramePath] = None
-    discovered_at: float = field(default_factory=now_ts)
+    def select(self, context: Optional[EvaluationContext], strategy: str, value: str, option_text: Optional[str] = None, option_value: Optional[str] = None) -> None:
+        """Recorded <select> steps carry TWO pieces of the chosen option -
+        see models.py's ActionRecord.select_option_text: `option_value`
+        (the option's `value` attribute, preferred at capture time) and
+        `option_text` (its visible label). Real-world `<option value="X">
+        Visible Label</option>` elements very often have X != Visible
+        Label, so a replay that only ever tries one of the two silently/
+        reliably fails whenever the app under test uses distinct codes vs.
+        display text (the common enterprise case) - mirrors the same
+        "no fallback across candidates" bug class already fixed for
+        locators elsewhere in this module. Try the value-attribute match
+        first (it's the more stable of the two - display text is more
+        likely to get relabelled), then the label match, so either one
+        succeeding is enough.
+        """
+        loc = self._locator(context, strategy, value)
+        attempts = []
+        if option_value:
+            attempts.append(("value", option_value))
+        if option_text and option_text != option_value:
+            attempts.append(("label", option_text))
+        elif option_value:
+            # No distinct label available (old recordings made before
+            # select_option_text existed only ever populate option_value -
+            # which, for an option with no value attribute at capture
+            # time, is actually the visible text) - retry the same string
+            # as a label match rather than giving up after one attempt.
+            attempts.append(("label", option_value))
+        if not attempts and option_text:
+            attempts.append(("label", option_text))
 
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        last_exc: Optional[Exception] = None
+        for kind, val in attempts:
+            try:
+                if kind == "value":
+                    loc.select_option(value=val, timeout=self._timeout_ms)
+                else:
+                    loc.select_option(label=val, timeout=self._timeout_ms)
+                return
+            except PlaywrightError as exc:
+                last_exc = exc
+                continue
+        if last_exc is not None:
+            raise last_exc
 
+    def check(self, context: Optional[EvaluationContext], strategy: str, value: str) -> None:
+        self._check_or_uncheck(context, strategy, value, checked=True)
 
-@dataclass
-class FrameRecord:
-    frame_id: str
-    page_id: str
-    frame_locator: str
-    frame_index: int
-    parent_frame_id: Optional[str]
-    nested_depth: int
-    src: str = ""
-    name: str = ""
-    discovered_at: float = field(default_factory=now_ts)
+    def uncheck(self, context: Optional[EvaluationContext], strategy: str, value: str) -> None:
+        self._check_or_uncheck(context, strategy, value, checked=False)
 
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+    def _check_or_uncheck(self, context: Optional[EvaluationContext], strategy: str, value: str, checked: bool) -> None:
+        """Radio buttons (recorded as CHECK - see bridge.js's `change`
+        listener) are overwhelmingly rendered with the real `<input
+        type="radio">` visually hidden (opacity:0, clipped, or positioned
+        off-screen) behind a custom-styled `<span>`/`<label>` the user
+        actually sees and clicks - kept in the DOM, not `display:none`,
+        specifically so it stays focusable/clickable for accessibility. A
+        real user's click always lands on and toggles that real input
+        regardless of how it's styled, which is exactly why this records
+        fine. Playwright's `.check()`/`.uncheck()` require the target to
+        pass an actionability check that includes being visible, though -
+        so a plain call here failed outright on precisely the elements
+        real users click every day, with no retry at all (unlike click(),
+        which already falls back for the same class of problem - see its
+        docstring above).
 
+        Three tiers, cheapest/safest first:
+          1. A normal check()/uncheck() - respects current state, already
+             a no-op if the element is already in the target state.
+          2. The same call with force=True - still state-aware and still
+             idempotent, just skips the visibility/stability actionability
+             checks that reject a genuinely-clickable-but-hidden input.
+          3. Last resort: set `.checked` directly via JS and fire
+             input/change (the same events bridge.js itself listens for)
+             so any React/Vue/Angular state bound to those events still
+             updates. This sets the exact target state explicitly rather
+             than toggling, so - unlike a raw synthetic click - it can't
+             land in the wrong state regardless of what the element's
+             current state was.
+        """
+        loc = self._locator(context, strategy, value)
+        method = "check" if checked else "uncheck"
+        try:
+            getattr(loc, method)(timeout=self._timeout_ms)
+            return
+        except PlaywrightError as exc:
+            logger.warning("%s(): real %s failed (%s) - retrying with force=True (common cause: a custom-styled radio/checkbox with a visually hidden native input).", method, method, exc)
+        try:
+            getattr(loc, method)(timeout=self._timeout_ms, force=True)
+            return
+        except PlaywrightError as exc:
+            logger.warning("%s(): force=True also failed (%s) - falling back to setting the DOM state directly.", method, exc)
+        loc.evaluate(
+            "(el, checked) => { if (el.checked !== checked) { el.checked = checked; el.dispatchEvent(new Event('input', {bubbles: true})); el.dispatchEvent(new Event('change', {bubbles: true})); } }",
+            checked,
+        )
 
-@dataclass
-class PageRecord:
-    page_id: str
-    url: str
-    title: str = ""
-    normalized_key: str = ""       # url path w/o volatile query params - used for page-object naming/dedup
-    first_seen_at: float = field(default_factory=now_ts)
-    last_seen_at: float = field(default_factory=now_ts)
-    dom_snapshot_path: str = ""
-    screenshot_path: str = ""
-    element_ids: List[str] = field(default_factory=list)
-    modal_ids: List[str] = field(default_factory=list)
-    frame_ids: List[str] = field(default_factory=list)
+    def hover(self, context: Optional[EvaluationContext], strategy: str, value: str) -> None:
+        self._locator(context, strategy, value).hover(timeout=self._timeout_ms)
 
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+    def scroll_to(self, context: Optional[EvaluationContext], strategy: str, value: str) -> None:
+        self._locator(context, strategy, value).scroll_into_view_if_needed(timeout=self._timeout_ms)
 
+    def press_key(self, context: Optional[EvaluationContext], strategy: str, value: str, key: str) -> None:
+        self._locator(context, strategy, value).press(_resolve_key(key), timeout=self._timeout_ms)
 
-# --------------------------------------------------------------------------
-# Layer B: User execution recording models
-# --------------------------------------------------------------------------
-@dataclass
-class ActionRecord:
-    step_number: int
-    action: str                       # ActionType
-    timestamp: float = field(default_factory=now_ts)
-    page_url: str = ""
-    page_title: str = ""
-    page_id: str = ""
-    element_id: Optional[str] = None
-    element_text: str = ""
-    element_tag: str = ""
-    element_name: str = ""            # human-friendly generated name, e.g. "email_input_1"
-    primary_locator_type: str = ""
-    primary_locator: str = ""
-    fallback_locators: List[Dict[str, str]] = field(default_factory=list)  # [{type, value}]
-    value: str = ""
-    test_data_key: Optional[str] = None   # e.g. "{{USERNAME}}" placeholder key
-    # Capture -> Store -> Reuse (see recorder.py's _derive_variable_name /
-    # correlation logic, and execution/variable_store.py): a value the app
-    # itself GENERATES fresh every run (an application ID, a reference
-    # number, a freshly-issued OTP) can't be replayed as a static literal -
-    # it's different every execution. When the user copies such a value
-    # during recording, captured_as names the {{variable}} it's stored
-    # under; any LATER step whose recorded value exactly matched that copy
-    # gets resolved_var set to the same name, so at execution time it's
-    # re-read live and re-typed live instead of replaying the stale
-    # recorded string. Independent of test_data_key/Test Data overrides -
-    # an explicit override still wins if both are present.
-    captured_as: Optional[str] = None
-    resolved_var: Optional[str] = None
-    frame_path: Optional[FramePath] = None
-    window_context: str = ""
-    modal_context: Optional[str] = None
-    wait_condition: str = ""
-    # SELECT steps only (see recorder.py's _handle_raw_event and
-    # bridge.js's `change` listener on <select> elements): `value` above
-    # holds the option's underlying `value` ATTRIBUTE (preferred at
-    # capture time since it's what Playwright's select_option(value=...)
-    # matches on), while select_option_text holds that same option's
-    # VISIBLE text. Real-world <option value="X">Visible Label</option>
-    # elements very often have X != Visible Label, so replay needs both:
-    # try the value-attribute match first, fall back to the label match
-    # if the option's value attribute has since changed but its visible
-    # text hasn't (or vice versa) - see action_engine.select().
-    select_option_text: str = ""
-    # Marks a step whose target element is EXPECTED to sometimes be absent
-    # on the live page - e.g. a denomination-table row that only renders
-    # for certain amounts, or one branch of a conditional/maker-checker
-    # workflow that the recorded run happened to take but a later run
-    # might not. Almost never set by the recorder itself - normally a
-    # manual designation the user adds in Review & Edit Steps after seeing
-    # a step fail for a data/flow reason rather than a locator bug. The
-    # one automatic exception: recorder.py flags a CLICK on the exact same
-    # element as the immediately preceding CLICK (e.g. a login/submit
-    # button clicked again after an error message or a slow response) -
-    # that retry is genuinely sometimes needed, so it's kept rather than
-    # deduped, but whether IT is needed on replay depends on whether the
-    # first click already worked this run. When true, a failed lookup
-    # gets a short wait (OPTIONAL_STEP_WAIT_SECONDS), skips AI
-    # self-healing entirely, and is reported as SKIP rather than FAIL -
-    # see Executor._run_step().
-    is_optional: bool = False
-    expected_result: str = ""
-    screenshot: str = ""
-    # BRD/SD change-detection bookkeeping (see backend/change_detection/) -
-    # never set by the recorder itself, only by change_applier.py after a
-    # document upload is reviewed and confirmed. A normal recorded step
-    # always has is_disabled=False and change_status="UNCHANGED".
-    is_disabled: bool = False        # True -> Executor skips instantly, no locator attempt at all
-    disabled_reason: str = ""
-    change_status: str = "UNCHANGED"  # "UNCHANGED" | "ADDED" | "REMOVED"
-    change_set_id: str = ""
+    def submit(self, context: Optional[EvaluationContext], strategy: str, value: str) -> None:
+        loc = self._locator(context, strategy, value)
+        try:
+            loc.evaluate(
+                "el => { if (el.form) { el.form.requestSubmit ? el.form.requestSubmit() : el.form.submit(); } "
+                "else { el.click(); } }",
+                timeout=self._timeout_ms,
+            )
+        except PlaywrightError:
+            loc.click(timeout=self._timeout_ms)
 
-    def to_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
-        return d
+    def upload(self, context: Optional[EvaluationContext], strategy: str, value: str, file_path: str) -> None:
+        # Playwright's set_input_files() is native support for file
+        # inputs - it works even on inputs hidden via CSS (a common
+        # pattern for custom-styled upload buttons), which Selenium's
+        # send_keys()-onto-the-input hack could not reliably do.
+        self._locator(context, strategy, value).set_input_files(file_path, timeout=self._timeout_ms)
 
-    def to_flat_row(self) -> Dict[str, Any]:
-        """Flattened representation matching the Excel execution schema."""
-        fb = self.fallback_locators or []
-        return {
-            "Step_Number": self.step_number,
-            "Action": self.action,
-            "Page_URL": self.page_url,
-            "Page_Title": self.page_title,
-            "Element_Name": self.element_name,
-            "Element_Text": self.element_text,
-            "Element_Tag": self.element_tag,
-            "Primary_Locator_Type": self.primary_locator_type,
-            "Primary_Locator": self.primary_locator,
-            "Fallback_Locator_1": _fb_value(fb, 0),
-            "Fallback_Locator_2": _fb_value(fb, 1),
-            "Fallback_Locator_3": _fb_value(fb, 2),
-            "Value": self.value,
-            "Test_Data_Key": self.test_data_key or "",
-            "Captured_As": self.captured_as or "",
-            "Resolved_Variable": self.resolved_var or "",
-            "Frame_Path": _frame_path_str(self.frame_path),
-            "Window_Context": self.window_context,
-            "Modal_Context": self.modal_context or "",
-            "Wait_Condition": self.wait_condition,
-            "Select_Option_Text": self.select_option_text,
-            "Optional_Step": "Y" if self.is_optional else "",
-            "Expected_Result": self.expected_result,
-            "Screenshot": self.screenshot,
-            "Disabled": "Y" if self.is_disabled else "",
-            "Disabled_Reason": self.disabled_reason,
-            "Change_Status": self.change_status,
-            "Change_Set_Id": self.change_set_id,
-        }
+    def navigate_back(self, page: Optional[Page] = None) -> None:
+        (page or self.page).go_back()
 
+    def navigate_forward(self, page: Optional[Page] = None) -> None:
+        (page or self.page).go_forward()
 
-def _fb_value(fallbacks: List[Dict[str, str]], idx: int) -> str:
-    if idx < len(fallbacks):
-        f = fallbacks[idx]
-        return f"{f.get('type', '')}::{f.get('value', '')}"
-    return ""
-
-
-def _frame_path_str(fp: Optional[FramePath]) -> str:
-    """Serialized as JSON (not a display string) so the executor can
-    losslessly reconstruct the FramePath to drive Selenium through the
-    exact same iframe hierarchy that was recorded. Empty string means
-    top-level document (no frames)."""
-    if not fp or not fp.path:
-        return ""
-    import json as _json
-    return _json.dumps(fp.to_dict())
-
-
-def parse_frame_path(value: str) -> Optional["FramePath"]:
-    if not value:
-        return None
-    import json as _json
-    try:
-        data = _json.loads(value)
-        return FramePath(**data)
-    except (ValueError, TypeError):
-        return None
-
-
-# --------------------------------------------------------------------------
-# Recording metadata
-# --------------------------------------------------------------------------
-@dataclass
-class RecordingMetadata:
-    recording_id: str
-    name: str
-    target_url: str
-    created_at: float = field(default_factory=now_ts)
-    updated_at: float = field(default_factory=now_ts)
-    status: str = "in_progress"   # in_progress | stopped | paused
-    browser: str = "chrome"
-    total_steps: int = 0
-    total_pages: int = 0
-    total_executions: int = 0
-    last_execution_at: Optional[float] = None
-    test_data_keys: List[str] = field(default_factory=list)
-    # A business-facing transaction code/name (e.g. "1010", "Cash Deposit") -
-    # never set by the recorder itself. Lets a BRD/Solution Document that
-    # references "Transaction 1010" be matched to the right recording when
-    # detecting element changes - see change_detection/transaction_matcher.py.
-    # Blank means "not tagged yet"; a recording can still be executed
-    # normally without one.
-    transaction_code: str = ""
-    # Who this recording belongs to (see backend/auth/) - set once, at
-    # creation time, from the logged-in user who started the recording.
-    # A regular user only ever sees/acts on recordings where
-    # owner_user_id matches their own user_id; an admin sees every
-    # recording regardless. owner_username is stored purely for display
-    # (an admin's Recordings/Reports/Change Detection views show "by
-    # <username>") so those pages don't need a UserStore lookup per row -
-    # it is NEVER used for the access check itself, only owner_user_id is
-    # (a username can change; the id it was created under can't).
-    # Blank means "no owner recorded" - only an admin can see/act on a
-    # recording in that state (see backend/app.py's _can_access_recording).
-    owner_user_id: str = ""
-    owner_username: str = ""
-    # Which application (see backend/applications/application_store.py)
-    # this recording belongs to - a tester working through 6-7+ different
-    # applications tags each recording at creation time by picking (or
-    # adding) an entry from a small, shared, growing list. Stores only the
-    # ApplicationStore id, never a copy of its name, so renaming the
-    # application later (once its official name is approved) is instantly
-    # reflected for every recording tagged with it - see
-    # ApplicationStore.rename(). Blank means "not tagged" - a recording can
-    # still be executed normally without one, exactly like transaction_code
-    # above.
-    application_id: str = ""
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-# --------------------------------------------------------------------------
-# Healing event model
-# --------------------------------------------------------------------------
-@dataclass
-class HealingEvent:
-    healing_id: str
-    step_number: int
-    page_url: str
-    old_locator_type: str
-    old_locator: str
-    new_locator_type: str
-    new_locator: str
-    confidence: float
-    healing_method: str        # "fallback" | "repository" | "dom_similarity" | "ai_semantic"
-    reason: str = ""
-    timestamp: float = field(default_factory=now_ts)
-    applied: bool = False
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-# --------------------------------------------------------------------------
-# Execution result models
-# --------------------------------------------------------------------------
-@dataclass
-class StepResult:
-    step_number: int
-    action: str
-    page_url: str
-    element_name: str
-    locator_used: str
-    locator_strategy: str
-    input_data: str
-    expected_result: str
-    actual_result: str
-    execution_time_ms: float
-    status: str                 # PASS | FAIL | SKIP | HEALED
-    screenshot: str = ""
-    error: str = ""
-    healing_event: Optional[Dict[str, Any]] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class ExecutionSummary:
-    execution_id: str
-    recording_id: str
-    recording_name: str
-    target_url: str
-    browser: str
-    start_time: float
-    end_time: Optional[float] = None
-    total_steps: int = 0
-    passed: int = 0
-    failed: int = 0
-    skipped: int = 0
-    healed: int = 0
-    step_results: List[Dict[str, Any]] = field(default_factory=list)
-
-    @property
-    def duration_seconds(self) -> float:
-        if self.end_time is None:
-            return 0.0
-        return round(self.end_time - self.start_time, 2)
-
-    @property
-    def pass_percentage(self) -> float:
-        if self.total_steps == 0:
-            return 0.0
-        return round(100.0 * self.passed / self.total_steps, 2)
-
-    @property
-    def fail_percentage(self) -> float:
-        if self.total_steps == 0:
-            return 0.0
-        return round(100.0 * self.failed / self.total_steps, 2)
-
-    def to_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
-        d["duration_seconds"] = self.duration_seconds
-        d["pass_percentage"] = self.pass_percentage
-        d["fail_percentage"] = self.fail_percentage
-        return d
+    def is_present(self, context: Optional[EvaluationContext], strategy: str, value: str, timeout: float = 2.0) -> bool:
+        try:
+            self._locator(context, strategy, value).wait_for(state="attached", timeout=timeout * 1000)
+            return True
+        except PlaywrightTimeoutError:
+            return False
