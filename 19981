@@ -1,324 +1,319 @@
 """
-browser_factory.py
+playwright_executor.py (formerly selenium_executor.py)
 
-Creates (or connects to) a Playwright browser + context + page, shared by
-both the recorder (manual recording session) and the executor (replay).
+Low-level bridge between a single Excel step-row and Playwright. Given a
+resolved (locator_type, locator_value) pair, dispatches to the right
+ActionEngine method based on the row's Action column. Also implements
+Self-Healing Stages 1-2 (try primary locator, then each fallback locator)
+since those are cheap/deterministic and don't need the full healing
+pipeline in healing/self_healer.py.
 
-IMPORTANT - Playwright's sync API is single-threaded: every Playwright
-call (launch, navigate, click, evaluate, ...) must happen on the same
-Python thread that started `sync_playwright()`. Calling Playwright objects
-from a different thread raises a greenlet/threading error, not a clean
-exception you can catch and ignore. Both callers of this module -
-RecorderSession's background polling thread, and Executor.run() (already
-invoked from ExecutionManager's own worker thread) - create their
-PlaywrightSession here and use it ENTIRELY within that one owning thread,
-including final cleanup via close(). Neither caller may hand the session
-to another thread, and Executor.terminate() (called from a different,
-request-handling thread - see executor.py) deliberately does not touch
-the Playwright objects directly for exactly this reason.
-
-Driver/browser binary resolution: unlike Selenium (which needed a
-matching chromedriver/msedgedriver binary, downloaded via webdriver-
-manager or pointed at manually), Playwright manages its own browser
-binaries - run `playwright install` once (see README section 4) and every
-supported browser is available with no separate driver management, no
-version-matching headaches, and no CHROME_DRIVER_PATH/EDGE_DRIVER_PATH
-settings to configure.
+Takes a `PlaywrightSession` (see recorder/browser_factory.py) rather than
+a bare Page, because a handful of actions (SWITCH_WINDOW, NEW_TAB,
+CLOSE_TAB) need to change which Page is "active" for every step after
+them - Playwright has no single mutable "current window" the way
+Selenium's driver did, so `session.page` IS that piece of mutable state,
+updated in place by the tab-management helpers below.
 """
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import Optional
+import time
+from typing import Any, Dict, Optional, Tuple
 
-from playwright.sync_api import Browser, BrowserContext, BrowserType, Page, Playwright, sync_playwright
+from playwright.sync_api import Error as PlaywrightError
 
 from backend.config import settings
+from backend.execution.action_engine import ActionEngine
+from backend.recorder import iframe_handler
+from backend.recorder.browser_factory import PlaywrightSession
+from backend.recorder.js_bridge import EvaluationContext
+from backend.storage.models import ActionType
 
-logger = logging.getLogger("universal_automation.recorder")
+logger = logging.getLogger("universal_automation.playwright_executor")
 
-
-class RemoteNodeUnreachableError(RuntimeError):
-    pass
-
-
-@dataclass
-class PlaywrightSession:
-    """Owns the full Playwright object graph for one browser session -
-    must be created AND closed on the same thread (see module docstring).
-    `page` is the one active tab callers interact with; recorder.py tracks
-    additional tabs itself via `context.pages` as they open."""
-    playwright: Playwright
-    browser: Browser
-    context: BrowserContext
-    page: Page
-
-    def close(self) -> None:
-        """Best-effort, ignores errors - mirrors the old driver.quit()'s
-        "don't fail the caller just because cleanup hit a snag (browser
-        already crashed/closed)" behavior."""
-        for obj, method in ((self.context, "close"), (self.browser, "close"), (self.playwright, "stop")):
-            try:
-                getattr(obj, method)()
-            except Exception:
-                pass
+# Actions that don't require resolving a locator/frame at all.
+_NO_LOCATOR_ACTIONS = (
+    ActionType.OPEN_URL, ActionType.WAIT, ActionType.SWITCH_WINDOW,
+    ActionType.NEW_TAB, ActionType.CLOSE_TAB, ActionType.NAVIGATE_BACK, ActionType.NAVIGATE_FORWARD,
+)
 
 
-# Real browsers ignore a page's own `window.close()` call unless that tab
-# believes it was opened by another script (via window.open(), a
-# target="_blank" link, etc.) - which is why a human clicking around a
-# target application never notices anything when its JS calls this: on
-# an ordinary, manually-opened tab it's just silently a no-op. Every page
-# Playwright creates, though, is opened through the DevTools protocol,
-# which Chromium/Edge internally treats the same way as "opened by
-# script" - so on an automation-driven tab, that same window.close() call
-# actually succeeds and tears the tab down out from under the run. This
-# surfaces as a step failing with "Target page, context or browser has
-# been closed" - indistinguishable, from this app's side, from a genuine
-# crash, except that it reliably recurs at the exact same step on every
-# retry of the exact same recording (a real crash wouldn't). Overriding
-# window.close to a no-op via an init script (which Playwright re-applies
-# to every new document, including after navigations, unlike a one-off
-# page.evaluate()) neutralizes this at the source, regardless of which
-# target application or which step triggers it. This does NOT affect this
-# platform's own deliberate tab handling (CLOSE_TAB uses Playwright's own
-# page.close() via CDP, not in-page JS, so it's a completely separate
-# mechanism untouched by this).
-_NEUTRALIZE_WINDOW_CLOSE_SCRIPT = "window.close = () => {};"
+def resolve_frame(session: PlaywrightSession, step: Dict[str, Any]) -> Optional[EvaluationContext]:
+    """Resolves the exact Frame/Page a step's element lives in from its
+    recorded FramePath, starting from the current active page. Returns
+    None if any segment of the path can no longer be resolved (e.g. the
+    iframe no longer exists) - the caller treats that as a locator
+    failure, same as before."""
+    return iframe_handler.resolve_frame(session.page, step.get("frame_path"))
 
 
-def _harden_context_against_self_close(context: BrowserContext) -> None:
-    context.add_init_script(_NEUTRALIZE_WINDOW_CLOSE_SCRIPT)
+def _switch_to_latest_page(session: PlaywrightSession) -> None:
+    pages = session.context.pages
+    if pages:
+        session.page = pages[-1]
+        try:
+            session.page.bring_to_front()
+        except PlaywrightError:
+            pass
 
 
-# Reported symptom: a step's click reliably ends with "Target page, context
-# or browser has been closed" - but the raw Playwright error alone can't
-# tell you WHY the page disappeared. At least three real, very different
-# causes all look identical from that error message alone: (1) the target
-# application's own logout/session-timeout redirect genuinely ending the
-# run, (2) the clicked link opening its destination in a brand-new tab and
-# the application replacing/closing the original one as part of that hand-
-# off (common for government-scheme-style micro-apps) - recoverable, since
-# the run could simply continue on the new tab, or (3) the page's renderer
-# actually crashing (a heavy/broken page, unrelated to any session logic),
-# which no amount of retrying or self-healing can recover from. Without
-# this, the application log gives no way to tell those apart after the
-# fact. Attached to every page in the context up front, and to every page
-# opened later (a new tab/popup), so nothing slips past unwatched.
-def _attach_close_diagnostics(context: BrowserContext) -> None:
-    def _watch_page(page: Page) -> None:
-        def _on_close() -> None:
-            try:
-                remaining = len(context.pages)
-            except Exception:
-                remaining = -1
-            logger.warning(
-                "[page_closed] A page closed (last known url=%s). %d page(s) remain open in "
-                "this context. If that's more than 0, the target application most likely "
-                "replaced this tab with a new one rather than the session actually ending - "
-                "if it's 0, this was probably a genuine logout/session-timeout/crash.",
-                getattr(page, "url", "?"), remaining,
-            )
-
-        def _on_crash() -> None:
-            logger.error(
-                "[page_crashed] The renderer for a page CRASHED (url=%s). This is a browser/page "
-                "crash, not an application logout or session timeout - self-healing/retries "
-                "cannot recover from it, and the rest of this context is normally unusable "
-                "afterwards.",
-                getattr(page, "url", "?"),
-            )
-
-        def _on_popup(popup: Page) -> None:
-            # Fires specifically when THIS page opened another one via
-            # window.open()/target="_blank" - context.on("page") below
-            # already watches the popup itself (close/crash), so this is
-            # purely an extra, more informative log line correlating which
-            # page opened which - a `window.open()` your JS didn't ask for
-            # a handle to (a "fire and forget" popup) is otherwise
-            # invisible until it closes.
-            logger.info(
-                "[popup_opened] %s opened a popup/new tab -> %s",
-                getattr(page, "url", "?"), getattr(popup, "url", "?"),
-            )
-
-        page.on("close", _on_close)
-        page.on("crash", _on_crash)
-        page.on("popup", _on_popup)
-
-    for existing in context.pages:
-        _watch_page(existing)
-    context.on("page", _watch_page)
-
-
-def _resolve_browser_type(pw: Playwright, browser: str) -> BrowserType:
-    b = (browser or "chrome").lower()
-    if b == "firefox":
-        return pw.firefox
-    if b in ("webkit", "safari"):
-        return pw.webkit
-    # "chrome" and "edge" both run on Chromium under Playwright - the
-    # bundled Chromium build is used for both by default (no separate
-    # driver/binary to install or version-match). Set PLAYWRIGHT_CHANNEL
-    # (e.g. "msedge" or "chrome") in .env if you specifically need the
-    # real installed browser binary instead of Playwright's bundled one.
-    return pw.chromium
-
-
-def create_session(
-    browser: str = None,
-    headless: bool = None,
-    remote_node_url: Optional[str] = None,
-) -> PlaywrightSession:
-    """Launches (or connects to) a browser and returns a ready-to-use
-    PlaywrightSession. Must be called on the thread that will go on to use
-    it - see the module docstring."""
-    browser = (browser or settings.DEFAULT_BROWSER).lower()
-    headless = settings.BROWSER_HEADLESS if headless is None else headless
-
-    pw = sync_playwright().start()
-    browser_type = _resolve_browser_type(pw, browser)
-
-    if remote_node_url:
-        return _connect_remote(pw, browser_type, remote_node_url)
-
-    launch_kwargs = {"headless": headless, "args": ["--disable-notifications", "--disable-popup-blocking"]}
-    if settings.PLAYWRIGHT_CHANNEL:
-        launch_kwargs["channel"] = settings.PLAYWRIGHT_CHANNEL
-    elif browser == "edge":
-        launch_kwargs["channel"] = "msedge"
-
-    # Reported symptom: recording and replay both open a visibly small
-    # browser window. `viewport=None` below (kept from before) only stops
-    # Playwright from clamping the CONTENT area to its own fixed 1280x720
-    # default on top of whatever window size the browser actually opened
-    # at - it does nothing to make that OS-level window itself large in
-    # the first place, despite the comment that used to be here claiming
-    # it was "the closest equivalent of Selenium's --start-maximized". A
-    # real --start-maximized-equivalent flag has to be passed at launch.
-    # Only relevant for a headed browser (headless has no real window to
-    # size) and differs per engine - Chromium takes a genuine
-    # --start-maximized flag; Firefox has no such flag but does honor
-    # -width/-height, which combined with viewport=None gets it just as
-    # large. WebKit has neither and is only ever used here for
-    # cross-engine spot-checks, not everyday recording/execution.
-    if not headless:
-        if browser_type is pw.chromium:
-            launch_kwargs["args"].append("--start-maximized")
-        elif browser_type is pw.firefox:
-            launch_kwargs["args"].extend(["-width", "1920", "-height", "1080"])
-
-    # A second, separate bug in the same "small window" symptom, easy to
-    # miss because it looks like it should work: passing viewport=None to
-    # new_context() below (which is what this used to do) does NOT reach
-    # Playwright's server at all. The Python bindings' locals_to_params()
-    # helper strips every argument whose value is exactly None before
-    # sending the call over the wire - so `new_context(viewport=None)` and
-    # `new_context()` produce the byte-for-byte identical request. Once
-    # neither `viewport` nor `noDefaultViewport` is present in that
-    # request, Playwright's own server-side default kicks in
-    # unconditionally: `if (!options.viewport && !options.noDefaultViewport)
-    # options.viewport = {width: 1280, height: 720}` (see
-    # driver/package/lib/server/browserContext.js). The end result: even
-    # with --start-maximized correctly maximizing the actual OS window
-    # above, the PAGE CONTENT inside it was still being force-rendered into
-    # a fixed 1280x720 box - which is exactly what "the browser opens
-    # half-screen" looks like on any monitor larger than that. The real,
-    # working flag is no_viewport=True (see below) - an explicit True
-    # survives locals_to_params() and actually sets noDefaultViewport.
+def _wait_for_new_page_or_open_blank(session: PlaywrightSession, timeout: float) -> None:
+    """Recorded when the recorder observed the page count go up - almost
+    always a side effect of the *previous* step (e.g. clicking a login/SSO
+    button that opens a popup), not something deliberately recreated here.
+    Waits briefly for the real popup (already triggered by the previous
+    step) to actually appear, and only opens a blank tab as a last resort
+    if one genuinely never shows up - mirrors the old Selenium version's
+    same reasoning, now via Playwright's own page-count/bring_to_front."""
+    before = len(session.context.pages)
+    deadline = time.time() + timeout
+    while len(session.context.pages) <= before and time.time() < deadline:
+        time.sleep(0.2)
+    if len(session.context.pages) <= before:
+        session.page = session.context.new_page()
+    else:
+        session.page = session.context.pages[-1]
     try:
-        b = browser_type.launch(**launch_kwargs)
-    except Exception as exc:
-        requested_channel = launch_kwargs.get("channel")
-        if requested_channel:
-            # Deliberately NOT falling back to Playwright's own bundled
-            # Chromium build here (the way this used to unconditionally do)
-            # - that fallback needs `playwright install`, which several
-            # deployments of this platform cannot run at all (locked-down
-            # environments with no package-download access), and is
-            # exactly why PLAYWRIGHT_CHANNEL/DEFAULT_BROWSER default to the
-            # real installed "msedge" channel in the first place (see
-            # config.py). Silently trying the bundled build anyway would
-            # either fail again with a much more confusing "executable
-            # doesn't exist" error, or - worse - quietly succeed on a
-            # DIFFERENT, unintended browser, which is exactly the kind of
-            # silent inconsistency this platform has been chasing all
-            # session. Fail loudly and specifically instead, so a launch
-            # problem is diagnosed as what it actually is (Edge isn't
-            # installed/reachable here) rather than masked.
-            raise RuntimeError(
-                f"Could not launch the '{requested_channel}' browser channel ({exc}). This platform "
-                f"is configured to use the real installed {requested_channel} binary, not Playwright's "
-                "own bundled Chromium (which needs `playwright install` and is not assumed to be "
-                "available) - verify Microsoft Edge is actually installed on this machine and that "
-                "Playwright can find it. Set PLAYWRIGHT_CHANNEL in .env to change which real browser "
-                "channel is used, or clear it (and set DEFAULT_BROWSER to something other than "
-                "'edge') only if this environment genuinely relies on Playwright's bundled build."
-            ) from exc
-        # No channel was explicitly requested at all - a plain, channel-
-        # less launch failing is far more likely a transient/environment
-        # issue than "the wrong browser is installed", so falling back to
-        # Playwright's own bundled build here (unlike the case above) is
-        # still a reasonable, low-risk recovery.
-        b = browser_type.launch(**launch_kwargs)
-
-    logger.info(
-        "[browser_launched] channel=%s headless=%s",
-        launch_kwargs.get("channel") or "(Playwright's bundled build, no channel requested)", headless,
-    )
-
-    # no_viewport=True (NOT viewport=None - see the note above try/except
-    # for why that looked plausible but silently did nothing) lets the
-    # actual (now maximized/full-size) browser window's size drive content
-    # size instead of Playwright's default fixed 1280x720 viewport.
-    context = b.new_context(no_viewport=True)
-    _harden_context_against_self_close(context)
-    _attach_close_diagnostics(context)
-    page = context.new_page()
-    return PlaywrightSession(playwright=pw, browser=b, context=context, page=page)
+        session.page.bring_to_front()
+    except PlaywrightError:
+        pass
 
 
-def _connect_remote(pw: Playwright, browser_type: BrowserType, remote_node_url: str) -> PlaywrightSession:
-    """Connects to a browser already running on someone else's PC instead
-    of launching one locally - lets multiple people share one central
-    instance of this platform while each person's recording/execution
-    runs in their own local browser (see the README's "remote browser
-    sessions" section).
-
-    NOTE for anyone who used this feature under the old Selenium version:
-    the endpoint you point this at has CHANGED. Selenium connected to a
-    bare chromedriver/msedgedriver binary (or a Selenium Grid node)
-    speaking the WebDriver wire protocol. Playwright has no such protocol;
-    it instead connects either to Chromium's own DevTools Protocol (CDP)
-    endpoint (launch Chrome/Chromium on their machine with
-    `--remote-debugging-port=<port>`, reachable as
-    `http://<their-ip>:<port>`) or to a `playwright run-server` endpoint
-    (a `ws://` / `wss://` URL). A `ws://`/`wss://` URL is treated as a
-    Playwright server endpoint; anything else is treated as a CDP
-    endpoint.
-    """
+def _close_current_page(session: PlaywrightSession) -> None:
     try:
-        if remote_node_url.startswith(("ws://", "wss://")):
-            b = browser_type.connect(remote_node_url)
+        session.page.close()
+    except PlaywrightError:
+        pass
+    remaining = session.context.pages
+    if remaining:
+        session.page = remaining[0]
+
+
+def _follow_new_tab_if_one_replaced_this_page(session: PlaywrightSession) -> bool:
+    """Reported symptom: a click on a "Open Scheme"-style link reliably
+    ended with "Target page, context or browser has been closed" - which
+    reads identically whether the application's session genuinely died, OR
+    the click legitimately opened its destination in a brand-new tab and
+    replaced/closed the original as part of that hand-off (a common
+    pattern for government-scheme-style micro-apps). Only the second case
+    is recoverable: if the acting page is now closed but the context still
+    has another page open with a real (non-blank) URL, that's a strong
+    signal the run should simply continue there rather than being treated
+    as a lost session. See browser_factory._attach_close_diagnostics(),
+    which logs this same signal either way so it's visible in the
+    application log regardless of which path this function takes."""
+    try:
+        if not session.page.is_closed():
+            return False
+        candidates = [p for p in session.context.pages if not p.is_closed()]
+    except PlaywrightError:
+        return False
+    if not candidates:
+        return False
+    newest = candidates[-1]
+    try:
+        newest_url = newest.url
+    except PlaywrightError:
+        return False
+    if not newest_url or newest_url == "about:blank":
+        return False  # no real destination to follow - don't guess
+    session.page = newest
+    try:
+        session.page.bring_to_front()
+    except PlaywrightError:
+        pass
+    return True
+
+
+def _parse_scroll_position(value: str) -> Tuple[Optional[int], Optional[int]]:
+    """Recorder.py encodes a recorded scroll's window.scrollX/scrollY as
+    "{x}:{y}" in the step's `value` (see its ActionType.SCROLL handling).
+    Returns (None, None) for anything that doesn't parse - a step recorded
+    before this existed, or a genuinely malformed value - so the caller can
+    fall back to the old generic nudge instead of crashing the step."""
+    if not value or ":" not in value:
+        return None, None
+    x_str, _, y_str = value.partition(":")
+    try:
+        return int(float(x_str)), int(float(y_str))
+    except ValueError:
+        return None, None
+
+
+def _scroll_to_recorded_position(session: PlaywrightSession, value: str) -> None:
+    """Reproduces a recorded page-level scroll (no specific element to
+    scroll to - see recorder.py's ActionType.SCROLL handling and the
+    execute_with_fallbacks() comment above) by scrolling to the exact
+    recorded window position, instead of the old fixed, arbitrary
+    `mouse.wheel(0, 400)` nudge that never actually matched what the user
+    did while recording."""
+    x, y = _parse_scroll_position(value)
+    if x is None or y is None:
+        session.page.mouse.wheel(0, 400)  # older recording with no captured position - best effort
+        return
+    try:
+        session.page.evaluate("([sx, sy]) => window.scrollTo(sx, sy)", [x, y])
+    except PlaywrightError:
+        session.page.mouse.wheel(0, 400)
+
+
+def try_locator(engine: ActionEngine, session: PlaywrightSession, step: Dict[str, Any], locator_type: str, locator_value: str) -> Tuple[bool, str]:
+    """Attempts to perform the step's action using a specific locator.
+    Returns (success, error_message)."""
+    action = step.get("action", "")
+    value = step.get("value", "")
+
+    context = None
+    if action not in _NO_LOCATOR_ACTIONS:
+        context = resolve_frame(session, step)
+        if context is None:
+            return False, "Unable to resolve the recorded frame hierarchy"
+
+    try:
+        if action == ActionType.OPEN_URL:
+            session.page.goto(step.get("value") or step.get("page_url"))
+        elif action == ActionType.CLICK:
+            engine.click(context, locator_type, locator_value)
+        elif action == ActionType.DOUBLE_CLICK:
+            engine.double_click(context, locator_type, locator_value)
+        elif action == ActionType.RIGHT_CLICK:
+            engine.right_click(context, locator_type, locator_value)
+        elif action == ActionType.TYPE:
+            engine.type(context, locator_type, locator_value, value)
+        elif action == ActionType.CLEAR:
+            engine.clear(context, locator_type, locator_value)
+        elif action == ActionType.SELECT:
+            # `value` is the recorded option's value ATTRIBUTE (recorder.py
+            # prefers it); select_option_text is that same option's visible
+            # label, captured separately since the two very often differ
+            # in real apps - see action_engine.select() for the fallback
+            # chain between them.
+            engine.select(context, locator_type, locator_value, option_text=step.get("select_option_text") or None, option_value=value or None)
+        elif action == ActionType.CHECK:
+            engine.check(context, locator_type, locator_value)
+        elif action == ActionType.UNCHECK:
+            engine.uncheck(context, locator_type, locator_value)
+        elif action == ActionType.HOVER:
+            engine.hover(context, locator_type, locator_value)
+        elif action == ActionType.SCROLL:
+            if locator_value:
+                engine.scroll_to(context, locator_type, locator_value)
+            else:
+                _scroll_to_recorded_position(session, value)
+        elif action == ActionType.PRESS_KEY:
+            engine.press_key(context, locator_type, locator_value, value or "Tab")
+        elif action == ActionType.PRESS_ENTER:
+            engine.press_key(context, locator_type, locator_value, "Enter")
+        elif action == ActionType.PRESS_TAB:
+            engine.press_key(context, locator_type, locator_value, "Tab")
+        elif action == ActionType.WAIT:
+            time.sleep(float(value) if value else 1.0)
+        elif action == ActionType.SUBMIT:
+            engine.submit(context, locator_type, locator_value)
+        elif action == ActionType.UPLOAD:
+            engine.upload(context, locator_type, locator_value, value)
+        elif action == ActionType.SWITCH_FRAME:
+            pass  # frame context is resolved per-step from frame_path already; nothing further to do
+        elif action == ActionType.SWITCH_WINDOW:
+            _switch_to_latest_page(session)
+        elif action == ActionType.NEW_TAB:
+            _wait_for_new_page_or_open_blank(session, engine.timeout)
+        elif action == ActionType.CLOSE_TAB:
+            _close_current_page(session)
+        elif action == ActionType.NAVIGATE_BACK:
+            engine.navigate_back(session.page)
+        elif action == ActionType.NAVIGATE_FORWARD:
+            engine.navigate_forward(session.page)
+        elif action == ActionType.CAPTURE:
+            # Capture -> Store -> Reuse (see execution/variable_store.py):
+            # stash the result on the step dict itself rather than
+            # widening this function's (success, error) return contract -
+            # `step` is already a fresh per-step dict by the time it
+            # reaches here (Executor._run_step builds one per step), so
+            # this is a safe, local side channel the caller reads right
+            # after this call returns.
+            step["_captured_value"] = engine.read_current_text(context, locator_type, locator_value)
         else:
-            b = browser_type.connect_over_cdp(remote_node_url)
-    except Exception as exc:
-        pw.stop()
-        raise RemoteNodeUnreachableError(
-            f"Could not reach the remote browser endpoint '{remote_node_url}'. Under Playwright this must "
-            "be a Chromium DevTools Protocol endpoint (launch Chrome/Chromium there with "
-            "--remote-debugging-port=<port>, reachable as http://<their-ip>:<port>) or a `playwright "
-            "run-server` ws:// endpoint - NOT a chromedriver/msedgedriver binary, which is what the old "
-            f"Selenium version of this platform used. Original error: {exc}"
-        ) from exc
+            return False, f"Unknown action type: {action}"
+        return True, ""
+    except PlaywrightError as exc:
+        # Deliberately not restricted to click-family actions: a new
+        # window/tab/popup replacing the page a step was acting on can
+        # show up as the *result* of any action, not just a plain click
+        # (a TYPE that submits on its last keystroke, a SELECT that
+        # triggers navigation via an onchange handler, a CHECK that
+        # confirms a modal choice, ...) - see
+        # _follow_new_tab_if_one_replaced_this_page()'s own docstring for
+        # why this is still safe to apply generically: it only ever
+        # engages when the page this step was acting on is confirmed
+        # closed AND another real (non-blank) page exists to continue on,
+        # which is a specific, rare, meaningful signal - not a blanket
+        # "ignore any error".
+        if _follow_new_tab_if_one_replaced_this_page(session):
+            logger.warning(
+                "Step's action closed the page it acted on, but the target application opened a "
+                "new window/tab/popup (now on %s) - continuing there instead of treating this as "
+                "a lost session. Action: %s. Original error: %s", session.page.url, action, exc,
+            )
+            return True, ""
+        return False, f"{type(exc).__name__}: {str(exc)[:300]}"
 
-    context = b.contexts[0] if b.contexts else b.new_context(no_viewport=True)
-    # Applied unconditionally, whether this context was freshly created or
-    # is a pre-existing one reused from the remote browser - a context
-    # that already had pages open before we connected could just as easily
-    # be carrying the same self-close vulnerability, and add_init_script()
-    # is harmless to call again if it somehow already had it.
-    _harden_context_against_self_close(context)
-    _attach_close_diagnostics(context)
-    page = context.pages[0] if context.pages else context.new_page()
-    return PlaywrightSession(playwright=pw, browser=b, context=context, page=page)
+
+def execute_with_fallbacks(engine: ActionEngine, session: PlaywrightSession, step: Dict[str, Any]) -> Dict[str, Any]:
+    """Self-healing Stage 1 + Stage 2: try the primary locator, then each
+    fallback locator in order. Returns a dict describing the outcome,
+    including which locator ultimately worked (if any) so the caller can
+    decide whether a "soft heal" (fallback promoted to primary) is
+    warranted."""
+    action = step.get("action", "")
+    if action in _NO_LOCATOR_ACTIONS:
+        ok, err = try_locator(engine, session, step, step.get("primary_locator_type", ""), step.get("primary_locator", ""))
+        return {"success": ok, "locator_type": step.get("primary_locator_type", ""), "locator_value": step.get("primary_locator", ""), "stage": "direct", "error": err}
+
+    primary_type = step.get("primary_locator_type", "")
+    primary_value = step.get("primary_locator", "")
+
+    # A recorded SCROLL step almost always has no target element at all -
+    # bridge.js's scroll listener fires on the window/document, never on a
+    # specific element (see recorder.py's _handle_raw_event), so a blank
+    # locator here is the NORMAL, expected case, not a broken recording.
+    # Treating it as a healable locator failure burned the full
+    # self-healing pipeline (locator repository search, live DOM crawl, AI
+    # stage) on every single recorded scroll - which could take upwards of
+    # ten seconds before still failing outright. Burning that much real
+    # time mid-run has already been confirmed (see the submit-button NAME
+    # collision fix) to risk colliding with a banking app's own session/
+    # idle timeout and taking the whole browser session down with it -
+    # exactly the FAIL-then-"Browser session lost"-cascade pattern this
+    # was reported as.
+    if action == ActionType.SCROLL and not primary_value:
+        ok, err = try_locator(engine, session, step, primary_type, primary_value)
+        return {"success": ok, "locator_type": primary_type, "locator_value": primary_value, "stage": "direct", "error": err}
+
+    if primary_type and primary_value:
+        ok, err = try_locator(engine, session, step, primary_type, primary_value)
+        if ok:
+            return {"success": True, "locator_type": primary_type, "locator_value": primary_value, "stage": "primary", "error": ""}
+        last_error = err
+    else:
+        last_error = "No primary locator recorded"
+
+    fallback_locators = step.get("fallback_locators", [])
+    if fallback_locators:
+        # See FALLBACK_WAIT_SECONDS in config.py: the primary attempt above
+        # already burned a full EXPLICIT_WAIT_SECONDS finding nothing, so
+        # each fallback gets a short, separate timeout instead of another
+        # full wait apiece.
+        original_timeout = engine.timeout
+        engine.timeout = min(engine.timeout, settings.FALLBACK_WAIT_SECONDS)
+        try:
+            for fb in fallback_locators:
+                ok, err = try_locator(engine, session, step, fb.get("type", ""), fb.get("value", ""))
+                if ok:
+                    return {"success": True, "locator_type": fb.get("type", ""), "locator_value": fb.get("value", ""), "stage": "fallback", "error": ""}
+                last_error = err
+        finally:
+            engine.timeout = original_timeout
+
+    return {"success": False, "locator_type": primary_type, "locator_value": primary_value, "stage": "exhausted", "error": last_error}
