@@ -80,21 +80,27 @@ def heal(
                     return _result(True, loc.strategy, loc.value, winner.score, "repository", "; ".join(winner.reasons))
 
     # ---- Stage 4: live DOM similarity -------------------------------
-    try:
-        ranked_dom = locator_matcher.best_match(
-            old_signature, session.page, page_id, settings.HEALING_MAX_CANDIDATES,
-            timeout_seconds=settings.HEALING_DOM_CRAWL_TIMEOUT_SECONDS,
-        )
-    except Exception as exc:
-        # Covers both a genuine Playwright error (closed page/context) AND
-        # the bounded-timeout TimeoutError js_bridge.py raises when the
-        # live page just isn't responding within
-        # HEALING_DOM_CRAWL_TIMEOUT_SECONDS - either way, healing simply
-        # couldn't inspect the live DOM this time, so give up on Stage 4
-        # cleanly rather than let the caller hang. See that setting's
-        # comment in config.py for why this cap exists.
-        logger.warning("DOM crawl during healing failed: %s", exc)
+    # Cheap pre-check before attempting the crawl: Browser.is_connected()
+    # is a simple, safe attribute-style check (no cross-thread call, no
+    # risk of hanging) that tells us whether there's any point trying.
+    # This is the real fix for the "self-healing hangs on an
+    # unresponsive/dead page" problem - a previous attempt tried to
+    # bound the evaluate() call itself with a background-thread timeout,
+    # but Playwright's sync API requires every Page/Frame/Locator call to
+    # happen on the single OS thread that owns the browser connection, so
+    # that approach broke with "Cannot switch to a different thread".
+    # There's no safe way to cancel a genuinely hung evaluate() call from
+    # here; skipping the attempt entirely when the browser is already
+    # confirmed gone is the best available mitigation.
+    if not _browser_alive(session):
+        logger.info("Skipping self-healing's live DOM crawl - browser is no longer connected.")
         ranked_dom = []
+    else:
+        try:
+            ranked_dom = locator_matcher.best_match(old_signature, session.page, page_id, settings.HEALING_MAX_CANDIDATES)
+        except Exception as exc:
+            logger.warning("DOM crawl during healing failed: %s", exc)
+            ranked_dom = []
 
     if ranked_dom and ranked_dom[0].score >= settings.HEALING_CONFIDENCE_THRESHOLD:
         winner = ranked_dom[0]
@@ -134,6 +140,16 @@ def heal(
     # ---- Stage 7: nothing cleared the confidence bar ----------------
     best_score = ranked_dom[0].score if ranked_dom else 0.0
     return _result(False, "", "", best_score, "none", "No candidate met the confidence threshold")
+
+
+def _browser_alive(session: PlaywrightSession) -> bool:
+    """Cheap, safe liveness probe - Browser.is_connected() is a plain
+    attribute-style check, not a page-level CDP round-trip, so it can't
+    hang the way an evaluate() call against an unresponsive page can."""
+    try:
+        return session.browser.is_connected()
+    except Exception:
+        return False
 
 
 def _validate(session: PlaywrightSession, engine: ActionEngine, step: Dict[str, Any], locator_type: str, locator_value: str) -> bool:
