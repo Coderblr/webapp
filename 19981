@@ -1,198 +1,46 @@
 """
-self_healer.py
+locator_matcher.py
 
-Orchestrates Self-Healing Stages 3-7 (spec sections 20-21), invoked by the
-executor only after Stages 1-2 (primary + fallback locators, handled in
-execution/selenium_executor.py) have already failed:
-
-  Stage 3: search the locator repository for same-page candidates
-  Stage 4: crawl + rank the live DOM (deterministic similarity)
-  Stage 5: AI-assisted candidate identification (LangChain + configurable
-           provider) when deterministic confidence is inconclusive
-  Stage 6: validate the winning candidate by actually resolving it in the
-           browser (never trust the score alone)
-  Stage 7: only return a healed locator if confidence clears the
-           configured threshold; the caller (executor) then updates the
-           locator repository AND the Excel file (spec section 21).
-
-Every attempt - successful or not - should be logged by the caller into
-HealingEvent / metadata_store so the dashboard's "Self-Healed" counters
-and the report's failure/healing sections stay accurate.
+Self-Healing Stage 4: "Inspect the current DOM and compare" - crawls the
+live page the failed step is on, and ranks every current element against
+the recorded element's signature using candidate_ranker's structural
+similarity scoring. This runs entirely without AI so it's fast and free;
+the AI stage (Stage 5) is only invoked when this stage's top score is
+below the confidence threshold.
 """
 from __future__ import annotations
 
-import logging
-import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from backend.ai import langchain_agent
-from backend.ai.prompt_templates import LOCATOR_RECOVERY_SYSTEM_PROMPT, locator_recovery_prompt
-from backend.config import settings
-from backend.execution import playwright_executor
-from backend.execution.action_engine import ActionEngine
-from backend.healing import locator_matcher
-from backend.recorder.browser_factory import PlaywrightSession
-from backend.storage.locator_store import LocatorRepository
-from backend.storage.models import HealingEvent, new_id
-
-logger = logging.getLogger("universal_automation.self_healer")
+from backend.healing.candidate_ranker import CandidateScore, rank_candidates
+from backend.recorder import dom_crawler
+from backend.recorder.js_bridge import EvaluationContext
+from backend.recorder.locator_engine import build_locators
+from backend.storage.models import LocatorCandidate
 
 
-def heal(
-    session: PlaywrightSession,
-    engine: ActionEngine,
-    step: Dict[str, Any],
-    locator_repo: Optional[LocatorRepository],
-    ai_provider: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Attempt to recover a working locator for a failed step.
-
-    Returns a dict:
-        {
-          "success": bool,
-          "new_locator_type": str,
-          "new_locator": str,
-          "confidence": float,
-          "healing_method": str,
-          "reason": str,
-        }
-    """
-    page_url = step.get("page_url", "")
-    page_id = _page_id_from_url(page_url)
-    old_signature = {
-        "element_tag": step.get("element_tag", ""),
-        "element_text": step.get("element_text", ""),
-        "attributes": {"name": step.get("element_name", "")},
-        "component_type": "",
-    }
-
-    # ---- Stage 3: locator repository search -----------------------
-    if locator_repo:
-        repo_candidates = locator_repo.find_candidates(page_id=page_id, limit=settings.HEALING_MAX_CANDIDATES)
-        if repo_candidates:
-            from backend.healing.candidate_ranker import rank_candidates
-            ranked = rank_candidates(old_signature, repo_candidates, top_n=3)
-            if ranked and ranked[0].score >= settings.HEALING_CONFIDENCE_THRESHOLD:
-                winner = ranked[0]
-                loc = locator_matcher.candidate_to_locator(winner.element)
-                validated = _validate(session, engine, step, loc.strategy, loc.value)
-                if validated:
-                    return _result(True, loc.strategy, loc.value, winner.score, "repository", "; ".join(winner.reasons))
-
-    # ---- Stage 4: live DOM similarity -------------------------------
-    # Cheap pre-check before attempting the crawl: Browser.is_connected()
-    # is a simple, safe attribute-style check (no cross-thread call, no
-    # risk of hanging) that tells us whether there's any point trying.
-    # This is the real fix for the "self-healing hangs on an
-    # unresponsive/dead page" problem - a previous attempt tried to
-    # bound the evaluate() call itself with a background-thread timeout,
-    # but Playwright's sync API requires every Page/Frame/Locator call to
-    # happen on the single OS thread that owns the browser connection, so
-    # that approach broke with "Cannot switch to a different thread".
-    # There's no safe way to cancel a genuinely hung evaluate() call from
-    # here; skipping the attempt entirely when the browser is already
-    # confirmed gone is the best available mitigation.
-    if not _browser_alive(session):
-        logger.info("Skipping self-healing's live DOM crawl - browser is no longer connected.")
-        ranked_dom = []
-    else:
-        try:
-            ranked_dom = locator_matcher.best_match(old_signature, session.page, page_id, settings.HEALING_MAX_CANDIDATES)
-        except Exception as exc:
-            logger.warning("DOM crawl during healing failed: %s", exc)
-            ranked_dom = []
-
-    if ranked_dom and ranked_dom[0].score >= settings.HEALING_CONFIDENCE_THRESHOLD:
-        winner = ranked_dom[0]
-        loc = locator_matcher.candidate_to_locator(winner.element)
-        validated = _validate(session, engine, step, loc.strategy, loc.value)
-        if validated:
-            return _result(True, loc.strategy, loc.value, winner.score, "dom_similarity", "; ".join(winner.reasons))
-
-    # ---- Stage 5: AI-assisted recovery ------------------------------
-    if ranked_dom and langchain_agent.is_provider_available(ai_provider):
-        try:
-            candidates_payload = [
-                {"index": i, **{k: c.element.get(k) for k in ("tag", "text", "role", "attributes", "component_type")}}
-                for i, c in enumerate(ranked_dom)
-            ]
-            response = langchain_agent.ask_json(
-                LOCATOR_RECOVERY_SYSTEM_PROMPT,
-                locator_recovery_prompt(
-                    step.get("primary_locator_type", ""), step.get("primary_locator", ""),
-                    old_signature, candidates_payload, page_url,
-                ),
-                provider=ai_provider,
-            )
-            idx = response.get("candidate_index", -1)
-            ai_confidence = float(response.get("confidence", 0))
-            if 0 <= idx < len(ranked_dom) and ai_confidence >= settings.HEALING_CONFIDENCE_THRESHOLD:
-                winner = ranked_dom[idx]
-                loc = locator_matcher.candidate_to_locator(winner.element)
-                validated = _validate(session, engine, step, loc.strategy, loc.value)
-                if validated:
-                    return _result(True, loc.strategy, loc.value, ai_confidence, "ai_semantic", response.get("reasoning", ""))
-        except langchain_agent.AIUnavailableError as exc:
-            logger.info("AI healing stage skipped: %s", exc)
-        except Exception as exc:
-            logger.warning("AI healing stage failed: %s", exc)
-
-    # ---- Stage 7: nothing cleared the confidence bar ----------------
-    best_score = ranked_dom[0].score if ranked_dom else 0.0
-    return _result(False, "", "", best_score, "none", "No candidate met the confidence threshold")
+def find_dom_candidates(context: EvaluationContext, page_id: str, max_candidates: int = 15) -> List[Dict[str, Any]]:
+    """Crawl the current page/frame and return raw ElementRecord dicts as
+    candidates for comparison."""
+    records = dom_crawler.crawl_current_context(context, page_id)
+    return [r.to_dict() for r in records][:max_candidates]
 
 
-def _browser_alive(session: PlaywrightSession) -> bool:
-    """Cheap, safe liveness probe - Browser.is_connected() is a plain
-    attribute-style check, not a page-level CDP round-trip, so it can't
-    hang the way an evaluate() call against an unresponsive page can."""
-    try:
-        return session.browser.is_connected()
-    except Exception:
-        return False
+def best_match(old_signature: Dict[str, Any], context: EvaluationContext, page_id: str, max_candidates: int = 15) -> List[CandidateScore]:
+    candidates = find_dom_candidates(context, page_id, max_candidates)
+    return rank_candidates(old_signature, candidates, top_n=5)
 
 
-def _validate(session: PlaywrightSession, engine: ActionEngine, step: Dict[str, Any], locator_type: str, locator_value: str) -> bool:
-    """Stage 6: never trust a score alone - confirm the candidate actually
-    resolves to a present element in the live DOM before healing."""
-    if not locator_value:
-        return False
-    try:
-        context = playwright_executor.resolve_frame(session, step)
-        return engine.is_present(context, locator_type, locator_value, timeout=3.0)
-    except Exception:
-        return False
-
-
-def _page_id_from_url(url: str) -> str:
-    import hashlib
-    normalized = (url or "").split("?")[0].rstrip("/")
-    return "page_" + hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
-
-
-def _result(success: bool, locator_type: str, locator_value: str, confidence: float, method: str, reason: str) -> Dict[str, Any]:
-    return {
-        "success": success,
-        "new_locator_type": locator_type,
-        "new_locator": locator_value,
-        "confidence": round(confidence, 3),
-        "healing_method": method,
-        "reason": reason,
-    }
-
-
-def make_event(step_number: int, page_url: str, old_type: str, old_value: str, result: Dict[str, Any]) -> HealingEvent:
-    return HealingEvent(
-        healing_id=new_id("heal_"),
-        step_number=step_number,
-        page_url=page_url,
-        old_locator_type=old_type,
-        old_locator=old_value,
-        new_locator_type=result.get("new_locator_type", ""),
-        new_locator=result.get("new_locator", ""),
-        confidence=result.get("confidence", 0.0),
-        healing_method=result.get("healing_method", ""),
-        reason=result.get("reason", ""),
-        timestamp=time.time(),
-        applied=result.get("success", False),
-    )
+def candidate_to_locator(candidate: Dict[str, Any]) -> LocatorCandidate:
+    """Given a winning candidate ElementRecord dict, return its single
+    best locator to use as the healed replacement."""
+    locators_raw = candidate.get("locators") or []
+    if not locators_raw:
+        # candidate came straight from bridge.js element info rather than
+        # a full ElementRecord - build locators on the fly.
+        built = build_locators(candidate)
+        if built:
+            return built[0]
+        return LocatorCandidate(strategy="CSS", value=candidate.get("css_path", ""))
+    best = max(locators_raw, key=lambda l: l.get("reliability_score", 0))
+    return LocatorCandidate(strategy=best["strategy"], value=best["value"], reliability_score=best.get("reliability_score", 0.5))
