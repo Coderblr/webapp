@@ -1,139 +1,50 @@
 """
-dom_crawler.py
+locator_matcher.py
 
-Crawls the DOM of the *current* Selenium browsing context (caller is
-responsible for having already switched into the right frame) and turns
-the raw element-info dicts from bridge.js into ElementRecord objects with
-locators pre-computed via locator_engine.
-
-Whenever a page is opened or a significant DOM change occurs, the recorder
-calls `crawl_current_context` again - this module does not cache anything
-itself; caching/dedup lives in the LocatorRepository (upsert by
-dom_signature-derived element_id).
+Self-Healing Stage 4: "Inspect the current DOM and compare" - crawls the
+live page the failed step is on, and ranks every current element against
+the recorded element's signature using candidate_ranker's structural
+similarity scoring. This runs entirely without AI so it's fast and free;
+the AI stage (Stage 5) is only invoked when this stage's top score is
+below the confidence threshold.
 """
 from __future__ import annotations
 
-import hashlib
 from typing import Any, Dict, List, Optional
 
-from backend.recorder import js_bridge
+from backend.healing.candidate_ranker import CandidateScore, rank_candidates
+from backend.recorder import dom_crawler
 from backend.recorder.js_bridge import EvaluationContext
-from backend.recorder.locator_engine import build_locators, classify_component, generate_element_name
-from backend.storage.models import ElementRecord, FramePath, PageRecord, ShadowPath, new_id
+from backend.recorder.locator_engine import build_locators
+from backend.storage.models import LocatorCandidate
 
 
-def _stable_element_id(page_id: str, dom_signature: str) -> str:
-    h = hashlib.sha1(f"{page_id}:{dom_signature}".encode("utf-8")).hexdigest()[:16]
-    return f"el_{h}"
+def find_dom_candidates(context: EvaluationContext, page_id: str, max_candidates: int = 15, timeout_seconds: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Crawl the current page/frame and return raw ElementRecord dicts as
+    candidates for comparison.
+
+    timeout_seconds: see dom_crawler.crawl_current_context() / js_bridge.py
+    - bounds the crawl so a genuinely slow/unresponsive live page can't
+    hang self-healing indefinitely (None preserves unbounded behavior)."""
+    records = dom_crawler.crawl_current_context(context, page_id, timeout_seconds=timeout_seconds)
+    return [r.to_dict() for r in records][:max_candidates]
 
 
-def crawl_current_context(
-    context: EvaluationContext,
-    page_id: str,
-    frame_path: Optional[FramePath] = None,
-    dynamic: bool = False,
-    timeout_seconds: Optional[float] = None,
-) -> List[ElementRecord]:
-    """Crawl every interesting element in the given Page/Frame.
-
-    timeout_seconds: bounds the underlying js_bridge call (see its
-    docstring) - None (default) preserves the original unbounded
-    behavior used everywhere except self-healing's live-DOM Stage 4
-    (see locator_matcher.py / self_healer.py / config.py's
-    HEALING_DOM_CRAWL_TIMEOUT_SECONDS)."""
-    raw_elements: List[Dict[str, Any]] = js_bridge.call(context, "return window.__UA__.crawlDom();", timeout_seconds=timeout_seconds) or []
-    records: List[ElementRecord] = []
-    for info in raw_elements:
-        record = to_element_record(info, page_id, frame_path=frame_path, dynamic=dynamic)
-        records.append(record)
-    return records
+def best_match(old_signature: Dict[str, Any], context: EvaluationContext, page_id: str, max_candidates: int = 15, timeout_seconds: Optional[float] = None) -> List[CandidateScore]:
+    candidates = find_dom_candidates(context, page_id, max_candidates, timeout_seconds=timeout_seconds)
+    return rank_candidates(old_signature, candidates, top_n=5)
 
 
-def crawl_shadow_roots(context: EvaluationContext, page_id: str, frame_path: Optional[FramePath] = None) -> List[ElementRecord]:
-    """Best-effort Shadow DOM crawl - see shadow_dom.py for the higher-level
-    wrapper; this helper turns raw shadow host/children info into records."""
-    raw = js_bridge.call(context, "return window.__UA__.detectShadowRoots();") or []
-    records: List[ElementRecord] = []
-    for entry in raw:
-        host = entry.get("host") or {}
-        host_selector = host.get("css_path") or host.get("id") or ""
-        for child_info in entry.get("children", []):
-            shadow_path = ShadowPath(hosts=[host_selector], final_selector=child_info.get("css_path", ""))
-            record = to_element_record(child_info, page_id, frame_path=frame_path, shadow_path=shadow_path)
-            records.append(record)
-    return records
-
-
-def to_element_record(
-    info: Dict[str, Any],
-    page_id: str,
-    frame_path: Optional[FramePath] = None,
-    shadow_path: Optional[ShadowPath] = None,
-    dynamic: bool = False,
-) -> ElementRecord:
-    component_type = classify_component(info)
-    # dom_signature alone (tag/id/name/class + index among the element's OWN
-    # immediate parent's children - see bridge.js's domSignature()) is only a
-    # single-level fingerprint. That collides for a very common real-world
-    # pattern: several structurally-identical elements that each sit alone
-    # inside their own individually-positioned wrapper (e.g. a segmented
-    # 4-box OTP field, each <input> the sole child of its own <div> box) -
-    # every box then reports the same tag/no-id/no-name/shared-class/idx=0,
-    # so they'd all hash to the same element_id and collapse into "the same
-    # field" for naming/dedup purposes, silently merging what should be 4
-    # distinct recorded steps under one element_name/test_data_key. css_path
-    # already walks multiple ancestor levels (up to 8) and so captures the
-    # positional difference between each box's wrapper - mixing it in here
-    # keeps the "same physical element revisited" case working (its css_path
-    # is unchanged across visits) while fixing the sibling-collision case.
-    element_id = _stable_element_id(
-        page_id,
-        info.get("dom_signature", "") + "|" + info.get("css_path", "") + (shadow_path.final_selector if shadow_path else ""),
-    )
-    locators = build_locators(info)
-    element_name = generate_element_name(info, component_type)
-
-    return ElementRecord(
-        element_id=element_id,
-        page_id=page_id,
-        dom_signature=info.get("dom_signature", ""),
-        tag=info.get("tag", ""),
-        attributes={
-            "id": info.get("id", ""),
-            "name": info.get("name", ""),
-            "class": info.get("class_name", ""),
-            "type": info.get("type", ""),
-            "value": info.get("value", ""),
-            "placeholder": info.get("placeholder", ""),
-            "title": info.get("title", ""),
-            "href": info.get("href", ""),
-            "src": info.get("src", ""),
-            "alt": info.get("alt", ""),
-            "for": info.get("for_attr", ""),
-            "autocomplete": info.get("autocomplete", ""),
-            **(info.get("data_attrs", {}) or {}),
-            "element_name": element_name,
-        },
-        text=info.get("text", ""),
-        role=info.get("role", ""),
-        visible=bool(info.get("visible", True)),
-        enabled=bool(info.get("enabled", True)),
-        interactable=bool(info.get("visible", True)) and bool(info.get("enabled", True)),
-        bounding_box=info.get("bounding_box", {}) or {},
-        parent_signature=info.get("parent_signature", ""),
-        locators=locators,
-        frame_path=frame_path,
-        shadow_path=shadow_path,
-        component_type=component_type,
-        dynamic=dynamic,
-    )
-
-
-def normalize_url(url: str) -> str:
-    return (url or "").split("?")[0].rstrip("/")
-
-
-def make_page_record(url: str, title: str) -> PageRecord:
-    normalized = normalize_url(url)
-    page_id = "page_" + hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
-    return PageRecord(page_id=page_id, url=url, title=title, normalized_key=normalized)
+def candidate_to_locator(candidate: Dict[str, Any]) -> LocatorCandidate:
+    """Given a winning candidate ElementRecord dict, return its single
+    best locator to use as the healed replacement."""
+    locators_raw = candidate.get("locators") or []
+    if not locators_raw:
+        # candidate came straight from bridge.js element info rather than
+        # a full ElementRecord - build locators on the fly.
+        built = build_locators(candidate)
+        if built:
+            return built[0]
+        return LocatorCandidate(strategy="CSS", value=candidate.get("css_path", ""))
+    best = max(locators_raw, key=lambda l: l.get("reliability_score", 0))
+    return LocatorCandidate(strategy=best["strategy"], value=best["value"], reliability_score=best.get("reliability_score", 0.5))
