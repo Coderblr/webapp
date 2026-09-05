@@ -1,368 +1,512 @@
-import { useEffect, useState } from "react";
-import { api, ApiError } from "@/lib/api";
-import LiveRecordingView from "@/components/LiveRecordingView";
-import {
-  Button,
-  Callout,
-  Checkbox,
-  DataTable,
-  Disclosure,
-  Field,
-  Panel,
-  PanelHeader,
-  Select,
-  Spinner,
-  TextInput,
-} from "@/components/ui";
+"""
+FastAPI backend for the recorder. Same 3 operations as before, now as a
+proper JSON API consumed by the Next.js frontend (frontend/) or anything
+else you want to point at it (curl, Postman, another UI) - plus auth
+(backend/auth_routes.py), admin (backend/admin_routes.py) and profile
+(backend/profile_routes.py) routers mounted below. Every /api/* route in
+this file now requires a logged-in user (Depends(get_current_user)); admin
+endpoints live in their own router.
 
-const OTHERS = "Others";
+Run with:
+    uvicorn backend.api:app --reload --port 8000
+"""
+import sys
+import asyncio
+import json
+import threading
+import uuid
+from pathlib import Path
+from typing import Optional
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-function actionLabel(a) {
-  const el = a.element || {};
-  return el.ariaLabel || el.placeholder || el.name || el.text || el.tag || "";
-}
+import yaml
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from dotenv import load_dotenv
 
-function actionDetail(a) {
-  let detail = a.value || "";
-  if (a.action === "keypress") {
-    detail = a.value || "";
-  } else if (a.captured_as) {
-    detail = `${detail}  ->  {{${a.captured_as}}}`;
-  } else if (a.resolved_var) {
-    detail = `{{${a.resolved_var}}}  (recorded: ${detail})`;
-  }
-  return detail;
-}
+load_dotenv()
 
-export default function RecordTab() {
-  const [applicationNames, setApplicationNames] = useState([]);
-  const [appsError, setAppsError] = useState(null);
-  const [selectedApp, setSelectedApp] = useState(OTHERS);
-  const [customUrl, setCustomUrl] = useState("");
-  const [recordingName, setRecordingName] = useState("");
-  const [headless, setHeadless] = useState(false);
+from recorder.recorder import Recorder
+from generator.build import build_artifacts
+from generator.test_data import extract_test_data, apply_test_data
+from runner.run_tests import run as run_behave
+from runner.run_recording import list_saved_recordings, run_recording
+from runner import transaction_store
+from agent.llm_factory import get_llm
+from database.db import init_db, get_session, close_db
+from database import repository as repo
+from shutdown_guard import register_cleanup
 
-  const [recordingActive, setRecordingActive] = useState(false);
-  const [recordingHeadless, setRecordingHeadless] = useState(false);
-  const [backendProcessId, setBackendProcessId] = useState(null);
+from auth.dependencies import get_current_user, get_client_ip, validate_token_for_websocket, CurrentUser
+from backend import auth_routes, admin_routes, profile_routes, recording_sessions
 
-  const [startBusy, setStartBusy] = useState(false);
-  const [startPhase, setStartPhase] = useState(null);
-  const [startError, setStartError] = useState(null);
-  const [startNotice, setStartNotice] = useState(null);
+APPLICATIONS_CONFIG = Path(__file__).resolve().parents[1] / "config" / "applications.yaml"
 
-  const [saveBusy, setSaveBusy] = useState(false);
-  const [saveError, setSaveError] = useState(null);
-  const [saveNotice, setSaveNotice] = useState(null);
+app = FastAPI(title="AI Test Recorder API")
+init_db()
 
-  const [runBusy, setRunBusy] = useState(false);
-  const [runError, setRunError] = useState(null);
+app.include_router(auth_routes.router)
+app.include_router(admin_routes.router)
+app.include_router(profile_routes.router)
 
-  const [buildResult, setBuildResult] = useState(null);
-  const [runResult, setRunResult] = useState(null);
+# Changes every time this process starts (fresh launch, or uvicorn --reload
+# restarting the worker). The frontend remembers this from when it started a
+# recording and compares it later - if it's different, the backend process
+# restarted mid-recording (in-memory STATE, including the open browser, is
+# gone), which needs a distinct message from "recording just failed to
+# launch" so this doesn't turn into a confusing generic error again.
+PROCESS_ID = str(uuid.uuid4())
 
-  const [statusPreview, setStatusPreview] = useState(null);
-  const [statusPreviewError, setStatusPreviewError] = useState(null);
+# The Next.js frontend runs on a different origin, so allow it to call this
+# API from the browser. CORS_ALLOWED_ORIGINS (.env) is a comma-separated
+# allowlist for production (e.g. "https://recorder.yourbank.internal") -
+# defaults to "*" for local dev only. Tighten this before hosting anywhere
+# real: with credentials/Bearer tokens, a wildcard origin is fine (no
+# cookies are used - the JWT travels in an explicit header/query param,
+# never automatically attached by the browser like a cookie would be), but
+# a real allowlist is still better hygiene once you know the frontend's
+# actual origin.
+import os as _os
+_cors_origins = _os.environ.get("CORS_ALLOWED_ORIGINS", "*")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if _cors_origins.strip() == "*" else [o.strip() for o in _cors_origins.split(",") if o.strip()],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-  useEffect(() => {
-    api
-      .getApplications()
-      .then((r) => setApplicationNames(r.applications))
-      .catch((e) => setAppsError(e.detail));
-  }, []);
+@app.on_event("shutdown")
+def _on_shutdown():
+    """
+    Runs on a graceful stop (Ctrl+C in the terminal, or uvicorn --reload
+    restarting the worker process) - closes every still-open recorder
+    browser session (there can be several now - one per concurrently
+    recording user, see backend/recording_sessions.py) and releases the
+    database's connection pool, so no Edge/Chrome process or
+    database/test_recorder.db is left locked behind.
+    """
+    _cleanup_all()
 
-  async function handleStart() {
-    setStartError(null);
-    setStartNotice(null);
-    if (selectedApp === OTHERS && !customUrl.trim()) {
-      setStartError("Enter a target URL for 'Others' first.");
-      return;
+
+def _cleanup_all(timeout: float = 15):
+    """Shared by the ASGI shutdown event above (normal Ctrl+C stop) AND
+    shutdown_guard's Windows console-close handler below (terminal window
+    closed directly) - whichever fires first runs this exactly once."""
+    recording_sessions.stop_all(timeout=timeout)
+    close_db()
+
+
+# Covers the case Ctrl+C/ASGI shutdown can't: the terminal window being
+# closed directly. Windows only gives ~5s to clean up in that case, so use
+# a shorter timeout than the normal graceful-stop path above.
+register_cleanup(lambda: _cleanup_all(timeout=3))
+
+
+class StartRequest(BaseModel):
+    url: str = ""
+    app_name: str = ""       # one of the names from GET /api/applications, or "" for a custom "Others" url
+    recording_name: str = "" # e.g. a transaction number or flow name, used to label the saved recording
+    headless: bool = False
+
+
+class RunRequest(BaseModel):
+    headless: bool = False
+
+
+class RunRecordingRequest(BaseModel):
+    recording_file: str
+    headless: bool = False
+    # No user_id anymore - a saved recording is always run as whichever
+    # authenticated user made the request (see auth/dependencies.py), so
+    # every run is unambiguously attributable to a real logged-in person.
+
+
+class TestDataUpdateRequest(BaseModel):
+    values: dict[str, str]  # {"3": "50000", "7": "Jane Doe"} - keys are action indices, see generator/test_data.py
+
+
+def _load_applications() -> dict:
+    """Application name -> URL, from config/applications.yaml. Missing/empty
+    file just means an empty dropdown (frontend still offers "Others")."""
+    if not APPLICATIONS_CONFIG.exists():
+        return {}
+    try:
+        data = yaml.safe_load(APPLICATIONS_CONFIG.read_text()) or {}
+        return data.get("applications") or {}
+    except Exception:
+        return {}
+
+
+@app.get("/api/applications")
+def get_applications(current_user: CurrentUser = Depends(get_current_user)):
+    """Names for the frontend's dropdown - URLs never leave the backend for
+    these; the frontend only ever sees/sends the app NAME (see
+    StartRequest.app_name below), matching "URLs live in the backend"."""
+    return {"applications": list(_load_applications().keys())}
+
+
+@app.post("/api/start")
+def start_recording(req: StartRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    applications = _load_applications()
+    if req.app_name and req.app_name in applications:
+        url = applications[req.app_name].strip()
+    else:
+        url = req.url.strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="URL is required (select a known application or provide one for 'Others')")
+
+    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
+    if state["recorder"] is not None:
+        raise HTTPException(status_code=400, detail="You already have a recording in progress - save or stop it first")
+
+    active = recording_sessions.count_active_recordings()
+    if active >= recording_sessions.MAX_CONCURRENT_RECORDINGS:
+        raise HTTPException(
+            status_code=503,
+            detail=f"The server is at capacity ({active}/{recording_sessions.MAX_CONCURRENT_RECORDINGS} concurrent "
+                   f"recordings) - please try again shortly.",
+        )
+
+    state["pending_recording_name"] = req.recording_name.strip() or None
+    state["start_error"] = None
+    state["launching"] = True
+
+    ip = get_client_ip(request)
+    with get_session() as session:
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id, action="START_RECORDING",
+            status="SUCCESS", details={"url": url, "app_name": req.app_name, "recording_name": req.recording_name,
+                                        "headless": req.headless},
+            endpoint="/api/start", ip_address=ip,
+        )
+
+    def _launch():
+        try:
+            # A hosted server (see backend/recording_sessions.py's docs and
+            # DEPLOYMENT_WINDOWS.md) typically has no desktop session for a
+            # headed browser window to render into, and the live-view
+            # WebSocket streams a headless browser just fine via CDP
+            # screencast either way - so FORCE_HEADLESS_RECORDING (.env,
+            # default true) overrides whatever the frontend's "headless"
+            # checkbox sent. Set it to false only for local single-user dev
+            # where seeing the real window is convenient.
+            import os
+            force_headless = os.environ.get("FORCE_HEADLESS_RECORDING", "true").lower().strip() != "false"
+            effective_headless = True if force_headless else req.headless
+            # Only bother with CDP screencast when actually headless - a
+            # headed run already gives a real, visible browser window, so
+            # the live-view widget would just be a redundant (and
+            # occasionally flaky, e.g. across an unstable dev-reload) second
+            # way to see the exact same thing. GET /api/status's "headless"
+            # field tells the frontend whether to even show that panel.
+            rec = Recorder(url, headless=effective_headless, enable_live_view=effective_headless).start()
+            state["recorder"] = rec
+            state["headless"] = effective_headless
+        except Exception as e:
+            # Previously this died silently in the background thread - the
+            # frontend would show "Launching browser..." and mark the
+            # recording as started regardless, so a failed launch (wrong
+            # channel, Edge not installed, bad URL, etc.) only surfaced
+            # later as a confusing 400 on Stop & Save. Now the frontend can
+            # poll GET /api/status and see exactly why it failed.
+            state["start_error"] = str(e)
+        finally:
+            state["launching"] = False
+
+    threading.Thread(target=_launch, daemon=True).start()
+    return {"ok": True, "message": f"Launching browser for {url}..."}
+
+
+@app.get("/api/status")
+def get_status(current_user: CurrentUser = Depends(get_current_user)):
+    """Poll this after /api/start - a browser launch happens in a background
+    thread, so success/failure isn't known at the time /api/start returns.
+    Also doubles as the general tool-status endpoint (recording in
+    progress / has a build / last run result) - all scoped to the CALLER's
+    own recording session (see backend/recording_sessions.py); this can
+    never see another user's in-progress recording."""
+    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
+    return {
+        "launching": state.get("launching", False),
+        "recording_active": state.get("recorder") is not None,
+        "start_error": state.get("start_error"),
+        "process_id": PROCESS_ID,
+        "recording_in_progress": state.get("recorder") is not None,
+        "has_build": state.get("build_result") is not None,
+        "last_run": state.get("last_run"),
+        "headless": state.get("headless"),  # None until a recorder has actually launched
+        "live_view_ws": "/api/ws/record" if state.get("recorder") is not None else None,
     }
-    setStartBusy(true);
-    try {
-      await api.startRecording({
-        app_name: selectedApp === OTHERS ? "" : selectedApp,
-        url: customUrl,
-        recording_name: recordingName,
-        headless,
-      });
 
-      setStartPhase("Launching browser...");
-      let launched = false;
-      let lastStatus = null;
-      for (let i = 0; i < 30; i++) {
-        await sleep(500);
-        lastStatus = await api.getStatus();
-        if (lastStatus.start_error) {
-          setStartError(`Recording failed to start: ${lastStatus.start_error}`);
-          break;
-        }
-        if (lastStatus.recording_active) {
-          launched = true;
-          break;
-        }
-      }
-      if (!launched && !(lastStatus && lastStatus.start_error)) {
-        setStartError("Browser launch is taking longer than expected - check the backend terminal for errors.");
-      }
-      if (launched && lastStatus) {
-        setRecordingActive(true);
-        setRecordingHeadless(!!lastStatus.headless);
-        setBackendProcessId(lastStatus.process_id);
-        setStartNotice("Recording started.");
-      }
-    } catch (e) {
-      setStartError(e.detail || e.message);
-    } finally {
-      setStartPhase(null);
-      setStartBusy(false);
+
+@app.post("/api/stop_and_save")
+def stop_and_save(request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
+    rec = state["recorder"]
+    if rec is None:
+        detail = "No recording in progress"
+        if state.get("start_error"):
+            detail += f" (the last start attempt failed: {state['start_error']})"
+        elif state.get("launching"):
+            detail += " (the browser is still launching - wait a moment and try again)"
+        raise HTTPException(status_code=400, detail=detail)
+
+    actions = rec.stop()
+    recording_name = state.pop("pending_recording_name", None)
+    path = rec.save(name=recording_name)
+    state["recorder"] = None
+
+    recording = {
+        "target_url": rec.target_url,
+        "recorded_at": Path(path).stem,
+        "recording_name": recording_name,
+        "actions": actions,
     }
-  }
+    state["recording"] = recording
 
-  async function handleSaveAndGenerate() {
-    setSaveError(null);
-    setSaveNotice(null);
-    setSaveBusy(true);
-    try {
-      const status = await api.getStatus().catch(() => null);
-      if (status && status.process_id && status.process_id !== backendProcessId) {
-        setRecordingActive(false);
-        setSaveError(
-          "The backend restarted since this recording started (its in-memory state, including the open browser, was lost) - start a new recording."
-        );
-        return;
-      }
-      const data = await api.stopAndSave();
-      setBuildResult(data);
-      setRecordingActive(false);
-      setSaveNotice(
-        `Generated ${data.build_result.step_count} steps / ${data.build_result.element_count} elements. (LLM used: ${data.llm_used})`
-      );
-    } catch (e) {
-      setSaveError(e.detail || e.message);
-    } finally {
-      setSaveBusy(false);
+    # Own output/ subfolder per auth session (backend/recording_sessions.py)
+    # so two people's Save & Generate never clobber each other's generated
+    # feature/steps/page files.
+    output_dir = recording_sessions.output_dir_for(current_user.session_id)
+    llm = get_llm()
+    build_result = build_artifacts(recording, llm=llm, output_dir=output_dir)
+    state["build_result"] = build_result
+
+    # Additive: surface the (now variable-annotated) actions and a quick
+    # name -> captured-value summary so the frontend can show what was
+    # recorded, including keyboard events and any Capture -> Store -> Reuse
+    # {{var}} pairs, without needing a separate endpoint.
+    variables_summary = {
+        a["captured_as"]: a.get("value")
+        for a in recording["actions"]
+        if a.get("action") == "copy" and a.get("captured_as")
     }
-  }
 
-  async function handleRun() {
-    setRunError(null);
-    setRunBusy(true);
-    try {
-      const result = await api.runCheck(headless);
-      setRunResult(result);
-    } catch (e) {
-      setRunError(e.detail || e.message);
-    } finally {
-      setRunBusy(false);
+    ip = get_client_ip(request)
+    with get_session() as session:
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id, action="STOP_AND_SAVE",
+            status="SUCCESS", details={"recording_file": path, "actions_captured": len(actions),
+                                        "recording_name": recording_name},
+            endpoint="/api/stop_and_save", ip_address=ip,
+        )
+
+    return {
+        "ok": True,
+        "recording_file": path,
+        "actions_captured": len(actions),
+        "build_result": build_result,
+        "llm_used": llm is not None,
+        "actions": recording["actions"],
+        "variables": variables_summary,
     }
-  }
 
-  async function handleRefreshStatus() {
-    setStatusPreviewError(null);
-    try {
-      setStatusPreview(await api.getStatus());
-    } catch (e) {
-      setStatusPreview(null);
-      setStatusPreviewError(e.detail || e.message);
-    }
-  }
 
-  const variables = (buildResult && buildResult.variables) || {};
-  const recordedActions = (buildResult && buildResult.actions) || [];
+@app.post("/api/run")
+def run_check(req: RunRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
+    output_dir = recording_sessions.output_dir_for(current_user.session_id)
+    if state["build_result"] is None and not (Path(output_dir) / "features" / "recorded.feature").exists():
+        raise HTTPException(status_code=400, detail="Nothing generated yet - record and save first")
 
-  return (
-    <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
-      {/* ---- Configuration panel -------------------------------------- */}
-      <Panel>
-        <PanelHeader title="Session" caption="Choose a target and start capturing." />
-        <div className="space-y-4 px-5 py-5">
-          {appsError && <Callout tone="error">Could not load application list: {appsError}</Callout>}
+    result = run_behave(output_dir=output_dir, headless=req.headless)
+    state["last_run"] = result
 
-          <Field label="Application">
-            <Select value={selectedApp} onChange={(e) => setSelectedApp(e.target.value)}>
-              {applicationNames.map((name) => (
-                <option key={name} value={name}>
-                  {name}
-                </option>
-              ))}
-              <option value={OTHERS}>{OTHERS}</option>
-            </Select>
-          </Field>
+    ip = get_client_ip(request)
+    with get_session() as session:
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id, action="RUN_CHECK",
+            status="SUCCESS" if result.get("ok") else "FAILURE", details={"headless": req.headless},
+            endpoint="/api/run", ip_address=ip,
+        )
+    return result
 
-          {selectedApp === OTHERS && (
-            <Field label="Target application URL">
-              <TextInput
-                placeholder="https://your-app.example.com"
-                value={customUrl}
-                onChange={(e) => setCustomUrl(e.target.value)}
-              />
-            </Field>
-          )}
 
-          <Field
-            label="Recording name"
-            hint="Used to label this recording in 'Run Saved Recording' and in exit reports."
-          >
-            <TextInput
-              placeholder="e.g. a transaction number, or 'New Loan Application'"
-              value={recordingName}
-              onChange={(e) => setRecordingName(e.target.value)}
-            />
-          </Field>
+@app.websocket("/api/ws/record")
+async def ws_record(websocket: WebSocket, token: str = Query(...)):
+    """Live view for a hosted, headless recording: streams CDP screencast
+    JPEG frames to the client and forwards its mouse/keyboard events back
+    to the real (server-side) browser - see recorder/recorder.py's
+    get_frame/queue_input. This is what makes "record a flow" usable when
+    the backend runs on a machine with no desktop session in front of the
+    person doing the recording (the normal case once this is hosted rather
+    than run on someone's own laptop).
 
-          <Checkbox label="headless" checked={headless} onChange={setHeadless} />
+    Browsers can't attach a custom Authorization header to a WebSocket
+    handshake, so the JWT travels as ?token=... instead - auth/dependencies.py's
+    validate_token_for_websocket runs the exact same checks (idle timeout,
+    revocation, account status) as every other endpoint.
+    """
+    await websocket.accept()
 
-          <div className="flex flex-col gap-2 border-t border-line pt-4">
-            <Button onClick={handleStart} disabled={recordingActive || startBusy}>
-              {startBusy ? "Starting..." : "Start Recording"}
-            </Button>
-            <Button variant="secondary" onClick={handleSaveAndGenerate} disabled={!recordingActive || saveBusy}>
-              {saveBusy ? "Saving..." : "Save & Generate"}
-            </Button>
-            <Button variant="secondary" onClick={handleRun} disabled={!buildResult || runBusy}>
-              {runBusy ? "Running..." : "Run / Check"}
-            </Button>
-          </div>
+    current_user = validate_token_for_websocket(token)
+    if current_user is None:
+        print("[live-view] rejected: invalid/expired/revoked token")
+        await websocket.close(code=4401, reason="Not authenticated")
+        return
 
-          <div className="space-y-2 pt-1">
-            {startPhase && <Spinner label={startPhase} />}
-            {startError && <Callout tone="error">{startError}</Callout>}
-            {startNotice && <Callout tone="success">{startNotice}</Callout>}
-            {saveBusy && <Spinner label="Stopping recording and generating feature/steps/page files..." />}
-            {saveError && <Callout tone="error">{saveError}</Callout>}
-            {saveNotice && <Callout tone="success">{saveNotice}</Callout>}
-            {runBusy && <Spinner label="Running generated Behave suite..." />}
-            {runError && <Callout tone="error">Run failed: {runError}</Callout>}
-            {recordingActive && (
-              <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-signal-rust">
-                <span className="pulse-dot h-2 w-2 rounded-full bg-signal-rust" />
-                Recording in progress
-              </div>
-            )}
-          </div>
-        </div>
-      </Panel>
+    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
+    rec = state.get("recorder")
+    if rec is None:
+        print(f"[live-view] rejected: no active recording for user {current_user.username} (session {current_user.session_id})")
+        await websocket.close(code=4404, reason="No active recording for this session")
+        return
 
-      {/* ---- Log panel --------------------------------------------------- */}
-      <div className="space-y-4">
-        {recordingActive && recordingHeadless && (
-          <Panel>
-            <PanelHeader
-              title="Live view"
-              caption="This runs on the server - what you see and interact with here is the real, remote browser being recorded."
-            />
-            <div className="px-5 py-5">
-              <LiveRecordingView active={recordingActive} />
-            </div>
-          </Panel>
-        )}
+    print(f"[live-view] connected: user {current_user.username}, session {current_user.session_id}")
 
-        {recordingActive && !recordingHeadless && (
-          <Panel>
-            <div className="px-5 py-5">
-              <Callout>
-                A real Edge browser window has opened on the machine running the backend - interact with it there
-                directly. (This is local/headed mode - the live view above only appears for headless/hosted
-                recordings, where there's no visible window to work with directly.)
-              </Callout>
-            </div>
-          </Panel>
-        )}
+    async def sender():
+        while True:
+            frame = await asyncio.to_thread(rec.get_frame, 1.0)
+            if state.get("recorder") is None:
+                break
+            if frame is not None:
+                await websocket.send_text(frame)
 
-        <Panel>
-          <PanelHeader title="Log" caption="Generation output, recorded actions, and the last run." />
-          <div className="space-y-3 px-5 py-5">
-            {runResult && (
-              <Callout tone={runResult.ok ? "success" : "error"}>
-                {runResult.ok ? "PASSED" : "FAILED (see log below)"}
-              </Callout>
-            )}
+    sender_task = asyncio.create_task(sender())
+    try:
+        while True:
+            event = await websocket.receive_json()
+            rec.queue_input(event)
+    except WebSocketDisconnect:
+        print(f"[live-view] disconnected: user {current_user.username}")
+    except Exception as e:
+        print(f"[live-view] error for user {current_user.username}: {e}")
+    finally:
+        sender_task.cancel()
 
-            {buildResult ? (
-              <div className="space-y-3">
-                <Disclosure title="Generation result">
-                  <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-rail p-3 font-mono text-xs scroll-thin">
-                    {JSON.stringify(buildResult.build_result, null, 2)}
-                  </pre>
-                </Disclosure>
 
-                {Object.keys(variables).length > 0 && (
-                  <Disclosure title={`Captured variables (${Object.keys(variables).length})`}>
-                    <p className="mb-2 text-xs text-muted">
-                      Values captured via copy/CTRL+C during recording, reused later via {"{{name}}"} placeholders.
-                    </p>
-                    <DataTable
-                      columns={[
-                        { key: "variable", label: "Variable", mono: true },
-                        { key: "value", label: "Captured value", mono: true },
-                      ]}
-                      rows={Object.entries(variables).map(([k, v]) => ({
-                        variable: `{{${k}}}`,
-                        value: v,
-                      }))}
-                    />
-                  </Disclosure>
-                )}
+# ------------------------------------------------------------------------
+# Users (read-only here - creation/edit/delete is admin-only, see
+# backend/admin_routes.py mounted under /api/admin/users)
+# ------------------------------------------------------------------------
 
-                {recordedActions.length > 0 && (
-                  <Disclosure title={`Recorded actions (${recordedActions.length})`}>
-                    <DataTable
-                      columns={[
-                        { key: "n", label: "#" },
-                        { key: "action", label: "Action" },
-                        { key: "element", label: "Element" },
-                        { key: "detail", label: "Value / key", mono: true },
-                      ]}
-                      rows={recordedActions.map((a, i) => ({
-                        n: i + 1,
-                        action: a.action || "",
-                        element: actionLabel(a),
-                        detail: actionDetail(a),
-                      }))}
-                    />
-                  </Disclosure>
-                )}
-              </div>
-            ) : (
-              <p className="text-sm text-muted">Nothing generated yet.</p>
-            )}
+@app.get("/api/users")
+def get_users_legacy(active_only: bool = False, current_user: CurrentUser = Depends(get_current_user)):
+    with get_session() as session:
+        users = repo.list_users(session, active_only=active_only)
+        return [
+            {"user_id": u.user_id, "name": u.name, "department": u.department,
+             "status": u.status, "created_date": u.created_date.isoformat()}
+            for u in users
+        ]
 
-            <div className="pt-1">
-              {runResult ? (
-                <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-[#151B22] p-4 font-mono text-xs text-[#D7DDE3] scroll-thin">
-                  {runResult.output || ""}
-                </pre>
-              ) : (
-                <p className="text-sm text-muted">Nothing run yet.</p>
-              )}
-            </div>
-          </div>
-        </Panel>
 
-        <Panel>
-          <div className="flex items-center justify-between px-5 py-4">
-            <div>
-              <h2 className="text-sm font-semibold text-ink">Backend status</h2>
-              {statusPreviewError && <p className="mt-0.5 text-xs text-signal-rust">{statusPreviewError}</p>}
-            </div>
-            <Button variant="secondary" onClick={handleRefreshStatus}>
-              Refresh status
-            </Button>
-          </div>
-          {statusPreview && (
-            <div className="border-t border-line px-5 py-4">
-              <pre className="overflow-auto whitespace-pre-wrap break-words rounded-sm bg-rail p-3 font-mono text-xs scroll-thin">
-                {JSON.stringify(statusPreview, null, 2)}
-              </pre>
-            </div>
-          )}
-        </Panel>
-      </div>
-    </div>
-  );
-}
+# ------------------------------------------------------------------------
+# Saved recordings - "run the recording he has and give exit report"
+# ------------------------------------------------------------------------
+
+@app.get("/api/recordings")
+def get_recordings(current_user: CurrentUser = Depends(get_current_user)):
+    return list_saved_recordings()
+
+
+def _safe_recording_path(file: str) -> Path:
+    """Resolves `file` (as returned by GET /api/recordings) and makes sure
+    it's actually inside recordings/ - a defensive check against a crafted
+    path (e.g. "../../.env") ever being read/written through this endpoint."""
+    recordings_dir = (Path(__file__).resolve().parents[1] / "recordings").resolve()
+    path = Path(file).resolve()
+    if recordings_dir not in path.parents or path.suffix != ".json":
+        raise HTTPException(status_code=400, detail="Invalid recording file")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Recording not found")
+    return path
+
+
+@app.get("/api/recordings/data")
+def get_recording_test_data(file: str, current_user: CurrentUser = Depends(get_current_user)):
+    """Backs the editable data grid shown before running a saved recording
+    (see generator/test_data.py) - every typed/selected value in the
+    recording, editable right there instead of downloading the Excel
+    report, changing values, and re-uploading."""
+    path = _safe_recording_path(file)
+    recording = json.loads(path.read_text())
+    return {"file": str(path), "fields": extract_test_data(recording)}
+
+
+@app.put("/api/recordings/data")
+def update_recording_test_data(
+    file: str, req: TestDataUpdateRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)
+):
+    """Writes edited values straight back into the saved recording JSON -
+    this becomes the new baseline test data for every future run of this
+    recording, not just a one-off override for the next click of Run."""
+    path = _safe_recording_path(file)
+    recording = json.loads(path.read_text())
+    recording = apply_test_data(recording, req.values)
+    path.write_text(json.dumps(recording, indent=2))
+
+    ip = get_client_ip(request)
+    with get_session() as session:
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id, action="TEST_DATA_UPDATED",
+            status="SUCCESS", details={"recording_file": str(path), "fields_changed": len(req.values)},
+            endpoint="/api/recordings/data", ip_address=ip,
+        )
+    return {"ok": True, "fields": extract_test_data(recording)}
+
+
+@app.post("/api/run_recording")
+def run_saved_recording(req: RunRecordingRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    """Runs a previously saved recording end-to-end (regenerate + execute)
+    and returns the exit report, attributed to whoever is logged in - the
+    frontend no longer picks a "run as" user, it's always the current
+    session. Everything about the run (status, steps, files produced) is
+    written to transactions/*.json (see runner/transaction_store.py) -
+    NOT the database, which is reserved for auth/session/activity data.
+
+    Any test-data edits (see /api/recordings/data above) are already
+    persisted into the recording file itself by the time this runs, so
+    there's nothing extra to pass through here - the run just reads
+    whatever's currently saved."""
+    ip = get_client_ip(request)
+    try:
+        report = run_recording(
+            recording_file=req.recording_file,
+            user_id=current_user.user_id,
+            headless=req.headless,
+        )
+        with get_session() as session:
+            repo.log_activity(
+                session, user_id=current_user.user_id, session_id=current_user.session_id, action="RUN_RECORDING",
+                status="SUCCESS" if report["status"] == "Success" else "FAILURE",
+                details={"recording_file": req.recording_file, "transaction_id": report["transaction_id"]},
+                endpoint="/api/run_recording", ip_address=ip,
+            )
+        return report
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ------------------------------------------------------------------------
+# Transaction history - read from transactions/*.json (see
+# runner/transaction_store.py), NOT the database. The database only holds
+# auth/session/activity data; recording-run history is plain files.
+# ------------------------------------------------------------------------
+
+@app.get("/api/transactions")
+def get_transactions(user_id: Optional[int] = None, limit: int = 50, current_user: CurrentUser = Depends(get_current_user)):
+    txns = transaction_store.list_transactions(user_id=user_id, limit=limit)
+    return [
+        {"transaction_id": t["transaction_id"], "user_id": t["user_id"],
+         "transaction_name": t["transaction_name"], "status": t["status"],
+         "date_time": t["date_time"]}
+        for t in txns
+    ]
+
+
+@app.get("/api/transactions/{transaction_id}")
+def get_transaction_report(transaction_id: int, current_user: CurrentUser = Depends(get_current_user)):
+    txn = transaction_store.get_transaction(transaction_id)
+    if txn is None:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return txn
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("backend.api:app", host="127.0.0.1", port=8000, reload=True)
