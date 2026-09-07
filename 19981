@@ -1,55 +1,171 @@
-"""
-Central auth configuration - every JWT/session/SSO knob lives here, read
-from environment variables (.env, see .env.example) with sane local-dev
-defaults.
+import { getToken } from "@/lib/auth-storage";
 
-SSO note (read this before wiring up SBI SSO later):
-  AUTH_PROVIDER stays "local" until an SSO integration is added. The
-  intended shape when that happens is:
+export const API_BASE =
+  (process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000").replace(/\/$/, "");
 
-    1. The IdP (ADFS / Azure AD / whatever SBI standardizes on) redirects
-       back to POST /api/auth/sso/callback with a SAML assertion or OIDC
-       code (see auth/providers.py - authenticate_sso() is the single
-       function to implement).
-    2. That function resolves/creates the local User row (matched on
-       `username` = the IdP's ADID/UPN claim) exactly like
-       authenticate_local() does today, and hands back the same User
-       object.
-    3. From there everything is identical to the local-password path:
-       backend/auth_routes.py's _issue_session_and_token() creates the
-       UserSession + JWT the same way regardless of which provider
-       authenticated the user.
+// ws:// (http) or wss:// (https) - mirrors API_BASE's scheme so the live
+// recording view works the same in local dev and behind a TLS-terminating
+// reverse proxy in production, without a separate env var to keep in sync.
+export const WS_BASE = API_BASE.replace(/^http/, "ws");
 
-  Nothing about session handling, the idle timeout, JWT shape, or the
-  admin/activity views needs to change for SSO - only authenticate_sso()
-  gets filled in, and AUTH_PROVIDER gets set to "sso" (or a per-request
-  toggle if both need to coexist during rollout).
-"""
-import os
+export class ApiError extends Error {
+  constructor(detail, status) {
+    super(detail);
+    this.detail = detail;
+    this.status = status;
+  }
+}
 
-AUTH_PROVIDER = os.environ.get("AUTH_PROVIDER", "local")  # "local" | "sso"
+// Registered by AuthContext so any 401 anywhere (idle timeout, revoked
+// session, expired token, ...) immediately drops the user back to /login
+// instead of leaving them staring at a broken page.
+let unauthorizedHandler = null;
+export function setUnauthorizedHandler(fn) {
+  unauthorizedHandler = fn;
+}
 
-JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "dev-only-secret-change-me-in-.env")
-JWT_ALGORITHM = "HS256"
+async function request(path, init, { auth = true } = {}) {
+  const headers = { "Content-Type": "application/json", ...(init && init.headers) };
+  if (auth) {
+    const token = getToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+  }
 
-# The JWT's own expiry is intentionally longer than the idle timeout below -
-# actual session liveness is enforced server-side via UserSession, so an
-# unused-but-valid token still gets rejected once idle. This is just an
-# outer ceiling.
-ACCESS_TOKEN_MAX_MINUTES = int(os.environ.get("ACCESS_TOKEN_MAX_MINUTES", "480"))  # 8h
+  let res;
+  try {
+    res = await fetch(`${API_BASE}${path}`, { ...init, headers, cache: "no-store" });
+  } catch (e) {
+    throw new ApiError(`Could not reach the backend at ${API_BASE}. Is it running? (${e.message})`, 0);
+  }
 
-# The headline requirement: auto-logout after this many minutes of no
-# authenticated requests.
-IDLE_TIMEOUT_MINUTES = int(os.environ.get("IDLE_TIMEOUT_MINUTES", "5"))
+  if (res.status === 401 && auth) {
+    let detail = "Session expired - please log in again.";
+    try {
+      const body = await res.json();
+      detail = body.detail || detail;
+    } catch {
+      /* no body */
+    }
+    if (unauthorizedHandler) unauthorizedHandler(detail);
+    throw new ApiError(detail, 401);
+  }
 
-# Absolute session ceiling regardless of activity (forces a fresh login
-# periodically even if the user never goes idle).
-SESSION_MAX_HOURS = int(os.environ.get("SESSION_MAX_HOURS", "12"))
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      detail = body.detail || detail;
+    } catch {
+      /* no body */
+    }
+    throw new ApiError(detail, res.status);
+  }
 
-# Where the frontend lives - only used to build the redirect target once
-# SSO is implemented (IdP -> /api/auth/sso/callback -> this URL + a token,
-# landing on the frontend's /sso/complete page). Not used by anything
-# today.
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+  const contentType = res.headers.get("content-type") || "";
+  if (res.status === 204) return undefined;
+  if (contentType.includes("text/csv")) return res.text();
+  return res.json();
+}
 
-MIN_PASSWORD_LENGTH = int(os.environ.get("MIN_PASSWORD_LENGTH", "8"))
+// ---------------------------------------------------------------------------
+// Auth (no token required for /login)
+// ---------------------------------------------------------------------------
+
+export const authApi = {
+  login: (username, password) =>
+    request("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }, { auth: false }),
+
+  changePassword: (current_password, new_password, confirm_password) =>
+    request("/api/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({ current_password, new_password, confirm_password }),
+    }),
+
+  logout: () => request("/api/auth/logout", { method: "POST" }),
+
+  me: () => request("/api/auth/me"),
+
+  // SSO - not implemented on the backend yet (see auth/providers.py), but
+  // the plumbing is real: sso_status() tells the login page whether to
+  // treat the "Sign in with SSO" button as live or "coming soon", and
+  // ssoLoginUrl() is where it navigates to once it is.
+  ssoStatus: () => request("/api/auth/sso/status", undefined, { auth: false }),
+  ssoLoginUrl: () => `${API_BASE}/api/auth/sso/login`,
+};
+
+// ---------------------------------------------------------------------------
+// Profile
+// ---------------------------------------------------------------------------
+
+export const profileApi = {
+  get: () => request("/api/profile/me"),
+  update: (body) => request("/api/profile/me", { method: "PUT", body: JSON.stringify(body) }),
+  activity: (limit = 100) => request(`/api/profile/activity?limit=${limit}`),
+  exportActivityUrl: () => `${API_BASE}/api/profile/activity/export`,
+};
+
+// ---------------------------------------------------------------------------
+// Admin
+// ---------------------------------------------------------------------------
+
+function toQuery(params) {
+  const qs = new URLSearchParams(
+    Object.fromEntries(Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== ""))
+  ).toString();
+  return qs ? `?${qs}` : "";
+}
+
+export const adminApi = {
+  createUser: (body) => request("/api/admin/users", { method: "POST", body: JSON.stringify(body) }),
+  listUsers: (params = {}) => request(`/api/admin/users${toQuery(params)}`),
+  getUser: (id) => request(`/api/admin/users/${id}`),
+  updateUser: (id, body) => request(`/api/admin/users/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteUser: (id) => request(`/api/admin/users/${id}`, { method: "DELETE" }),
+  resetPassword: (id, temp_password = "") =>
+    request(`/api/admin/users/${id}/reset-password`, { method: "POST", body: JSON.stringify({ temp_password }) }),
+
+  listSessions: () => request("/api/admin/sessions"),
+  revokeSession: (sessionId) => request(`/api/admin/sessions/${sessionId}/revoke`, { method: "POST" }),
+
+  listActivity: (params = {}) => request(`/api/admin/activity${toQuery(params)}`),
+  exportActivityUrl: (params = {}) => `${API_BASE}/api/admin/activity/export${toQuery(params)}`,
+
+  dashboardStats: () => request("/api/admin/dashboard/stats"),
+};
+
+// ---------------------------------------------------------------------------
+// Recorder tool endpoints (unchanged shapes, now all auth-required)
+// ---------------------------------------------------------------------------
+
+export const api = {
+  getApplications: () => request("/api/applications"),
+
+  startRecording: (body) => request("/api/start", { method: "POST", body: JSON.stringify(body) }),
+
+  getStatus: () => request("/api/status"),
+
+  stopAndSave: () => request("/api/stop_and_save", { method: "POST" }),
+
+  // Discards the current recording without saving/generating anything -
+  // for abandoning one mid-flow.
+  stopRecording: () => request("/api/stop", { method: "POST" }),
+
+  runCheck: (headless) => request("/api/run", { method: "POST", body: JSON.stringify({ headless }) }),
+
+  getRecordings: () => request("/api/recordings"),
+
+  // Editable test-data grid shown before running a saved recording (see
+  // generator/test_data.py) - lets a user change typed/selected values
+  // right in the browser instead of downloading the Excel report, editing
+  // it, and re-uploading. Edits persist into the recording file itself.
+  getRecordingTestData: (file) => request(`/api/recordings/data?${new URLSearchParams({ file })}`),
+  updateRecordingTestData: (file, values) =>
+    request(`/api/recordings/data?${new URLSearchParams({ file })}`, {
+      method: "PUT",
+      body: JSON.stringify({ values }),
+    }),
+
+  // No more user_id - a saved recording always runs as whoever is logged in.
+  runRecording: (recording_file, headless) =>
+    request("/api/run_recording", { method: "POST", body: JSON.stringify({ recording_file, headless }) }),
+};
