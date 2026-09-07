@@ -1,188 +1,305 @@
-// Builds the exit report client-side from the same JSON the API already
-// returns (POST /api/run_recording) - no extra backend endpoint needed,
-// and it works identically whether the report is opened in a new browser
-// tab or downloaded as a file.
+import { useEffect, useState } from "react";
+import { api } from "@/lib/api";
+import { useAuth } from "@/context/AuthContext";
+import { buildReportText, buildReportHtml, downloadBlob, openReportInBrowser } from "@/lib/report";
+import {
+  Button,
+  Callout,
+  Checkbox,
+  DataTable,
+  Disclosure,
+  Field,
+  Metric,
+  Panel,
+  PanelHeader,
+  Select,
+  Spinner,
+  StatusBadge,
+  TextInput,
+} from "@/components/ui";
 
-export function buildReportText(report) {
-  const line = "=".repeat(72);
-  const dash = "-".repeat(72);
-  const lines = [
-    line,
-    "AI TEST RECORDER - EXIT REPORT",
-    line,
-    `Transaction ID : ${report.transaction_id}`,
-    `Recording      : ${report.transaction_name}`,
-    `Run by         : ${report.user}`,
-    `Run at (UTC)   : ${report.date_time}`,
-    `Overall Status : ${report.status}`,
-    dash,
-    `${"#".padEnd(4)}${"Playwright Step".padEnd(50)}${"Status".padEnd(10)}`,
-    dash,
-  ];
-  report.steps.forEach((s, i) => {
-    lines.push(`${String(i + 1).padEnd(4)}${s.step_name.slice(0, 48).padEnd(50)}${s.status.padEnd(10)}`);
-    if (s.error_message) lines.push(`     -> ERROR: ${s.error_message}`);
-  });
-  lines.push(dash, `Passed: ${report.passed_count}   Failed: ${report.failed_count}   Total: ${report.step_count}`, line);
-  return lines.join("\n");
-}
+export default function RunSavedTab() {
+  const { user } = useAuth();
 
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
+  const [recordings, setRecordings] = useState([]);
+  const [recordingsError, setRecordingsError] = useState(null);
+  const [selectedRecFile, setSelectedRecFile] = useState("");
+  const [runHeadless, setRunHeadless] = useState(false);
 
-// A hand-rolled SVG donut chart (no charting library) so the report stays
-// a single, self-contained HTML file that opens correctly straight from
-// disk or a blob URL, with no external script/CSS dependency to fetch.
-function donutChartSvg(passed, failed) {
-  const total = passed + failed || 1;
-  const radius = 70;
-  const circumference = 2 * Math.PI * radius;
-  const passedLen = (passed / total) * circumference;
-  const passedPct = Math.round((passed / total) * 100);
+  // ---- test data (editable, shown before running - see generator/test_data.py) ----
+  const [testData, setTestData] = useState([]);
+  const [testDataLoading, setTestDataLoading] = useState(false);
+  const [testDataError, setTestDataError] = useState(null);
+  const [editValues, setEditValues] = useState({}); // { [action index]: current input value }
+  const [savingData, setSavingData] = useState(false);
+  const [saveDataNotice, setSaveDataNotice] = useState(null);
+  const [saveDataError, setSaveDataError] = useState(null);
 
-  return `
-    <svg viewBox="0 0 180 180" width="180" height="180" role="img" aria-label="Passed vs failed steps">
-      <circle cx="90" cy="90" r="${radius}" fill="none" stroke="#EFEEE6" stroke-width="20" />
-      <circle cx="90" cy="90" r="${radius}" fill="none" stroke="#B3452F" stroke-width="20"
-        stroke-dasharray="${circumference} ${circumference}" transform="rotate(-90 90 90)" />
-      <circle cx="90" cy="90" r="${radius}" fill="none" stroke="#0F7B6C" stroke-width="20"
-        stroke-dasharray="${passedLen} ${circumference - passedLen}" transform="rotate(-90 90 90)" />
-      <text x="90" y="86" text-anchor="middle" font-size="30" font-weight="700" fill="#1C232B"
-        font-family="ui-monospace, Consolas, monospace">${passedPct}%</text>
-      <text x="90" y="106" text-anchor="middle" font-size="12" fill="#5B6672"
-        font-family="Segoe UI, -apple-system, sans-serif">passed</text>
-    </svg>`;
-}
+  const [runBusy, setRunBusy] = useState(false);
+  const [runError, setRunError] = useState(null);
+  const [report, setReport] = useState(null);
 
-export function buildReportHtml(report) {
-  const overallOk = report.status === "Success";
-
-  const stepRows = report.steps
-    .map((s, i) => {
-      const ok = s.status === "Passed";
-      return `
-        <tr>
-          <td>${i + 1}</td>
-          <td>${escapeHtml(s.step_name)}</td>
-          <td><span class="badge ${ok ? "badge-pass" : "badge-fail"}">${escapeHtml(s.status)}</span></td>
-          <td class="mono">${escapeHtml(s.error_message || "")}</td>
-        </tr>`;
-    })
-    .join("");
-
-  const fileRows = (report.files || [])
-    .map((f) => `<tr><td>${escapeHtml(f.file_name)}</td><td class="mono">${escapeHtml(f.folder_path)}</td></tr>`)
-    .join("");
-
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Exit Report - Transaction #${report.transaction_id}</title>
-<style>
-  :root { color-scheme: light; }
-  * { box-sizing: border-box; }
-  body {
-    font-family: "Segoe UI", -apple-system, Inter, sans-serif;
-    background: #FAFAF7; color: #1C232B; margin: 0; padding: 40px 24px;
+  async function loadRecordings() {
+    try {
+      const r = await api.getRecordings();
+      setRecordings(r);
+      setRecordingsError(null);
+      if (r.length && !selectedRecFile) setSelectedRecFile(r[0].file);
+    } catch (e) {
+      setRecordingsError(e.detail || e.message);
+    }
   }
-  .wrap { max-width: 900px; margin: 0 auto; }
-  h1 { font-size: 20px; margin: 0 0 4px; }
-  h2 { font-size: 14px; margin: 0 0 14px; }
-  .sub { color: #5B6672; font-size: 13px; margin-bottom: 24px; }
-  .card { background: #fff; border: 1px solid #E1E0D8; border-radius: 4px; padding: 24px; margin-bottom: 20px; }
-  .top { display: flex; align-items: center; gap: 32px; flex-wrap: wrap; }
-  .metrics { display: grid; grid-template-columns: repeat(2, minmax(120px, 1fr)); gap: 12px; flex: 1; min-width: 260px; }
-  .metric { border: 1px solid #E1E0D8; padding: 12px 14px; border-radius: 4px; }
-  .metric .n { font-family: ui-monospace, Consolas, monospace; font-size: 22px; font-weight: 600; }
-  .metric .l { font-size: 11px; text-transform: uppercase; color: #5B6672; letter-spacing: .04em; margin-top: 2px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #E1E0D8; vertical-align: top; }
-  th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #5B6672; background: #EFEEE6; }
-  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
-  .badge {
-    display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px;
-    font-weight: 600; text-transform: uppercase; border: 1px solid transparent;
-  }
-  .badge-pass { background: #EAF5F2; color: #0B5C51; border-color: rgba(15,123,108,.3); }
-  .badge-fail { background: #FBEEEA; color: #B3452F; border-color: rgba(179,69,47,.3); }
-  .status-pill { display: inline-flex; padding: 5px 14px; border-radius: 4px; font-weight: 700; font-size: 13px; text-transform: uppercase; }
-  pre {
-    white-space: pre-wrap; word-break: break-word; background: #151B22; color: #D7DDE3;
-    padding: 16px; border-radius: 4px; font-size: 12px; overflow: auto; margin: 0;
-  }
-  @media print { body { background: #fff; padding: 0; } .card { border: none; box-shadow: none; } }
-</style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>AI Test Recorder — Exit Report</h1>
-    <div class="sub">
-      Transaction #${report.transaction_id} &middot; ${escapeHtml(report.transaction_name)} &middot;
-      run by ${escapeHtml(report.user)} &middot; ${escapeHtml(report.date_time)} UTC
-    </div>
 
-    <div class="card top">
-      ${donutChartSvg(report.passed_count, report.failed_count)}
-      <div class="metrics">
-        <div class="metric"><div class="n">${report.step_count}</div><div class="l">Steps</div></div>
-        <div class="metric"><div class="n">${report.passed_count}</div><div class="l">Passed</div></div>
-        <div class="metric"><div class="n">${report.failed_count}</div><div class="l">Failed</div></div>
-        <div class="metric">
-          <span class="status-pill ${overallOk ? "badge-pass" : "badge-fail"}">${escapeHtml(report.status)}</span>
+  useEffect(() => {
+    loadRecordings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function loadTestData(file) {
+    setTestDataLoading(true);
+    setTestDataError(null);
+    setSaveDataNotice(null);
+    setSaveDataError(null);
+    try {
+      const data = await api.getRecordingTestData(file);
+      setTestData(data.fields);
+      setEditValues(Object.fromEntries(data.fields.map((f) => [f.index, f.value])));
+    } catch (e) {
+      setTestData([]);
+      setEditValues({});
+      setTestDataError(e.detail || e.message);
+    } finally {
+      setTestDataLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    setReport(null); // a different recording's exit report shouldn't linger once you switch
+    if (selectedRecFile) loadTestData(selectedRecFile);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedRecFile]);
+
+  function updateValue(index, value) {
+    setEditValues((prev) => ({ ...prev, [index]: value }));
+    setSaveDataNotice(null);
+  }
+
+  async function saveTestDataOnly() {
+    setSavingData(true);
+    setSaveDataError(null);
+    setSaveDataNotice(null);
+    try {
+      const data = await api.updateRecordingTestData(selectedRecFile, editValues);
+      setTestData(data.fields);
+      setSaveDataNotice("Test data saved - future runs of this recording will use these values too.");
+    } catch (e) {
+      setSaveDataError(e.detail || e.message);
+    } finally {
+      setSavingData(false);
+    }
+  }
+
+  async function handleRun() {
+    if (!selectedRecFile) return;
+    setRunError(null);
+    setRunBusy(true);
+    try {
+      // Whatever is currently in the grid is what gets run - saved to the
+      // recording first (so it's also the new baseline for next time),
+      // then executed. No separate "save" step required.
+      if (testData.length > 0) {
+        await api.updateRecordingTestData(selectedRecFile, editValues);
+      }
+      const r = await api.runRecording(selectedRecFile, runHeadless);
+      setReport(r);
+    } catch (e) {
+      setRunError(e.detail || e.message);
+    } finally {
+      setRunBusy(false);
+    }
+  }
+
+  return (
+    <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
+      <Panel>
+        <PanelHeader title="Run a saved recording" caption="Pick a recording, review/edit its test data, then run it." />
+        <div className="space-y-4 px-5 py-5">
+          <Callout>
+            Running as <strong>{user?.first_name} {user?.last_name}</strong> ({user?.username}). Every run is logged
+            against your account.
+          </Callout>
+
+          {recordingsError && <Callout tone="error">Could not load recordings: {recordingsError}</Callout>}
+
+          {recordings.length === 0 ? (
+            <Callout>No saved recordings found yet. Record one in the &ldquo;Record &amp; Generate&rdquo; tab first.</Callout>
+          ) : (
+            <>
+              <Field label="Saved recording">
+                <Select value={selectedRecFile} onChange={(e) => setSelectedRecFile(e.target.value)}>
+                  {recordings.map((r) => (
+                    <option key={r.file} value={r.file}>
+                      {r.name} — {r.target_url} ({r.action_count} actions)
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+
+              <Checkbox label="headless" checked={runHeadless} onChange={setRunHeadless} />
+
+              <Button onClick={handleRun} disabled={runBusy} className="w-full">
+                {runBusy ? "Running..." : "Run recording"}
+              </Button>
+
+              {runBusy && <Spinner label="Running the saved recording..." />}
+              {runError && <Callout tone="error">Run failed: {runError}</Callout>}
+            </>
+          )}
         </div>
+      </Panel>
+
+      <div className="space-y-4">
+        {selectedRecFile && (
+          <Panel>
+            <div className="flex items-center justify-between border-b border-line px-5 py-4">
+              <div>
+                <h2 className="text-sm font-semibold text-ink">Test data</h2>
+                <p className="mt-0.5 text-xs text-muted">
+                  The values this recording types/selects when it runs. Edit anything below, then hit{" "}
+                  <strong>Run recording</strong> - no need to download or re-upload the Excel report; changes save
+                  straight into this recording.
+                </p>
+              </div>
+              {testData.length > 0 && (
+                <Button variant="secondary" onClick={saveTestDataOnly} disabled={savingData}>
+                  {savingData ? "Saving..." : "Save without running"}
+                </Button>
+              )}
+            </div>
+            <div className="px-5 py-4">
+              {testDataLoading && <Spinner label="Loading test data..." />}
+              {testDataError && <Callout tone="error">{testDataError}</Callout>}
+              {saveDataError && <Callout tone="error">{saveDataError}</Callout>}
+              {saveDataNotice && <Callout tone="success">{saveDataNotice}</Callout>}
+
+              {!testDataLoading && !testDataError && testData.length === 0 && (
+                <p className="text-sm text-muted">
+                  This recording has no typed or selected values to edit (e.g. it's clicks/navigation only).
+                </p>
+              )}
+
+              {testData.length > 0 && (
+                <DataTable
+                  columns={[
+                    { key: "label", label: "Field" },
+                    { key: "action", label: "Type", mono: true },
+                    { key: "value", label: "Value" },
+                  ]}
+                  rows={testData.map((f) => ({
+                    label: f.label,
+                    action: f.action,
+                    value: (
+                      <TextInput
+                        value={editValues[f.index] ?? ""}
+                        onChange={(e) => updateValue(f.index, e.target.value)}
+                      />
+                    ),
+                  }))}
+                />
+              )}
+            </div>
+          </Panel>
+        )}
+
+        {report && (
+          <Panel>
+            <PanelHeader title="Exit report" />
+            <div className="space-y-5 px-5 py-5">
+              <div className="flex items-center gap-3">
+                <StatusBadge status={report.status} />
+                <span className="font-mono text-sm text-muted">Transaction #{report.transaction_id}</span>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                <Metric label="Steps" value={report.step_count} />
+                <Metric label="Passed" value={report.passed_count} />
+                <Metric label="Failed" value={report.failed_count} />
+                <Metric label="Run by" value={report.user} />
+              </div>
+
+              <div>
+                <h3 className="mb-2 text-sm font-semibold text-ink">Automation log</h3>
+                <DataTable
+                  columns={[
+                    { key: "n", label: "#" },
+                    { key: "step", label: "Playwright step" },
+                    { key: "status", label: "Status" },
+                    { key: "error", label: "Error", mono: true },
+                  ]}
+                  rows={report.steps.map((s, i) => ({
+                    n: i + 1,
+                    step: s.step_name,
+                    status: <StatusBadge status={s.status} />,
+                    error: s.error_message || "",
+                  }))}
+                />
+              </div>
+
+              <Disclosure title={`Files produced (${report.files.length})`}>
+                <DataTable
+                  columns={[
+                    { key: "file_name", label: "File" },
+                    { key: "folder_path", label: "Folder", mono: true },
+                  ]}
+                  rows={report.files.map((f) => ({ file_name: f.file_name, folder_path: f.folder_path }))}
+                />
+              </Disclosure>
+
+              <Disclosure title="Raw Behave output">
+                <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-[#151B22] p-4 font-mono text-xs text-[#D7DDE3] scroll-thin">
+                  {report.raw_output}
+                </pre>
+              </Disclosure>
+
+              <div className="flex flex-wrap gap-2">
+                <Button onClick={() => openReportInBrowser(report)}>Open report in browser</Button>
+                <Button
+                  variant="secondary"
+                  onClick={() =>
+                    downloadBlob(
+                      `transaction_${report.transaction_id}_exit_report.html`,
+                      buildReportHtml(report),
+                      "text/html"
+                    )
+                  }
+                >
+                  Download (.html)
+                </Button>
+                <Button
+                  variant="secondary"
+                  onClick={() =>
+                    downloadBlob(
+                      `transaction_${report.transaction_id}_exit_report.txt`,
+                      buildReportText(report),
+                      "text/plain"
+                    )
+                  }
+                >
+                  Download (.txt)
+                </Button>
+              </div>
+            </div>
+          </Panel>
+        )}
+
+        {!selectedRecFile && (
+          <Panel>
+            <div className="px-5 py-10 text-center text-sm text-muted">
+              Pick a saved recording to review its test data and run it.
+            </div>
+          </Panel>
+        )}
       </div>
     </div>
-
-    <div class="card">
-      <h2>Automation log</h2>
-      <table>
-        <thead><tr><th>#</th><th>Playwright step</th><th>Status</th><th>Error</th></tr></thead>
-        <tbody>${stepRows}</tbody>
-      </table>
-    </div>
-
-    ${
-      fileRows
-        ? `<div class="card">
-      <h2>Files produced</h2>
-      <table><thead><tr><th>File</th><th>Folder</th></tr></thead><tbody>${fileRows}</tbody></table>
-    </div>`
-        : ""
-    }
-
-    <div class="card">
-      <h2>Raw Behave output</h2>
-      <pre>${escapeHtml(report.raw_output || "")}</pre>
-    </div>
-  </div>
-</body>
-</html>`;
-}
-
-export function downloadBlob(filename, content, mimeType) {
-  const blob = new Blob([content], { type: mimeType });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
-/** Opens the HTML report directly in a new browser tab (Chrome/Edge -
- * whichever the user is already in), rather than downloading it first. */
-export function openReportInBrowser(report) {
-  const html = buildReportHtml(report);
-  const blob = new Blob([html], { type: "text/html" });
-  const url = URL.createObjectURL(blob);
-  window.open(url, "_blank", "noopener,noreferrer");
-  // Give the new tab time to actually load the blob before revoking it.
-  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  );
 }
