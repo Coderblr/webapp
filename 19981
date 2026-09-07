@@ -1,57 +1,188 @@
-import { useEffect } from "react";
-import { useRouter } from "next/router";
-import Head from "next/head";
-import { useAuth } from "@/context/AuthContext";
-import { setToken } from "@/lib/auth-storage";
+// Builds the exit report client-side from the same JSON the API already
+// returns (POST /api/run_recording) - no extra backend endpoint needed,
+// and it works identically whether the report is opened in a new browser
+// tab or downloaded as a file.
 
-/**
- * Not reachable yet - nothing redirects here until SSO is actually wired
- * up (see backend/auth_routes.py's sso_callback docstring for exactly how
- * it will: after validating the IdP's assertion and issuing our own JWT
- * the same way a normal login does, it redirects the browser to
- * `${FRONTEND_URL}/sso/complete?token=<jwt>`).
- *
- * This page's only job is to grab that token out of the URL, store it the
- * same way a normal username/password login does (see
- * context/AuthContext.js's login()), and continue into the app - so the
- * user's experience is identical either way once SSO lands, and nothing
- * here needs to change when it does.
- */
-export default function SsoCompletePage() {
-  const router = useRouter();
-  const { refreshUser } = useAuth();
+export function buildReportText(report) {
+  const line = "=".repeat(72);
+  const dash = "-".repeat(72);
+  const lines = [
+    line,
+    "AI TEST RECORDER - EXIT REPORT",
+    line,
+    `Transaction ID : ${report.transaction_id}`,
+    `Recording      : ${report.transaction_name}`,
+    `Run by         : ${report.user}`,
+    `Run at (UTC)   : ${report.date_time}`,
+    `Overall Status : ${report.status}`,
+    dash,
+    `${"#".padEnd(4)}${"Playwright Step".padEnd(50)}${"Status".padEnd(10)}`,
+    dash,
+  ];
+  report.steps.forEach((s, i) => {
+    lines.push(`${String(i + 1).padEnd(4)}${s.step_name.slice(0, 48).padEnd(50)}${s.status.padEnd(10)}`);
+    if (s.error_message) lines.push(`     -> ERROR: ${s.error_message}`);
+  });
+  lines.push(dash, `Passed: ${report.passed_count}   Failed: ${report.failed_count}   Total: ${report.step_count}`, line);
+  return lines.join("\n");
+}
 
-  useEffect(() => {
-    if (!router.isReady) return;
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
 
-    const { token, error } = router.query;
+// A hand-rolled SVG donut chart (no charting library) so the report stays
+// a single, self-contained HTML file that opens correctly straight from
+// disk or a blob URL, with no external script/CSS dependency to fetch.
+function donutChartSvg(passed, failed) {
+  const total = passed + failed || 1;
+  const radius = 70;
+  const circumference = 2 * Math.PI * radius;
+  const passedLen = (passed / total) * circumference;
+  const passedPct = Math.round((passed / total) * 100);
 
-    if (error) {
-      const reason = Array.isArray(error) ? error[0] : error;
-      router.replace({ pathname: "/login", query: { reason } });
-      return;
-    }
+  return `
+    <svg viewBox="0 0 180 180" width="180" height="180" role="img" aria-label="Passed vs failed steps">
+      <circle cx="90" cy="90" r="${radius}" fill="none" stroke="#EFEEE6" stroke-width="20" />
+      <circle cx="90" cy="90" r="${radius}" fill="none" stroke="#B3452F" stroke-width="20"
+        stroke-dasharray="${circumference} ${circumference}" transform="rotate(-90 90 90)" />
+      <circle cx="90" cy="90" r="${radius}" fill="none" stroke="#0F7B6C" stroke-width="20"
+        stroke-dasharray="${passedLen} ${circumference - passedLen}" transform="rotate(-90 90 90)" />
+      <text x="90" y="86" text-anchor="middle" font-size="30" font-weight="700" fill="#1C232B"
+        font-family="ui-monospace, Consolas, monospace">${passedPct}%</text>
+      <text x="90" y="106" text-anchor="middle" font-size="12" fill="#5B6672"
+        font-family="Segoe UI, -apple-system, sans-serif">passed</text>
+    </svg>`;
+}
 
-    if (!token) {
-      router.replace("/login");
-      return;
-    }
+export function buildReportHtml(report) {
+  const overallOk = report.status === "Success";
 
-    setToken(Array.isArray(token) ? token[0] : token);
-    refreshUser()
-      .then((user) => router.replace(user.must_change_password ? "/change-password" : "/dashboard"))
-      .catch(() =>
-        router.replace({ pathname: "/login", query: { reason: "SSO sign-in failed - please try again." } })
-      );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [router.isReady, router.query]);
+  const stepRows = report.steps
+    .map((s, i) => {
+      const ok = s.status === "Passed";
+      return `
+        <tr>
+          <td>${i + 1}</td>
+          <td>${escapeHtml(s.step_name)}</td>
+          <td><span class="badge ${ok ? "badge-pass" : "badge-fail"}">${escapeHtml(s.status)}</span></td>
+          <td class="mono">${escapeHtml(s.error_message || "")}</td>
+        </tr>`;
+    })
+    .join("");
 
-  return (
-    <div className="flex min-h-screen items-center justify-center bg-paper text-sm text-muted">
-      <Head>
-        <title>Signing in... - AI Test Recorder</title>
-      </Head>
-      Completing sign-in...
+  const fileRows = (report.files || [])
+    .map((f) => `<tr><td>${escapeHtml(f.file_name)}</td><td class="mono">${escapeHtml(f.folder_path)}</td></tr>`)
+    .join("");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Exit Report - Transaction #${report.transaction_id}</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: "Segoe UI", -apple-system, Inter, sans-serif;
+    background: #FAFAF7; color: #1C232B; margin: 0; padding: 40px 24px;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 14px; margin: 0 0 14px; }
+  .sub { color: #5B6672; font-size: 13px; margin-bottom: 24px; }
+  .card { background: #fff; border: 1px solid #E1E0D8; border-radius: 4px; padding: 24px; margin-bottom: 20px; }
+  .top { display: flex; align-items: center; gap: 32px; flex-wrap: wrap; }
+  .metrics { display: grid; grid-template-columns: repeat(2, minmax(120px, 1fr)); gap: 12px; flex: 1; min-width: 260px; }
+  .metric { border: 1px solid #E1E0D8; padding: 12px 14px; border-radius: 4px; }
+  .metric .n { font-family: ui-monospace, Consolas, monospace; font-size: 22px; font-weight: 600; }
+  .metric .l { font-size: 11px; text-transform: uppercase; color: #5B6672; letter-spacing: .04em; margin-top: 2px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #E1E0D8; vertical-align: top; }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #5B6672; background: #EFEEE6; }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px;
+    font-weight: 600; text-transform: uppercase; border: 1px solid transparent;
+  }
+  .badge-pass { background: #EAF5F2; color: #0B5C51; border-color: rgba(15,123,108,.3); }
+  .badge-fail { background: #FBEEEA; color: #B3452F; border-color: rgba(179,69,47,.3); }
+  .status-pill { display: inline-flex; padding: 5px 14px; border-radius: 4px; font-weight: 700; font-size: 13px; text-transform: uppercase; }
+  pre {
+    white-space: pre-wrap; word-break: break-word; background: #151B22; color: #D7DDE3;
+    padding: 16px; border-radius: 4px; font-size: 12px; overflow: auto; margin: 0;
+  }
+  @media print { body { background: #fff; padding: 0; } .card { border: none; box-shadow: none; } }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>AI Test Recorder — Exit Report</h1>
+    <div class="sub">
+      Transaction #${report.transaction_id} &middot; ${escapeHtml(report.transaction_name)} &middot;
+      run by ${escapeHtml(report.user)} &middot; ${escapeHtml(report.date_time)} UTC
     </div>
-  );
+
+    <div class="card top">
+      ${donutChartSvg(report.passed_count, report.failed_count)}
+      <div class="metrics">
+        <div class="metric"><div class="n">${report.step_count}</div><div class="l">Steps</div></div>
+        <div class="metric"><div class="n">${report.passed_count}</div><div class="l">Passed</div></div>
+        <div class="metric"><div class="n">${report.failed_count}</div><div class="l">Failed</div></div>
+        <div class="metric">
+          <span class="status-pill ${overallOk ? "badge-pass" : "badge-fail"}">${escapeHtml(report.status)}</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Automation log</h2>
+      <table>
+        <thead><tr><th>#</th><th>Playwright step</th><th>Status</th><th>Error</th></tr></thead>
+        <tbody>${stepRows}</tbody>
+      </table>
+    </div>
+
+    ${
+      fileRows
+        ? `<div class="card">
+      <h2>Files produced</h2>
+      <table><thead><tr><th>File</th><th>Folder</th></tr></thead><tbody>${fileRows}</tbody></table>
+    </div>`
+        : ""
+    }
+
+    <div class="card">
+      <h2>Raw Behave output</h2>
+      <pre>${escapeHtml(report.raw_output || "")}</pre>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+export function downloadBlob(filename, content, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/** Opens the HTML report directly in a new browser tab (Chrome/Edge -
+ * whichever the user is already in), rather than downloading it first. */
+export function openReportInBrowser(report) {
+  const html = buildReportHtml(report);
+  const blob = new Blob([html], { type: "text/html" });
+  const url = URL.createObjectURL(blob);
+  window.open(url, "_blank", "noopener,noreferrer");
+  // Give the new tab time to actually load the blob before revoking it.
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
