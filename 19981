@@ -1,181 +1,55 @@
 """
-POST /api/auth/login            - username + password -> JWT
-POST /api/auth/change-password  - temp/current password -> new password (also clears must_change_password)
-POST /api/auth/logout           - revokes the current session
-GET  /api/auth/me               - current user's profile (also counts as activity, refreshing the idle timer)
+Central auth configuration - every JWT/session/SSO knob lives here, read
+from environment variables (.env, see .env.example) with sane local-dev
+defaults.
 
-SSO (not implemented yet - see auth/config.py + auth/providers.py for the
-integration plan; these three exist now purely as stable, documented
-plumbing so only auth/providers.py:authenticate_sso needs writing later):
-GET  /api/auth/sso/status        - lets the frontend know whether to show/enable the SSO button
-GET  /api/auth/sso/login         - would redirect the browser to the IdP
-GET|POST /api/auth/sso/callback  - the IdP's redirect-back target
+SSO note (read this before wiring up SBI SSO later):
+  AUTH_PROVIDER stays "local" until an SSO integration is added. The
+  intended shape when that happens is:
+
+    1. The IdP (ADFS / Azure AD / whatever SBI standardizes on) redirects
+       back to POST /api/auth/sso/callback with a SAML assertion or OIDC
+       code (see auth/providers.py - authenticate_sso() is the single
+       function to implement).
+    2. That function resolves/creates the local User row (matched on
+       `username` = the IdP's ADID/UPN claim) exactly like
+       authenticate_local() does today, and hands back the same User
+       object.
+    3. From there everything is identical to the local-password path:
+       backend/auth_routes.py's _issue_session_and_token() creates the
+       UserSession + JWT the same way regardless of which provider
+       authenticated the user.
+
+  Nothing about session handling, the idle timeout, JWT shape, or the
+  admin/activity views needs to change for SSO - only authenticate_sso()
+  gets filled in, and AUTH_PROVIDER gets set to "sso" (or a per-request
+  toggle if both need to coexist during rollout).
 """
-from __future__ import annotations
+import os
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import RedirectResponse
+AUTH_PROVIDER = os.environ.get("AUTH_PROVIDER", "local")  # "local" | "sso"
 
-from database.db import get_session
-from database import repository as repo
-from database.models import User
-from auth.providers import authenticate_local
-from auth.security import hash_password, verify_password, validate_password_strength
-from auth.jwt_utils import create_access_token
-from auth.dependencies import get_current_user, get_client_ip, CurrentUser
-from auth.config import SESSION_MAX_HOURS, AUTH_PROVIDER, FRONTEND_URL
-from auth.schemas import LoginRequest, LoginResponse, ChangePasswordRequest, UserOut
+JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "dev-only-secret-change-me-in-.env")
+JWT_ALGORITHM = "HS256"
 
-router = APIRouter(prefix="/api/auth", tags=["auth"])
+# The JWT's own expiry is intentionally longer than the idle timeout below -
+# actual session liveness is enforced server-side via UserSession, so an
+# unused-but-valid token still gets rejected once idle. This is just an
+# outer ceiling.
+ACCESS_TOKEN_MAX_MINUTES = int(os.environ.get("ACCESS_TOKEN_MAX_MINUTES", "480"))  # 8h
 
+# The headline requirement: auto-logout after this many minutes of no
+# authenticated requests.
+IDLE_TIMEOUT_MINUTES = int(os.environ.get("IDLE_TIMEOUT_MINUTES", "5"))
 
-def _user_out(user: User) -> UserOut:
-    return UserOut.model_validate(user)
+# Absolute session ceiling regardless of activity (forces a fresh login
+# periodically even if the user never goes idle).
+SESSION_MAX_HOURS = int(os.environ.get("SESSION_MAX_HOURS", "12"))
 
+# Where the frontend lives - only used to build the redirect target once
+# SSO is implemented (IdP -> /api/auth/sso/callback -> this URL + a token,
+# landing on the frontend's /sso/complete page). Not used by anything
+# today.
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
 
-def _issue_session_and_token(db, user: User, ip: str, user_agent: str, action: str) -> LoginResponse:
-    """Shared by every auth path (local password today; SSO once
-    auth/providers.py:authenticate_sso is implemented) - creates the
-    UserSession + JWT the exact same way regardless of how the user was
-    authenticated, so nothing about session handling, the idle timeout, or
-    the admin "who's online" view needs to change when SSO is added.
-    `action` is just which activity-log action to record (e.g. "LOGIN" vs
-    a future "SSO_LOGIN")."""
-    sess = repo.create_session(db, user.user_id, ip, user_agent, SESSION_MAX_HOURS)
-    repo.mark_login(db, user.user_id)
-    token = create_access_token(user_id=user.user_id, username=user.username, role=user.role, session_id=sess.session_id)
-    repo.log_activity(
-        db, user_id=user.user_id, session_id=sess.session_id, action=action, status="SUCCESS",
-        endpoint=f"/api/auth/{'sso/callback' if action != 'LOGIN' else 'login'}", ip_address=ip,
-    )
-    return LoginResponse(access_token=token, must_change_password=user.must_change_password, user=_user_out(user))
-
-
-@router.post("/login", response_model=LoginResponse)
-def login(req: LoginRequest, request: Request):
-    ip = get_client_ip(request)
-    with get_session() as db:
-        user = authenticate_local(db, req.username, req.password)
-        if user is None:
-            repo.log_activity(
-                db, user_id=None, session_id=None, action="LOGIN_FAILED", status="FAILURE",
-                details={"username": req.username}, endpoint="/api/auth/login", ip_address=ip,
-            )
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password.")
-        return _issue_session_and_token(db, user, ip, request.headers.get("user-agent"), action="LOGIN")
-
-
-@router.post("/change-password")
-def change_password(req: ChangePasswordRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
-    ip = get_client_ip(request)
-    with get_session() as db:
-        user = repo.get_user(db, current_user.user_id)
-        if user is None:
-            raise HTTPException(status_code=404, detail="User not found.")
-
-        if not verify_password(req.current_password, user.password_hash or ""):
-            repo.log_activity(
-                db, user_id=user.user_id, session_id=current_user.session_id, action="PASSWORD_CHANGE_FAILED",
-                status="FAILURE", endpoint="/api/auth/change-password", ip_address=ip,
-            )
-            raise HTTPException(status_code=400, detail="Current/temporary password is incorrect.")
-
-        error = validate_password_strength(req.new_password)
-        if error:
-            raise HTTPException(status_code=400, detail=error)
-        if req.new_password == req.current_password:
-            raise HTTPException(status_code=400, detail="New password must be different from the current password.")
-
-        repo.set_user_password(db, user.user_id, hash_password(req.new_password), must_change_password=False)
-        repo.log_activity(
-            db, user_id=user.user_id, session_id=current_user.session_id, action="PASSWORD_CHANGED",
-            status="SUCCESS", endpoint="/api/auth/change-password", ip_address=ip,
-        )
-        return {"ok": True, "message": "Password changed successfully."}
-
-
-@router.post("/logout")
-def logout(request: Request, current_user: CurrentUser = Depends(get_current_user)):
-    ip = get_client_ip(request)
-    with get_session() as db:
-        repo.revoke_session(db, current_user.session_id, reason="logout")
-        repo.log_activity(
-            db, user_id=current_user.user_id, session_id=current_user.session_id, action="LOGOUT",
-            status="SUCCESS", endpoint="/api/auth/logout", ip_address=ip,
-        )
-    return {"ok": True}
-
-
-@router.get("/me", response_model=UserOut)
-def me(current_user: CurrentUser = Depends(get_current_user)):
-    with get_session() as db:
-        user = repo.get_user(db, current_user.user_id)
-        if user is None:
-            raise HTTPException(status_code=404, detail="User not found.")
-        return _user_out(user)
-
-
-# ---------------------------------------------------------------------------
-# SSO - not implemented yet. See auth/config.py for the full integration
-# plan and auth/providers.py:authenticate_sso for the one function that
-# needs writing when SBI's IdP details are available.
-# ---------------------------------------------------------------------------
-
-@router.get("/sso/status")
-def sso_status():
-    """The frontend calls this before showing/enabling its "Sign in with
-    SSO" button - so the button can exist in the UI right now (as
-    requested) without misleading anyone into thinking it already works.
-    Flips to {"enabled": true} the moment AUTH_PROVIDER=sso is set, with
-    no frontend code changes needed."""
-    return {"enabled": AUTH_PROVIDER == "sso", "provider": AUTH_PROVIDER}
-
-
-@router.get("/sso/login")
-def sso_login_initiate():
-    """NOT YET IMPLEMENTED. Once wired up, this redirects (302) the
-    browser to the IdP's authorization endpoint - a SAML AuthnRequest URL
-    or an OIDC /authorize URL, built from SBI's issued client id / entity
-    id / redirect URI (new .env values to add alongside AUTH_PROVIDER).
-    Example of what this becomes for OIDC:
-
-        params = {
-            "client_id": SSO_CLIENT_ID, "response_type": "code",
-            "redirect_uri": f"{BACKEND_PUBLIC_URL}/api/auth/sso/callback",
-            "scope": "openid profile email", "state": <csrf nonce>,
-        }
-        return RedirectResponse(f"{SSO_AUTHORIZE_URL}?{urlencode(params)}")
-    """
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail=f"SSO is not configured yet (AUTH_PROVIDER={AUTH_PROVIDER!r}). See auth/providers.py.",
-    )
-
-
-@router.api_route("/sso/callback", methods=["GET", "POST"])
-def sso_callback(request: Request):
-    """NOT YET IMPLEMENTED. The IdP redirects here after the user
-    authenticates - GET with ?code=&state= for OIDC, or POST with a
-    SAMLResponse form field for SAML; which one depends on what SBI
-    provides, hence accepting both methods now rather than guessing.
-
-    Once implemented, the body becomes roughly:
-
-        assertion = ... extract SAMLResponse / OIDC code from `request` ...
-        with get_session() as db:
-            user = authenticate_sso(db, assertion)  # auth/providers.py
-            if user is None:
-                return RedirectResponse(f"{FRONTEND_URL}/login?reason=SSO+sign-in+failed")
-            login_response = _issue_session_and_token(
-                db, user, get_client_ip(request), request.headers.get("user-agent"), action="SSO_LOGIN"
-            )
-        # Bearer tokens live in localStorage, not a cookie (see
-        # frontend/lib/auth-storage.js) - so the token has to reach the
-        # browser via the redirect URL itself; the frontend's
-        # /sso/complete page (already built) picks it up from there.
-        return RedirectResponse(f"{FRONTEND_URL}/sso/complete?token={login_response.access_token}")
-    """
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail=f"SSO is not configured yet (AUTH_PROVIDER={AUTH_PROVIDER!r}). See auth/providers.py.",
-    )
+MIN_PASSWORD_LENGTH = int(os.environ.get("MIN_PASSWORD_LENGTH", "8"))
