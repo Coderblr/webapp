@@ -1,404 +1,181 @@
-import { useEffect, useState } from "react";
-import { api, ApiError } from "@/lib/api";
-import LiveRecordingView from "@/components/LiveRecordingView";
-import {
-  Button,
-  Callout,
-  Checkbox,
-  DataTable,
-  Disclosure,
-  Field,
-  Panel,
-  PanelHeader,
-  Select,
-  Spinner,
-  TextInput,
-} from "@/components/ui";
+"""
+POST /api/auth/login            - username + password -> JWT
+POST /api/auth/change-password  - temp/current password -> new password (also clears must_change_password)
+POST /api/auth/logout           - revokes the current session
+GET  /api/auth/me               - current user's profile (also counts as activity, refreshing the idle timer)
 
-const OTHERS = "Others";
+SSO (not implemented yet - see auth/config.py + auth/providers.py for the
+integration plan; these three exist now purely as stable, documented
+plumbing so only auth/providers.py:authenticate_sso needs writing later):
+GET  /api/auth/sso/status        - lets the frontend know whether to show/enable the SSO button
+GET  /api/auth/sso/login         - would redirect the browser to the IdP
+GET|POST /api/auth/sso/callback  - the IdP's redirect-back target
+"""
+from __future__ import annotations
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import RedirectResponse
 
-function actionLabel(a) {
-  const el = a.element || {};
-  return el.ariaLabel || el.placeholder || el.name || el.text || el.tag || "";
-}
+from database.db import get_session
+from database import repository as repo
+from database.models import User
+from auth.providers import authenticate_local
+from auth.security import hash_password, verify_password, validate_password_strength
+from auth.jwt_utils import create_access_token
+from auth.dependencies import get_current_user, get_client_ip, CurrentUser
+from auth.config import SESSION_MAX_HOURS, AUTH_PROVIDER, FRONTEND_URL
+from auth.schemas import LoginRequest, LoginResponse, ChangePasswordRequest, UserOut
 
-function actionDetail(a) {
-  let detail = a.value || "";
-  if (a.action === "keypress") {
-    detail = a.value || "";
-  } else if (a.captured_as) {
-    detail = `${detail}  ->  {{${a.captured_as}}}`;
-  } else if (a.resolved_var) {
-    detail = `{{${a.resolved_var}}}  (recorded: ${detail})`;
-  }
-  return detail;
-}
+router = APIRouter(prefix="/api/auth", tags=["auth"])
 
-export default function RecordTab() {
-  const [applicationNames, setApplicationNames] = useState([]);
-  const [appsError, setAppsError] = useState(null);
-  const [selectedApp, setSelectedApp] = useState(OTHERS);
-  const [customUrl, setCustomUrl] = useState("");
-  const [recordingName, setRecordingName] = useState("");
-  const [headless, setHeadless] = useState(false);
 
-  const [recordingActive, setRecordingActive] = useState(false);
-  const [recordingHeadless, setRecordingHeadless] = useState(false);
-  const [backendProcessId, setBackendProcessId] = useState(null);
+def _user_out(user: User) -> UserOut:
+    return UserOut.model_validate(user)
 
-  const [startBusy, setStartBusy] = useState(false);
-  const [startPhase, setStartPhase] = useState(null);
-  const [startError, setStartError] = useState(null);
-  const [startNotice, setStartNotice] = useState(null);
 
-  const [saveBusy, setSaveBusy] = useState(false);
-  const [saveError, setSaveError] = useState(null);
-  const [saveNotice, setSaveNotice] = useState(null);
+def _issue_session_and_token(db, user: User, ip: str, user_agent: str, action: str) -> LoginResponse:
+    """Shared by every auth path (local password today; SSO once
+    auth/providers.py:authenticate_sso is implemented) - creates the
+    UserSession + JWT the exact same way regardless of how the user was
+    authenticated, so nothing about session handling, the idle timeout, or
+    the admin "who's online" view needs to change when SSO is added.
+    `action` is just which activity-log action to record (e.g. "LOGIN" vs
+    a future "SSO_LOGIN")."""
+    sess = repo.create_session(db, user.user_id, ip, user_agent, SESSION_MAX_HOURS)
+    repo.mark_login(db, user.user_id)
+    token = create_access_token(user_id=user.user_id, username=user.username, role=user.role, session_id=sess.session_id)
+    repo.log_activity(
+        db, user_id=user.user_id, session_id=sess.session_id, action=action, status="SUCCESS",
+        endpoint=f"/api/auth/{'sso/callback' if action != 'LOGIN' else 'login'}", ip_address=ip,
+    )
+    return LoginResponse(access_token=token, must_change_password=user.must_change_password, user=_user_out(user))
 
-  const [stopBusy, setStopBusy] = useState(false);
-  const [stopError, setStopError] = useState(null);
-  const [stopNotice, setStopNotice] = useState(null);
 
-  const [runBusy, setRunBusy] = useState(false);
-  const [runError, setRunError] = useState(null);
+@router.post("/login", response_model=LoginResponse)
+def login(req: LoginRequest, request: Request):
+    ip = get_client_ip(request)
+    with get_session() as db:
+        user = authenticate_local(db, req.username, req.password)
+        if user is None:
+            repo.log_activity(
+                db, user_id=None, session_id=None, action="LOGIN_FAILED", status="FAILURE",
+                details={"username": req.username}, endpoint="/api/auth/login", ip_address=ip,
+            )
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password.")
+        return _issue_session_and_token(db, user, ip, request.headers.get("user-agent"), action="LOGIN")
 
-  const [buildResult, setBuildResult] = useState(null);
-  const [runResult, setRunResult] = useState(null);
 
-  const [statusPreview, setStatusPreview] = useState(null);
-  const [statusPreviewError, setStatusPreviewError] = useState(null);
+@router.post("/change-password")
+def change_password(req: ChangePasswordRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    ip = get_client_ip(request)
+    with get_session() as db:
+        user = repo.get_user(db, current_user.user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found.")
 
-  useEffect(() => {
-    api
-      .getApplications()
-      .then((r) => setApplicationNames(r.applications))
-      .catch((e) => setAppsError(e.detail));
-  }, []);
+        if not verify_password(req.current_password, user.password_hash or ""):
+            repo.log_activity(
+                db, user_id=user.user_id, session_id=current_user.session_id, action="PASSWORD_CHANGE_FAILED",
+                status="FAILURE", endpoint="/api/auth/change-password", ip_address=ip,
+            )
+            raise HTTPException(status_code=400, detail="Current/temporary password is incorrect.")
 
-  async function handleStart() {
-    setStartError(null);
-    setStartNotice(null);
-    setStopError(null);
-    setStopNotice(null);
-    if (selectedApp === OTHERS && !customUrl.trim()) {
-      setStartError("Enter a target URL for 'Others' first.");
-      return;
-    }
-    setStartBusy(true);
-    try {
-      await api.startRecording({
-        app_name: selectedApp === OTHERS ? "" : selectedApp,
-        url: customUrl,
-        recording_name: recordingName,
-        headless,
-      });
+        error = validate_password_strength(req.new_password)
+        if error:
+            raise HTTPException(status_code=400, detail=error)
+        if req.new_password == req.current_password:
+            raise HTTPException(status_code=400, detail="New password must be different from the current password.")
 
-      setStartPhase("Launching browser...");
-      let launched = false;
-      let lastStatus = null;
-      for (let i = 0; i < 30; i++) {
-        await sleep(500);
-        lastStatus = await api.getStatus();
-        if (lastStatus.start_error) {
-          setStartError(`Recording failed to start: ${lastStatus.start_error}`);
-          break;
+        repo.set_user_password(db, user.user_id, hash_password(req.new_password), must_change_password=False)
+        repo.log_activity(
+            db, user_id=user.user_id, session_id=current_user.session_id, action="PASSWORD_CHANGED",
+            status="SUCCESS", endpoint="/api/auth/change-password", ip_address=ip,
+        )
+        return {"ok": True, "message": "Password changed successfully."}
+
+
+@router.post("/logout")
+def logout(request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    ip = get_client_ip(request)
+    with get_session() as db:
+        repo.revoke_session(db, current_user.session_id, reason="logout")
+        repo.log_activity(
+            db, user_id=current_user.user_id, session_id=current_user.session_id, action="LOGOUT",
+            status="SUCCESS", endpoint="/api/auth/logout", ip_address=ip,
+        )
+    return {"ok": True}
+
+
+@router.get("/me", response_model=UserOut)
+def me(current_user: CurrentUser = Depends(get_current_user)):
+    with get_session() as db:
+        user = repo.get_user(db, current_user.user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found.")
+        return _user_out(user)
+
+
+# ---------------------------------------------------------------------------
+# SSO - not implemented yet. See auth/config.py for the full integration
+# plan and auth/providers.py:authenticate_sso for the one function that
+# needs writing when SBI's IdP details are available.
+# ---------------------------------------------------------------------------
+
+@router.get("/sso/status")
+def sso_status():
+    """The frontend calls this before showing/enabling its "Sign in with
+    SSO" button - so the button can exist in the UI right now (as
+    requested) without misleading anyone into thinking it already works.
+    Flips to {"enabled": true} the moment AUTH_PROVIDER=sso is set, with
+    no frontend code changes needed."""
+    return {"enabled": AUTH_PROVIDER == "sso", "provider": AUTH_PROVIDER}
+
+
+@router.get("/sso/login")
+def sso_login_initiate():
+    """NOT YET IMPLEMENTED. Once wired up, this redirects (302) the
+    browser to the IdP's authorization endpoint - a SAML AuthnRequest URL
+    or an OIDC /authorize URL, built from SBI's issued client id / entity
+    id / redirect URI (new .env values to add alongside AUTH_PROVIDER).
+    Example of what this becomes for OIDC:
+
+        params = {
+            "client_id": SSO_CLIENT_ID, "response_type": "code",
+            "redirect_uri": f"{BACKEND_PUBLIC_URL}/api/auth/sso/callback",
+            "scope": "openid profile email", "state": <csrf nonce>,
         }
-        if (lastStatus.recording_active) {
-          launched = true;
-          break;
-        }
-      }
-      if (!launched && !(lastStatus && lastStatus.start_error)) {
-        setStartError("Browser launch is taking longer than expected - check the backend terminal for errors.");
-      }
-      if (launched && lastStatus) {
-        setRecordingActive(true);
-        setRecordingHeadless(!!lastStatus.headless);
-        setBackendProcessId(lastStatus.process_id);
-        setStartNotice("Recording started.");
-      }
-    } catch (e) {
-      setStartError(e.detail || e.message);
-    } finally {
-      setStartPhase(null);
-      setStartBusy(false);
-    }
-  }
+        return RedirectResponse(f"{SSO_AUTHORIZE_URL}?{urlencode(params)}")
+    """
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=f"SSO is not configured yet (AUTH_PROVIDER={AUTH_PROVIDER!r}). See auth/providers.py.",
+    )
 
-  async function handleStopRecording() {
-    if (!window.confirm("Stop recording? Everything captured so far will be discarded - use 'Save & Generate' instead if you want to keep it.")) {
-      return;
-    }
-    setStopError(null);
-    setStopNotice(null);
-    setStopBusy(true);
-    try {
-      const result = await api.stopRecording();
-      setRecordingActive(false);
-      setRecordingHeadless(false);
-      setStopNotice(`Recording stopped and discarded (${result.actions_discarded} actions).`);
-    } catch (e) {
-      setStopError(e.detail || e.message);
-    } finally {
-      setStopBusy(false);
-    }
-  }
 
-  async function handleSaveAndGenerate() {
-    setSaveError(null);
-    setSaveNotice(null);
-    setSaveBusy(true);
-    try {
-      const status = await api.getStatus().catch(() => null);
-      if (status && status.process_id && status.process_id !== backendProcessId) {
-        setRecordingActive(false);
-        setSaveError(
-          "The backend restarted since this recording started (its in-memory state, including the open browser, was lost) - start a new recording."
-        );
-        return;
-      }
-      const data = await api.stopAndSave();
-      setBuildResult(data);
-      setRecordingActive(false);
-      setSaveNotice(
-        `Generated ${data.build_result.step_count} steps / ${data.build_result.element_count} elements. (LLM used: ${data.llm_used})`
-      );
-    } catch (e) {
-      setSaveError(e.detail || e.message);
-    } finally {
-      setSaveBusy(false);
-    }
-  }
+@router.api_route("/sso/callback", methods=["GET", "POST"])
+def sso_callback(request: Request):
+    """NOT YET IMPLEMENTED. The IdP redirects here after the user
+    authenticates - GET with ?code=&state= for OIDC, or POST with a
+    SAMLResponse form field for SAML; which one depends on what SBI
+    provides, hence accepting both methods now rather than guessing.
 
-  async function handleRun() {
-    setRunError(null);
-    setRunBusy(true);
-    try {
-      const result = await api.runCheck(headless);
-      setRunResult(result);
-    } catch (e) {
-      setRunError(e.detail || e.message);
-    } finally {
-      setRunBusy(false);
-    }
-  }
+    Once implemented, the body becomes roughly:
 
-  async function handleRefreshStatus() {
-    setStatusPreviewError(null);
-    try {
-      setStatusPreview(await api.getStatus());
-    } catch (e) {
-      setStatusPreview(null);
-      setStatusPreviewError(e.detail || e.message);
-    }
-  }
-
-  const variables = (buildResult && buildResult.variables) || {};
-  const recordedActions = (buildResult && buildResult.actions) || [];
-
-  return (
-    <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
-      {/* ---- Configuration panel -------------------------------------- */}
-      <Panel>
-        <PanelHeader title="Session" caption="Choose a target and start capturing." />
-        <div className="space-y-4 px-5 py-5">
-          {appsError && <Callout tone="error">Could not load application list: {appsError}</Callout>}
-
-          <Field label="Application">
-            <Select value={selectedApp} onChange={(e) => setSelectedApp(e.target.value)}>
-              {applicationNames.map((name) => (
-                <option key={name} value={name}>
-                  {name}
-                </option>
-              ))}
-              <option value={OTHERS}>{OTHERS}</option>
-            </Select>
-          </Field>
-
-          {selectedApp === OTHERS && (
-            <Field label="Target application URL">
-              <TextInput
-                placeholder="https://your-app.example.com"
-                value={customUrl}
-                onChange={(e) => setCustomUrl(e.target.value)}
-              />
-            </Field>
-          )}
-
-          <Field
-            label="Recording name"
-            hint="Used to label this recording in 'Run Saved Recording' and in exit reports."
-          >
-            <TextInput
-              placeholder="e.g. a transaction number, or 'New Loan Application'"
-              value={recordingName}
-              onChange={(e) => setRecordingName(e.target.value)}
-            />
-          </Field>
-
-          <Checkbox label="headless" checked={headless} onChange={setHeadless} />
-
-          <div className="flex flex-col gap-2 border-t border-line pt-4">
-            <Button onClick={handleStart} disabled={recordingActive || startBusy}>
-              {startBusy ? "Starting..." : "Start Recording"}
-            </Button>
-            <Button variant="secondary" onClick={handleSaveAndGenerate} disabled={!recordingActive || saveBusy}>
-              {saveBusy ? "Saving..." : "Save & Generate"}
-            </Button>
-            <Button
-              variant="secondary"
-              onClick={handleStopRecording}
-              disabled={!recordingActive || stopBusy}
-              className="!border-signal-rust/40 !text-signal-rust hover:!border-signal-rust"
-            >
-              {stopBusy ? "Stopping..." : "Stop Recording"}
-            </Button>
-            <Button variant="secondary" onClick={handleRun} disabled={!buildResult || runBusy}>
-              {runBusy ? "Running..." : "Run / Check"}
-            </Button>
-          </div>
-
-          <div className="space-y-2 pt-1">
-            {startPhase && <Spinner label={startPhase} />}
-            {startError && <Callout tone="error">{startError}</Callout>}
-            {startNotice && <Callout tone="success">{startNotice}</Callout>}
-            {saveBusy && <Spinner label="Stopping recording and generating feature/steps/page files..." />}
-            {saveError && <Callout tone="error">{saveError}</Callout>}
-            {saveNotice && <Callout tone="success">{saveNotice}</Callout>}
-            {stopBusy && <Spinner label="Stopping and discarding the recording..." />}
-            {stopError && <Callout tone="error">{stopError}</Callout>}
-            {stopNotice && <Callout>{stopNotice}</Callout>}
-            {runBusy && <Spinner label="Running generated Behave suite..." />}
-            {runError && <Callout tone="error">Run failed: {runError}</Callout>}
-            {recordingActive && (
-              <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-signal-rust">
-                <span className="pulse-dot h-2 w-2 rounded-full bg-signal-rust" />
-                Recording in progress
-              </div>
-            )}
-          </div>
-        </div>
-      </Panel>
-
-      {/* ---- Log panel --------------------------------------------------- */}
-      <div className="space-y-4">
-        {recordingActive && recordingHeadless && (
-          <Panel>
-            <PanelHeader
-              title="Live view"
-              caption="This runs on the server - what you see and interact with here is the real, remote browser being recorded."
-            />
-            <div className="px-5 py-5">
-              <LiveRecordingView active={recordingActive} />
-            </div>
-          </Panel>
-        )}
-
-        {recordingActive && !recordingHeadless && (
-          <Panel>
-            <div className="px-5 py-5">
-              <Callout>
-                A real Edge browser window has opened on the machine running the backend - interact with it there
-                directly. (This is local/headed mode - the live view above only appears for headless/hosted
-                recordings, where there's no visible window to work with directly.)
-              </Callout>
-            </div>
-          </Panel>
-        )}
-
-        <Panel>
-          <PanelHeader title="Log" caption="Generation output, recorded actions, and the last run." />
-          <div className="space-y-3 px-5 py-5">
-            {runResult && (
-              <Callout tone={runResult.ok ? "success" : "error"}>
-                {runResult.ok ? "PASSED" : "FAILED (see log below)"}
-              </Callout>
-            )}
-
-            {buildResult ? (
-              <div className="space-y-3">
-                <Disclosure title="Generation result">
-                  <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-rail p-3 font-mono text-xs scroll-thin">
-                    {JSON.stringify(buildResult.build_result, null, 2)}
-                  </pre>
-                </Disclosure>
-
-                {Object.keys(variables).length > 0 && (
-                  <Disclosure title={`Captured variables (${Object.keys(variables).length})`}>
-                    <p className="mb-2 text-xs text-muted">
-                      Values captured via copy/CTRL+C during recording, reused later via {"{{name}}"} placeholders.
-                    </p>
-                    <DataTable
-                      columns={[
-                        { key: "variable", label: "Variable", mono: true },
-                        { key: "value", label: "Captured value", mono: true },
-                      ]}
-                      rows={Object.entries(variables).map(([k, v]) => ({
-                        variable: `{{${k}}}`,
-                        value: v,
-                      }))}
-                    />
-                  </Disclosure>
-                )}
-
-                {recordedActions.length > 0 && (
-                  <Disclosure title={`Recorded actions (${recordedActions.length})`}>
-                    <DataTable
-                      columns={[
-                        { key: "n", label: "#" },
-                        { key: "action", label: "Action" },
-                        { key: "element", label: "Element" },
-                        { key: "detail", label: "Value / key", mono: true },
-                      ]}
-                      rows={recordedActions.map((a, i) => ({
-                        n: i + 1,
-                        action: a.action || "",
-                        element: actionLabel(a),
-                        detail: actionDetail(a),
-                      }))}
-                    />
-                  </Disclosure>
-                )}
-              </div>
-            ) : (
-              <p className="text-sm text-muted">Nothing generated yet.</p>
-            )}
-
-            <div className="pt-1">
-              {runResult ? (
-                <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-[#151B22] p-4 font-mono text-xs text-[#D7DDE3] scroll-thin">
-                  {runResult.output || ""}
-                </pre>
-              ) : (
-                <p className="text-sm text-muted">Nothing run yet.</p>
-              )}
-            </div>
-          </div>
-        </Panel>
-
-        <Panel>
-          <div className="flex items-center justify-between px-5 py-4">
-            <div>
-              <h2 className="text-sm font-semibold text-ink">Backend status</h2>
-              {statusPreviewError && <p className="mt-0.5 text-xs text-signal-rust">{statusPreviewError}</p>}
-            </div>
-            <Button variant="secondary" onClick={handleRefreshStatus}>
-              Refresh status
-            </Button>
-          </div>
-          {statusPreview && (
-            <div className="border-t border-line px-5 py-4">
-              <pre className="overflow-auto whitespace-pre-wrap break-words rounded-sm bg-rail p-3 font-mono text-xs scroll-thin">
-                {JSON.stringify(statusPreview, null, 2)}
-              </pre>
-            </div>
-          )}
-        </Panel>
-      </div>
-    </div>
-  );
-}
+        assertion = ... extract SAMLResponse / OIDC code from `request` ...
+        with get_session() as db:
+            user = authenticate_sso(db, assertion)  # auth/providers.py
+            if user is None:
+                return RedirectResponse(f"{FRONTEND_URL}/login?reason=SSO+sign-in+failed")
+            login_response = _issue_session_and_token(
+                db, user, get_client_ip(request), request.headers.get("user-agent"), action="SSO_LOGIN"
+            )
+        # Bearer tokens live in localStorage, not a cookie (see
+        # frontend/lib/auth-storage.js) - so the token has to reach the
+        # browser via the redirect URL itself; the frontend's
+        # /sso/complete page (already built) picks it up from there.
+        return RedirectResponse(f"{FRONTEND_URL}/sso/complete?token={login_response.access_token}")
+    """
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=f"SSO is not configured yet (AUTH_PROVIDER={AUTH_PROVIDER!r}). See auth/providers.py.",
+    )
