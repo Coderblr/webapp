@@ -1,121 +1,107 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import { useRouter } from "next/router";
-import { authApi, setUnauthorizedHandler } from "@/lib/api";
-import { getToken, setToken, clearToken } from "@/lib/auth-storage";
+"""
+Runs the generated behave suite and returns structured pass/fail output.
 
-const AuthContext = createContext(null);
+Uses a real subprocess (`sys.executable -m behave ...`) normally - this is
+what lets behave's own CLI/formatters work completely unmodified, and
+keeps each run in a totally clean process (no leftover step-registry state
+from a previous run).
 
-// Requirement: auto-logout after 5 minutes with no interaction. The server
-// independently enforces the same 5-minute idle window on every API call
-// (see auth/dependencies.py) - this client-side timer is what makes it
-// happen even if the user just sits on a page making no requests at all,
-// and gives a friendly warning before it fires.
-const IDLE_LIMIT_MS = 12 * 60 * 60 * 1000; // 12 hours - keep in sync with IDLE_TIMEOUT_MINUTES in .env
-const IDLE_WARNING_MS = 60 * 1000; // show a "you're about to be logged out" banner 60s ahead
+IMPORTANT for the local desktop agent (local_agent/): `sys.executable`
+inside a PyInstaller-frozen executable (see local_agent/local_agent.spec)
+is the path to the FROZEN .EXE ITSELF, not a real Python interpreter -
+there is no "python.exe" to shell out to. `[sys.executable, "-m", "behave",
+...]` would try to re-launch the agent app with nonsense arguments instead
+of actually running behave, which is exactly why "Start Recording" (in-
+process, via recorder/recorder.py - no subprocess involved) worked from a
+packaged local_agent.exe while "Run" (this file, subprocess-based) did
+not: the subprocess never got anywhere near actually launching Playwright.
 
-export function AuthProvider({ children }) {
-  const router = useRouter();
-  const [user, setUser] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [idleWarning, setIdleWarning] = useState(false);
-  const lastActivityRef = useRef(Date.now());
-  const idleWarnedRef = useRef(false);
+run_behave_cli() below detects a frozen build (`sys.frozen`, set by
+PyInstaller) and calls behave's own programmatic entry point
+(`behave.__main__.main`) IN-PROCESS instead - no subprocess, no
+sys.executable problem. Since that reuses the current process across
+multiple test runs on a long-running agent, it also resets behave's global
+step registry before each call (see _reset_step_registry) - without that,
+a second run would fail with spurious "ambiguous step" errors from the
+first run's step definitions never being cleared.
+"""
+from __future__ import annotations
+import contextlib
+import io
+import os
+import subprocess
+import sys
+from pathlib import Path
 
-  const goToLogin = useCallback(
-    (message) => {
-      clearToken();
-      setUser(null);
-      const query = message ? { reason: message } : {};
-      router.replace({ pathname: "/login", query });
-    },
-    [router]
-  );
+ROOT = Path(__file__).parent.parent
 
-  // Wire the API client's 401 handler straight to logout - a session that
-  // the server considers dead (idle timeout, revoked, expired) should kick
-  // the user out immediately no matter which page triggered the call.
-  useEffect(() => {
-    setUnauthorizedHandler((detail) => goToLogin(detail));
-  }, [goToLogin]);
 
-  // ---- bootstrap: is there a valid token already? ------------------------
-  useEffect(() => {
-    const token = getToken();
-    if (!token) {
-      setLoading(false);
-      return;
-    }
-    authApi
-      .me()
-      .then((u) => setUser(u))
-      .catch(() => clearToken())
-      .finally(() => setLoading(false));
-  }, []);
+def _reset_step_registry() -> None:
+    """Only relevant for the in-process (frozen-exe) path below - a normal
+    subprocess run starts a brand new Python process each time, so this
+    isn't needed there. Behave keeps its @given/@when/@then registrations
+    in one process-wide registry; without resetting it, running a SECOND
+    test in the same long-running agent process would see both runs' step
+    definitions at once and fail with "ambiguous step" errors."""
+    try:
+        import behave.step_registry as step_registry
+        step_registry.registry.steps = {"given": [], "when": [], "then": [], "step": []}
+    except Exception:
+        pass  # best-effort - a failure here shouldn't block the actual test run
 
-  // ---- idle timer ----------------------------------------------------------
-  useEffect(() => {
-    if (!user) return;
 
-    const markActive = () => {
-      lastActivityRef.current = Date.now();
-      if (idleWarnedRef.current) {
-        idleWarnedRef.current = false;
-        setIdleWarning(false);
-      }
-    };
+def run_behave_cli(behave_args: list[str], cwd: str, env_overrides: dict) -> dict:
+    """Runs behave with `behave_args` (e.g. [features_dir, "--no-capture"]),
+    returning {"returncode", "output"}. See this module's docstring for why
+    there are two code paths."""
+    if getattr(sys, "frozen", False):
+        from behave.__main__ import main as behave_main
 
-    const events = ["mousemove", "mousedown", "keydown", "scroll", "touchstart"];
-    events.forEach((e) => window.addEventListener(e, markActive, { passive: true }));
+        _reset_step_registry()
+        old_cwd = os.getcwd()
+        old_env = {k: os.environ.get(k) for k in env_overrides}
+        stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
+        returncode = 1
+        try:
+            os.chdir(cwd)
+            os.environ.update(env_overrides)
+            with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
+                try:
+                    result = behave_main(behave_args)
+                    returncode = result if isinstance(result, int) else 0
+                except SystemExit as e:
+                    returncode = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+        finally:
+            os.chdir(old_cwd)
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        return {"returncode": returncode, "output": stdout_buf.getvalue() + "\n" + stderr_buf.getvalue()}
 
-    const interval = setInterval(() => {
-      const idleFor = Date.now() - lastActivityRef.current;
-      if (idleFor >= IDLE_LIMIT_MS) {
-        goToLogin("Your session timed out due to inactivity. Please log in again.");
-      } else if (idleFor >= IDLE_LIMIT_MS - IDLE_WARNING_MS) {
-        idleWarnedRef.current = true;
-        setIdleWarning(true);
-      }
-    }, 1000);
+    full_env = {**os.environ, **env_overrides}
+    proc = subprocess.run(
+        [sys.executable, "-m", "behave", *behave_args],
+        cwd=cwd, capture_output=True, text=True, env=full_env,
+    )
+    return {"returncode": proc.returncode, "output": proc.stdout + "\n" + proc.stderr}
 
-    return () => {
-      events.forEach((e) => window.removeEventListener(e, markActive));
-      clearInterval(interval);
-    };
-  }, [user, goToLogin]);
 
-  async function login(username, password) {
-    const data = await authApi.login(username, password);
-    setToken(data.access_token);
-    setUser(data.user);
-    return data; // { must_change_password, user, ... }
-  }
+def run(output_dir: str = "output", headless: bool = False) -> dict:
+    features_dir = Path(output_dir) / "features"
+    if not features_dir.exists():
+        return {"ok": False, "returncode": -1, "output": f"No features found at {features_dir}. Generate first."}
 
-  async function logout() {
-    try {
-      await authApi.logout();
-    } catch {
-      /* best effort - clear locally regardless */
-    }
-    clearToken();
-    setUser(null);
-    router.replace("/login");
-  }
+    result = run_behave_cli(
+        [str(features_dir), "--no-capture"],
+        cwd=str(ROOT),
+        env_overrides={"HEADLESS": "true" if headless else "false"},
+    )
+    return {"ok": result["returncode"] == 0, "returncode": result["returncode"], "output": result["output"]}
 
-  async function refreshUser() {
-    const u = await authApi.me();
-    setUser(u);
-    return u;
-  }
 
-  return (
-    <AuthContext.Provider value={{ user, loading, login, logout, refreshUser, idleWarning }}>
-      {children}
-    </AuthContext.Provider>
-  );
-}
-
-export function useAuth() {
-  const ctx = useContext(AuthContext);
-  if (!ctx) throw new Error("useAuth must be used within AuthProvider");
-  return ctx;
-}
+if __name__ == "__main__":
+    result = run()
+    print(result["output"])
+    sys.exit(result["returncode"])
