@@ -1,107 +1,141 @@
 """
-Runs the generated behave suite and returns structured pass/fail output.
+Runs a Behave test suite ON THIS MACHINE, reusing the EXISTING
+runner/run_tests.py unmodified (per the task's constraints - no second
+independent test-execution implementation) for the plain pass/fail path,
+plus a JSON-formatter variant (mirroring runner/run_recording.py's
+_run_behave_json exactly) so a "Run Saved Recording" executed via the
+agent gets the same per-step granularity as one executed server-side -
+see run_test_with_json_report below.
 
-Uses a real subprocess (`sys.executable -m behave ...`) normally - this is
-what lets behave's own CLI/formatters work completely unmodified, and
-keeps each run in a totally clean process (no leftover step-registry state
-from a previous run).
-
-IMPORTANT for the local desktop agent (local_agent/): `sys.executable`
-inside a PyInstaller-frozen executable (see local_agent/local_agent.spec)
-is the path to the FROZEN .EXE ITSELF, not a real Python interpreter -
-there is no "python.exe" to shell out to. `[sys.executable, "-m", "behave",
-...]` would try to re-launch the agent app with nonsense arguments instead
-of actually running behave, which is exactly why "Start Recording" (in-
-process, via recorder/recorder.py - no subprocess involved) worked from a
-packaged local_agent.exe while "Run" (this file, subprocess-based) did
-not: the subprocess never got anywhere near actually launching Playwright.
-
-run_behave_cli() below detects a frozen build (`sys.frozen`, set by
-PyInstaller) and calls behave's own programmatic entry point
-(`behave.__main__.main`) IN-PROCESS instead - no subprocess, no
-sys.executable problem. Since that reuses the current process across
-multiple test runs on a long-running agent, it also resets behave's global
-step registry before each call (see _reset_step_registry) - without that,
-a second run would fail with spurious "ambiguous step" errors from the
-first run's step definitions never being cleared.
+Why this works with zero changes to runner/run_tests.py: it invokes
+`python -m behave <features_dir>` with `cwd=<project root>` - and it's
+specifically that `cwd` (not any sys.path manipulation inside
+runner/environment.py) that makes `recorder`/`agent`/`runner` importable,
+because Python's `-m` flag inserts the CURRENT WORKING DIRECTORY onto
+sys.path. Confirmed by direct experiment: the exact same
+runner/environment.py fails with `ModuleNotFoundError: No module named
+'recorder'` when behave is invoked from any other cwd. Since this
+project's own layout puts local_agent/ right next to recorder/, agent/,
+and runner/ (same as the central server today), calling
+runner.run_tests.run() from here "just works" for a workspace at ANY
+nesting depth under agent_workspace/ - identical to how the server's own
+per-session output/sessions/<id>/ dirs already rely on this same mechanism.
 """
 from __future__ import annotations
-import contextlib
-import io
+import json
 import os
+import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
+from typing import Optional
 
-ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from runner.run_tests import run as run_behave, run_behave_cli
+from local_agent.config import WORKSPACE_DIR
+from local_agent.logger import get_logger
+
+logger = get_logger("execution")
+
+_ENV_SOURCE = Path(__file__).resolve().parent / "agent_environment.py"
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _reset_step_registry() -> None:
-    """Only relevant for the in-process (frozen-exe) path below - a normal
-    subprocess run starts a brand new Python process each time, so this
-    isn't needed there. Behave keeps its @given/@when/@then registrations
-    in one process-wide registry; without resetting it, running a SECOND
-    test in the same long-running agent process would see both runs' step
-    definitions at once and fail with "ambiguous step" errors."""
+def _new_execution_dir() -> Path:
+    """Per spec section 17: an isolated workspace per execution so
+    concurrent runs (however unlikely on a single agent that handles one
+    thing at a time today - see connection_manager.py's BUSY state) can
+    never overwrite each other's files."""
+    execution_id = uuid.uuid4().hex[:12]
+    workspace = WORKSPACE_DIR / f"execution-{execution_id}"
+    workspace.mkdir(parents=True, exist_ok=True)
+    return workspace
+
+
+def _write_workspace(files: dict, workspace: Path) -> None:
+    for rel_path, content in files.items():
+        dest = workspace / rel_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content)
+    env_dest = workspace / "features" / "environment.py"
+    if not env_dest.exists():
+        shutil.copy(_ENV_SOURCE, env_dest)
+
+
+def run_test(files: dict, headless: bool = True) -> dict:
+    """Plain pass/fail execution via the existing runner/run_tests.py -
+    used by the live "Record & Generate" tab's Run/Check button (no
+    per-step JSON needed there)."""
+    workspace = _new_execution_dir()
+    logger.info(f"Starting local test execution in {workspace}")
     try:
-        import behave.step_registry as step_registry
-        step_registry.registry.steps = {"given": [], "when": [], "then": [], "step": []}
-    except Exception:
-        pass  # best-effort - a failure here shouldn't block the actual test run
+        _write_workspace(files, workspace)
+        result = run_behave(output_dir=str(workspace), headless=headless)
+        logger.info(f"Execution finished: ok={result.get('ok')}")
+        return result
+    except Exception as e:
+        logger.exception("Local test execution failed unexpectedly")
+        return {"ok": False, "returncode": -1, "output": f"Agent-side execution error: {e}"}
 
 
-def run_behave_cli(behave_args: list[str], cwd: str, env_overrides: dict) -> dict:
-    """Runs behave with `behave_args` (e.g. [features_dir, "--no-capture"]),
-    returning {"returncode", "output"}. See this module's docstring for why
-    there are two code paths."""
-    if getattr(sys, "frozen", False):
-        from behave.__main__ import main as behave_main
+def run_test_with_json_report(files: dict, headless: bool = True) -> dict:
+    """Same as run_test, but also captures Behave's `--format json` output
+    (mirroring runner/run_recording.py's _run_behave_json exactly) so a
+    "Run Saved Recording" executed via this agent gets the same per-step
+    pass/fail/error detail as one executed server-side - see
+    backend/api.py's run_saved_recording, which needs this shape to keep
+    generating the same exit report regardless of where the test actually ran.
 
-        _reset_step_registry()
-        old_cwd = os.getcwd()
-        old_env = {k: os.environ.get(k) for k in env_overrides}
-        stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
-        returncode = 1
+    Uses runner.run_tests.run_behave_cli, which correctly handles a
+    PyInstaller-frozen agent (see that module's docstring - this is the
+    fix for "Start Recording opens a browser but Run/Run Saved Recording
+    doesn't" when running from a packaged local_agent.exe: sys.executable
+    inside a frozen exe is the exe itself, not a real Python interpreter,
+    so the old subprocess-based invocation here never actually launched
+    behave at all).
+
+    Returns {"ok", "returncode", "output", "json": [...]} - "json" is the
+    raw parsed Behave JSON array (possibly empty if Behave crashed before
+    producing it), exactly what runner/run_recording.py's
+    _extract_steps() already knows how to flatten.
+    """
+    workspace = _new_execution_dir()
+    logger.info(f"Starting local test execution (with JSON report) in {workspace}")
+    try:
+        _write_workspace(files, workspace)
+        features_dir = workspace / "features"
+        results_path = workspace / "behave_results.json"
+
+        result = run_behave_cli(
+            [str(features_dir), "--no-capture", "--format", "json", "--outfile", str(results_path)],
+            cwd=str(_PROJECT_ROOT),
+            env_overrides={"HEADLESS": "true" if headless else "false"},
+        )
         try:
-            os.chdir(cwd)
-            os.environ.update(env_overrides)
-            with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
-                try:
-                    result = behave_main(behave_args)
-                    returncode = result if isinstance(result, int) else 0
-                except SystemExit as e:
-                    returncode = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
-        finally:
-            os.chdir(old_cwd)
-            for k, v in old_env.items():
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
-        return {"returncode": returncode, "output": stdout_buf.getvalue() + "\n" + stderr_buf.getvalue()}
+            parsed = json.loads(results_path.read_text())
+        except Exception:
+            parsed = []
 
-    full_env = {**os.environ, **env_overrides}
-    proc = subprocess.run(
-        [sys.executable, "-m", "behave", *behave_args],
-        cwd=cwd, capture_output=True, text=True, env=full_env,
-    )
-    return {"returncode": proc.returncode, "output": proc.stdout + "\n" + proc.stderr}
+        logger.info(f"Execution finished: returncode={result['returncode']}")
+        return {"ok": result["returncode"] == 0, "returncode": result["returncode"], "output": result["output"], "json": parsed}
+    except Exception as e:
+        logger.exception("Local test execution (JSON report) failed unexpectedly")
+        return {"ok": False, "returncode": -1, "output": f"Agent-side execution error: {e}", "json": []}
 
 
-def run(output_dir: str = "output", headless: bool = False) -> dict:
-    features_dir = Path(output_dir) / "features"
-    if not features_dir.exists():
-        return {"ok": False, "returncode": -1, "output": f"No features found at {features_dir}. Generate first."}
-
-    result = run_behave_cli(
-        [str(features_dir), "--no-capture"],
-        cwd=str(ROOT),
-        env_overrides={"HEADLESS": "true" if headless else "false"},
-    )
-    return {"ok": result["returncode"] == 0, "returncode": result["returncode"], "output": result["output"]}
-
-
-if __name__ == "__main__":
-    result = run()
-    print(result["output"])
-    sys.exit(result["returncode"])
+def cleanup_old_executions(keep_last: int = 10) -> None:
+    """Retention per spec section 18 - avoid the workspace directory
+    growing unbounded across a long-running agent's lifetime. Called
+    periodically by client.py, not on every single run (recent executions
+    are kept around briefly in case their artifacts/logs are still useful
+    to look at locally)."""
+    if not WORKSPACE_DIR.exists():
+        return
+    executions = sorted(WORKSPACE_DIR.glob("execution-*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in executions[keep_last:]:
+        try:
+            shutil.rmtree(old, ignore_errors=True)
+        except Exception:
+            pass
