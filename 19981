@@ -1,305 +1,121 @@
-import { useEffect, useState } from "react";
-import { api } from "@/lib/api";
-import { useAuth } from "@/context/AuthContext";
-import { buildReportText, buildReportHtml, downloadBlob, openReportInBrowser } from "@/lib/report";
-import {
-  Button,
-  Callout,
-  Checkbox,
-  DataTable,
-  Disclosure,
-  Field,
-  Metric,
-  Panel,
-  PanelHeader,
-  Select,
-  Spinner,
-  StatusBadge,
-  TextInput,
-} from "@/components/ui";
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/router";
+import { authApi, setUnauthorizedHandler } from "@/lib/api";
+import { getToken, setToken, clearToken } from "@/lib/auth-storage";
 
-export default function RunSavedTab() {
-  const { user } = useAuth();
+const AuthContext = createContext(null);
 
-  const [recordings, setRecordings] = useState([]);
-  const [recordingsError, setRecordingsError] = useState(null);
-  const [selectedRecFile, setSelectedRecFile] = useState("");
-  const [runHeadless, setRunHeadless] = useState(false);
+// Requirement: auto-logout after 5 minutes with no interaction. The server
+// independently enforces the same 5-minute idle window on every API call
+// (see auth/dependencies.py) - this client-side timer is what makes it
+// happen even if the user just sits on a page making no requests at all,
+// and gives a friendly warning before it fires.
+const IDLE_LIMIT_MS = 12 * 60 * 60 * 1000; // 12 hours - keep in sync with IDLE_TIMEOUT_MINUTES in .env
+const IDLE_WARNING_MS = 60 * 1000; // show a "you're about to be logged out" banner 60s ahead
 
-  // ---- test data (editable, shown before running - see generator/test_data.py) ----
-  const [testData, setTestData] = useState([]);
-  const [testDataLoading, setTestDataLoading] = useState(false);
-  const [testDataError, setTestDataError] = useState(null);
-  const [editValues, setEditValues] = useState({}); // { [action index]: current input value }
-  const [savingData, setSavingData] = useState(false);
-  const [saveDataNotice, setSaveDataNotice] = useState(null);
-  const [saveDataError, setSaveDataError] = useState(null);
+export function AuthProvider({ children }) {
+  const router = useRouter();
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [idleWarning, setIdleWarning] = useState(false);
+  const lastActivityRef = useRef(Date.now());
+  const idleWarnedRef = useRef(false);
 
-  const [runBusy, setRunBusy] = useState(false);
-  const [runError, setRunError] = useState(null);
-  const [report, setReport] = useState(null);
+  const goToLogin = useCallback(
+    (message) => {
+      clearToken();
+      setUser(null);
+      const query = message ? { reason: message } : {};
+      router.replace({ pathname: "/login", query });
+    },
+    [router]
+  );
 
-  async function loadRecordings() {
-    try {
-      const r = await api.getRecordings();
-      setRecordings(r);
-      setRecordingsError(null);
-      if (r.length && !selectedRecFile) setSelectedRecFile(r[0].file);
-    } catch (e) {
-      setRecordingsError(e.detail || e.message);
-    }
-  }
-
+  // Wire the API client's 401 handler straight to logout - a session that
+  // the server considers dead (idle timeout, revoked, expired) should kick
+  // the user out immediately no matter which page triggered the call.
   useEffect(() => {
-    loadRecordings();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    setUnauthorizedHandler((detail) => goToLogin(detail));
+  }, [goToLogin]);
+
+  // ---- bootstrap: is there a valid token already? ------------------------
+  useEffect(() => {
+    const token = getToken();
+    if (!token) {
+      setLoading(false);
+      return;
+    }
+    authApi
+      .me()
+      .then((u) => setUser(u))
+      .catch(() => clearToken())
+      .finally(() => setLoading(false));
   }, []);
 
-  async function loadTestData(file) {
-    setTestDataLoading(true);
-    setTestDataError(null);
-    setSaveDataNotice(null);
-    setSaveDataError(null);
-    try {
-      const data = await api.getRecordingTestData(file);
-      setTestData(data.fields);
-      setEditValues(Object.fromEntries(data.fields.map((f) => [f.index, f.value])));
-    } catch (e) {
-      setTestData([]);
-      setEditValues({});
-      setTestDataError(e.detail || e.message);
-    } finally {
-      setTestDataLoading(false);
-    }
-  }
-
+  // ---- idle timer ----------------------------------------------------------
   useEffect(() => {
-    setReport(null); // a different recording's exit report shouldn't linger once you switch
-    if (selectedRecFile) loadTestData(selectedRecFile);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedRecFile]);
+    if (!user) return;
 
-  function updateValue(index, value) {
-    setEditValues((prev) => ({ ...prev, [index]: value }));
-    setSaveDataNotice(null);
-  }
-
-  async function saveTestDataOnly() {
-    setSavingData(true);
-    setSaveDataError(null);
-    setSaveDataNotice(null);
-    try {
-      const data = await api.updateRecordingTestData(selectedRecFile, editValues);
-      setTestData(data.fields);
-      setSaveDataNotice("Test data saved - future runs of this recording will use these values too.");
-    } catch (e) {
-      setSaveDataError(e.detail || e.message);
-    } finally {
-      setSavingData(false);
-    }
-  }
-
-  async function handleRun() {
-    if (!selectedRecFile) return;
-    setRunError(null);
-    setRunBusy(true);
-    try {
-      // Whatever is currently in the grid is what gets run - saved to the
-      // recording first (so it's also the new baseline for next time),
-      // then executed. No separate "save" step required.
-      if (testData.length > 0) {
-        await api.updateRecordingTestData(selectedRecFile, editValues);
+    const markActive = () => {
+      lastActivityRef.current = Date.now();
+      if (idleWarnedRef.current) {
+        idleWarnedRef.current = false;
+        setIdleWarning(false);
       }
-      const r = await api.runRecording(selectedRecFile, runHeadless);
-      setReport(r);
-    } catch (e) {
-      setRunError(e.detail || e.message);
-    } finally {
-      setRunBusy(false);
+    };
+
+    const events = ["mousemove", "mousedown", "keydown", "scroll", "touchstart"];
+    events.forEach((e) => window.addEventListener(e, markActive, { passive: true }));
+
+    const interval = setInterval(() => {
+      const idleFor = Date.now() - lastActivityRef.current;
+      if (idleFor >= IDLE_LIMIT_MS) {
+        goToLogin("Your session timed out due to inactivity. Please log in again.");
+      } else if (idleFor >= IDLE_LIMIT_MS - IDLE_WARNING_MS) {
+        idleWarnedRef.current = true;
+        setIdleWarning(true);
+      }
+    }, 1000);
+
+    return () => {
+      events.forEach((e) => window.removeEventListener(e, markActive));
+      clearInterval(interval);
+    };
+  }, [user, goToLogin]);
+
+  async function login(username, password) {
+    const data = await authApi.login(username, password);
+    setToken(data.access_token);
+    setUser(data.user);
+    return data; // { must_change_password, user, ... }
+  }
+
+  async function logout() {
+    try {
+      await authApi.logout();
+    } catch {
+      /* best effort - clear locally regardless */
     }
+    clearToken();
+    setUser(null);
+    router.replace("/login");
+  }
+
+  async function refreshUser() {
+    const u = await authApi.me();
+    setUser(u);
+    return u;
   }
 
   return (
-    <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
-      <Panel>
-        <PanelHeader title="Run a saved recording" caption="Pick a recording, review/edit its test data, then run it." />
-        <div className="space-y-4 px-5 py-5">
-          <Callout>
-            Running as <strong>{user?.first_name} {user?.last_name}</strong> ({user?.username}). Every run is logged
-            against your account.
-          </Callout>
-
-          {recordingsError && <Callout tone="error">Could not load recordings: {recordingsError}</Callout>}
-
-          {recordings.length === 0 ? (
-            <Callout>No saved recordings found yet. Record one in the &ldquo;Record &amp; Generate&rdquo; tab first.</Callout>
-          ) : (
-            <>
-              <Field label="Saved recording">
-                <Select value={selectedRecFile} onChange={(e) => setSelectedRecFile(e.target.value)}>
-                  {recordings.map((r) => (
-                    <option key={r.file} value={r.file}>
-                      {r.name} — {r.target_url} ({r.action_count} actions)
-                    </option>
-                  ))}
-                </Select>
-              </Field>
-
-              <Checkbox label="headless" checked={runHeadless} onChange={setRunHeadless} />
-
-              <Button onClick={handleRun} disabled={runBusy} className="w-full">
-                {runBusy ? "Running..." : "Run recording"}
-              </Button>
-
-              {runBusy && <Spinner label="Running the saved recording..." />}
-              {runError && <Callout tone="error">Run failed: {runError}</Callout>}
-            </>
-          )}
-        </div>
-      </Panel>
-
-      <div className="space-y-4">
-        {selectedRecFile && (
-          <Panel>
-            <div className="flex items-center justify-between border-b border-line px-5 py-4">
-              <div>
-                <h2 className="text-sm font-semibold text-ink">Test data</h2>
-                <p className="mt-0.5 text-xs text-muted">
-                  The values this recording types/selects when it runs. Edit anything below, then hit{" "}
-                  <strong>Run recording</strong> - no need to download or re-upload the Excel report; changes save
-                  straight into this recording.
-                </p>
-              </div>
-              {testData.length > 0 && (
-                <Button variant="secondary" onClick={saveTestDataOnly} disabled={savingData}>
-                  {savingData ? "Saving..." : "Save without running"}
-                </Button>
-              )}
-            </div>
-            <div className="px-5 py-4">
-              {testDataLoading && <Spinner label="Loading test data..." />}
-              {testDataError && <Callout tone="error">{testDataError}</Callout>}
-              {saveDataError && <Callout tone="error">{saveDataError}</Callout>}
-              {saveDataNotice && <Callout tone="success">{saveDataNotice}</Callout>}
-
-              {!testDataLoading && !testDataError && testData.length === 0 && (
-                <p className="text-sm text-muted">
-                  This recording has no typed or selected values to edit (e.g. it's clicks/navigation only).
-                </p>
-              )}
-
-              {testData.length > 0 && (
-                <DataTable
-                  columns={[
-                    { key: "label", label: "Field" },
-                    { key: "action", label: "Type", mono: true },
-                    { key: "value", label: "Value" },
-                  ]}
-                  rows={testData.map((f) => ({
-                    label: f.label,
-                    action: f.action,
-                    value: (
-                      <TextInput
-                        value={editValues[f.index] ?? ""}
-                        onChange={(e) => updateValue(f.index, e.target.value)}
-                      />
-                    ),
-                  }))}
-                />
-              )}
-            </div>
-          </Panel>
-        )}
-
-        {report && (
-          <Panel>
-            <PanelHeader title="Exit report" />
-            <div className="space-y-5 px-5 py-5">
-              <div className="flex items-center gap-3">
-                <StatusBadge status={report.status} />
-                <span className="font-mono text-sm text-muted">Transaction #{report.transaction_id}</span>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-                <Metric label="Steps" value={report.step_count} />
-                <Metric label="Passed" value={report.passed_count} />
-                <Metric label="Failed" value={report.failed_count} />
-                <Metric label="Run by" value={report.user} />
-              </div>
-
-              <div>
-                <h3 className="mb-2 text-sm font-semibold text-ink">Automation log</h3>
-                <DataTable
-                  columns={[
-                    { key: "n", label: "#" },
-                    { key: "step", label: "Playwright step" },
-                    { key: "status", label: "Status" },
-                    { key: "error", label: "Error", mono: true },
-                  ]}
-                  rows={report.steps.map((s, i) => ({
-                    n: i + 1,
-                    step: s.step_name,
-                    status: <StatusBadge status={s.status} />,
-                    error: s.error_message || "",
-                  }))}
-                />
-              </div>
-
-              <Disclosure title={`Files produced (${report.files.length})`}>
-                <DataTable
-                  columns={[
-                    { key: "file_name", label: "File" },
-                    { key: "folder_path", label: "Folder", mono: true },
-                  ]}
-                  rows={report.files.map((f) => ({ file_name: f.file_name, folder_path: f.folder_path }))}
-                />
-              </Disclosure>
-
-              <Disclosure title="Raw Behave output">
-                <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-[#151B22] p-4 font-mono text-xs text-[#D7DDE3] scroll-thin">
-                  {report.raw_output}
-                </pre>
-              </Disclosure>
-
-              <div className="flex flex-wrap gap-2">
-                <Button onClick={() => openReportInBrowser(report)}>Open report in browser</Button>
-                <Button
-                  variant="secondary"
-                  onClick={() =>
-                    downloadBlob(
-                      `transaction_${report.transaction_id}_exit_report.html`,
-                      buildReportHtml(report),
-                      "text/html"
-                    )
-                  }
-                >
-                  Download (.html)
-                </Button>
-                <Button
-                  variant="secondary"
-                  onClick={() =>
-                    downloadBlob(
-                      `transaction_${report.transaction_id}_exit_report.txt`,
-                      buildReportText(report),
-                      "text/plain"
-                    )
-                  }
-                >
-                  Download (.txt)
-                </Button>
-              </div>
-            </div>
-          </Panel>
-        )}
-
-        {!selectedRecFile && (
-          <Panel>
-            <div className="px-5 py-10 text-center text-sm text-muted">
-              Pick a saved recording to review its test data and run it.
-            </div>
-          </Panel>
-        )}
-      </div>
-    </div>
+    <AuthContext.Provider value={{ user, loading, login, logout, refreshUser, idleWarning }}>
+      {children}
+    </AuthContext.Provider>
   );
+}
+
+export function useAuth() {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error("useAuth must be used within AuthProvider");
+  return ctx;
 }
