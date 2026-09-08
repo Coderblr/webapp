@@ -1,141 +1,189 @@
-"""
-Runs a Behave test suite ON THIS MACHINE, reusing the EXISTING
-runner/run_tests.py unmodified (per the task's constraints - no second
-independent test-execution implementation) for the plain pass/fail path,
-plus a JSON-formatter variant (mirroring runner/run_recording.py's
-_run_behave_json exactly) so a "Run Saved Recording" executed via the
-agent gets the same per-step granularity as one executed server-side -
-see run_test_with_json_report below.
+# -*- mode: python ; coding: utf-8 -*-
+#
+# PyInstaller spec for freezing local_agent into a standalone
+# local_agent.exe, so an end user's PC needs no Python installation at all
+# (see docs/electron-local-agent-architecture.md's "Packaging" section).
+#
+# IMPORTANT: this spec has NOT been built or tested here - doing so
+# requires an actual Windows machine (PyInstaller's Windows target must
+# run on Windows, or under Wine with real limitations). Treat this as a
+# verified-on-your-machine starting point once you build it, not an
+# artifact that's already been confirmed working.
+#
+# Usage (on a Windows machine, from the project root, inside a venv with
+# local_agent/requirements-agent.txt + pyinstaller installed):
+#
+#   pip install -r local_agent\requirements-agent.txt
+#   pip install pyinstaller
+#   pyinstaller local_agent\local_agent.spec
+#
+# Produces dist\local_agent\local_agent.exe (one-folder build, not
+# one-file - Playwright's own browser binaries are large enough that a
+# one-folder build is the more practical choice; electron-builder's
+# extraResources then bundles that whole dist\local_agent\ folder instead
+# of raw .py files + a system Python - see electron/package.json).
 
-Why this works with zero changes to runner/run_tests.py: it invokes
-`python -m behave <features_dir>` with `cwd=<project root>` - and it's
-specifically that `cwd` (not any sys.path manipulation inside
-runner/environment.py) that makes `recorder`/`agent`/`runner` importable,
-because Python's `-m` flag inserts the CURRENT WORKING DIRECTORY onto
-sys.path. Confirmed by direct experiment: the exact same
-runner/environment.py fails with `ModuleNotFoundError: No module named
-'recorder'` when behave is invoked from any other cwd. Since this
-project's own layout puts local_agent/ right next to recorder/, agent/,
-and runner/ (same as the central server today), calling
-runner.run_tests.run() from here "just works" for a workspace at ANY
-nesting depth under agent_workspace/ - identical to how the server's own
-per-session output/sessions/<id>/ dirs already rely on this same mechanism.
-"""
-from __future__ import annotations
-import json
-import os
-import shutil
-import subprocess
-import sys
-import uuid
 from pathlib import Path
-from typing import Optional
+from PyInstaller.utils.hooks import collect_submodules
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# ---------------------------------------------------------
+# Project paths
+# ---------------------------------------------------------
+#
+# PyInstaller provides SPECPATH while executing the .spec file.
+#
+# SPECPATH:
+#   C:\...\ai-test-recorder-pw\local_agent
+#
+# Therefore:
+#   PROJECT_ROOT = C:\...\ai-test-recorder-pw
+#   AGENT_ROOT   = C:\...\ai-test-recorder-pw\local_agent
+#
+SPEC_DIR = Path(SPECPATH).resolve()
+PROJECT_ROOT = SPEC_DIR.parent
+AGENT_ROOT = SPEC_DIR
 
-from runner.run_tests import run as run_behave, run_behave_cli
-from local_agent.config import WORKSPACE_DIR
-from local_agent.logger import get_logger
+# ---------------------------------------------------------
+# Validate important files before building - fail fast with a clear
+# message instead of a confusing mid-build PyInstaller error if this spec
+# is ever run from the wrong location or against a stale checkout.
+# ---------------------------------------------------------
+MAIN_PY = AGENT_ROOT / "main.py"
+INJECTOR_JS = PROJECT_ROOT / "recorder" / "recorder_injector.js"
+AGENT_ENVIRONMENT = AGENT_ROOT / "agent_environment.py"
 
-logger = get_logger("execution")
+if not MAIN_PY.exists():
+    raise FileNotFoundError(f"local_agent main.py not found: {MAIN_PY}")
+if not INJECTOR_JS.exists():
+    raise FileNotFoundError(f"recorder_injector.js not found: {INJECTOR_JS}")
+if not AGENT_ENVIRONMENT.exists():
+    raise FileNotFoundError(f"agent_environment.py not found: {AGENT_ENVIRONMENT}")
 
-_ENV_SOURCE = Path(__file__).resolve().parent / "agent_environment.py"
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+# ---------------------------------------------------------
+# Hidden imports
+# ---------------------------------------------------------
+# Playwright does some dynamic importing (its driver-process bridge, the
+# generated sync API wrappers) that PyInstaller's static analysis can
+# miss - collect_submodules pulls in everything under the package rather
+# than hoping the single explicit entry below is sufficient.
+hiddenimports = (
+    collect_submodules("playwright")
+    + ["playwright.sync_api"]
+    # Behave is now invoked via its own programmatic entry point
+    # (behave.__main__.main) rather than as an external `python -m behave`
+    # subprocess when running from this frozen exe - see
+    # runner/run_tests.py's run_behave_cli for why (sys.executable inside a
+    # frozen build points at this exe, not a real Python interpreter, so
+    # shelling out to "behave" never worked from a packaged build). That
+    # means behave's own submodules need to be statically bundled here too,
+    # not just importable at dev-time.
+    + collect_submodules("behave")
+)
 
+# ---------------------------------------------------------
+# Analysis
+# ---------------------------------------------------------
+a = Analysis(
+    [str(MAIN_PY)],
+    pathex=[
+        str(PROJECT_ROOT),
+        str(AGENT_ROOT),
+    ],
+    binaries=[],
+    datas=[
+        # Recorder injector used by the local agent (read as a text file
+        # at runtime - see recorder/recorder.py's INJECTOR_PATH; not a
+        # .py module PyInstaller would bundle automatically).
+        (
+            str(INJECTOR_JS),
+            "recorder",
+        ),
+        # Agent environment module/data
+        (
+            str(AGENT_ENVIRONMENT),
+            "local_agent",
+        ),
+    ],
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        # Central-server-only packages that must NOT be shipped to an end
+        # user's PC (see local_agent/agent_environment.py's docstring for
+        # why "agent" - the AI/self-healing package - specifically is
+        # excluded: local execution deliberately runs without self-healing
+        # so no LLM key/dependency needs to exist client-side). If any of
+        # these accidentally get pulled in by a stray import, this list is
+        # what catches it at build time as a missing-module error instead
+        # of silently shipping backend code to end users.
+        "fastapi",
+        "sqlalchemy",
+        "jwt",
+        "bcrypt",
+        "jinja2",
+        "pandas",
+        "openpyxl",
+        "backend",
+        "database",
+        "agent",
+        "generator",
+    ],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=None,
+    noarchive=False,
+)
 
-def _new_execution_dir() -> Path:
-    """Per spec section 17: an isolated workspace per execution so
-    concurrent runs (however unlikely on a single agent that handles one
-    thing at a time today - see connection_manager.py's BUSY state) can
-    never overwrite each other's files."""
-    execution_id = uuid.uuid4().hex[:12]
-    workspace = WORKSPACE_DIR / f"execution-{execution_id}"
-    workspace.mkdir(parents=True, exist_ok=True)
-    return workspace
+# ---------------------------------------------------------
+# PYZ
+# ---------------------------------------------------------
+pyz = PYZ(
+    a.pure,
+    a.zipped_data,
+    cipher=None,
+)
 
+# ---------------------------------------------------------
+# EXE
+# ---------------------------------------------------------
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name="local_agent",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=True,  # keep a console window for now so connection/errors are visible - revisit once the Electron UI surfaces agent logs well enough to hide it
+    disable_windowed_traceback=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
 
-def _write_workspace(files: dict, workspace: Path) -> None:
-    for rel_path, content in files.items():
-        dest = workspace / rel_path
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(content)
-    env_dest = workspace / "features" / "environment.py"
-    if not env_dest.exists():
-        shutil.copy(_ENV_SOURCE, env_dest)
+# ---------------------------------------------------------
+# COLLECT
+# ---------------------------------------------------------
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name="local_agent",
+)
 
-
-def run_test(files: dict, headless: bool = True) -> dict:
-    """Plain pass/fail execution via the existing runner/run_tests.py -
-    used by the live "Record & Generate" tab's Run/Check button (no
-    per-step JSON needed there)."""
-    workspace = _new_execution_dir()
-    logger.info(f"Starting local test execution in {workspace}")
-    try:
-        _write_workspace(files, workspace)
-        result = run_behave(output_dir=str(workspace), headless=headless)
-        logger.info(f"Execution finished: ok={result.get('ok')}")
-        return result
-    except Exception as e:
-        logger.exception("Local test execution failed unexpectedly")
-        return {"ok": False, "returncode": -1, "output": f"Agent-side execution error: {e}"}
-
-
-def run_test_with_json_report(files: dict, headless: bool = True) -> dict:
-    """Same as run_test, but also captures Behave's `--format json` output
-    (mirroring runner/run_recording.py's _run_behave_json exactly) so a
-    "Run Saved Recording" executed via this agent gets the same per-step
-    pass/fail/error detail as one executed server-side - see
-    backend/api.py's run_saved_recording, which needs this shape to keep
-    generating the same exit report regardless of where the test actually ran.
-
-    Uses runner.run_tests.run_behave_cli, which correctly handles a
-    PyInstaller-frozen agent (see that module's docstring - this is the
-    fix for "Start Recording opens a browser but Run/Run Saved Recording
-    doesn't" when running from a packaged local_agent.exe: sys.executable
-    inside a frozen exe is the exe itself, not a real Python interpreter,
-    so the old subprocess-based invocation here never actually launched
-    behave at all).
-
-    Returns {"ok", "returncode", "output", "json": [...]} - "json" is the
-    raw parsed Behave JSON array (possibly empty if Behave crashed before
-    producing it), exactly what runner/run_recording.py's
-    _extract_steps() already knows how to flatten.
-    """
-    workspace = _new_execution_dir()
-    logger.info(f"Starting local test execution (with JSON report) in {workspace}")
-    try:
-        _write_workspace(files, workspace)
-        features_dir = workspace / "features"
-        results_path = workspace / "behave_results.json"
-
-        result = run_behave_cli(
-            [str(features_dir), "--no-capture", "--format", "json", "--outfile", str(results_path)],
-            cwd=str(_PROJECT_ROOT),
-            env_overrides={"HEADLESS": "true" if headless else "false"},
-        )
-        try:
-            parsed = json.loads(results_path.read_text())
-        except Exception:
-            parsed = []
-
-        logger.info(f"Execution finished: returncode={result['returncode']}")
-        return {"ok": result["returncode"] == 0, "returncode": result["returncode"], "output": result["output"], "json": parsed}
-    except Exception as e:
-        logger.exception("Local test execution (JSON report) failed unexpectedly")
-        return {"ok": False, "returncode": -1, "output": f"Agent-side execution error: {e}", "json": []}
-
-
-def cleanup_old_executions(keep_last: int = 10) -> None:
-    """Retention per spec section 18 - avoid the workspace directory
-    growing unbounded across a long-running agent's lifetime. Called
-    periodically by client.py, not on every single run (recent executions
-    are kept around briefly in case their artifacts/logs are still useful
-    to look at locally)."""
-    if not WORKSPACE_DIR.exists():
-        return
-    executions = sorted(WORKSPACE_DIR.glob("execution-*"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for old in executions[keep_last:]:
-        try:
-            shutil.rmtree(old, ignore_errors=True)
-        except Exception:
-            pass
+# ---------------------------------------------------------
+# NOT HANDLED BY THIS SPEC (see docs/electron-local-agent-architecture.md)
+# ---------------------------------------------------------
+#   - Playwright's own browser binaries (`playwright install msedge`) are
+#     NOT bundled by PyInstaller - they need a separate install step,
+#     either bundled as additional `datas`/`binaries` entries (large - a
+#     full Chromium-based browser download) or run once at application
+#     first-launch with a visible progress indicator. Decide which before
+#     relying on this spec for a real installer.
