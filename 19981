@@ -1,867 +1,158 @@
 """
-FastAPI backend for the recorder. Same 3 operations as before, now as a
-proper JSON API consumed by the Next.js frontend (frontend/) or anything
-else you want to point at it (curl, Postman, another UI) - plus auth
-(backend/auth_routes.py), admin (backend/admin_routes.py) and profile
-(backend/profile_routes.py) routers mounted below. Every /api/* route in
-this file now requires a logged-in user (Depends(get_current_user)); admin
-endpoints live in their own router.
+Runs a Behave test suite ON THIS MACHINE, reusing the EXISTING
+runner/run_tests.py unmodified (per the task's constraints - no second
+independent test-execution implementation) for the plain pass/fail path,
+plus a JSON-formatter variant (mirroring runner/run_recording.py's
+_run_behave_json exactly) so a "Run Saved Recording" executed via the
+agent gets the same per-step granularity as one executed server-side -
+see run_test_with_json_report below.
 
-Logging: see logging.ini / logging_setup.py - everything from INFO up goes
-to logs/app.log, ERROR and up (including full tracebacks - see the global
-exception handler below and the per-stage try/excepts in stop_and_save)
-also goes to logs/error.log, and both mirror to the console. A bare 500
-with no detail (like "Save & Generate failed: 500 Server Error") should
-always have a matching traceback in logs/error.log after this - if it
-doesn't, logging.ini itself failed to load (logging_setup falls back to a
-bare console-only config and logs a warning about that specifically).
-
-Run with:
-    uvicorn backend.api:app --reload --port 8000
+Why this works with zero changes to runner/run_tests.py: it invokes
+`python -m behave <features_dir>` with `cwd=<project root>` - and it's
+specifically that `cwd` (not any sys.path manipulation inside
+runner/environment.py) that makes `recorder`/`agent`/`runner` importable,
+because Python's `-m` flag inserts the CURRENT WORKING DIRECTORY onto
+sys.path. Confirmed by direct experiment: the exact same
+runner/environment.py fails with `ModuleNotFoundError: No module named
+'recorder'` when behave is invoked from any other cwd. Since this
+project's own layout puts local_agent/ right next to recorder/, agent/,
+and runner/ (same as the central server today), calling
+runner.run_tests.run() from here "just works" for a workspace at ANY
+nesting depth under agent_workspace/ - identical to how the server's own
+per-session output/sessions/<id>/ dirs already rely on this same mechanism.
 """
-import sys
-import asyncio
+from __future__ import annotations
 import json
-import threading
-import traceback
+import os
+import shutil
+import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import yaml
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from dotenv import load_dotenv
+from runner.run_tests import run as run_behave, run_behave_cli
+from local_agent.config import WORKSPACE_DIR
+from local_agent.logger import get_logger
 
-load_dotenv()
+logger = get_logger("execution")
 
-from logging_setup import configure_logging
-configure_logging()
-import logging
-logger = logging.getLogger(__name__)
-
-from recorder.recorder import Recorder, save_recording_json
-from generator.build import build_artifacts
-from generator.test_data import extract_test_data, apply_test_data
-from runner.run_tests import run as run_behave
-from runner.run_recording import list_saved_recordings, run_recording
-from runner import transaction_store
-from agent.llm_factory import get_llm
-from database.db import init_db, get_session, close_db
-from database import repository as repo
-from shutdown_guard import register_cleanup
-
-from auth.dependencies import get_current_user, get_client_ip, validate_token_for_websocket, CurrentUser
-from backend import auth_routes, admin_routes, profile_routes, agent_routes, recording_sessions, agent_registry
-
-APPLICATIONS_CONFIG = Path(__file__).resolve().parents[1] / "config" / "applications.yaml"
-
-# The central server must NEVER launch a headed Playwright browser for a
-# production end user (see docs/electron-local-agent-architecture.md) - so
-# by default, no connected agent = a clear error, not a silent fallback to
-# server-side recording. Set this to "true" ONLY for local development
-# convenience (so a developer without the desktop app running can still
-# exercise the recorder tab) - it must stay "false" for any real deployment.
-import os as _os_flags
-ALLOW_SERVER_FALLBACK = _os_flags.environ.get("ALLOW_SERVER_FALLBACK", "false").lower().strip() == "true"
-
-NO_AGENT_ERROR = (
-    "Local desktop agent is not connected. Please start the AI Test Recorder "
-    "desktop application and sign in, then try again."
-)
-
-app = FastAPI(title="AI Test Recorder API")
-init_db()
+_ENV_SOURCE = Path(__file__).resolve().parent / "agent_environment.py"
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
-    """
-    Safety net for ANY endpoint that raises something not already turned
-    into an HTTPException - without this, FastAPI's default behavior is to
-    return a bare "500 Internal Server Error" with NOTHING in the response
-    and (depending on how uvicorn's own logging is configured) not
-    necessarily anything in a log file either - exactly the
-    "Save & Generate failed: 500 Server Error" report with no way to
-    diagnose it further. This logs the full traceback to logs/error.log
-    (via the root logger - see logging.ini) and returns a JSON body that at
-    least names the exception instead of an empty response.
-    """
-    logger.error(
-        "Unhandled exception on %s %s\n%s",
-        request.method, request.url.path,
-        "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
-    )
-    return JSONResponse(
-        status_code=500,
-        content={"detail": f"Internal server error ({type(exc).__name__}: {exc}). See logs/error.log for the full traceback."},
-    )
+def _new_execution_dir() -> Path:
+    """Per spec section 17: an isolated workspace per execution so
+    concurrent runs (however unlikely on a single agent that handles one
+    thing at a time today - see connection_manager.py's BUSY state) can
+    never overwrite each other's files."""
+    execution_id = uuid.uuid4().hex[:12]
+    workspace = WORKSPACE_DIR / f"execution-{execution_id}"
+    workspace.mkdir(parents=True, exist_ok=True)
+    return workspace
 
 
-app.include_router(auth_routes.router)
-app.include_router(admin_routes.router)
-app.include_router(profile_routes.router)
-app.include_router(agent_routes.router)
-
-# Changes every time this process starts (fresh launch, or uvicorn --reload
-# restarting the worker). The frontend remembers this from when it started a
-# recording and compares it later - if it's different, the backend process
-# restarted mid-recording (in-memory STATE, including the open browser, is
-# gone), which needs a distinct message from "recording just failed to
-# launch" so this doesn't turn into a confusing generic error again.
-PROCESS_ID = str(uuid.uuid4())
-
-# The Next.js frontend runs on a different origin, so allow it to call this
-# API from the browser. CORS_ALLOWED_ORIGINS (.env) is a comma-separated
-# allowlist for production (e.g. "https://recorder.yourbank.internal") -
-# defaults to "*" for local dev only. Tighten this before hosting anywhere
-# real: with credentials/Bearer tokens, a wildcard origin is fine (no
-# cookies are used - the JWT travels in an explicit header/query param,
-# never automatically attached by the browser like a cookie would be), but
-# a real allowlist is still better hygiene once you know the frontend's
-# actual origin.
-import os as _os
-_cors_origins = _os.environ.get("CORS_ALLOWED_ORIGINS", "*")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"] if _cors_origins.strip() == "*" else [o.strip() for o in _cors_origins.split(",") if o.strip()],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.on_event("startup")
-async def _on_startup():
-    """Runs the stale-agent reaper for the lifetime of the process (see
-    backend/agent_registry.py's reap_stale_agents) - catches a dropped
-    agent connection that the WebSocket layer itself never cleanly
-    detected (some network failures don't deliver a close frame)."""
-    asyncio.ensure_future(agent_registry.reap_stale_agents())
+def _write_workspace(files: dict, workspace: Path) -> None:
+    """Writes every received file into the workspace, EXCEPT
+    "features/environment.py" - that one always comes from this agent's
+    OWN local, self-healing-free copy (_ENV_SOURCE = agent_environment.py),
+    never from whatever the server sent, even if a caller's `files` dict
+    happens to include one. This is deliberate, not an oversight: the
+    server's own environment.py imports agent.llm_factory/agent.self_healer
+    for LLM-backed self-healing, which a packaged local_agent.exe does NOT
+    bundle (see local_agent/local_agent.spec's excludes) - using the
+    server's copy here crashes Behave with "ModuleNotFoundError: No module
+    named 'agent'" before before_all() ever calls launch_browser(), which
+    is exactly why Run/Run Saved Recording previously never opened a
+    browser at all even though Start Recording (no environment.py
+    involved) worked fine. See backend/api.py's _collect_generated_files,
+    which as of this fix no longer even sends one - this check is the
+    second, redundant layer of protection against the same mistake."""
+    for rel_path, content in files.items():
+        if rel_path == "features/environment.py":
+            continue
+        dest = workspace / rel_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content)
+    env_dest = workspace / "features" / "environment.py"
+    env_dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(_ENV_SOURCE, env_dest)
 
 
-@app.on_event("shutdown")
-def _on_shutdown():
-    """
-    Runs on a graceful stop (Ctrl+C in the terminal, or uvicorn --reload
-    restarting the worker process) - closes every still-open recorder
-    browser session (there can be several now - one per concurrently
-    recording user, see backend/recording_sessions.py) and releases the
-    database's connection pool, so no Edge/Chrome process or
-    database/test_recorder.db is left locked behind.
-    """
-    _cleanup_all()
-
-
-def _cleanup_all(timeout: float = 15):
-    """Shared by the ASGI shutdown event above (normal Ctrl+C stop) AND
-    shutdown_guard's Windows console-close handler below (terminal window
-    closed directly) - whichever fires first runs this exactly once."""
-    recording_sessions.stop_all(timeout=timeout)
-    close_db()
-
-
-# Covers the case Ctrl+C/ASGI shutdown can't: the terminal window being
-# closed directly. Windows only gives ~5s to clean up in that case, so use
-# a shorter timeout than the normal graceful-stop path above.
-register_cleanup(lambda: _cleanup_all(timeout=3))
-
-
-class StartRequest(BaseModel):
-    url: str = ""
-    app_name: str = ""       # one of the names from GET /api/applications, or "" for a custom "Others" url
-    recording_name: str = "" # e.g. a transaction number or flow name, used to label the saved recording
-    headless: bool = False
-
-
-class RunRequest(BaseModel):
-    headless: bool = False
-
-
-class RunRecordingRequest(BaseModel):
-    recording_file: str
-    headless: bool = False
-    # No user_id anymore - a saved recording is always run as whichever
-    # authenticated user made the request (see auth/dependencies.py), so
-    # every run is unambiguously attributable to a real logged-in person.
-
-
-class TestDataUpdateRequest(BaseModel):
-    values: dict[str, str]  # {"3": "50000", "7": "Jane Doe"} - keys are action indices, see generator/test_data.py
-
-
-def _load_applications() -> dict:
-    """Application name -> URL, from config/applications.yaml. Missing/empty
-    file just means an empty dropdown (frontend still offers "Others")."""
-    if not APPLICATIONS_CONFIG.exists():
-        return {}
+def run_test(files: dict, headless: bool = True) -> dict:
+    """Plain pass/fail execution via the existing runner/run_tests.py -
+    used by the live "Record & Generate" tab's Run/Check button (no
+    per-step JSON needed there)."""
+    workspace = _new_execution_dir()
+    logger.info(f"Starting local test execution in {workspace}")
     try:
-        data = yaml.safe_load(APPLICATIONS_CONFIG.read_text()) or {}
-        return data.get("applications") or {}
-    except Exception:
-        return {}
-
-
-@app.get("/api/applications")
-def get_applications(current_user: CurrentUser = Depends(get_current_user)):
-    """Names for the frontend's dropdown - URLs never leave the backend for
-    these; the frontend only ever sees/sends the app NAME (see
-    StartRequest.app_name below), matching "URLs live in the backend"."""
-    return {"applications": list(_load_applications().keys())}
-
-
-@app.post("/api/start")
-async def start_recording(req: StartRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
-    """
-    Requires a connected desktop agent (backend/agent_registry.py) - the
-    whole point of the Electron/local-agent architecture: the actual
-    browser launches on the USER'S OWN PC via their local agent, never
-    here. This backend only sends a command and stores metadata
-    (backend/recording_sessions.py's "mode"/"agent_id" fields) - no
-    Recorder, no browser object, ever exists in this process for a
-    production recording.
-
-    ALLOW_SERVER_FALLBACK (.env, default false) is a LOCAL-DEV-ONLY escape
-    hatch: with it set, a missing agent falls back to the original
-    server-side headless Recorder + live-view path instead of erroring -
-    useful for developing the recorder tab without also running the
-    desktop app, but this must stay false for any real deployment (see
-    docs/electron-local-agent-architecture.md).
-    """
-    applications = _load_applications()
-    if req.app_name and req.app_name in applications:
-        url = applications[req.app_name].strip()
-    else:
-        url = req.url.strip()
-    if not url:
-        raise HTTPException(status_code=400, detail="URL is required (select a known application or provide one for 'Others')")
-
-    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
-    if state["recorder"] is not None or state.get("agent_recording_active"):
-        raise HTTPException(status_code=400, detail="You already have a recording in progress - save or stop it first")
-
-    ip = get_client_ip(request)
-    conn = agent_registry.get_for_user(current_user.user_id)
-
-    if conn is None and not ALLOW_SERVER_FALLBACK:
-        raise HTTPException(status_code=409, detail=NO_AGENT_ERROR)
-
-    # ---- AGENT mode ---------------------------------------------------------
-    if conn is not None:
-        try:
-            response = await agent_registry.send_command(
-                conn, "START_RECORDING", {"url": url, "headless": req.headless},
-            )
-        except (asyncio.TimeoutError, ConnectionError) as e:
-            raise HTTPException(status_code=502, detail=f"Local agent did not respond: {e}")
-
-        if not response.get("ok", False):
-            raise HTTPException(status_code=400, detail=response.get("error", "Agent failed to start recording."))
-
-        state["mode"] = "agent"
-        state["agent_id"] = conn.agent_id
-        state["agent_recording_active"] = True
-        state["pending_recording_name"] = req.recording_name.strip() or None
-        state["target_url"] = url
-        conn.busy = True
-
-        with get_session() as session:
-            repo.log_activity(
-                session, user_id=current_user.user_id, session_id=current_user.session_id, action="START_RECORDING",
-                status="SUCCESS", details={"url": url, "recording_name": req.recording_name, "mode": "agent",
-                                            "agent_id": conn.agent_id},
-                endpoint="/api/start", ip_address=ip,
-            )
-        return {"ok": True, "message": f"Recording started on your local agent ({conn.hostname or conn.agent_id})."}
-
-    # ---- SERVER mode - only reachable when ALLOW_SERVER_FALLBACK=true, since
-    # the 409 above already returned for conn is None otherwise. Local-dev-only. ---
-    active = recording_sessions.count_active_recordings()
-    if active >= recording_sessions.MAX_CONCURRENT_RECORDINGS:
-        raise HTTPException(
-            status_code=503,
-            detail=f"The server is at capacity ({active}/{recording_sessions.MAX_CONCURRENT_RECORDINGS} concurrent "
-                   f"recordings) - please try again shortly.",
-        )
-
-    state["mode"] = "server"
-    state["pending_recording_name"] = req.recording_name.strip() or None
-    state["start_error"] = None
-    state["launching"] = True
-
-    with get_session() as session:
-        repo.log_activity(
-            session, user_id=current_user.user_id, session_id=current_user.session_id, action="START_RECORDING",
-            status="SUCCESS", details={"url": url, "app_name": req.app_name, "recording_name": req.recording_name,
-                                        "headless": req.headless, "mode": "server"},
-            endpoint="/api/start", ip_address=ip,
-        )
-
-    def _launch():
-        try:
-            # A hosted server (see backend/recording_sessions.py's docs and
-            # DEPLOYMENT_WINDOWS.md) typically has no desktop session for a
-            # headed browser window to render into, and the live-view
-            # WebSocket streams a headless browser just fine via CDP
-            # screencast either way - so FORCE_HEADLESS_RECORDING (.env,
-            # default true) overrides whatever the frontend's "headless"
-            # checkbox sent. Set it to false only for local single-user dev
-            # where seeing the real window is convenient.
-            import os
-            force_headless = os.environ.get("FORCE_HEADLESS_RECORDING", "true").lower().strip() != "false"
-            effective_headless = True if force_headless else req.headless
-            # Only bother with CDP screencast when actually headless - a
-            # headed run already gives a real, visible browser window, so
-            # the live-view widget would just be a redundant (and
-            # occasionally flaky, e.g. across an unstable dev-reload) second
-            # way to see the exact same thing. GET /api/status's "headless"
-            # field tells the frontend whether to even show that panel.
-            rec = Recorder(url, headless=effective_headless, enable_live_view=effective_headless).start()
-            state["recorder"] = rec
-            state["headless"] = effective_headless
-        except Exception as e:
-            # Previously this died silently in the background thread - the
-            # frontend would show "Launching browser..." and mark the
-            # recording as started regardless, so a failed launch (wrong
-            # channel, Edge not installed, bad URL, etc.) only surfaced
-            # later as a confusing 400 on Stop & Save. Now the frontend can
-            # poll GET /api/status and see exactly why it failed.
-            state["start_error"] = str(e)
-        finally:
-            state["launching"] = False
-
-    threading.Thread(target=_launch, daemon=True).start()
-    return {"ok": True, "message": f"Launching browser for {url}..."}
-
-
-@app.get("/api/status")
-def get_status(current_user: CurrentUser = Depends(get_current_user)):
-    """Poll this after /api/start - a browser launch happens in a background
-    thread (server mode) or on the agent (agent mode), so success/failure
-    isn't known at the time /api/start returns. Also doubles as the general
-    tool-status endpoint (recording in progress / has a build / last run
-    result) - all scoped to the CALLER's own recording session (see
-    backend/recording_sessions.py); this can never see another user's
-    in-progress recording."""
-    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
-    recording_active = state.get("recorder") is not None or state.get("agent_recording_active", False)
-    return {
-        "launching": state.get("launching", False),
-        "recording_active": recording_active,
-        "start_error": state.get("start_error"),
-        "process_id": PROCESS_ID,
-        "recording_in_progress": recording_active,
-        "has_build": state.get("build_result") is not None,
-        "last_run": state.get("last_run"),
-        "headless": state.get("headless"),  # None until a recorder has actually launched (server mode only)
-        "live_view_ws": "/api/ws/record" if state.get("recorder") is not None else None,
-        "mode": state.get("mode", "server"),  # "server" or "agent" - lets the frontend skip the live-view panel entirely in agent mode (a real window is already open on the user's own PC)
-    }
-
-
-def _agent_conn_for_state(state: dict, current_user: CurrentUser):
-    """Looks up the SAME agent connection a session started recording on -
-    if it disconnected/reconnected with a new object since (e.g. the
-    desktop app restarted), this deliberately fails clearly rather than
-    silently sending the stop command to a stale/wrong connection."""
-    if state.get("mode") != "agent":
-        return None
-    conn = agent_registry.get_for_user(current_user.user_id)
-    if conn is None or conn.agent_id != state.get("agent_id"):
-        return None
-    return conn
-
-
-@app.post("/api/stop")
-async def stop_recording(request: Request, current_user: CurrentUser = Depends(get_current_user)):
-    """Stops and DISCARDS the current recording without saving/generating
-    anything - for abandoning a recording mid-flow (wrong URL, made a
-    mistake, changed your mind). Use /api/stop_and_save instead to keep
-    what was recorded."""
-    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
-    ip = get_client_ip(request)
-
-    if state.get("mode") == "agent":
-        conn = _agent_conn_for_state(state, current_user)
-        if conn is None or not state.get("agent_recording_active"):
-            raise HTTPException(status_code=400, detail="No recording in progress (your local agent may have disconnected).")
-        try:
-            response = await agent_registry.send_command(conn, "STOP_RECORDING", {})
-        except (asyncio.TimeoutError, ConnectionError) as e:
-            raise HTTPException(status_code=502, detail=f"Local agent did not respond: {e}")
-        finally:
-            state["agent_recording_active"] = False
-            conn.busy = False
-        actions_discarded = len(response.get("actions", []))
-    else:
-        rec = state["recorder"]
-        if rec is None:
-            detail = "No recording in progress"
-            if state.get("start_error"):
-                detail += f" (the last start attempt failed: {state['start_error']})"
-            elif state.get("launching"):
-                detail += " (the browser is still launching - wait a moment and try again)"
-            raise HTTPException(status_code=400, detail=detail)
-        actions = rec.stop()
-        state["recorder"] = None
-        actions_discarded = len(actions)
-
-    state["pending_recording_name"] = None
-
-    with get_session() as session:
-        repo.log_activity(
-            session, user_id=current_user.user_id, session_id=current_user.session_id, action="STOP_RECORDING_DISCARDED",
-            status="SUCCESS", details={"actions_discarded": actions_discarded, "mode": state.get("mode")},
-            endpoint="/api/stop", ip_address=ip,
-        )
-    return {"ok": True, "actions_discarded": actions_discarded}
-
-
-@app.post("/api/stop_and_save")
-async def stop_and_save(request: Request, current_user: CurrentUser = Depends(get_current_user)):
-    """
-    Split into per-stage try/excepts (stop -> save -> build) rather than one
-    big try/except around everything: a failure in build_artifacts() (e.g.
-    a bad recording, an LLM hiccup, a broken template) is a DIFFERENT
-    problem from a failure stopping/saving the recording itself (browser
-    crashed, agent disconnected mid-stop) - and critically, if generation
-    fails the recording itself is still safely saved to disk, so the
-    response should say so instead of just "500 Internal Server Error"
-    with the JSON already lost. Every stage logs the full traceback to
-    logs/error.log before turning it into an HTTPException - see
-    logging.ini/logging_setup.py.
-    """
-    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
-    ip = get_client_ip(request)
-    recording_name = state.pop("pending_recording_name", None)
-
-    if state.get("mode") == "agent":
-        conn = _agent_conn_for_state(state, current_user)
-        if conn is None or not state.get("agent_recording_active"):
-            raise HTTPException(status_code=400, detail="No recording in progress (your local agent may have disconnected).")
-        try:
-            response = await agent_registry.send_command(conn, "STOP_RECORDING", {})
-        except (asyncio.TimeoutError, ConnectionError) as e:
-            logger.exception("Agent STOP_RECORDING failed for user_id=%s", current_user.user_id)
-            raise HTTPException(status_code=502, detail=f"Local agent did not respond: {e}")
-        finally:
-            state["agent_recording_active"] = False
-            conn.busy = False
-
-        if not response.get("ok", False):
-            raise HTTPException(status_code=400, detail=response.get("error", "Agent failed to stop the recording."))
-
-        actions = response.get("actions", [])
-        target_url = response.get("target_url") or state.get("target_url") or ""
-        try:
-            # Persisted server-side either way (see recorder/recorder.py's
-            # save_recording_json) - "Run Saved Recording", the generator,
-            # and everything downstream never need to know whether a
-            # recording was captured locally or by an agent.
-            path = save_recording_json(target_url, actions, name=recording_name)
-        except Exception:
-            logger.exception("save_recording_json() failed for user_id=%s", current_user.user_id)
-            raise HTTPException(status_code=500, detail="Failed to save the recording JSON - see logs/error.log")
-    else:
-        rec = state["recorder"]
-        if rec is None:
-            detail = "No recording in progress"
-            if state.get("start_error"):
-                detail += f" (the last start attempt failed: {state['start_error']})"
-            elif state.get("launching"):
-                detail += " (the browser is still launching - wait a moment and try again)"
-            raise HTTPException(status_code=400, detail=detail)
-
-        try:
-            actions = rec.stop()
-        except Exception:
-            logger.exception("Recorder.stop() failed")
-            state["recorder"] = None
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to stop the recorder (the browser may have crashed or been closed manually) - see logs/error.log",
-            )
-
-        try:
-            path = rec.save(name=recording_name)
-        except Exception:
-            logger.exception("Recorder.save() failed")
-            raise HTTPException(status_code=500, detail="Failed to save the recording JSON - see logs/error.log")
-        finally:
-            target_url = rec.target_url
-            state["recorder"] = None
-
-    recording = {
-        "target_url": target_url,
-        "recorded_at": Path(path).stem,
-        "recording_name": recording_name,
-        "actions": actions,
-    }
-    state["recording"] = recording
-
-    # Own output/ subfolder per auth session (backend/recording_sessions.py)
-    # so two people's Save & Generate never clobber each other's generated
-    # feature/steps/page files.
-    output_dir = recording_sessions.output_dir_for(current_user.session_id)
-    llm = get_llm()
-    try:
-        build_result = await asyncio.to_thread(build_artifacts, recording, llm=llm, output_dir=output_dir)
-    except Exception:
-        logger.exception("build_artifacts() failed while generating feature/steps/page files for %s", path)
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"Recording was saved to {path}, but generating the feature/steps/page files failed - "
-                "see logs/error.log for the full traceback. You can retry generation later from "
-                "the saved recording without re-recording."
-            ),
-        )
-    state["build_result"] = build_result
-
-    # Additive: surface the (now variable-annotated) actions and a quick
-    # name -> captured-value summary so the frontend can show what was
-    # recorded, including keyboard events and any Capture -> Store -> Reuse
-    # {{var}} pairs, without needing a separate endpoint.
-    variables_summary = {
-        a["captured_as"]: a.get("value")
-        for a in recording["actions"]
-        if a.get("action") == "copy" and a.get("captured_as")
-    }
-
-    with get_session() as session:
-        repo.log_activity(
-            session, user_id=current_user.user_id, session_id=current_user.session_id, action="STOP_AND_SAVE",
-            status="SUCCESS", details={"recording_file": path, "actions_captured": len(actions),
-                                        "recording_name": recording_name, "mode": state.get("mode")},
-            endpoint="/api/stop_and_save", ip_address=ip,
-        )
-
-    return {
-        "ok": True,
-        "recording_file": path,
-        "actions_captured": len(actions),
-        "build_result": build_result,
-        "llm_used": llm is not None,
-        "actions": recording["actions"],
-        "variables": variables_summary,
-    }
-
-
-@app.post("/api/run")
-async def run_check(req: RunRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
-    """Runs the just-generated Behave suite. Requires a connected desktop
-    agent by default - packages the generated files' CONTENTS (not paths -
-    the agent has no access to this server's filesystem) and has the local
-    agent execute Behave on the user's own PC, against their own real
-    browser. ALLOW_SERVER_FALLBACK (.env, local-dev-only, default false)
-    permits the original server-side execution instead - see /api/start's
-    docstring for why this must stay off in production."""
-    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
-    output_dir = recording_sessions.output_dir_for(current_user.session_id)
-    output_path = Path(output_dir)
-    if state["build_result"] is None and not (output_path / "features" / "recorded.feature").exists():
-        raise HTTPException(status_code=400, detail="Nothing generated yet - record and save first")
-
-    ip = get_client_ip(request)
-    conn = agent_registry.get_for_user(current_user.user_id)
-
-    if conn is None and not ALLOW_SERVER_FALLBACK:
-        raise HTTPException(status_code=409, detail=NO_AGENT_ERROR)
-
-    if conn is not None:
-        files = _collect_generated_files(output_path)
-        try:
-            response = await agent_registry.send_command(
-                conn, "START_TEST", {"headless": req.headless, "files": files}, timeout=120,
-            )
-        except (asyncio.TimeoutError, ConnectionError) as e:
-            logger.exception("Agent START_TEST failed for user_id=%s", current_user.user_id)
-            raise HTTPException(status_code=502, detail=f"Local agent did not respond: {e}")
-        result = {"ok": response.get("ok", False), "output": response.get("output", "")}
-    else:
-        try:
-            result = await asyncio.to_thread(run_behave, output_dir=output_dir, headless=req.headless)
-        except Exception:
-            logger.exception("run_behave() failed for user_id=%s", current_user.user_id)
-            raise HTTPException(status_code=500, detail="Failed to execute the generated test suite - see logs/error.log")
-
-    state["last_run"] = result
-
-    with get_session() as session:
-        repo.log_activity(
-            session, user_id=current_user.user_id, session_id=current_user.session_id, action="RUN_CHECK",
-            status="SUCCESS" if result.get("ok") else "FAILURE",
-            details={"headless": req.headless, "mode": "agent" if conn is not None else "server"},
-            endpoint="/api/run", ip_address=ip,
-        )
-    return result
-
-
-def _collect_generated_files(output_path: Path) -> dict:
-    """Reads every generated feature/steps/page/locators file's CONTENT
-    (not just its path - see run_check above) so it can be shipped to a
-    local agent that has no access to this server's disk. Keys are
-    relative paths so the agent can recreate the same layout in its own
-    isolated workspace (see local_agent/execution_manager.py).
-
-    Deliberately does NOT include "features/environment.py": the
-    server's copy (generator/build.py, sourced from runner/environment.py)
-    imports agent.llm_factory/agent.self_healer for LLM-backed self-healing
-    - a hard dependency a packaged local_agent.exe deliberately does NOT
-    bundle (see local_agent/local_agent.spec's excludes list and
-    local_agent/agent_environment.py's module docstring for why). Sending
-    it anyway and letting the agent overwrite it caused exactly the bug
-    this comment is warning against: "ModuleNotFoundError: No module named
-    'agent'" crashing Behave before before_all() ever calls
-    launch_browser() - so Run/Run Saved Recording never opened a browser
-    at all, even though Start Recording worked fine (no environment.py
-    involved there). The agent always uses its OWN local, self-healing-free
-    environment.py instead (local_agent/execution_manager.py's
-    _write_workspace enforces this unconditionally, as a second layer of
-    protection against this exact mistake)."""
-    files = {}
-    for rel in ("features/recorded.feature", "features/steps/recorded_steps.py",
-                "pages/recorded_page.py", "pages/locators.json"):
-        p = output_path / rel
-        if p.exists():
-            files[rel] = p.read_text()
-    return files
-
-
-@app.websocket("/api/ws/record")
-async def ws_record(websocket: WebSocket, token: str = Query(...)):
-    """Live view for a hosted, headless recording: streams CDP screencast
-    JPEG frames to the client and forwards its mouse/keyboard events back
-    to the real (server-side) browser - see recorder/recorder.py's
-    get_frame/queue_input. This is what makes "record a flow" usable when
-    the backend runs on a machine with no desktop session in front of the
-    person doing the recording (the normal case once this is hosted rather
-    than run on someone's own laptop).
-
-    Browsers can't attach a custom Authorization header to a WebSocket
-    handshake, so the JWT travels as ?token=... instead - auth/dependencies.py's
-    validate_token_for_websocket runs the exact same checks (idle timeout,
-    revocation, account status) as every other endpoint.
-    """
-    await websocket.accept()
-
-    current_user = validate_token_for_websocket(token)
-    if current_user is None:
-        print("[live-view] rejected: invalid/expired/revoked token")
-        await websocket.close(code=4401, reason="Not authenticated")
-        return
-
-    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
-    rec = state.get("recorder")
-    if rec is None:
-        print(f"[live-view] rejected: no active recording for user {current_user.username} (session {current_user.session_id})")
-        await websocket.close(code=4404, reason="No active recording for this session")
-        return
-
-    print(f"[live-view] connected: user {current_user.username}, session {current_user.session_id}")
-
-    async def sender():
-        while True:
-            frame = await asyncio.to_thread(rec.get_frame, 1.0)
-            if state.get("recorder") is None:
-                break
-            if frame is not None:
-                await websocket.send_text(frame)
-
-    sender_task = asyncio.create_task(sender())
-    try:
-        while True:
-            event = await websocket.receive_json()
-            rec.queue_input(event)
-    except WebSocketDisconnect:
-        print(f"[live-view] disconnected: user {current_user.username}")
+        _write_workspace(files, workspace)
+        result = run_behave(output_dir=str(workspace), headless=headless)
+        logger.info(f"Execution finished: ok={result.get('ok')}")
+        return result
     except Exception as e:
-        print(f"[live-view] error for user {current_user.username}: {e}")
-    finally:
-        sender_task.cancel()
+        logger.exception("Local test execution failed unexpectedly")
+        return {"ok": False, "returncode": -1, "output": f"Agent-side execution error: {e}"}
 
 
-# ------------------------------------------------------------------------
-# Users (read-only here - creation/edit/delete is admin-only, see
-# backend/admin_routes.py mounted under /api/admin/users)
-# ------------------------------------------------------------------------
+def run_test_with_json_report(files: dict, headless: bool = True) -> dict:
+    """Same as run_test, but also captures Behave's `--format json` output
+    (mirroring runner/run_recording.py's _run_behave_json exactly) so a
+    "Run Saved Recording" executed via this agent gets the same per-step
+    pass/fail/error detail as one executed server-side - see
+    backend/api.py's run_saved_recording, which needs this shape to keep
+    generating the same exit report regardless of where the test actually ran.
 
-@app.get("/api/users")
-def get_users_legacy(active_only: bool = False, current_user: CurrentUser = Depends(get_current_user)):
-    with get_session() as session:
-        users = repo.list_users(session, active_only=active_only)
-        return [
-            {"user_id": u.user_id, "name": u.name, "department": u.department,
-             "status": u.status, "created_date": u.created_date.isoformat()}
-            for u in users
-        ]
+    Uses runner.run_tests.run_behave_cli, which correctly handles a
+    PyInstaller-frozen agent (see that module's docstring - this is the
+    fix for "Start Recording opens a browser but Run/Run Saved Recording
+    doesn't" when running from a packaged local_agent.exe: sys.executable
+    inside a frozen exe is the exe itself, not a real Python interpreter,
+    so the old subprocess-based invocation here never actually launched
+    behave at all).
 
-
-# ------------------------------------------------------------------------
-# Saved recordings - "run the recording he has and give exit report"
-# ------------------------------------------------------------------------
-
-@app.get("/api/recordings")
-def get_recordings(current_user: CurrentUser = Depends(get_current_user)):
-    return list_saved_recordings()
-
-
-def _safe_recording_path(file: str) -> Path:
-    """Resolves `file` (as returned by GET /api/recordings) and makes sure
-    it's actually inside recordings/ - a defensive check against a crafted
-    path (e.g. "../../.env") ever being read/written through this endpoint."""
-    recordings_dir = (Path(__file__).resolve().parents[1] / "recordings").resolve()
-    path = Path(file).resolve()
-    if recordings_dir not in path.parents or path.suffix != ".json":
-        raise HTTPException(status_code=400, detail="Invalid recording file")
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Recording not found")
-    return path
-
-
-@app.get("/api/recordings/data")
-def get_recording_test_data(file: str, current_user: CurrentUser = Depends(get_current_user)):
-    """Backs the editable data grid shown before running a saved recording
-    (see generator/test_data.py) - every typed/selected value in the
-    recording, editable right there instead of downloading the Excel
-    report, changing values, and re-uploading."""
-    path = _safe_recording_path(file)
-    recording = json.loads(path.read_text())
-    return {"file": str(path), "fields": extract_test_data(recording)}
-
-
-@app.put("/api/recordings/data")
-def update_recording_test_data(
-    file: str, req: TestDataUpdateRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)
-):
-    """Writes edited values straight back into the saved recording JSON -
-    this becomes the new baseline test data for every future run of this
-    recording, not just a one-off override for the next click of Run."""
-    path = _safe_recording_path(file)
-    recording = json.loads(path.read_text())
-    recording = apply_test_data(recording, req.values)
-    path.write_text(json.dumps(recording, indent=2))
-
-    ip = get_client_ip(request)
-    with get_session() as session:
-        repo.log_activity(
-            session, user_id=current_user.user_id, session_id=current_user.session_id, action="TEST_DATA_UPDATED",
-            status="SUCCESS", details={"recording_file": str(path), "fields_changed": len(req.values)},
-            endpoint="/api/recordings/data", ip_address=ip,
-        )
-    return {"ok": True, "fields": extract_test_data(recording)}
-
-
-@app.post("/api/run_recording")
-async def run_saved_recording(req: RunRecordingRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
-    """Runs a previously saved recording end-to-end (regenerate + execute)
-    and returns the exit report, attributed to whoever is logged in - the
-    frontend no longer picks a "run as" user, it's always the current
-    session. Everything about the run (status, steps, files produced) is
-    written to transactions/*.json (see runner/transaction_store.py) -
-    NOT the database, which is reserved for auth/session/activity data.
-
-    Requires a connected desktop agent by default (ALLOW_SERVER_FALLBACK
-    is the local-dev-only escape hatch - see /api/start's docstring) - the
-    Behave/Playwright execution happens on the user's own PC via
-    local_agent/execution_manager.py's run_test_with_json_report, which
-    returns the exact same {returncode, stdout, stderr, json} shape the
-    server-side path always produced, so the exit report this generates is
-    identical either way.
-
-    Any test-data edits (see /api/recordings/data above) are already
-    persisted into the recording file itself by the time this runs, so
-    there's nothing extra to pass through here - the run just reads
-    whatever's currently saved."""
-    ip = get_client_ip(request)
-    conn = agent_registry.get_for_user(current_user.user_id)
-
-    if conn is None and not ALLOW_SERVER_FALLBACK:
-        raise HTTPException(status_code=409, detail=NO_AGENT_ERROR)
-
-    execute_fn = None
-    if conn is not None:
-        # run_recording() itself runs in a worker thread (asyncio.to_thread
-        # below) since build_artifacts/file IO are blocking - but the
-        # actual agent call MUST run on the MAIN event loop, since that's
-        # the loop the agent's WebSocket object belongs to (see
-        # backend/agent_routes.py's ws_agent). asyncio.run_coroutine_threadsafe
-        # is exactly the tool for "call async code, targeting a specific
-        # already-running loop, from a different thread": it schedules the
-        # coroutine on `main_loop` and lets THIS worker thread block on the
-        # result without touching the WebSocket itself from the wrong loop.
-        main_loop = asyncio.get_event_loop()
-
-        def execute_fn(run_output_dir: str, run_headless: bool) -> dict:
-            files = _collect_generated_files(Path(run_output_dir))
-            future = asyncio.run_coroutine_threadsafe(
-                agent_registry.send_command(
-                    conn, "START_TEST",
-                    {"headless": run_headless, "files": files, "want_json_report": True},
-                    timeout=120,
-                ),
-                main_loop,
-            )
-            response = future.result(timeout=125)
-            return {
-                "returncode": 0 if response.get("ok") else 1,
-                "stdout": response.get("output", ""),
-                "stderr": "",
-                "json": response.get("json", []),
-            }
-
+    Returns {"ok", "returncode", "output", "json": [...]} - "json" is the
+    raw parsed Behave JSON array (possibly empty if Behave crashed before
+    producing it), exactly what runner/run_recording.py's
+    _extract_steps() already knows how to flatten.
+    """
+    workspace = _new_execution_dir()
+    logger.info(f"Starting local test execution (with JSON report) in {workspace}")
     try:
-        report = await asyncio.to_thread(
-            run_recording,
-            recording_file=req.recording_file,
-            user_id=current_user.user_id,
-            headless=req.headless,
-            execute_fn=execute_fn,
+        _write_workspace(files, workspace)
+        features_dir = workspace / "features"
+        results_path = workspace / "behave_results.json"
+
+        result = run_behave_cli(
+            [str(features_dir), "--no-capture", "--format", "json", "--outfile", str(results_path)],
+            cwd=str(_PROJECT_ROOT),
+            env_overrides={"HEADLESS": "true" if headless else "false"},
         )
-        with get_session() as session:
-            repo.log_activity(
-                session, user_id=current_user.user_id, session_id=current_user.session_id, action="RUN_RECORDING",
-                status="SUCCESS" if report["status"] == "Success" else "FAILURE",
-                details={"recording_file": req.recording_file, "transaction_id": report["transaction_id"],
-                         "mode": "agent" if conn is not None else "server"},
-                endpoint="/api/run_recording", ip_address=ip,
-            )
-        return report
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except TimeoutError:
-        raise HTTPException(status_code=502, detail="Local agent did not respond in time while running the test.")
+        try:
+            parsed = json.loads(results_path.read_text())
+        except Exception:
+            parsed = []
+
+        logger.info(f"Execution finished: returncode={result['returncode']}")
+        return {"ok": result["returncode"] == 0, "returncode": result["returncode"], "output": result["output"], "json": parsed}
+    except Exception as e:
+        logger.exception("Local test execution (JSON report) failed unexpectedly")
+        return {"ok": False, "returncode": -1, "output": f"Agent-side execution error: {e}", "json": []}
 
 
-# ------------------------------------------------------------------------
-# Transaction history - read from transactions/*.json (see
-# runner/transaction_store.py), NOT the database. The database only holds
-# auth/session/activity data; recording-run history is plain files.
-# ------------------------------------------------------------------------
-
-@app.get("/api/transactions")
-def get_transactions(user_id: Optional[int] = None, limit: int = 50, current_user: CurrentUser = Depends(get_current_user)):
-    txns = transaction_store.list_transactions(user_id=user_id, limit=limit)
-    return [
-        {"transaction_id": t["transaction_id"], "user_id": t["user_id"],
-         "transaction_name": t["transaction_name"], "status": t["status"],
-         "date_time": t["date_time"]}
-        for t in txns
-    ]
-
-
-@app.get("/api/transactions/{transaction_id}")
-def get_transaction_report(transaction_id: int, current_user: CurrentUser = Depends(get_current_user)):
-    txn = transaction_store.get_transaction(transaction_id)
-    if txn is None:
-        raise HTTPException(status_code=404, detail="Transaction not found")
-    return txn
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("backend.api:app", host="127.0.0.1", port=8000, reload=True)
+def cleanup_old_executions(keep_last: int = 10) -> None:
+    """Retention per spec section 18 - avoid the workspace directory
+    growing unbounded across a long-running agent's lifetime. Called
+    periodically by client.py, not on every single run (recent executions
+    are kept around briefly in case their artifacts/logs are still useful
+    to look at locally)."""
+    if not WORKSPACE_DIR.exists():
+        return
+    executions = sorted(WORKSPACE_DIR.glob("execution-*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in executions[keep_last:]:
+        try:
+            shutil.rmtree(old, ignore_errors=True)
+        except Exception:
+            pass
