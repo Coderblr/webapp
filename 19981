@@ -1,216 +1,85 @@
-# -*- mode: python ; coding: utf-8 -*-
-#
-# PyInstaller spec for freezing local_agent into a standalone
-# local_agent.exe, so an end user's PC needs no Python installation at all
-# (see docs/electron-local-agent-architecture.md's "Packaging" section).
-#
-# IMPORTANT: this spec has NOT been built or tested here - doing so
-# requires an actual Windows machine (PyInstaller's Windows target must
-# run on Windows, or under Wine with real limitations). Treat this as a
-# verified-on-your-machine starting point once you build it, not an
-# artifact that's already been confirmed working.
-#
-# Usage (on a Windows machine, from the project root, inside a venv with
-# local_agent/requirements-agent.txt + pyinstaller installed):
-#
-#   pip install -r local_agent\requirements-agent.txt
-#   pip install pyinstaller
-#   pyinstaller local_agent\local_agent.spec
-#
-# Produces dist\local_agent\local_agent.exe (one-folder build, not
-# one-file - Playwright's own browser binaries are large enough that a
-# one-folder build is the more practical choice; electron-builder's
-# extraResources then bundles that whole dist\local_agent\ folder instead
-# of raw .py files + a system Python - see electron/package.json).
+"""
+Runs the generated behave suite and returns structured pass/fail output.
 
+Uses a real subprocess so every run gets a genuinely fresh, isolated
+Python process - important because behave keeps process-wide global state
+(step registrations, and evidently more than just that - see the history
+below) that leaks across runs sharing one process.
+
+IMPORTANT for the local desktop agent (local_agent/): `sys.executable`
+inside a PyInstaller-frozen executable (see local_agent/local_agent.spec)
+is the path to the FROZEN .EXE ITSELF, not a real Python interpreter -
+there is no separate "python.exe" to shell out to. `[sys.executable, "-m",
+"behave", ...]` would try to re-launch the agent app with nonsense
+arguments instead of actually running behave, which is exactly why "Start
+Recording" (in-process, via recorder/recorder.py - no subprocess involved)
+worked from a packaged local_agent.exe while "Run" (this file, subprocess-
+based) did not.
+
+Two things were tried and abandoned before landing on the current design -
+documented here so nobody re-attempts them:
+
+  1. In-process invocation (`behave.__main__.main()` called directly, no
+     subprocess at all) when frozen. This worked for a SINGLE run, but a
+     second test run in the same long-running agent process failed with
+     "AmbiguousStep: ... has already been defined" - even after explicitly
+     resetting `behave.step_registry.registry` before each call. Something
+     else internal to behave (never fully identified - possibly a
+     `Runner`/`ModelRunner`-level cache, possibly matcher-level state) was
+     still holding onto the first run's step definitions. Chasing down and
+     resetting every piece of undocumented internal state behave might
+     accumulate is fragile and not a fight worth continuing.
+
+  2. This settled on: have the frozen exe RE-INVOKE ITSELF as a subprocess
+     with a hidden `--behave-worker <behave CLI args>` flag it recognizes
+     (see local_agent/main.py) - `sys.executable` inside a frozen build
+     correctly points at the exe's own path, so `[sys.executable,
+     "--behave-worker", ...]` genuinely launches a fresh copy of the same
+     .exe, which short-circuits straight to `behave.__main__.main()` and
+     exits. This gives every test run its own real, fully independent OS
+     process - identical isolation to the non-frozen path's real
+     `python.exe` subprocess, just self-hosted instead of relying on a
+     system Python that doesn't exist in a frozen build.
+"""
+from __future__ import annotations
+import os
+import subprocess
+import sys
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_submodules
 
-# ---------------------------------------------------------
-# Project paths
-# ---------------------------------------------------------
-#
-# PyInstaller provides SPECPATH while executing the .spec file.
-#
-# SPECPATH:
-#   C:\...\ai-test-recorder-pw\local_agent
-#
-# Therefore:
-#   PROJECT_ROOT = C:\...\ai-test-recorder-pw
-#   AGENT_ROOT   = C:\...\ai-test-recorder-pw\local_agent
-#
-SPEC_DIR = Path(SPECPATH).resolve()
-PROJECT_ROOT = SPEC_DIR.parent
-AGENT_ROOT = SPEC_DIR
+ROOT = Path(__file__).parent.parent
 
-# ---------------------------------------------------------
-# Validate important files before building - fail fast with a clear
-# message instead of a confusing mid-build PyInstaller error if this spec
-# is ever run from the wrong location or against a stale checkout.
-# ---------------------------------------------------------
-MAIN_PY = AGENT_ROOT / "main.py"
-INJECTOR_JS = PROJECT_ROOT / "recorder" / "recorder_injector.js"
-AGENT_ENVIRONMENT = AGENT_ROOT / "agent_environment.py"
 
-if not MAIN_PY.exists():
-    raise FileNotFoundError(f"local_agent main.py not found: {MAIN_PY}")
-if not INJECTOR_JS.exists():
-    raise FileNotFoundError(f"recorder_injector.js not found: {INJECTOR_JS}")
-if not AGENT_ENVIRONMENT.exists():
-    raise FileNotFoundError(f"agent_environment.py not found: {AGENT_ENVIRONMENT}")
+def run_behave_cli(behave_args: list[str], cwd: str, env_overrides: dict) -> dict:
+    """Runs behave with `behave_args` (e.g. [features_dir, "--no-capture"]),
+    returning {"returncode", "output"}. Always a real subprocess - see this
+    module's docstring for why a frozen build spawns itself rather than a
+    system Python."""
+    full_env = {**os.environ, **env_overrides}
 
-# ---------------------------------------------------------
-# Hidden imports
-# ---------------------------------------------------------
-# Playwright does some dynamic importing (its driver-process bridge, the
-# generated sync API wrappers) that PyInstaller's static analysis can
-# miss - collect_submodules pulls in everything under the package rather
-# than hoping the single explicit entry below is sufficient.
-hiddenimports = (
-    collect_submodules("playwright")
-    + ["playwright.sync_api"]
-    # Behave is now invoked via its own programmatic entry point
-    # (behave.__main__.main) rather than as an external `python -m behave`
-    # subprocess when running from this frozen exe - see
-    # runner/run_tests.py's run_behave_cli for why (sys.executable inside a
-    # frozen build points at this exe, not a real Python interpreter, so
-    # shelling out to "behave" never worked from a packaged build). That
-    # means behave's own submodules need to be statically bundled here too,
-    # not just importable at dev-time.
-    + collect_submodules("behave")
-    # CRITICAL: local_agent/agent_environment.py is bundled as a DATA file
-    # (see `datas` below) - copied to disk at runtime and loaded by Behave
-    # from OUTSIDE this frozen bundle, not `import`ed by any of local_agent's
-    # own .py source. PyInstaller's static analysis only bundles modules it
-    # can see being imported somewhere in the traced source graph, so it has
-    # NO WAY of knowing agent_environment.py needs these at runtime - both
-    # were missing from earlier builds one at a time
-    # ("ModuleNotFoundError: No module named 'agent'", then "... 'runner.variables'"),
-    # each crashing Behave before before_all() ever launched a browser.
-    # Listed explicitly (NOT via collect_submodules("runner")/("recorder"))
-    # because runner/ also contains run_recording.py and
-    # transaction_store.py, which import database/generator/agent (the
-    # central-server-only packages this build deliberately excludes below)
-    # - blanket-collecting the whole package risks either breaking this
-    # build outright (those imports may not even be installed in a minimal
-    # requirements-agent.txt venv) or silently bundling server code that
-    # has no business being on an end user's PC. If agent_environment.py
-    # ever starts importing something new from runner/ or recorder/, add
-    # it here explicitly rather than switching back to collect_submodules.
-    + [
-        "runner.variables",
-        "runner.run_tests",
-        "recorder.browser_factory",
-        "recorder.recorder",
-        "recorder.locator_strategy",
-        "recorder.variable_capture",
-    ]
-)
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, "--behave-worker", *behave_args]
+    else:
+        cmd = [sys.executable, "-m", "behave", *behave_args]
 
-# ---------------------------------------------------------
-# Analysis
-# ---------------------------------------------------------
-a = Analysis(
-    [str(MAIN_PY)],
-    pathex=[
-        str(PROJECT_ROOT),
-        str(AGENT_ROOT),
-    ],
-    binaries=[],
-    datas=[
-        # Recorder injector used by the local agent (read as a text file
-        # at runtime - see recorder/recorder.py's INJECTOR_PATH; not a
-        # .py module PyInstaller would bundle automatically).
-        (
-            str(INJECTOR_JS),
-            "recorder",
-        ),
-        # Agent environment module/data
-        (
-            str(AGENT_ENVIRONMENT),
-            "local_agent",
-        ),
-    ],
-    hiddenimports=hiddenimports,
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[],
-    excludes=[
-        # Central-server-only packages that must NOT be shipped to an end
-        # user's PC (see local_agent/agent_environment.py's docstring for
-        # why "agent" - the AI/self-healing package - specifically is
-        # excluded: local execution deliberately runs without self-healing
-        # so no LLM key/dependency needs to exist client-side). If any of
-        # these accidentally get pulled in by a stray import, this list is
-        # what catches it at build time as a missing-module error instead
-        # of silently shipping backend code to end users.
-        "fastapi",
-        "sqlalchemy",
-        "jwt",
-        "bcrypt",
-        "jinja2",
-        "pandas",
-        "openpyxl",
-        "backend",
-        "database",
-        "agent",
-        "generator",
-    ],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=None,
-    noarchive=False,
-)
+    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=full_env)
+    return {"returncode": proc.returncode, "output": proc.stdout + "\n" + proc.stderr}
 
-# ---------------------------------------------------------
-# PYZ
-# ---------------------------------------------------------
-pyz = PYZ(
-    a.pure,
-    a.zipped_data,
-    cipher=None,
-)
 
-# ---------------------------------------------------------
-# EXE
-# ---------------------------------------------------------
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
-    exclude_binaries=True,
-    name="local_agent",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
-    console=True,  # keep a console window for now so connection/errors are visible - revisit once the Electron UI surfaces agent logs well enough to hide it
-    disable_windowed_traceback=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-)
+def run(output_dir: str = "output", headless: bool = False) -> dict:
+    features_dir = Path(output_dir) / "features"
+    if not features_dir.exists():
+        return {"ok": False, "returncode": -1, "output": f"No features found at {features_dir}. Generate first."}
 
-# ---------------------------------------------------------
-# COLLECT
-# ---------------------------------------------------------
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name="local_agent",
-)
+    result = run_behave_cli(
+        [str(features_dir), "--no-capture"],
+        cwd=str(ROOT),
+        env_overrides={"HEADLESS": "true" if headless else "false"},
+    )
+    return {"ok": result["returncode"] == 0, "returncode": result["returncode"], "output": result["output"]}
 
-# ---------------------------------------------------------
-# NOT HANDLED BY THIS SPEC (see docs/electron-local-agent-architecture.md)
-# ---------------------------------------------------------
-#   - Playwright's own browser binaries (`playwright install msedge`) are
-#     NOT bundled by PyInstaller - they need a separate install step,
-#     either bundled as additional `datas`/`binaries` entries (large - a
-#     full Chromium-based browser download) or run once at application
-#     first-launch with a visible progress indicator. Decide which before
-#     relying on this spec for a real installer.
+
+if __name__ == "__main__":
+    result = run()
+    print(result["output"])
+    sys.exit(result["returncode"])
