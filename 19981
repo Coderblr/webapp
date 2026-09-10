@@ -1,851 +1,603 @@
 """
-FastAPI backend for the recorder. Same 3 operations as before, now as a
-proper JSON API consumed by the Next.js frontend (frontend/) or anything
-else you want to point at it (curl, Postman, another UI) - plus auth
-(backend/auth_routes.py), admin (backend/admin_routes.py) and profile
-(backend/profile_routes.py) routers mounted below. Every /api/* route in
-this file now requires a logged-in user (Depends(get_current_user)); admin
-endpoints live in their own router.
+Playwright-driven recorder. Launches a real browser against the target
+application, injects the capture script so it survives navigations, and
+polls it for newly captured click/type actions until the user stops the
+recording. Produces a raw JSON recording that the generator/agent layer
+turns into feature/steps/page files.
 
-Logging: see logging.ini / logging_setup.py - everything from INFO up goes
-to logs/app.log, ERROR and up (including full tracebacks - see the global
-exception handler below and the per-stage try/excepts in stop_and_save)
-also goes to logs/error.log, and both mirror to the console. A bare 500
-with no detail (like "Save & Generate failed: 500 Server Error") should
-always have a matching traceback in logs/error.log after this - if it
-doesn't, logging.ini itself failed to load (logging_setup falls back to a
-bare console-only config and logs a warning about that specifically).
+Threading note (important): Playwright's SYNC API is NOT thread-safe - a
+Page/Browser/BrowserContext may only be used from the single thread that
+created it. `start()`/`stop()` may be called from any thread (e.g. a
+FastAPI request handler launches on one thread and stops from another),
+but everything that actually touches the browser (launch, polling,
+navigation, closing) runs on ONE dedicated worker thread owned by this
+Recorder - `start()`/`stop()` hand work off to that thread instead of
+calling Playwright directly from the caller's thread.
 
-Run with:
-    uvicorn backend.api:app --reload --port 8000
+An earlier version of this module polled from a SECOND background thread
+on a timer - that violated the rule above and silently broke capture
+(every poll call failed and was swallowed by a broad except). A version
+after that tried pushing actions from the page via
+`page.expose_function()` instead of polling - but Playwright's sync API
+only actually dispatches an exposed-function callback back to Python while
+the owning thread is blocked inside an actual Playwright call (e.g.
+`page.wait_for_timeout()`); a thread idling on a plain Python primitive
+like `queue.Queue.get()` never gets the callback delivered, so nothing
+was captured that way either. This version polls `page.evaluate()` in a
+loop, but - critically - that loop runs on the SAME worker thread that
+created the page, using `page.wait_for_timeout()` as the sleep so the
+loop is both safe (no cross-thread calls) and self-pumping.
+
+Live view (remote recording): the same worker thread also drives an
+optional CDP screencast (frames out) and input-forwarding (events in) -
+see `_start_screencast`/`_on_screencast_frame`/`queue_input`/
+`_drain_input_queue` below - so a hosted, headless recording can still be
+watched and controlled from a browser that isn't sitting at this machine.
+Frames/input cross the thread boundary via plain `queue.Queue`s, which
+*are* thread-safe, unlike Playwright's own API. The screencast always
+follows the ORIGINAL page (index 0 below) - a live view is inherently a
+single picture, so a popup opening doesn't change what's being streamed.
+
+Multi-page / multi-frame / dialog support (popups, target="_blank" links,
+window.open() new tabs/windows, and native alert/confirm/prompt dialogs):
+
+  - Every Playwright Page this Recorder ever sees (the original page, plus
+    any popup/new-tab/new-window Playwright reports via the browser
+    CONTEXT's "page" event) gets the SAME injector script and is polled
+    every tick alongside the original page - not just the one that was
+    open when recording started. Each flushed action is tagged with
+    "page_index" (0 = the original page, 1/2/... in creation order) so the
+    generator/replay side knows which browser tab/window it belongs to.
+  - A synthetic "new_window" action is recorded the instant a new page is
+    detected (before it's even finished loading), and "window_closed" the
+    instant one closes - both tagged with "opener_page_index" so replay
+    can switch back to whichever tab/window was active before/after.
+  - Native browser dialogs (alert/confirm/prompt/beforeunload) are
+    auto-accepted (Playwright hangs the page otherwise, since registering
+    ANY "dialog" listener switches off Playwright's own default
+    auto-dismiss) and logged as a synthetic "dialog" action so replay can
+    do the same and the exit report shows it happened.
+  - Frames/iframes: Playwright's `page.add_init_script()` already runs the
+    injector in every child frame too (not just the main document), so
+    clicks/types inside a same-origin iframe are captured by that frame's
+    own isolated copy of the script automatically - the gap was that
+    `page.evaluate()` only ever drains the MAIN frame's queue. This version
+    polls `page.frames` and drains each one, and (for any non-main frame)
+    computes a "frame_path" - a list of CSS selectors locating the chain of
+    <iframe> elements from the top page down to that frame - via
+    `Frame.frame_element()` plus the injector's exposed
+    `window.__recorderCssPathFor` helper, evaluated in each ancestor
+    frame's own context. See `_frame_path_for`.
 """
-import sys
-import asyncio
+from __future__ import annotations
 import json
-import threading
-import traceback
-import uuid
-from pathlib import Path
-from typing import Optional
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import yaml
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from dotenv import load_dotenv
-
-load_dotenv()
-
-from logging_setup import configure_logging
-configure_logging()
 import logging
+import queue
+import threading
+import time
+from pathlib import Path
+from datetime import datetime
+
+try:
+    from recorder.browser_factory import launch_browser
+except ImportError:
+    # allows `python recorder/recorder.py` to be run directly too
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from recorder.browser_factory import launch_browser
+
+INJECTOR_PATH = Path(__file__).parent / "recorder_injector.js"
 logger = logging.getLogger(__name__)
 
-from recorder.recorder import Recorder, save_recording_json
-from generator.build import build_artifacts
-from generator.test_data import extract_test_data, apply_test_data
-from runner.run_tests import run as run_behave
-from runner.run_recording import list_saved_recordings, run_recording
-from runner import transaction_store
-from agent.llm_factory import get_llm
-from database.db import init_db, get_session, close_db
-from database import repository as repo
-from shutdown_guard import register_cleanup
 
-from auth.dependencies import get_current_user, get_client_ip, validate_token_for_websocket, CurrentUser
-from backend import auth_routes, admin_routes, profile_routes, agent_routes, recording_sessions, agent_registry
-
-APPLICATIONS_CONFIG = Path(__file__).resolve().parents[1] / "config" / "applications.yaml"
-
-# The central server must NEVER launch a headed Playwright browser for a
-# production end user (see docs/electron-local-agent-architecture.md) - so
-# by default, no connected agent = a clear error, not a silent fallback to
-# server-side recording. Set this to "true" ONLY for local development
-# convenience (so a developer without the desktop app running can still
-# exercise the recorder tab) - it must stay "false" for any real deployment.
-import os as _os_flags
-ALLOW_SERVER_FALLBACK = _os_flags.environ.get("ALLOW_SERVER_FALLBACK", "false").lower().strip() == "true"
-
-NO_AGENT_ERROR = (
-    "Local desktop agent is not connected. Please start the AI Test Recorder "
-    "desktop application and sign in, then try again."
-)
-
-app = FastAPI(title="AI Test Recorder API")
-init_db()
-
-
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
+def _json_safe_default(obj):
     """
-    Safety net for ANY endpoint that raises something not already turned
-    into an HTTPException - without this, FastAPI's default behavior is to
-    return a bare "500 Internal Server Error" with NOTHING in the response
-    and (depending on how uvicorn's own logging is configured) not
-    necessarily anything in a log file either - exactly the
-    "Save & Generate failed: 500 Server Error" report with no way to
-    diagnose it further. This logs the full traceback to logs/error.log
-    (via the root logger - see logging.ini) and returns a JSON body that at
-    least names the exception instead of an empty response.
+    Passed as json.dumps()'s `default=` in save_recording_json below - a
+    last line of defense so a bug that leaks a live Playwright object
+    (Page, Frame, ElementHandle, etc.) into an action dict logs a clear
+    warning and coerces it to a string instead of crashing the WHOLE save
+    (and therefore losing the entire recording) with an opaque
+    "TypeError: Object of type Page is not JSON serializable" - which is
+    exactly what a closure bug in an event handler could produce (see
+    _attach_page's comment on the "close" event) and is worth guarding
+    against structurally, not just fixing the one instance of it.
     """
-    logger.error(
-        "Unhandled exception on %s %s\n%s",
-        request.method, request.url.path,
-        "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+    logger.warning(
+        "Non-JSON-serializable value %r (%s) found while saving a recording - "
+        "coercing it to a string. This usually means a Playwright object leaked "
+        "into an action dict (a real bug worth reporting) rather than a plain "
+        "value; the recording is still saved, but check logs/error.log's "
+        "context around this warning.",
+        obj, type(obj).__name__,
     )
-    return JSONResponse(
-        status_code=500,
-        content={"detail": f"Internal server error ({type(exc).__name__}: {exc}). See logs/error.log for the full traceback."},
-    )
+    return str(obj)
 
 
-app.include_router(auth_routes.router)
-app.include_router(admin_routes.router)
-app.include_router(profile_routes.router)
-app.include_router(agent_routes.router)
-
-# Changes every time this process starts (fresh launch, or uvicorn --reload
-# restarting the worker). The frontend remembers this from when it started a
-# recording and compares it later - if it's different, the backend process
-# restarted mid-recording (in-memory STATE, including the open browser, is
-# gone), which needs a distinct message from "recording just failed to
-# launch" so this doesn't turn into a confusing generic error again.
-PROCESS_ID = str(uuid.uuid4())
-
-# The Next.js frontend runs on a different origin, so allow it to call this
-# API from the browser. CORS_ALLOWED_ORIGINS (.env) is a comma-separated
-# allowlist for production (e.g. "https://recorder.yourbank.internal") -
-# defaults to "*" for local dev only. Tighten this before hosting anywhere
-# real: with credentials/Bearer tokens, a wildcard origin is fine (no
-# cookies are used - the JWT travels in an explicit header/query param,
-# never automatically attached by the browser like a cookie would be), but
-# a real allowlist is still better hygiene once you know the frontend's
-# actual origin.
-import os as _os
-_cors_origins = _os.environ.get("CORS_ALLOWED_ORIGINS", "*")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"] if _cors_origins.strip() == "*" else [o.strip() for o in _cors_origins.split(",") if o.strip()],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.on_event("startup")
-async def _on_startup():
-    """Runs the stale-agent reaper for the lifetime of the process (see
-    backend/agent_registry.py's reap_stale_agents) - catches a dropped
-    agent connection that the WebSocket layer itself never cleanly
-    detected (some network failures don't deliver a close frame)."""
-    asyncio.ensure_future(agent_registry.reap_stale_agents())
+def _slugify(name: str, max_len: int = 50) -> str:
+    """Turns a free-typed recording name (e.g. "TXN-4521 / New Loan Application")
+    into a filesystem-safe filename fragment."""
+    cleaned = "".join(c if c.isalnum() else "_" for c in name.strip())
+    cleaned = "_".join(filter(None, cleaned.split("_")))
+    return cleaned[:max_len] or "recording"
 
 
-@app.on_event("shutdown")
-def _on_shutdown():
-    """
-    Runs on a graceful stop (Ctrl+C in the terminal, or uvicorn --reload
-    restarting the worker process) - closes every still-open recorder
-    browser session (there can be several now - one per concurrently
-    recording user, see backend/recording_sessions.py) and releases the
-    database's connection pool, so no Edge/Chrome process or
-    database/test_recorder.db is left locked behind.
-    """
-    _cleanup_all()
-
-
-def _cleanup_all(timeout: float = 15):
-    """Shared by the ASGI shutdown event above (normal Ctrl+C stop) AND
-    shutdown_guard's Windows console-close handler below (terminal window
-    closed directly) - whichever fires first runs this exactly once."""
-    recording_sessions.stop_all(timeout=timeout)
-    close_db()
-
-
-# Covers the case Ctrl+C/ASGI shutdown can't: the terminal window being
-# closed directly. Windows only gives ~5s to clean up in that case, so use
-# a shorter timeout than the normal graceful-stop path above.
-register_cleanup(lambda: _cleanup_all(timeout=3))
-
-
-class StartRequest(BaseModel):
-    url: str = ""
-    app_name: str = ""       # one of the names from GET /api/applications, or "" for a custom "Others" url
-    recording_name: str = "" # e.g. a transaction number or flow name, used to label the saved recording
-    headless: bool = False
-
-
-class RunRequest(BaseModel):
-    headless: bool = False
-
-
-class RunRecordingRequest(BaseModel):
-    recording_file: str
-    headless: bool = False
-    # No user_id anymore - a saved recording is always run as whichever
-    # authenticated user made the request (see auth/dependencies.py), so
-    # every run is unambiguously attributable to a real logged-in person.
-
-
-class TestDataUpdateRequest(BaseModel):
-    values: dict[str, str]  # {"3": "50000", "7": "Jane Doe"} - keys are action indices, see generator/test_data.py
-
-
-def _load_applications() -> dict:
-    """Application name -> URL, from config/applications.yaml. Missing/empty
-    file just means an empty dropdown (frontend still offers "Others")."""
-    if not APPLICATIONS_CONFIG.exists():
-        return {}
-    try:
-        data = yaml.safe_load(APPLICATIONS_CONFIG.read_text()) or {}
-        return data.get("applications") or {}
-    except Exception:
-        return {}
-
-
-@app.get("/api/applications")
-def get_applications(current_user: CurrentUser = Depends(get_current_user)):
-    """Names for the frontend's dropdown - URLs never leave the backend for
-    these; the frontend only ever sees/sends the app NAME (see
-    StartRequest.app_name below), matching "URLs live in the backend"."""
-    return {"applications": list(_load_applications().keys())}
-
-
-@app.post("/api/start")
-async def start_recording(req: StartRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
-    """
-    Requires a connected desktop agent (backend/agent_registry.py) - the
-    whole point of the Electron/local-agent architecture: the actual
-    browser launches on the USER'S OWN PC via their local agent, never
-    here. This backend only sends a command and stores metadata
-    (backend/recording_sessions.py's "mode"/"agent_id" fields) - no
-    Recorder, no browser object, ever exists in this process for a
-    production recording.
-
-    ALLOW_SERVER_FALLBACK (.env, default false) is a LOCAL-DEV-ONLY escape
-    hatch: with it set, a missing agent falls back to the original
-    server-side headless Recorder + live-view path instead of erroring -
-    useful for developing the recorder tab without also running the
-    desktop app, but this must stay false for any real deployment (see
-    docs/electron-local-agent-architecture.md).
-    """
-    applications = _load_applications()
-    if req.app_name and req.app_name in applications:
-        url = applications[req.app_name].strip()
-    else:
-        url = req.url.strip()
-    if not url:
-        raise HTTPException(status_code=400, detail="URL is required (select a known application or provide one for 'Others')")
-
-    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
-    if state["recorder"] is not None or state.get("agent_recording_active"):
-        raise HTTPException(status_code=400, detail="You already have a recording in progress - save or stop it first")
-
-    ip = get_client_ip(request)
-    conn = agent_registry.get_for_user(current_user.user_id)
-
-    if conn is None and not ALLOW_SERVER_FALLBACK:
-        raise HTTPException(status_code=409, detail=NO_AGENT_ERROR)
-
-    # ---- AGENT mode ---------------------------------------------------------
-    if conn is not None:
-        try:
-            response = await agent_registry.send_command(
-                conn, "START_RECORDING", {"url": url, "headless": req.headless},
-            )
-        except (asyncio.TimeoutError, ConnectionError) as e:
-            raise HTTPException(status_code=502, detail=f"Local agent did not respond: {e}")
-
-        if not response.get("ok", False):
-            raise HTTPException(status_code=400, detail=response.get("error", "Agent failed to start recording."))
-
-        state["mode"] = "agent"
-        state["agent_id"] = conn.agent_id
-        state["agent_recording_active"] = True
-        state["pending_recording_name"] = req.recording_name.strip() or None
-        state["target_url"] = url
-        conn.busy = True
-
-        with get_session() as session:
-            repo.log_activity(
-                session, user_id=current_user.user_id, session_id=current_user.session_id, action="START_RECORDING",
-                status="SUCCESS", details={"url": url, "recording_name": req.recording_name, "mode": "agent",
-                                            "agent_id": conn.agent_id},
-                endpoint="/api/start", ip_address=ip,
-            )
-        return {"ok": True, "message": f"Recording started on your local agent ({conn.hostname or conn.agent_id})."}
-
-    # ---- SERVER mode - only reachable when ALLOW_SERVER_FALLBACK=true, since
-    # the 409 above already returned for conn is None otherwise. Local-dev-only. ---
-    active = recording_sessions.count_active_recordings()
-    if active >= recording_sessions.MAX_CONCURRENT_RECORDINGS:
-        raise HTTPException(
-            status_code=503,
-            detail=f"The server is at capacity ({active}/{recording_sessions.MAX_CONCURRENT_RECORDINGS} concurrent "
-                   f"recordings) - please try again shortly.",
-        )
-
-    state["mode"] = "server"
-    state["pending_recording_name"] = req.recording_name.strip() or None
-    state["start_error"] = None
-    state["launching"] = True
-
-    with get_session() as session:
-        repo.log_activity(
-            session, user_id=current_user.user_id, session_id=current_user.session_id, action="START_RECORDING",
-            status="SUCCESS", details={"url": url, "app_name": req.app_name, "recording_name": req.recording_name,
-                                        "headless": req.headless, "mode": "server"},
-            endpoint="/api/start", ip_address=ip,
-        )
-
-    def _launch():
-        try:
-            # A hosted server (see backend/recording_sessions.py's docs and
-            # DEPLOYMENT_WINDOWS.md) typically has no desktop session for a
-            # headed browser window to render into, and the live-view
-            # WebSocket streams a headless browser just fine via CDP
-            # screencast either way - so FORCE_HEADLESS_RECORDING (.env,
-            # default true) overrides whatever the frontend's "headless"
-            # checkbox sent. Set it to false only for local single-user dev
-            # where seeing the real window is convenient.
-            import os
-            force_headless = os.environ.get("FORCE_HEADLESS_RECORDING", "true").lower().strip() != "false"
-            effective_headless = True if force_headless else req.headless
-            # Only bother with CDP screencast when actually headless - a
-            # headed run already gives a real, visible browser window, so
-            # the live-view widget would just be a redundant (and
-            # occasionally flaky, e.g. across an unstable dev-reload) second
-            # way to see the exact same thing. GET /api/status's "headless"
-            # field tells the frontend whether to even show that panel.
-            rec = Recorder(url, headless=effective_headless, enable_live_view=effective_headless).start()
-            state["recorder"] = rec
-            state["headless"] = effective_headless
-        except Exception as e:
-            # Previously this died silently in the background thread - the
-            # frontend would show "Launching browser..." and mark the
-            # recording as started regardless, so a failed launch (wrong
-            # channel, Edge not installed, bad URL, etc.) only surfaced
-            # later as a confusing 400 on Stop & Save. Now the frontend can
-            # poll GET /api/status and see exactly why it failed.
-            state["start_error"] = str(e)
-        finally:
-            state["launching"] = False
-
-    threading.Thread(target=_launch, daemon=True).start()
-    return {"ok": True, "message": f"Launching browser for {url}..."}
-
-
-@app.get("/api/status")
-def get_status(current_user: CurrentUser = Depends(get_current_user)):
-    """Poll this after /api/start - a browser launch happens in a background
-    thread (server mode) or on the agent (agent mode), so success/failure
-    isn't known at the time /api/start returns. Also doubles as the general
-    tool-status endpoint (recording in progress / has a build / last run
-    result) - all scoped to the CALLER's own recording session (see
-    backend/recording_sessions.py); this can never see another user's
-    in-progress recording."""
-    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
-    recording_active = state.get("recorder") is not None or state.get("agent_recording_active", False)
-    return {
-        "launching": state.get("launching", False),
-        "recording_active": recording_active,
-        "start_error": state.get("start_error"),
-        "process_id": PROCESS_ID,
-        "recording_in_progress": recording_active,
-        "has_build": state.get("build_result") is not None,
-        "last_run": state.get("last_run"),
-        "headless": state.get("headless"),  # None until a recorder has actually launched (server mode only)
-        "live_view_ws": "/api/ws/record" if state.get("recorder") is not None else None,
-        "mode": state.get("mode", "server"),  # "server" or "agent" - lets the frontend skip the live-view panel entirely in agent mode (a real window is already open on the user's own PC)
-    }
-
-
-def _agent_conn_for_state(state: dict, current_user: CurrentUser):
-    """Looks up the SAME agent connection a session started recording on -
-    if it disconnected/reconnected with a new object since (e.g. the
-    desktop app restarted), this deliberately fails clearly rather than
-    silently sending the stop command to a stale/wrong connection."""
-    if state.get("mode") != "agent":
-        return None
-    conn = agent_registry.get_for_user(current_user.user_id)
-    if conn is None or conn.agent_id != state.get("agent_id"):
-        return None
-    return conn
-
-
-@app.post("/api/stop")
-async def stop_recording(request: Request, current_user: CurrentUser = Depends(get_current_user)):
-    """Stops and DISCARDS the current recording without saving/generating
-    anything - for abandoning a recording mid-flow (wrong URL, made a
-    mistake, changed your mind). Use /api/stop_and_save instead to keep
-    what was recorded."""
-    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
-    ip = get_client_ip(request)
-
-    if state.get("mode") == "agent":
-        conn = _agent_conn_for_state(state, current_user)
-        if conn is None or not state.get("agent_recording_active"):
-            raise HTTPException(status_code=400, detail="No recording in progress (your local agent may have disconnected).")
-        try:
-            response = await agent_registry.send_command(conn, "STOP_RECORDING", {})
-        except (asyncio.TimeoutError, ConnectionError) as e:
-            raise HTTPException(status_code=502, detail=f"Local agent did not respond: {e}")
-        finally:
-            state["agent_recording_active"] = False
-            conn.busy = False
-        actions_discarded = len(response.get("actions", []))
-    else:
-        rec = state["recorder"]
-        if rec is None:
-            detail = "No recording in progress"
-            if state.get("start_error"):
-                detail += f" (the last start attempt failed: {state['start_error']})"
-            elif state.get("launching"):
-                detail += " (the browser is still launching - wait a moment and try again)"
-            raise HTTPException(status_code=400, detail=detail)
-        actions = rec.stop()
-        state["recorder"] = None
-        actions_discarded = len(actions)
-
-    state["pending_recording_name"] = None
-
-    with get_session() as session:
-        repo.log_activity(
-            session, user_id=current_user.user_id, session_id=current_user.session_id, action="STOP_RECORDING_DISCARDED",
-            status="SUCCESS", details={"actions_discarded": actions_discarded, "mode": state.get("mode")},
-            endpoint="/api/stop", ip_address=ip,
-        )
-    return {"ok": True, "actions_discarded": actions_discarded}
-
-
-@app.post("/api/stop_and_save")
-async def stop_and_save(request: Request, current_user: CurrentUser = Depends(get_current_user)):
-    """
-    Split into per-stage try/excepts (stop -> save -> build) rather than one
-    big try/except around everything: a failure in build_artifacts() (e.g.
-    a bad recording, an LLM hiccup, a broken template) is a DIFFERENT
-    problem from a failure stopping/saving the recording itself (browser
-    crashed, agent disconnected mid-stop) - and critically, if generation
-    fails the recording itself is still safely saved to disk, so the
-    response should say so instead of just "500 Internal Server Error"
-    with the JSON already lost. Every stage logs the full traceback to
-    logs/error.log before turning it into an HTTPException - see
-    logging.ini/logging_setup.py.
-    """
-    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
-    ip = get_client_ip(request)
-    recording_name = state.pop("pending_recording_name", None)
-
-    if state.get("mode") == "agent":
-        conn = _agent_conn_for_state(state, current_user)
-        if conn is None or not state.get("agent_recording_active"):
-            raise HTTPException(status_code=400, detail="No recording in progress (your local agent may have disconnected).")
-        try:
-            response = await agent_registry.send_command(conn, "STOP_RECORDING", {})
-        except (asyncio.TimeoutError, ConnectionError) as e:
-            logger.exception("Agent STOP_RECORDING failed for user_id=%s", current_user.user_id)
-            raise HTTPException(status_code=502, detail=f"Local agent did not respond: {e}")
-        finally:
-            state["agent_recording_active"] = False
-            conn.busy = False
-
-        if not response.get("ok", False):
-            raise HTTPException(status_code=400, detail=response.get("error", "Agent failed to stop the recording."))
-
-        actions = response.get("actions", [])
-        target_url = response.get("target_url") or state.get("target_url") or ""
-        try:
-            # Persisted server-side either way (see recorder/recorder.py's
-            # save_recording_json) - "Run Saved Recording", the generator,
-            # and everything downstream never need to know whether a
-            # recording was captured locally or by an agent.
-            path = save_recording_json(target_url, actions, name=recording_name)
-        except Exception:
-            logger.exception("save_recording_json() failed for user_id=%s", current_user.user_id)
-            raise HTTPException(status_code=500, detail="Failed to save the recording JSON - see logs/error.log")
-    else:
-        rec = state["recorder"]
-        if rec is None:
-            detail = "No recording in progress"
-            if state.get("start_error"):
-                detail += f" (the last start attempt failed: {state['start_error']})"
-            elif state.get("launching"):
-                detail += " (the browser is still launching - wait a moment and try again)"
-            raise HTTPException(status_code=400, detail=detail)
-
-        try:
-            actions = rec.stop()
-        except Exception:
-            logger.exception("Recorder.stop() failed")
-            state["recorder"] = None
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to stop the recorder (the browser may have crashed or been closed manually) - see logs/error.log",
-            )
-
-        try:
-            path = rec.save(name=recording_name)
-        except Exception:
-            logger.exception("Recorder.save() failed")
-            raise HTTPException(status_code=500, detail="Failed to save the recording JSON - see logs/error.log")
-        finally:
-            target_url = rec.target_url
-            state["recorder"] = None
-
-    recording = {
+def save_recording_json(target_url: str, actions: list, out_dir: str = "recordings", name: str = None) -> str:
+    """Writes a recording JSON in the exact shape/naming convention
+    Recorder.save() below uses - factored out so a recording captured by a
+    LOCAL AGENT (see backend/api.py's agent-mode /api/stop_and_save, and
+    local_agent/recording_manager.py) can be persisted server-side
+    identically to one captured by this process's own Recorder, with no
+    special-casing anywhere downstream (generator/build.py,
+    runner/run_recording.py, the "Run Saved Recording" list, etc. don't
+    know or care which path produced the file)."""
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{_slugify(name)}_{ts}.json" if name and name.strip() else f"recording_{ts}.json"
+    path = Path(out_dir) / filename
+    payload = {
         "target_url": target_url,
-        "recorded_at": Path(path).stem,
-        "recording_name": recording_name,
+        "recorded_at": ts,
+        "recording_name": name.strip() if name and name.strip() else None,
         "actions": actions,
     }
-    state["recording"] = recording
-
-    # Own output/ subfolder per auth session (backend/recording_sessions.py)
-    # so two people's Save & Generate never clobber each other's generated
-    # feature/steps/page files.
-    output_dir = recording_sessions.output_dir_for(current_user.session_id)
-    llm = get_llm()
-    try:
-        build_result = await asyncio.to_thread(build_artifacts, recording, llm=llm, output_dir=output_dir)
-    except Exception:
-        logger.exception("build_artifacts() failed while generating feature/steps/page files for %s", path)
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"Recording was saved to {path}, but generating the feature/steps/page files failed - "
-                "see logs/error.log for the full traceback. You can retry generation later from "
-                "the saved recording without re-recording."
-            ),
-        )
-    state["build_result"] = build_result
-
-    # Additive: surface the (now variable-annotated) actions and a quick
-    # name -> captured-value summary so the frontend can show what was
-    # recorded, including keyboard events and any Capture -> Store -> Reuse
-    # {{var}} pairs, without needing a separate endpoint.
-    variables_summary = {
-        a["captured_as"]: a.get("value")
-        for a in recording["actions"]
-        if a.get("action") == "copy" and a.get("captured_as")
-    }
-
-    with get_session() as session:
-        repo.log_activity(
-            session, user_id=current_user.user_id, session_id=current_user.session_id, action="STOP_AND_SAVE",
-            status="SUCCESS", details={"recording_file": path, "actions_captured": len(actions),
-                                        "recording_name": recording_name, "mode": state.get("mode")},
-            endpoint="/api/stop_and_save", ip_address=ip,
-        )
-
-    return {
-        "ok": True,
-        "recording_file": path,
-        "actions_captured": len(actions),
-        "build_result": build_result,
-        "llm_used": llm is not None,
-        "actions": recording["actions"],
-        "variables": variables_summary,
-    }
+    path.write_text(json.dumps(payload, indent=2, default=_json_safe_default))
+    return str(path)
 
 
-@app.post("/api/run")
-async def run_check(req: RunRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
-    """Runs the just-generated Behave suite. Requires a connected desktop
-    agent by default - packages the generated files' CONTENTS (not paths -
-    the agent has no access to this server's filesystem) and has the local
-    agent execute Behave on the user's own PC, against their own real
-    browser. ALLOW_SERVER_FALLBACK (.env, local-dev-only, default false)
-    permits the original server-side execution instead - see /api/start's
-    docstring for why this must stay off in production."""
-    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
-    output_dir = recording_sessions.output_dir_for(current_user.session_id)
-    output_path = Path(output_dir)
-    if state["build_result"] is None and not (output_path / "features" / "recorded.feature").exists():
-        raise HTTPException(status_code=400, detail="Nothing generated yet - record and save first")
+class Recorder:
+    def __init__(self, target_url: str, headless: bool = False, poll_interval: float = 0.4,
+                 enable_live_view: bool = True):
+        self.target_url = target_url
+        self.headless = headless
+        self.poll_interval = poll_interval
+        self.session = None  # BrowserSession (playwright + browser + context) - only ever touched on _worker's thread
+        self.page = None     # Playwright Page for the ORIGINAL tab (index 0) - only ever touched on _worker's thread
+        self.actions = []    # accumulated raw actions
+        self._lock = threading.Lock()
+        self._js_source = INJECTOR_PATH.read_text()
 
-    ip = get_client_ip(request)
-    conn = agent_registry.get_for_user(current_user.user_id)
+        # Multi-page bookkeeping (popups / new tabs / new windows) - all
+        # only ever touched on the worker thread, same as self.page/session.
+        # Each entry: {"page": <Page>, "index": int, "closed": bool}
+        self._pages = []
+        self._opener_of = {}   # page_index -> the page_index that was active when it was opened (or None for index 0)
+        self._active_index = 0  # index of the page we currently consider "in focus" (last one with recorded activity)
 
-    if conn is None and not ALLOW_SERVER_FALLBACK:
-        raise HTTPException(status_code=409, detail=NO_AGENT_ERROR)
+        self._worker = None
+        self._ready_event = threading.Event()
+        self._stop_requested = threading.Event()
+        self._stopped_event = threading.Event()
+        self._start_error = None
 
-    if conn is not None:
-        files = _collect_generated_files(output_path)
+        # ---- live view (remote screencast + input forwarding) -----------
+        # Lets a browser that is NOT sitting in front of this machine (e.g.
+        # a hosted server with no desktop session, driven concurrently by
+        # several different users) see and control this recording via
+        # Chrome DevTools Protocol - see backend/api.py's /api/ws/record
+        # WebSocket, which bridges frames/input between here and the
+        # frontend's live-view widget. `_cdp`/frame-grabbing/input-dispatch
+        # only ever run on the SAME worker thread as everything else above
+        # (Playwright sync API constraint - see module docstring); the
+        # queues are what make it safe to hand frames/input across threads.
+        # Always tied to the ORIGINAL page (index 0) - see module docstring.
+        self.enable_live_view = enable_live_view
+        self._cdp = None
+        self._frame_queue: "queue.Queue[str]" = queue.Queue(maxsize=2)  # small: always prefer the newest frame
+        self._input_queue: "queue.Queue[dict]" = queue.Queue()
+
+    # ---- lifecycle -------------------------------------------------
+    def start(self):
+        """
+        Safe to call from any thread. Spins up the dedicated worker thread
+        that owns the browser (and does all the polling) for the rest of
+        this Recorder's life, and blocks (from the caller's thread) until
+        the browser is actually up and navigated, or raises whatever error
+        the worker hit while launching.
+        """
+        self._worker = threading.Thread(target=self._run, daemon=True)
+        self._worker.start()
+        if not self._ready_event.wait(timeout=30):
+            raise TimeoutError("Timed out waiting for the recorder's browser to launch")
+        if self._start_error is not None:
+            raise self._start_error
+        return self
+
+    # ---- multi-page / dialog / frame plumbing -----------------------
+    def _attach_page(self, page, index: int):
+        """Wires a Playwright Page (the original one, or a popup/new tab/new
+        window Playwright reported) so it's captured the same way as the
+        main page: re-injects the capture script on every navigation, and
+        auto-handles native dialogs. Safe to call for index 0 too."""
         try:
-            response = await agent_registry.send_command(
-                conn, "START_TEST", {"headless": req.headless, "files": files}, timeout=120,
-            )
-        except (asyncio.TimeoutError, ConnectionError) as e:
-            logger.exception("Agent START_TEST failed for user_id=%s", current_user.user_id)
-            raise HTTPException(status_code=502, detail=f"Local agent did not respond: {e}")
-        result = {"ok": response.get("ok", False), "output": response.get("output", "")}
-    else:
-        try:
-            result = await asyncio.to_thread(run_behave, output_dir=output_dir, headless=req.headless)
+            page.add_init_script(self._js_source)
         except Exception:
-            logger.exception("run_behave() failed for user_id=%s", current_user.user_id)
-            raise HTTPException(status_code=500, detail="Failed to execute the generated test suite - see logs/error.log")
+            pass
+        page.on("dialog", lambda dialog, i=index: self._on_dialog(dialog, i))
+        # BUG-PRONE PATTERN AVOIDED: Playwright's "close" event calls the
+        # handler WITH the Page itself as a positional argument (unlike
+        # what you might assume from the JS API) - a lambda capturing
+        # `index` via a default value while ALSO accepting that positional
+        # arg under the SAME parameter name would silently receive the
+        # (now-closed) Page object instead of the intended int index,
+        # which then blows up json.dumps() in save_recording_json with
+        # "Object of type Page is not JSON serializable". Giving the
+        # incoming argument its own distinct name avoids that collision.
+        page.on("close", lambda closed_page, i=index: self._on_page_closed(i))
 
-    state["last_run"] = result
+    def _on_dialog(self, dialog, page_index: int):
+        """Native alert/confirm/prompt/beforeunload dialogs suspend the page
+        until accepted/dismissed - and once ANY listener is registered,
+        Playwright's own default auto-dismiss no longer applies, so this
+        MUST resolve the dialog itself or recording would hang the instant
+        the target app shows one. Always accepts (using the dialog's own
+        default value for prompts) and logs what happened as a synthetic
+        "dialog" action so the generated replay can do the same and the
+        exit report shows it occurred."""
+        try:
+            with self._lock:
+                self.actions.append({
+                    "ts": int(time.time() * 1000),
+                    "action": "dialog",
+                    "value": dialog.message,
+                    "dialog_type": dialog.type,
+                    "element": {"tag": "dialog", "type": dialog.type, "text": dialog.message,
+                                "placeholder": "", "name": "", "ariaLabel": ""},
+                    "locators": [],
+                    "url": None,
+                    "page_index": page_index,
+                    "frame_path": [],
+                })
+        finally:
+            try:
+                dialog.accept()
+            except Exception:
+                try:
+                    dialog.dismiss()
+                except Exception:
+                    pass
 
-    with get_session() as session:
-        repo.log_activity(
-            session, user_id=current_user.user_id, session_id=current_user.session_id, action="RUN_CHECK",
-            status="SUCCESS" if result.get("ok") else "FAILURE",
-            details={"headless": req.headless, "mode": "agent" if conn is not None else "server"},
-            endpoint="/api/run", ip_address=ip,
-        )
-    return result
+    def _on_new_page(self, new_page):
+        """Fired by the browser CONTEXT (not a single page) whenever ANY
+        page/tab/window opens under it - a target="_blank" link, a
+        window.open() call, "open link in new tab", etc. Assigns it the
+        next index, records a synthetic "new_window" action immediately
+        (before the new page has even finished loading - its URL gets
+        picked up naturally on the next poll once it's flushed for the
+        first time), and starts capturing/polling it exactly like the
+        original page."""
+        with self._lock:
+            index = len(self._pages)
+            opener_index = self._active_index
+            self._pages.append({"page": new_page, "index": index, "closed": False})
+            self._opener_of[index] = opener_index
+            self.actions.append({
+                "ts": int(time.time() * 1000),
+                "action": "new_window",
+                "value": None,
+                "element": {"tag": "window", "type": "", "text": "", "placeholder": "", "name": "", "ariaLabel": ""},
+                "locators": [],
+                "url": None,
+                "page_index": index,
+                "opener_page_index": opener_index,
+                "frame_path": [],
+            })
+            self._active_index = index
+        self._attach_page(new_page, index)
 
+    def _on_page_closed(self, page_index: int):
+        """Fired when a tab/window closes (popup dismissed, user closes it,
+        etc). Marks it closed (so polling stops touching it) and records a
+        synthetic "window_closed" action tagged with the tab/window it was
+        opened FROM, so replay knows which one to switch back to."""
+        with self._lock:
+            for entry in self._pages:
+                if entry["index"] == page_index:
+                    entry["closed"] = True
+            opener_index = self._opener_of.get(page_index, 0)
+            self.actions.append({
+                "ts": int(time.time() * 1000),
+                "action": "window_closed",
+                "value": None,
+                "element": {"tag": "window", "type": "", "text": "", "placeholder": "", "name": "", "ariaLabel": ""},
+                "locators": [],
+                "url": None,
+                "page_index": page_index,
+                "opener_page_index": opener_index,
+                "frame_path": [],
+            })
+            self._active_index = opener_index
 
-def _collect_generated_files(output_path: Path) -> dict:
-    """Reads every generated feature/steps/page/locators file's CONTENT
-    (not just its path - see run_check above) so it can be shipped to a
-    local agent that has no access to this server's disk. Keys are
-    relative paths so the agent can recreate the same layout in its own
-    isolated workspace (see local_agent/execution_manager.py)."""
-    files = {}
-    for rel in ("features/recorded.feature", "features/environment.py", "features/steps/recorded_steps.py",
-                "pages/recorded_page.py", "pages/locators.json"):
-        p = output_path / rel
-        if p.exists():
-            files[rel] = p.read_text()
-    return files
+    def _frame_path_for(self, frame) -> list:
+        """Builds the list of CSS selectors (outermost -> innermost) needed
+        to drill from the top of the page down to `frame` via nested
+        <iframe>/<frame> elements - e.g. ['#billing-iframe', 'iframe.step2']
+        means "the iframe found at #billing-iframe, and inside THAT
+        document, the iframe found at .step2". Used to tag actions that
+        happened inside an iframe so replay can resolve them the same way
+        (see page.tmpl's BasePage._root_for). Best-effort: if a selector
+        can't be computed for some ancestor (detached mid-navigation,
+        cross-origin quirk, etc.) falls back to a generic 'iframe' selector
+        rather than dropping the action's frame context entirely."""
+        chain = []
+        cur = frame
+        try:
+            while cur is not None and cur.parent_frame is not None:
+                parent = cur.parent_frame
+                selector = None
+                try:
+                    handle = cur.frame_element()
+                    selector = parent.evaluate(
+                        "(el) => (window.__recorderCssPathFor && el) ? window.__recorderCssPathFor(el) : null",
+                        handle,
+                    )
+                except Exception:
+                    selector = None
+                chain.append(selector or "iframe")
+                cur = parent
+        except Exception:
+            pass
+        chain.reverse()
+        return chain
 
+    def _flush_once(self):
+        """Pulls whatever the injected script has queued since the last
+        flush, from EVERY tracked page and EVERY frame within each page (not
+        just the main frame of the original page - see module docstring).
+        Must only ever be called from the worker thread."""
+        for entry in list(self._pages):
+            if entry["closed"]:
+                continue
+            page = entry["page"]
+            index = entry["index"]
+            try:
+                frames = list(page.frames)
+            except Exception:
+                continue
+            main_frame = None
+            try:
+                main_frame = page.main_frame
+            except Exception:
+                pass
+            for frame in frames:
+                try:
+                    new_items = frame.evaluate(
+                        "() => window.__flushActions ? window.__flushActions() : []"
+                    )
+                except Exception:
+                    continue
+                if not new_items:
+                    continue
+                frame_path = [] if frame == main_frame else self._frame_path_for(frame)
+                for item in new_items:
+                    item["page_index"] = index
+                    item["frame_path"] = frame_path
+                with self._lock:
+                    self.actions.extend(new_items)
+                self._active_index = index
 
-@app.websocket("/api/ws/record")
-async def ws_record(websocket: WebSocket, token: str = Query(...)):
-    """Live view for a hosted, headless recording: streams CDP screencast
-    JPEG frames to the client and forwards its mouse/keyboard events back
-    to the real (server-side) browser - see recorder/recorder.py's
-    get_frame/queue_input. This is what makes "record a flow" usable when
-    the backend runs on a machine with no desktop session in front of the
-    person doing the recording (the normal case once this is hosted rather
-    than run on someone's own laptop).
+    # ---- live view: screencast (server -> viewer) --------------------
+    def _start_screencast(self):
+        """Best-effort: if CDP screencast can't be started (older browser,
+        channel quirk, whatever), the recording continues exactly as
+        before, just without a live remote view. Must only run on the
+        worker thread (creates a CDP session bound to self.page - the
+        ORIGINAL page, index 0; see module docstring)."""
+        try:
+            self._cdp = self.page.context.new_cdp_session(self.page)
+            self._cdp.on("Page.screencastFrame", self._on_screencast_frame)
+            self._cdp.send("Page.startScreencast", {
+                "format": "jpeg", "quality": 60,
+                "maxWidth": self.page.viewport_size["width"] if self.page.viewport_size else 1440,
+                "maxHeight": self.page.viewport_size["height"] if self.page.viewport_size else 900,
+                "everyNthFrame": 1,
+            })
+        except Exception:
+            self._cdp = None
 
-    Browsers can't attach a custom Authorization header to a WebSocket
-    handshake, so the JWT travels as ?token=... instead - auth/dependencies.py's
-    validate_token_for_websocket runs the exact same checks (idle timeout,
-    revocation, account status) as every other endpoint.
-    """
-    await websocket.accept()
+    def _on_screencast_frame(self, params: dict):
+        """CDP event handler - fires on Playwright's internal dispatch
+        thread, NOT necessarily the worker thread, so this only ever
+        touches the thread-safe queue (never self.page directly, other
+        than the required frame ack)."""
+        try:
+            self._cdp.send("Page.screencastFrameAck", {"sessionId": params["sessionId"]})
+        except Exception:
+            pass
+        data = params.get("data")  # base64-encoded JPEG, ready to hand straight to a client
+        if not data:
+            return
+        try:
+            self._frame_queue.get_nowait()  # drop the previous frame if the viewer hasn't read it yet
+        except queue.Empty:
+            pass
+        try:
+            self._frame_queue.put_nowait(data)
+        except queue.Full:
+            pass
 
-    current_user = validate_token_for_websocket(token)
-    if current_user is None:
-        print("[live-view] rejected: invalid/expired/revoked token")
-        await websocket.close(code=4401, reason="Not authenticated")
-        return
+    def get_frame(self, timeout: float = 1.0) -> "str | None":
+        """Blocking pull of the latest screencast frame (base64 JPEG), for
+        a caller on ITS OWN thread (see backend/api.py's WS handler, which
+        calls this via asyncio.to_thread). Returns None on timeout, which
+        just means "nothing new yet" - not an error."""
+        try:
+            return self._frame_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
 
-    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
-    rec = state.get("recorder")
-    if rec is None:
-        print(f"[live-view] rejected: no active recording for user {current_user.username} (session {current_user.session_id})")
-        await websocket.close(code=4404, reason="No active recording for this session")
-        return
+    # ---- live view: input forwarding (viewer -> server) ---------------
+    def queue_input(self, event: dict):
+        """Safe to call from any thread (e.g. the WS handler's async
+        context) - just enqueues; the actual CDP dispatch happens on the
+        worker thread in _drain_input_queue below."""
+        self._input_queue.put(event)
 
-    print(f"[live-view] connected: user {current_user.username}, session {current_user.session_id}")
-
-    async def sender():
+    def _drain_input_queue(self):
+        """Must only run on the worker thread. Applies every queued input
+        event since the last poll tick."""
         while True:
-            frame = await asyncio.to_thread(rec.get_frame, 1.0)
-            if state.get("recorder") is None:
+            try:
+                event = self._input_queue.get_nowait()
+            except queue.Empty:
+                return
+            self._dispatch_input(event)
+
+    def _dispatch_input(self, event: dict):
+        if self._cdp is None:
+            return
+        kind = event.get("type")
+        try:
+            if kind in ("mousePressed", "mouseReleased", "mouseMoved", "mouseWheel"):
+                params = {
+                    "type": kind,
+                    "x": event.get("x", 0), "y": event.get("y", 0),
+                    "button": event.get("button", "left"),
+                    "clickCount": event.get("clickCount", 1),
+                }
+                if kind == "mouseWheel":
+                    params["deltaX"] = event.get("deltaX", 0)
+                    params["deltaY"] = event.get("deltaY", 0)
+                self._cdp.send("Input.dispatchMouseEvent", params)
+            elif kind == "insertText":
+                # Typed characters go through Input.insertText rather than
+                # raw key events - far more reliable for actually landing
+                # text in a field over CDP, and the existing
+                # recorder_injector.js still sees the resulting real
+                # 'input'/'change' DOM events exactly as if it were typed
+                # locally, so action capture is unaffected.
+                self._cdp.send("Input.insertText", {"text": event.get("text", "")})
+            elif kind in ("keyDown", "keyUp", "rawKeyDown"):
+                # Non-printable / control keys (Backspace, Enter, Tab,
+                # arrows, Escape, Ctrl/Alt combos, ...) that insertText
+                # can't express.
+                self._cdp.send("Input.dispatchKeyEvent", {
+                    "type": kind,
+                    "key": event.get("key", ""),
+                    "code": event.get("code", ""),
+                    "windowsVirtualKeyCode": event.get("keyCode", 0),
+                    "nativeVirtualKeyCode": event.get("keyCode", 0),
+                })
+        except Exception:
+            pass  # a dropped input event shouldn't crash the recording
+
+    def _run(self):
+        """Runs entirely on the dedicated worker thread - every Playwright call in
+        this Recorder's lifetime happens here, so nothing about it needs to be
+        thread-safe on its own, and it's the ONLY thread that ever touches
+        self.page/self.session/self._pages."""
+        try:
+            self.session = launch_browser(headless=self.headless)
+            self.page = self.session.new_page()
+            self._pages = [{"page": self.page, "index": 0, "closed": False}]
+            self._opener_of = {0: None}
+            self._active_index = 0
+
+            # Catches EVERY page/tab/window opened under this browser context
+            # from here on - popups, target="_blank" links, window.open().
+            self.session.context.on("page", self._on_new_page)
+
+            # Re-inject the capture script on every new document (survives
+            # navigation/SPA reloads, and every child iframe too - see module
+            # docstring) - also wires up dialog auto-handling for this page.
+            self._attach_page(self.page, 0)
+            self.page.goto(self.target_url)
+            if self.enable_live_view:
+                self._start_screencast()
+        except Exception as e:
+            self._start_error = e
+            self._ready_event.set()
+            return
+
+        self._ready_event.set()
+
+        # Poll for newly captured actions until stop() asks us to shut down.
+        # page.wait_for_timeout() is a real Playwright call (unlike
+        # time.sleep()/queue.get()), so it also keeps Playwright's own
+        # internal dispatch pumped correctly while we wait.
+        while not self._stop_requested.is_set():
+            self._flush_once()
+            self._drain_input_queue()
+            try:
+                self.page.wait_for_timeout(self.poll_interval * 1000)
+            except Exception:
                 break
-            if frame is not None:
-                await websocket.send_text(frame)
 
-    sender_task = asyncio.create_task(sender())
-    try:
-        while True:
-            event = await websocket.receive_json()
-            rec.queue_input(event)
-    except WebSocketDisconnect:
-        print(f"[live-view] disconnected: user {current_user.username}")
-    except Exception as e:
-        print(f"[live-view] error for user {current_user.username}: {e}")
-    finally:
-        sender_task.cancel()
+        # final flush + teardown, still on this same worker thread
+        self._flush_once()
+        if self.session:
+            self.session.close()
 
+        self._stopped_event.set()
 
-# ------------------------------------------------------------------------
-# Users (read-only here - creation/edit/delete is admin-only, see
-# backend/admin_routes.py mounted under /api/admin/users)
-# ------------------------------------------------------------------------
+    def stop(self, timeout: float = 15) -> list:
+        """Safe to call from any thread. Signals the worker thread to flush and
+        tear down the browser, and waits (up to `timeout` seconds) for that to
+        finish. `timeout` is lowered by callers racing a hard deadline - e.g.
+        shutdown_guard.py gives itself only a few seconds to clean up before
+        Windows force-kills the process after a closed terminal window."""
+        if self._worker is not None and self._worker.is_alive():
+            self._stop_requested.set()
+            self._stopped_event.wait(timeout=timeout)
 
-@app.get("/api/users")
-def get_users_legacy(active_only: bool = False, current_user: CurrentUser = Depends(get_current_user)):
-    with get_session() as session:
-        users = repo.list_users(session, active_only=active_only)
-        return [
-            {"user_id": u.user_id, "name": u.name, "department": u.department,
-             "status": u.status, "created_date": u.created_date.isoformat()}
-            for u in users
-        ]
+        # Merge same-element 'type' actions that fired within a short window
+        # of each other (see coalesce_consecutive_types's docstring - mainly
+        # for masked/native date inputs firing more than one change event
+        # per user edit) - best-effort, and runs BEFORE variable annotation
+        # below so {{var}} correlation sees the final, de-duplicated values.
+        try:
+            from recorder.variable_capture import coalesce_consecutive_types
+            with self._lock:
+                self.actions = coalesce_consecutive_types(self.actions)
+        except Exception:
+            pass
 
+        # Enrich copy/paste actions with the Capture -> Store -> Reuse
+        # variable metadata (see recorder/variable_capture.py) - best-effort:
+        # if this module is missing for some reason, recording still works
+        # exactly as before, just without the {{var}} correlation.
+        try:
+            from recorder.variable_capture import annotate_variables
+            with self._lock:
+                self.actions = annotate_variables(self.actions)
+        except Exception:
+            pass
 
-# ------------------------------------------------------------------------
-# Saved recordings - "run the recording he has and give exit report"
-# ------------------------------------------------------------------------
+        return self.actions
 
-@app.get("/api/recordings")
-def get_recordings(current_user: CurrentUser = Depends(get_current_user)):
-    return list_saved_recordings()
-
-
-def _safe_recording_path(file: str) -> Path:
-    """Resolves `file` (as returned by GET /api/recordings) and makes sure
-    it's actually inside recordings/ - a defensive check against a crafted
-    path (e.g. "../../.env") ever being read/written through this endpoint."""
-    recordings_dir = (Path(__file__).resolve().parents[1] / "recordings").resolve()
-    path = Path(file).resolve()
-    if recordings_dir not in path.parents or path.suffix != ".json":
-        raise HTTPException(status_code=400, detail="Invalid recording file")
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Recording not found")
-    return path
-
-
-@app.get("/api/recordings/data")
-def get_recording_test_data(file: str, current_user: CurrentUser = Depends(get_current_user)):
-    """Backs the editable data grid shown before running a saved recording
-    (see generator/test_data.py) - every typed/selected value in the
-    recording, editable right there instead of downloading the Excel
-    report, changing values, and re-uploading."""
-    path = _safe_recording_path(file)
-    recording = json.loads(path.read_text())
-    return {"file": str(path), "fields": extract_test_data(recording)}
-
-
-@app.put("/api/recordings/data")
-def update_recording_test_data(
-    file: str, req: TestDataUpdateRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)
-):
-    """Writes edited values straight back into the saved recording JSON -
-    this becomes the new baseline test data for every future run of this
-    recording, not just a one-off override for the next click of Run."""
-    path = _safe_recording_path(file)
-    recording = json.loads(path.read_text())
-    recording = apply_test_data(recording, req.values)
-    path.write_text(json.dumps(recording, indent=2))
-
-    ip = get_client_ip(request)
-    with get_session() as session:
-        repo.log_activity(
-            session, user_id=current_user.user_id, session_id=current_user.session_id, action="TEST_DATA_UPDATED",
-            status="SUCCESS", details={"recording_file": str(path), "fields_changed": len(req.values)},
-            endpoint="/api/recordings/data", ip_address=ip,
-        )
-    return {"ok": True, "fields": extract_test_data(recording)}
-
-
-@app.post("/api/run_recording")
-async def run_saved_recording(req: RunRecordingRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
-    """Runs a previously saved recording end-to-end (regenerate + execute)
-    and returns the exit report, attributed to whoever is logged in - the
-    frontend no longer picks a "run as" user, it's always the current
-    session. Everything about the run (status, steps, files produced) is
-    written to transactions/*.json (see runner/transaction_store.py) -
-    NOT the database, which is reserved for auth/session/activity data.
-
-    Requires a connected desktop agent by default (ALLOW_SERVER_FALLBACK
-    is the local-dev-only escape hatch - see /api/start's docstring) - the
-    Behave/Playwright execution happens on the user's own PC via
-    local_agent/execution_manager.py's run_test_with_json_report, which
-    returns the exact same {returncode, stdout, stderr, json} shape the
-    server-side path always produced, so the exit report this generates is
-    identical either way.
-
-    Any test-data edits (see /api/recordings/data above) are already
-    persisted into the recording file itself by the time this runs, so
-    there's nothing extra to pass through here - the run just reads
-    whatever's currently saved."""
-    ip = get_client_ip(request)
-    conn = agent_registry.get_for_user(current_user.user_id)
-
-    if conn is None and not ALLOW_SERVER_FALLBACK:
-        raise HTTPException(status_code=409, detail=NO_AGENT_ERROR)
-
-    execute_fn = None
-    if conn is not None:
-        # run_recording() itself runs in a worker thread (asyncio.to_thread
-        # below) since build_artifacts/file IO are blocking - but the
-        # actual agent call MUST run on the MAIN event loop, since that's
-        # the loop the agent's WebSocket object belongs to (see
-        # backend/agent_routes.py's ws_agent). asyncio.run_coroutine_threadsafe
-        # is exactly the tool for "call async code, targeting a specific
-        # already-running loop, from a different thread": it schedules the
-        # coroutine on `main_loop` and lets THIS worker thread block on the
-        # result without touching the WebSocket itself from the wrong loop.
-        main_loop = asyncio.get_event_loop()
-
-        def execute_fn(run_output_dir: str, run_headless: bool) -> dict:
-            files = _collect_generated_files(Path(run_output_dir))
-            future = asyncio.run_coroutine_threadsafe(
-                agent_registry.send_command(
-                    conn, "START_TEST",
-                    {"headless": run_headless, "files": files, "want_json_report": True},
-                    timeout=120,
-                ),
-                main_loop,
-            )
-            response = future.result(timeout=125)
-            return {
-                "returncode": 0 if response.get("ok") else 1,
-                "stdout": response.get("output", ""),
-                "stderr": "",
-                "json": response.get("json", []),
-            }
-
-    try:
-        report = await asyncio.to_thread(
-            run_recording,
-            recording_file=req.recording_file,
-            user_id=current_user.user_id,
-            headless=req.headless,
-            execute_fn=execute_fn,
-        )
-        with get_session() as session:
-            repo.log_activity(
-                session, user_id=current_user.user_id, session_id=current_user.session_id, action="RUN_RECORDING",
-                status="SUCCESS" if report["status"] == "Success" else "FAILURE",
-                details={"recording_file": req.recording_file, "transaction_id": report["transaction_id"],
-                         "mode": "agent" if conn is not None else "server"},
-                endpoint="/api/run_recording", ip_address=ip,
-            )
-        return report
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except TimeoutError:
-        raise HTTPException(status_code=502, detail="Local agent did not respond in time while running the test.")
-
-
-# ------------------------------------------------------------------------
-# Transaction history - read from transactions/*.json (see
-# runner/transaction_store.py), NOT the database. The database only holds
-# auth/session/activity data; recording-run history is plain files.
-# ------------------------------------------------------------------------
-
-@app.get("/api/transactions")
-def get_transactions(user_id: Optional[int] = None, limit: int = 50, current_user: CurrentUser = Depends(get_current_user)):
-    txns = transaction_store.list_transactions(user_id=user_id, limit=limit)
-    return [
-        {"transaction_id": t["transaction_id"], "user_id": t["user_id"],
-         "transaction_name": t["transaction_name"], "status": t["status"],
-         "date_time": t["date_time"]}
-        for t in txns
-    ]
-
-
-@app.get("/api/transactions/{transaction_id}")
-def get_transaction_report(transaction_id: int, current_user: CurrentUser = Depends(get_current_user)):
-    txn = transaction_store.get_transaction(transaction_id)
-    if txn is None:
-        raise HTTPException(status_code=404, detail="Transaction not found")
-    return txn
+    def save(self, out_dir: str = "recordings", name: str = None) -> str:
+        """
+        `name` is the user-provided label for this recording (e.g. a
+        transaction number or flow name, entered in the frontend) - used as
+        a human-readable filename prefix so it's identifiable in the "Run
+        Saved Recording" list, and stored as "recording_name" in the JSON
+        (see runner/run_recording.py, which prefers it over the raw
+        timestamp for the transaction name / exit report). Falls back to a
+        plain timestamped filename if no name was given, unchanged from
+        before.
+        """
+        with self._lock:
+            actions_snapshot = list(self.actions)
+        return save_recording_json(self.target_url, actions_snapshot, out_dir=out_dir, name=name)
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("backend.api:app", host="127.0.0.1", port=8000, reload=True)
+    import argparse
+    import time
+    parser = argparse.ArgumentParser(description="Record a browser session")
+    parser.add_argument("--url", required=True)
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--seconds", type=int, default=None, help="auto-stop after N seconds (omit to record until Ctrl+C)")
+    args = parser.parse_args()
+
+    rec = Recorder(args.url, headless=args.headless).start()
+    print("Recording started. Interact with the browser window.")
+    try:
+        if args.seconds:
+            time.sleep(args.seconds)
+        else:
+            input("Press ENTER to stop recording...\n")
+    except KeyboardInterrupt:
+        pass
+    rec.stop()
+    path = rec.save()
+    print(f"Saved recording to {path}")
