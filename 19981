@@ -1,366 +1,620 @@
-/*
-Injected via Playwright's page.add_init_script() so it re-attaches on every
-navigation (including SPA route changes that reload the document, and full
-page loads). Captures click + input/change events and builds MULTIPLE
-independent locator strategies per element so the generated tests don't
-depend on a single brittle selector. Actions are queued here and drained
-by the Python side polling window.__flushActions() (see
-recorder/recorder.py) from the single worker thread that owns the page.
-*/
-(function () {
-  if (window.__recorderInstalled) return;
-  window.__recorderInstalled = true;
+"""
+Auto-generated Page Object.
+Locators live in locators.json (not hard-coded here) so the self-healing
+agent can patch a broken selector without touching this file.
+"""
+from __future__ import annotations
+import json
+import time
+from pathlib import Path
 
-  // Actions are also mirrored to sessionStorage (same-origin, survives a
-  // navigation) so a queued action isn't lost if the page navigates/reloads
-  // (e.g. pressing Enter submits the form) before the Python side's next
-  // poll had a chance to flush window.__recordedQueue - that race is why
-  // Enter/submit-triggered actions could intermittently go unrecorded.
-  var STORAGE_KEY = '__recorderQueue';
+from playwright.sync_api import Page, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 
-  function loadPersistedQueue() {
-    try {
-      var raw = sessionStorage.getItem(STORAGE_KEY);
-      return raw ? JSON.parse(raw) : [];
-    } catch (e) {
-      return [];
-    }
-  }
+LOCATORS_PATH = Path(__file__).parent / "locators.json"
 
-  function persistQueue() {
-    try {
-      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(window.__recordedQueue));
-    } catch (e) { /* storage unavailable/full - keep going in-memory only */ }
-  }
+# Recorded keypress values (see recorder/recorder_injector.js) mapped to the
+# key name Playwright's Locator.press()/Keyboard.press() expects.
+_KEY_MAP = {
+    "ENTER": "Enter",
+    "BACKSPACE": "Backspace",
+    "ARROW_UP": "ArrowUp",
+    "ARROW_DOWN": "ArrowDown",
+    "ARROW_LEFT": "ArrowLeft",
+    "ARROW_RIGHT": "ArrowRight",
+    "TAB": "Tab",
+    "ESCAPE": "Escape",
+    "DELETE": "Delete",
+    "SPACE": "Space",
+    "HOME": "Home",
+    "END": "End",
+}
+_KEY_MAP.update({f"F{i}": f"F{i}" for i in range(1, 13)})
 
-  window.__recordedQueue = loadPersistedQueue();
+# Modifier + key combos. Playwright accepts these as a single "Modifier+Key"
+# string directly (no separate keydown/keyup calls needed, unlike Selenium).
+_COMBO_MAP = {
+    "CTRL+A": "Control+A",
+    "CTRL+C": "Control+C",
+    "CTRL+V": "Control+V",
+    "CTRL+X": "Control+X",
+    "CTRL+P": "Control+P",
+    "CTRL+S": "Control+S",
+    "SHIFT+TAB": "Shift+Tab",
+}
 
-  function cssEscape(s) {
-    return (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/([^a-zA-Z0-9_-])/g, '\\$1');
-  }
 
-  function isUnique(selector) {
-    try {
-      return document.querySelectorAll(selector).length === 1;
-    } catch (e) {
-      return false;
-    }
-  }
+def _css_attr_quote(value: str) -> str:
+    """Safely double-quotes a string for use inside a CSS attribute selector."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
-  function cssPath(el) {
-    if (!(el instanceof Element)) return null;
-    var path = [];
-    while (el && el.nodeType === Node.ELEMENT_NODE && el.tagName.toLowerCase() !== 'html') {
-      var selector = el.tagName.toLowerCase();
-      if (el.id) {
-        selector = '#' + cssEscape(el.id);
-        path.unshift(selector);
-        break;
-      } else {
-        var sib = el, nth = 1;
-        while ((sib = sib.previousElementSibling)) {
-          if (sib.tagName === el.tagName) nth++;
-        }
-        selector += ':nth-of-type(' + nth + ')';
-      }
-      path.unshift(selector);
-      el = el.parentElement;
-    }
-    return path.join(' > ');
-  }
 
-  function xpathOf(el) {
-    if (el.id) return '//*[@id="' + el.id + '"]';
-    var parts = [];
-    while (el && el.nodeType === Node.ELEMENT_NODE) {
-      var idx = 1;
-      var sib = el.previousElementSibling;
-      while (sib) {
-        if (sib.tagName === el.tagName) idx++;
-        sib = sib.previousElementSibling;
-      }
-      parts.unshift(el.tagName.toLowerCase() + '[' + idx + ']');
-      el = el.parentElement;
-    }
-    return '/' + parts.join('/');
-  }
+def _xpath_literal(value: str) -> str:
+    """Safely quotes a string for use inside an XPath expression, even if it contains quotes."""
+    if '"' not in value:
+        return f'"{value}"'
+    if "'" not in value:
+        return f"'{value}'"
+    parts = value.split('"')
+    return "concat(" + ', \'"\', '.join(f'"{p}"' for p in parts) + ")"
 
-  function textXPath(el) {
-    var text = (el.innerText || el.textContent || '').trim();
-    if (!text || text.length > 60) return null;
-    var tag = el.tagName.toLowerCase();
-    return "//" + tag + "[normalize-space(.)=\"" + text.replace(/"/g, '') + "\"]";
-  }
 
-  function isUniqueXPath(xpath) {
-    try {
-      var result = document.evaluate('count(' + xpath + ')', document, null, XPathResult.NUMBER_TYPE, null);
-      return result.numberValue === 1;
-    } catch (e) {
-      return false;
-    }
-  }
+def _selector_for(strategy: str, value: str) -> str:
+    """Turns a captured (strategy, value) pair into a Playwright selector string."""
+    if strategy == "ID":
+        return f"css=[id={_css_attr_quote(value)}]"
+    if strategy == "NAME":
+        return f"css=[name={_css_attr_quote(value)}]"
+    if strategy == "CSS":
+        return f"css={value}"
+    if strategy == "XPATH":
+        return f"xpath={value}"
+    raise ValueError(f"Unknown locator strategy '{strategy}'")
 
-  function ancestorTextXPath(el) {
-    // Radio/checkbox inputs usually have NO text content of their own - the
-    // visible option label lives on a wrapping component instead (e.g.
-    // Angular Material's <mat-radio-button>/<mat-checkbox>, or a plain
-    // wrapping <label>), so textXPath(el) above returns null for them. That
-    // leaves the input's auto-generated id (e.g. Angular's "mat-radio-9-input")
-    // as the only usable locator - and that id is NOT stable across page
-    // loads, since frameworks like Angular/React generate it from a global
-    // counter that depends on everything else rendered earlier on the page.
-    // Climbing to the nearest wrapper with short, meaningful text and
-    // anchoring an XPath on THAT text (then navigating back down to the
-    // input) gives a locator based on what a real user actually sees - e.g.
-    // //mat-radio-button[normalize-space(.)="Yes"]//input - which stays
-    // correct regardless of what id Angular happens to generate this time.
-    if (!(el.tagName === 'INPUT' && (el.type === 'radio' || el.type === 'checkbox'))) return null;
-    var wrapper = el.closest('mat-radio-button, mat-checkbox, [role="radio"], [role="checkbox"], label') || el.parentElement;
-    var depth = 0;
-    while (wrapper && depth < 4) {
-      var text = (wrapper.innerText || wrapper.textContent || '').trim();
-      if (text && text.length <= 60) {
-        var tag = wrapper.tagName.toLowerCase();
-        var xp = "//" + tag + "[normalize-space(.)=\"" + text.replace(/"/g, '') + "\"]//input[@type=\"" + el.type + "\"]";
-        if (isUniqueXPath(xp)) return xp;
-      }
-      wrapper = wrapper.parentElement;
-      depth++;
-    }
-    return null;
-  }
 
-  function buildLocators(el) {
-    var locs = [];
+# Substrings Playwright's own error messages use when an action gets cut
+# short by the PAGE NAVIGATING AWAY mid-action - e.g. clicking a login/submit
+# button that causes a full page load. This is Playwright's normal (if
+# confusingly-worded) way of reporting that the frame/execution context it
+# was tracking got torn down - it does NOT mean the click failed; it almost
+# always means the click worked and the page had already moved on before
+# Playwright finished its own bookkeeping for that action. Treating this as
+# a real failure and retrying (or worse, re-querying the OLD page's selector
+# on the NEW page) is what causes a working login/submit click to still
+# report an error, or to hang for Playwright's own default action timeout
+# waiting for an element that's gone because the page already navigated.
+_NAVIGATION_INTERRUPTED_HINTS = (
+    "execution context was destroyed",
+    "most likely because of a navigation",
+    "target closed",
+    "frame was detached",
+    "navigating frame was detached",
+)
 
-    if (el.getAttribute('data-testid')) {
-      var v = el.getAttribute('data-testid');
-      var sel = '[data-testid="' + cssEscape(v) + '"]';
-      if (isUnique(sel)) locs.push({ strategy: 'CSS', value: sel, note: 'data-testid' });
-    }
-    if (el.id) {
-      var idSel = '#' + cssEscape(el.id);
-      if (isUnique(idSel)) locs.push({ strategy: 'ID', value: el.id });
-    }
-    if (el.name) {
-      var nameSel = '[name="' + cssEscape(el.name) + '"]';
-      if (isUnique(nameSel)) locs.push({ strategy: 'NAME', value: el.name });
-    }
-    if (el.getAttribute('aria-label')) {
-      var al = el.getAttribute('aria-label');
-      var alSel = '[aria-label="' + cssEscape(al) + '"]';
-      if (isUnique(alSel)) locs.push({ strategy: 'CSS', value: alSel, note: 'aria-label' });
-    }
-    if (el.getAttribute('placeholder')) {
-      var ph = el.getAttribute('placeholder');
-      var phSel = '[placeholder="' + cssEscape(ph) + '"]';
-      if (isUnique(phSel)) locs.push({ strategy: 'CSS', value: phSel, note: 'placeholder' });
-    }
-    var txp = textXPath(el);
-    if (txp) locs.push({ strategy: 'XPATH', value: txp, note: 'text' });
 
-    var atxp = ancestorTextXPath(el);
-    if (atxp) locs.push({ strategy: 'XPATH', value: atxp, note: 'text' });
+def _navigation_interrupted(exc: Exception) -> bool:
+    return any(hint in str(exc).lower() for hint in _NAVIGATION_INTERRUPTED_HINTS)
 
-    var cp = cssPath(el);
-    if (cp) locs.push({ strategy: 'CSS', value: cp, note: 'generated-path' });
 
-    var xp = xpathOf(el);
-    if (xp) locs.push({ strategy: 'XPATH', value: xp, note: 'generated-path' });
 
-    return locs;
-  }
+class BasePage:
+    def __init__(self, page: Page, timeout: int = 8, poll_interval: float = 0.25, heal_callback=None, max_wait_seconds: int = 90):
+        self.page = page
+        self.timeout = timeout
+        self.poll_interval = poll_interval
+        self.heal_callback = heal_callback  # optional fn(element_name, page) -> {"strategy":..., "value":...} or None
+        self.locators = json.loads(LOCATORS_PATH.read_text())
+        # Adaptive-wait ceiling for wait_ready() below - see its docstring.
+        # Override e.g. RecordedPage(page, max_wait_seconds=180) if a
+        # particular environment's APIs are known to run especially slow.
+        self.max_wait_seconds = max_wait_seconds
 
-  function describe(el) {
-    return {
-      tag: el.tagName.toLowerCase(),
-      type: el.getAttribute('type') || '',
-      text: (el.innerText || el.textContent || '').trim().slice(0, 60),
-      placeholder: el.getAttribute('placeholder') || '',
-      name: el.name || '',
-      ariaLabel: el.getAttribute('aria-label') || ''
-    };
-  }
+    def switch_page(self, new_page: Page):
+        """
+        Redirects every subsequent element lookup/action to a DIFFERENT
+        Playwright Page - used when a recorded flow interacts with a popup,
+        a new tab/window opened via target="_blank"/window.open(), or
+        switches back to the original window after closing one (see
+        generator/build.py's page_index/opens_new_page handling and
+        steps.tmpl's new_page_wrapper/maybe_switch macros, which call this
+        automatically). All existing methods (click, type_text, etc.)
+        keep working unchanged afterward - they just now resolve elements
+        against `new_page` instead.
+        """
+        self.page = new_page
 
-  function record(action, el, value) {
-    window.__recordedQueue.push({
-      ts: Date.now(),
-      action: action,
-      value: value === undefined ? null : value,
-      element: describe(el),
-      locators: buildLocators(el),
-      url: window.location.href
-    });
-    persistQueue();
-  }
+    def _root_for(self, frame_path: list | None):
+        """
+        Resolves the Playwright object (Page, or a nested FrameLocator) that
+        element lookups should actually run against, given the "frame_path"
+        recorded for that element (a list of CSS selectors, outermost ->
+        innermost, locating the chain of <iframe> elements to drill through -
+        see Recorder._frame_path_for). Empty/missing frame_path (the normal
+        case, and every locator recorded before iframe support existed)
+        resolves to `self.page` itself, unchanged.
+        """
+        root = self.page
+        for selector in (frame_path or []):
+            root = root.frame_locator(selector)
+        return root
 
-  document.addEventListener('click', function (e) {
-    var el = e.target;
-    if (!el || el === document || el === document.body) return;
-    // walk up to nearest clickable-ish element if the click landed on an inline text node wrapper.
-    // Includes radio/checkbox inputs and <label> so clicks on custom-styled radio/checkbox UIs
-    // (where the visible click target is a label or wrapping span, not the native input) still
-    // resolve to the actual underlying <input>.
-    var clickable = el.closest(
-      'button, a, [role="button"], input[type="submit"], input[type="button"], ' +
-      'input[type="radio"], input[type="checkbox"], label, [onclick]'
-    ) || el;
+    def _frame_root(self, element_name: str):
+        """The frame_path is recorded per ACTION, not per element name, but
+        every candidate locator saved for a given element_name came from the
+        same action/frame, so the first candidate's frame_path speaks for
+        all of them."""
+        candidates = self.locators.get(element_name, [])
+        frame_path = candidates[0].get("frame_path") if candidates else None
+        return self._root_for(frame_path)
 
-    if (clickable.tagName && clickable.tagName.toLowerCase() === 'label') {
-      var forId = clickable.getAttribute('for');
-      var resolved = forId ? document.getElementById(forId) : clickable.querySelector('input, select');
-      if (resolved) clickable = resolved;
-    }
+    def _find(self, element_name: str, require_visible: bool = True):
+        """
+        Polls ALL known locator strategies for this element together within a
+        single shared time budget, instead of waiting the full timeout for
+        each strategy in turn - this is what keeps lookups fast even when the
+        first strategy or two no longer match the page. Returns a Playwright
+        Locator resolved to a single (`.first`) element. If the element was
+        recorded inside an iframe, resolves through the recorded
+        "frame_path" first (see _root_for) instead of searching the page
+        directly - a locator that's perfectly valid INSIDE an iframe's own
+        document will simply never match anything on the parent page.
+        """
+        candidates = self.locators.get(element_name, [])
+        root = self._frame_root(element_name)
+        deadline = time.time() + self.timeout
 
-    if (clickable.tagName === 'INPUT' && (clickable.type === 'radio' || clickable.type === 'checkbox')) {
-      // The browser applies the click's default action (actually flipping
-      // .checked) AFTER all capture/bubble listeners have run, so reading
-      // clickable.checked synchronously here would still see the OLD value.
-      // Deferring to the next tick lets us record the RESULTING checked
-      // state as this action's value - the generated replay step then uses
-      // that as an explicit target state (Playwright's check()/uncheck())
-      // instead of a blind click, so replay can never double-toggle it.
-      var target = clickable;
-      setTimeout(function () {
-        record('click', target, target.checked);
-      }, 0);
-      return;
-    }
+        while time.time() < deadline:
+            for cand in candidates:
+                try:
+                    loc = root.locator(_selector_for(cand["strategy"], cand["value"]))
+                    if loc.count() == 0:
+                        continue
+                    el = loc.first
+                    if not require_visible or el.is_visible():
+                        return el
+                except PlaywrightError:
+                    continue
+            time.sleep(self.poll_interval)
 
-    record('click', clickable);
-  }, true);
+        # Every known strategy failed within the time budget requiring
+        # visibility. Before self-healing/giving up, try once more allowing
+        # a NON-visible match: styled checkbox/radio widgets (Bootstrap,
+        # MUI, Ant Design, and plenty of custom CSS) very commonly keep the
+        # real <input type="radio"/"checkbox"> in the DOM but visually
+        # hidden (opacity:0, 1x1px, clip-path, etc.) while a label/span
+        # renders the visible control - the native input is still exactly
+        # what needs to be interacted with, it's just never "visible" by
+        # Playwright's definition. This relaxed pass is what makes those
+        # work instead of just timing out.
+        if require_visible:
+            for cand in candidates:
+                try:
+                    loc = root.locator(_selector_for(cand["strategy"], cand["value"]))
+                    if loc.count() > 0:
+                        return loc.first
+                except PlaywrightError:
+                    continue
 
-  document.addEventListener('change', function (e) {
-    var el = e.target;
-    if (!el) return;
-    var tag = el.tagName.toLowerCase();
+        # still nothing - try self-healing if available. Note: self-healing
+        # operates against the TOP-LEVEL page (it re-reads page.content()),
+        # not the resolved iframe root - repairing a broken locator that
+        # lives inside an iframe is out of scope for now.
+        if self.heal_callback:
+            fix = self.heal_callback(element_name, self.page)
+            if fix:
+                try:
+                    loc = root.locator(_selector_for(fix["strategy"], fix["value"]))
+                    if loc.count() > 0:
+                        fix = {**fix, "frame_path": candidates[0].get("frame_path") if candidates else []}
+                        self.locators.setdefault(element_name, []).insert(0, fix)
+                        LOCATORS_PATH.write_text(json.dumps(self.locators, indent=2))
+                        return loc.first
+                except PlaywrightError:
+                    pass
 
-    if (tag === 'select') {
-      var opt = el.options[el.selectedIndex];
-      record('select', el, opt ? opt.text.trim() : el.value);
-      return;
-    }
-    if (tag === 'input' && (el.type === 'radio' || el.type === 'checkbox')) {
-      // handled by the click listener above (clicking IS the interaction for these;
-      // recording it again here would create a duplicate/redundant step)
-      return;
-    }
-    if (tag === 'input' || tag === 'textarea') {
-      record('type', el, el.value);
-    }
-  }, true);
+        raise PlaywrightTimeoutError(
+            f"Could not locate a visible element for '{element_name}' with any known strategy "
+            f"({[c['strategy'] for c in candidates]}) within {self.timeout}s, and self-healing "
+            f"did not resolve it."
+        )
 
-  // Capture keyboard-driven actions (Enter to submit, Backspace to clear/edit,
-  // Arrow Up/Down to move through suggestion lists, Ctrl combos, function keys,
-  // etc.) separately from typed text, since these are user-initiated key presses
-  // rather than a change to the field's value.
-  //
-  // CTRL+C / CTRL+V / CTRL+X are deliberately NOT recorded here - they're
-  // captured with richer data (the actual copied/pasted text and the source/
-  // target element) by the dedicated copy/cut/paste listeners below instead,
-  // so recording them again here would just be a redundant, value-less entry.
-  var SIMPLE_KEY_MAP = {
-    'Enter': 'ENTER',
-    'Backspace': 'BACKSPACE',
-    'Escape': 'ESCAPE',
-    'Delete': 'DELETE',
-    ' ': 'SPACE',
-    'Spacebar': 'SPACE',
-    'ArrowUp': 'ARROW_UP',
-    'ArrowDown': 'ARROW_DOWN',
-    'ArrowLeft': 'ARROW_LEFT',
-    'ArrowRight': 'ARROW_RIGHT',
-    'Home': 'HOME',
-    'End': 'END'
-  };
-  for (var _f = 1; _f <= 12; _f++) SIMPLE_KEY_MAP['F' + _f] = 'F' + _f;
+    def wait_ready(self, element_name: str, timeout: int = None):
+        """
+        Blocks until `element_name` resolves via ANY known strategy (see
+        _find above). Adaptive: starts with the (optionally larger) explicit
+        timeout - normally the wait time measured from the original
+        recording, so a step that recorded slow (e.g. an API-backed lookup)
+        gets a matching wait while a fast one doesn't sit around waiting
+        needlessly - but if that's not actually enough THIS run (real API/
+        network timing varies - a backend that took 5s when this was
+        recorded might take 20s under load later), keeps waiting beyond it,
+        up to self.max_wait_seconds total, instead of failing the step the
+        moment the originally-recorded duration elapses. It's almost always
+        better to wait longer than to fail a step that would have succeeded
+        a few seconds later.
+        """
+        original_timeout = self.timeout
+        target = max(self.timeout, timeout or 0)
+        self.timeout = min(target, self.max_wait_seconds)
+        try:
+            self._find(element_name)
+            return
+        except PlaywrightTimeoutError:
+            if self.timeout >= self.max_wait_seconds:
+                raise
+        finally:
+            self.timeout = original_timeout
 
-  // Ctrl/Cmd combos recorded generically as a single keypress action (so
-  // playback can literally re-press them via Playwright). 'c'/'v'/'x' are
-  // excluded here on purpose - see note above.
-  var CTRL_COMBO_MAP = {
-    'a': 'CTRL+A',
-    'p': 'CTRL+P',
-    's': 'CTRL+S'
-  };
+        # Didn't show up within the expected/recorded time - give it the
+        # rest of the adaptive budget before actually failing the step.
+        remaining = self.max_wait_seconds - target
+        self.timeout = remaining
+        try:
+            self._find(element_name)
+        finally:
+            self.timeout = original_timeout
 
-  function keyComboLabel(e) {
-    var key = e.key;
-    var ctrlLike = e.ctrlKey || e.metaKey;
+    def _looks_visually_hidden(self, el) -> bool:
+        """
+        True for the common 'intentionally hidden but technically visible to
+        Playwright' CSS patterns used by custom checkbox/radio widgets - a
+        near-zero-size box, or one positioned far outside the document (e.g.
+        the `position:absolute; left:-9999px` accessibility-hiding
+        technique). Playwright's own is_visible() considers these VISIBLE
+        (opacity and off-screen positioning don't affect the
+        `visibility`/`display` properties it actually checks) - so without
+        this, click()/set_checked() below would try to actually scroll the
+        page to that off-screen position before clicking, which is exactly
+        what makes the whole page visibly jump/scroll sideways for elements
+        hidden this way.
+        """
+        try:
+            box = el.bounding_box()
+        except PlaywrightError:
+            return True
+        if box is None:
+            return True
+        if box["width"] < 2 or box["height"] < 2:
+            return True
+        if box["x"] < -1000 or box["y"] < -1000:
+            return True
+        return False
 
-    if (ctrlLike && !e.altKey) {
-      var combo = CTRL_COMBO_MAP[(key || '').toLowerCase()];
-      if (combo) return combo;
-      if (['c', 'v', 'x'].indexOf((key || '').toLowerCase()) !== -1) return null;
-    }
-    if (e.shiftKey && key === 'Tab') return 'SHIFT+TAB';
-    if (!ctrlLike && !e.altKey) {
-      if (key === 'Tab') return 'TAB';
-      return SIMPLE_KEY_MAP[key] || null;
-    }
-    return null;
-  }
+    def _safe_scroll(self, el):
+        """
+        Best-effort scroll, bounded by self.timeout instead of Playwright's
+        ~30s default action timeout, and never lets a scroll failure bubble
+        up and abort the whole step. This is what every action method below
+        calls instead of a bare scroll_into_view_if_needed() - a hidden or
+        off-screen element (a date-picker's real <input> behind a styled
+        widget, a field that's disabled/invisible until an earlier field is
+        filled, etc.) would otherwise make Playwright retry the scroll for
+        its full default timeout before finally raising, hanging the entire
+        step for ~30 seconds over something that was never meant to be
+        scrolled to in the first place.
+        """
+        if self._looks_visually_hidden(el):
+            return
+        try:
+            el.scroll_into_view_if_needed(timeout=self.timeout * 1000)
+        except PlaywrightError:
+            pass
 
-  document.addEventListener('keydown', function (e) {
-    var el = e.target;
-    if (!el) return;
-    var label = keyComboLabel(e);
-    if (label) {
-      record('keypress', el, label);
-    }
-  }, true);
+    def click(self, element_name: str):
+        el = self._find(element_name)
+        if not self._looks_visually_hidden(el):
+            self._safe_scroll(el)
+            try:
+                el.click(timeout=self.timeout * 1000)
+                return
+            except (PlaywrightTimeoutError, PlaywrightError) as e:
+                if _navigation_interrupted(e):
+                    # the click almost certainly worked - the page just
+                    # navigated away (e.g. a login/submit button) before
+                    # Playwright finished its own post-click bookkeeping.
+                    # Treating this as a failure and retrying below would
+                    # re-query THIS element on the NEW page it just navigated
+                    # to, where it (correctly) no longer exists.
+                    return
+                try:
+                    # element is present but something (overlay, animation,
+                    # off-screen positioning) is blocking a native click -
+                    # force bypasses the actionability checks that just failed.
+                    el.click(force=True, timeout=self.timeout * 1000)
+                    return
+                except (PlaywrightTimeoutError, PlaywrightError) as e2:
+                    if _navigation_interrupted(e2):
+                        return
+        # Either visually-hidden by design (skip straight here - no point
+        # scrolling to reveal something meant to stay hidden), or the normal
+        # path above failed. Dispatch a native click directly on the DOM node
+        # via JS - this never scrolls/moves the page and bypasses Playwright's
+        # actionability checks (including visibility) entirely. Per spec,
+        # calling .click() on a checkbox/radio still triggers the browser's
+        # normal toggle behavior, not just the click event, so this is
+        # equivalent to a real user click. Explicit timeout here (rather than
+        # Playwright's own 30s default) so a GENUINE failure - the element
+        # really is gone, not just navigated past - fails in a reasonable
+        # time instead of hanging.
+        try:
+            el.evaluate("node => node.click()", timeout=self.timeout * 1000)
+        except (PlaywrightTimeoutError, PlaywrightError) as e:
+            if not _navigation_interrupted(e):
+                raise
 
-  // Real-time copy/cut/paste capture: records not just THAT a copy/paste
-  // happened, but the actual text value and the source (copy/cut) or target
-  // (paste) element, so the variable Capture -> Store -> Reuse pipeline (see
-  // recorder/variable_capture.py) can later recognize "this pasted value is
-  // the same one copied earlier from that generated-username field" and turn
-  // it into a {{username}}-style placeholder instead of baking in the
-  // literal string.
-  function selectedTextFrom(el) {
-    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') &&
-        typeof el.selectionStart === 'number' && el.selectionStart !== el.selectionEnd) {
-      return el.value.substring(el.selectionStart, el.selectionEnd);
-    }
-    var sel = window.getSelection();
-    return sel ? sel.toString() : '';
-  }
+    def set_checked(self, element_name: str, checked: bool):
+        """
+        Sets a checkbox/radio to an explicit target state - idempotent by
+        design (reads the current state first and does nothing further if
+        it's already correct), which is what makes replay safe from the
+        double-toggle a blind click() risks: if an earlier fallback tier
+        actually succeeded before raising, or this step re-runs, checking
+        the current state first means we never click a second time by
+        mistake. Used instead of click() specifically for recorded
+        radio/checkbox actions (see generator/build.py) - the recorded
+        value is the RESULTING checked state captured right after the
+        original click, not just "click happened".
+        """
+        el = self._find(element_name)
+        if not self._looks_visually_hidden(el):
+            self._safe_scroll(el)
 
-  function recordCopyLike() {
-    var el = document.activeElement;
-    var text = selectedTextFrom(el);
-    if (!text) return;
-    record('copy', (el instanceof Element) ? el : document.body, text);
-  }
+        try:
+            current = el.is_checked()
+        except PlaywrightError:
+            current = None
+        if current == checked:
+            return
 
-  document.addEventListener('copy', recordCopyLike, true);
-  document.addEventListener('cut', recordCopyLike, true);
+        if not self._looks_visually_hidden(el):
+            try:
+                (el.check if checked else el.uncheck)(timeout=self.timeout * 1000)
+                return
+            except (PlaywrightTimeoutError, PlaywrightError) as e:
+                if _navigation_interrupted(e):
+                    return
+                try:
+                    (el.check if checked else el.uncheck)(timeout=self.timeout * 1000, force=True)
+                    return
+                except (PlaywrightTimeoutError, PlaywrightError) as e2:
+                    if _navigation_interrupted(e2):
+                        return
 
-  document.addEventListener('paste', function (e) {
-    var el = e.target;
-    var text = '';
-    try {
-      text = (e.clipboardData || window.clipboardData).getData('text');
-    } catch (err) { /* clipboard not readable here - resolved at build/runtime instead */ }
-    record('paste', el, text);
-  }, true);
+        # Last resort, and the direct path for visually-hidden elements:
+        # re-verify the live state right before acting (in case an earlier
+        # tier above partially succeeded despite raising) so this never
+        # dispatches a click that isn't actually needed.
+        try:
+            already = bool(el.evaluate("node => !!node.checked", timeout=self.timeout * 1000))
+        except PlaywrightError:
+            already = None
+        if already != checked:
+            try:
+                el.evaluate("node => node.click()", timeout=self.timeout * 1000)
+            except (PlaywrightTimeoutError, PlaywrightError) as e:
+                if not _navigation_interrupted(e):
+                    raise
 
-  window.__flushActions = function () {
-    var q = window.__recordedQueue;
-    window.__recordedQueue = [];
-    persistQueue();
-    return q;
-  };
+    def type_text(self, element_name: str, value: str):
+        el = self._find(element_name)
+        self._safe_scroll(el)
+        try:
+            el.fill(value, timeout=self.timeout * 1000)
+        except (PlaywrightTimeoutError, PlaywrightError) as e:
+            if _navigation_interrupted(e):
+                return
+            el.evaluate(
+                "(node, val) => {"
+                "  node.value = val;"
+                "  node.dispatchEvent(new Event('input', {bubbles: true}));"
+                "  node.dispatchEvent(new Event('change', {bubbles: true}));"
+                "}",
+                value,
+                timeout=self.timeout * 1000,
+            )
 
-  // Exposed so the Python side (recorder/recorder.py) can compute a stable
-  // CSS path for an <iframe>/<frame> DOM ELEMENT from *inside the PARENT
-  // frame's context* (Playwright's Frame.frame_element() returns that
-  // element handle, but it has to be evaluated against the parent frame,
-  // not the iframe's own document) - this is how mainframe/iframe support
-  // builds a "frame_path" (a chain of selectors from the top page down to
-  // the frame an action happened in) without needing any new JS of its
-  // own; it just reuses the same cssPath() this file already uses for
-  // in-page elements. See Recorder._frame_path_for.
-  window.__recorderCssPathFor = cssPath;
-})();
+    def paste_text(self, element_name: str, value: str):
+        """
+        Like type_text(), but for a recorded PASTE action specifically:
+        dispatches a real synthetic 'paste' ClipboardEvent instead of just
+        setting the field's value. fill()/direct value-setting alone never
+        fires a 'paste' event, so an app with its own onPaste handling
+        (rich text editors, OTP boxes, format-on-paste fields like phone/
+        currency inputs) wouldn't see anything happen with type_text()
+        alone even though the DOM value looks right. If no listener calls
+        preventDefault() on the synthetic event (i.e. nothing intercepted
+        it), this applies the same default fill behavior itself, matching
+        what a real unhandled paste does.
+        """
+        el = self._find(element_name)
+        self._safe_scroll(el)
+        try:
+            el.evaluate(
+                "(node, val) => {"
+                "  node.focus();"
+                "  const dt = new DataTransfer();"
+                "  dt.setData('text/plain', val);"
+                "  const evt = new ClipboardEvent('paste', {"
+                "    clipboardData: dt, bubbles: true, cancelable: true"
+                "  });"
+                "  const notCancelled = node.dispatchEvent(evt);"
+                "  if (notCancelled) {"
+                "    node.value = val;"
+                "    node.dispatchEvent(new Event('input', {bubbles: true}));"
+                "    node.dispatchEvent(new Event('change', {bubbles: true}));"
+                "  }"
+                "}",
+                value,
+                timeout=self.timeout * 1000,
+            )
+        except (PlaywrightTimeoutError, PlaywrightError) as e:
+            if not _navigation_interrupted(e):
+                self.type_text(element_name, value)
+
+    def press_key(self, element_name: str, key_name: str):
+        """
+        Sends a key or Ctrl/Shift combo (Enter, Backspace, Arrow Up/Down/Left/Right,
+        Tab, Shift+Tab, Escape, Delete, Space, Home, End, F1-F12, Ctrl+A/C/V/X/P/S,
+        etc.) to the element via Playwright's press() - key_name is one of the
+        values the recorder captures (e.g. "ENTER", "BACKSPACE", "ARROW_UP", "CTRL+A").
+        """
+        key_name = (key_name or "").upper()
+        el = self._find(element_name)
+        self._safe_scroll(el)
+
+        key = _COMBO_MAP.get(key_name) or _KEY_MAP.get(key_name)
+        if key is None:
+            raise ValueError(
+                f"Unsupported key '{key_name}'. Known keys: {sorted(list(_KEY_MAP) + list(_COMBO_MAP))}"
+            )
+        try:
+            el.press(key, timeout=self.timeout * 1000)
+        except (PlaywrightTimeoutError, PlaywrightError) as e:
+            if _navigation_interrupted(e):
+                return
+            el.evaluate("node => node.focus()", timeout=self.timeout * 1000)
+            el.press(key, timeout=self.timeout * 1000)
+
+    def press_enter(self, element_name: str):
+        """Kept for backward compatibility - equivalent to press_key(element_name, "ENTER")."""
+        self.press_key(element_name, "ENTER")
+
+    def press_backspace(self, element_name: str):
+        self.press_key(element_name, "BACKSPACE")
+
+    def press_arrow_up(self, element_name: str):
+        self.press_key(element_name, "ARROW_UP")
+
+    def press_arrow_down(self, element_name: str):
+        self.press_key(element_name, "ARROW_DOWN")
+
+    def press_tab(self, element_name: str):
+        self.press_key(element_name, "TAB")
+
+    def press_shift_tab(self, element_name: str):
+        self.press_key(element_name, "SHIFT+TAB")
+
+    def press_escape(self, element_name: str):
+        self.press_key(element_name, "ESCAPE")
+
+    def press_ctrl_a(self, element_name: str):
+        self.press_key(element_name, "CTRL+A")
+
+    def press_ctrl_s(self, element_name: str):
+        self.press_key(element_name, "CTRL+S")
+
+    def press_ctrl_p(self, element_name: str):
+        self.press_key(element_name, "CTRL+P")
+
+    def capture_value(self, element_name: str) -> str:
+        """
+        Reads the CURRENT live value out of an element for the Capture ->
+        Store -> Reuse variable pipeline (see runner/variables.py). Prefers
+        Playwright DOM extraction - input_value() for inputs/textareas/selects,
+        falling back to text_content() for non-input elements/labels - since
+        that's the most reliable, headless-friendly way to read it. Only if
+        the element exposes neither does this fall back to reading the
+        browser's own clipboard, still entirely through Playwright
+        (page.evaluate calling navigator.clipboard.readText() - no external
+        clipboard library involved).
+        """
+        el = self._find(element_name)
+        value = None
+        try:
+            value = el.input_value(timeout=self.timeout * 1000)
+        except PlaywrightError:
+            pass
+        if not value:
+            try:
+                value = el.text_content(timeout=self.timeout * 1000)
+            except PlaywrightError:
+                value = None
+        if value:
+            return value
+        try:
+            return self.page.evaluate(
+                "async () => {"
+                "  try {"
+                "    if (navigator.clipboard && navigator.clipboard.readText) {"
+                "      return (await navigator.clipboard.readText()) || '';"
+                "    }"
+                "  } catch (e) {}"
+                "  return '';"
+                "}"
+            ) or ""
+        except Exception:
+            return ""
+
+    def select_option(self, element_name: str, option_text: str):
+        """
+        Handles native <select> dropdowns via Playwright's select_option()
+        (the reliable way - clicking/sending keys directly to a <select> is
+        what usually causes "dropdown issues"). Falls back to selecting by
+        value, then to a generic click-open-and-click-option approach for
+        custom (non-native) dropdown widgets that aren't real <select>
+        elements.
+        """
+        el = self._find(element_name)
+        self._safe_scroll(el)
+
+        tag_name = el.evaluate("node => node.tagName.toLowerCase()", timeout=self.timeout * 1000)
+        if tag_name == "select":
+            try:
+                el.select_option(label=option_text, timeout=self.timeout * 1000)
+                return
+            except (PlaywrightTimeoutError, PlaywrightError) as e:
+                if _navigation_interrupted(e):
+                    return
+            try:
+                el.select_option(value=option_text, timeout=self.timeout * 1000)
+                return
+            except (PlaywrightTimeoutError, PlaywrightError) as e:
+                if _navigation_interrupted(e):
+                    return
+
+        # Not a native <select>, or text/value didn't match an <option> exactly -
+        # treat it as a custom dropdown: open it, then click the option by its text.
+        try:
+            el.click(timeout=self.timeout * 1000)
+        except (PlaywrightTimeoutError, PlaywrightError) as e:
+            if not _navigation_interrupted(e):
+                raise
+        # Search within the SAME iframe (if any) the dropdown itself lives
+        # in, not the top page - a custom dropdown's option list almost
+        # always renders inside that same document.
+        root = self._frame_root(element_name)
+        option = root.locator(f"xpath=//*[normalize-space(text())={_xpath_literal(option_text)}]")
+        try:
+            option.first.click(timeout=self.timeout * 1000)
+        except (PlaywrightTimeoutError, PlaywrightError) as e:
+            if not _navigation_interrupted(e):
+                raise
+
+
+class RecordedPage(BasePage):
+    """Convenience wrappers matching the recorded element names."""
+{% for name in element_names %}
+    def click_{{ name }}(self):
+        self.click("{{ name }}")
+
+    def type_{{ name }}(self, value):
+        self.type_text("{{ name }}", value)
+
+    def paste_{{ name }}(self, value):
+        self.paste_text("{{ name }}", value)
+
+    def set_checked_{{ name }}(self, checked):
+        self.set_checked("{{ name }}", checked)
+
+    def press_enter_{{ name }}(self):
+        self.press_enter("{{ name }}")
+
+    def press_key_{{ name }}(self, key_name):
+        self.press_key("{{ name }}", key_name)
+
+    def capture_{{ name }}(self):
+        return self.capture_value("{{ name }}")
+
+    def select_{{ name }}(self, option_text):
+        self.select_option("{{ name }}", option_text)
+{% endfor %}
