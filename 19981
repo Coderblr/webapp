@@ -1,603 +1,366 @@
-"""
-Playwright-driven recorder. Launches a real browser against the target
-application, injects the capture script so it survives navigations, and
-polls it for newly captured click/type actions until the user stops the
-recording. Produces a raw JSON recording that the generator/agent layer
-turns into feature/steps/page files.
+/*
+Injected via Playwright's page.add_init_script() so it re-attaches on every
+navigation (including SPA route changes that reload the document, and full
+page loads). Captures click + input/change events and builds MULTIPLE
+independent locator strategies per element so the generated tests don't
+depend on a single brittle selector. Actions are queued here and drained
+by the Python side polling window.__flushActions() (see
+recorder/recorder.py) from the single worker thread that owns the page.
+*/
+(function () {
+  if (window.__recorderInstalled) return;
+  window.__recorderInstalled = true;
 
-Threading note (important): Playwright's SYNC API is NOT thread-safe - a
-Page/Browser/BrowserContext may only be used from the single thread that
-created it. `start()`/`stop()` may be called from any thread (e.g. a
-FastAPI request handler launches on one thread and stops from another),
-but everything that actually touches the browser (launch, polling,
-navigation, closing) runs on ONE dedicated worker thread owned by this
-Recorder - `start()`/`stop()` hand work off to that thread instead of
-calling Playwright directly from the caller's thread.
+  // Actions are also mirrored to sessionStorage (same-origin, survives a
+  // navigation) so a queued action isn't lost if the page navigates/reloads
+  // (e.g. pressing Enter submits the form) before the Python side's next
+  // poll had a chance to flush window.__recordedQueue - that race is why
+  // Enter/submit-triggered actions could intermittently go unrecorded.
+  var STORAGE_KEY = '__recorderQueue';
 
-An earlier version of this module polled from a SECOND background thread
-on a timer - that violated the rule above and silently broke capture
-(every poll call failed and was swallowed by a broad except). A version
-after that tried pushing actions from the page via
-`page.expose_function()` instead of polling - but Playwright's sync API
-only actually dispatches an exposed-function callback back to Python while
-the owning thread is blocked inside an actual Playwright call (e.g.
-`page.wait_for_timeout()`); a thread idling on a plain Python primitive
-like `queue.Queue.get()` never gets the callback delivered, so nothing
-was captured that way either. This version polls `page.evaluate()` in a
-loop, but - critically - that loop runs on the SAME worker thread that
-created the page, using `page.wait_for_timeout()` as the sleep so the
-loop is both safe (no cross-thread calls) and self-pumping.
-
-Live view (remote recording): the same worker thread also drives an
-optional CDP screencast (frames out) and input-forwarding (events in) -
-see `_start_screencast`/`_on_screencast_frame`/`queue_input`/
-`_drain_input_queue` below - so a hosted, headless recording can still be
-watched and controlled from a browser that isn't sitting at this machine.
-Frames/input cross the thread boundary via plain `queue.Queue`s, which
-*are* thread-safe, unlike Playwright's own API. The screencast always
-follows the ORIGINAL page (index 0 below) - a live view is inherently a
-single picture, so a popup opening doesn't change what's being streamed.
-
-Multi-page / multi-frame / dialog support (popups, target="_blank" links,
-window.open() new tabs/windows, and native alert/confirm/prompt dialogs):
-
-  - Every Playwright Page this Recorder ever sees (the original page, plus
-    any popup/new-tab/new-window Playwright reports via the browser
-    CONTEXT's "page" event) gets the SAME injector script and is polled
-    every tick alongside the original page - not just the one that was
-    open when recording started. Each flushed action is tagged with
-    "page_index" (0 = the original page, 1/2/... in creation order) so the
-    generator/replay side knows which browser tab/window it belongs to.
-  - A synthetic "new_window" action is recorded the instant a new page is
-    detected (before it's even finished loading), and "window_closed" the
-    instant one closes - both tagged with "opener_page_index" so replay
-    can switch back to whichever tab/window was active before/after.
-  - Native browser dialogs (alert/confirm/prompt/beforeunload) are
-    auto-accepted (Playwright hangs the page otherwise, since registering
-    ANY "dialog" listener switches off Playwright's own default
-    auto-dismiss) and logged as a synthetic "dialog" action so replay can
-    do the same and the exit report shows it happened.
-  - Frames/iframes: Playwright's `page.add_init_script()` already runs the
-    injector in every child frame too (not just the main document), so
-    clicks/types inside a same-origin iframe are captured by that frame's
-    own isolated copy of the script automatically - the gap was that
-    `page.evaluate()` only ever drains the MAIN frame's queue. This version
-    polls `page.frames` and drains each one, and (for any non-main frame)
-    computes a "frame_path" - a list of CSS selectors locating the chain of
-    <iframe> elements from the top page down to that frame - via
-    `Frame.frame_element()` plus the injector's exposed
-    `window.__recorderCssPathFor` helper, evaluated in each ancestor
-    frame's own context. See `_frame_path_for`.
-"""
-from __future__ import annotations
-import json
-import logging
-import queue
-import threading
-import time
-from pathlib import Path
-from datetime import datetime
-
-try:
-    from recorder.browser_factory import launch_browser
-except ImportError:
-    # allows `python recorder/recorder.py` to be run directly too
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from recorder.browser_factory import launch_browser
-
-INJECTOR_PATH = Path(__file__).parent / "recorder_injector.js"
-logger = logging.getLogger(__name__)
-
-
-def _json_safe_default(obj):
-    """
-    Passed as json.dumps()'s `default=` in save_recording_json below - a
-    last line of defense so a bug that leaks a live Playwright object
-    (Page, Frame, ElementHandle, etc.) into an action dict logs a clear
-    warning and coerces it to a string instead of crashing the WHOLE save
-    (and therefore losing the entire recording) with an opaque
-    "TypeError: Object of type Page is not JSON serializable" - which is
-    exactly what a closure bug in an event handler could produce (see
-    _attach_page's comment on the "close" event) and is worth guarding
-    against structurally, not just fixing the one instance of it.
-    """
-    logger.warning(
-        "Non-JSON-serializable value %r (%s) found while saving a recording - "
-        "coercing it to a string. This usually means a Playwright object leaked "
-        "into an action dict (a real bug worth reporting) rather than a plain "
-        "value; the recording is still saved, but check logs/error.log's "
-        "context around this warning.",
-        obj, type(obj).__name__,
-    )
-    return str(obj)
-
-
-def _slugify(name: str, max_len: int = 50) -> str:
-    """Turns a free-typed recording name (e.g. "TXN-4521 / New Loan Application")
-    into a filesystem-safe filename fragment."""
-    cleaned = "".join(c if c.isalnum() else "_" for c in name.strip())
-    cleaned = "_".join(filter(None, cleaned.split("_")))
-    return cleaned[:max_len] or "recording"
-
-
-def save_recording_json(target_url: str, actions: list, out_dir: str = "recordings", name: str = None) -> str:
-    """Writes a recording JSON in the exact shape/naming convention
-    Recorder.save() below uses - factored out so a recording captured by a
-    LOCAL AGENT (see backend/api.py's agent-mode /api/stop_and_save, and
-    local_agent/recording_manager.py) can be persisted server-side
-    identically to one captured by this process's own Recorder, with no
-    special-casing anywhere downstream (generator/build.py,
-    runner/run_recording.py, the "Run Saved Recording" list, etc. don't
-    know or care which path produced the file)."""
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{_slugify(name)}_{ts}.json" if name and name.strip() else f"recording_{ts}.json"
-    path = Path(out_dir) / filename
-    payload = {
-        "target_url": target_url,
-        "recorded_at": ts,
-        "recording_name": name.strip() if name and name.strip() else None,
-        "actions": actions,
+  function loadPersistedQueue() {
+    try {
+      var raw = sessionStorage.getItem(STORAGE_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch (e) {
+      return [];
     }
-    path.write_text(json.dumps(payload, indent=2, default=_json_safe_default))
-    return str(path)
+  }
 
+  function persistQueue() {
+    try {
+      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(window.__recordedQueue));
+    } catch (e) { /* storage unavailable/full - keep going in-memory only */ }
+  }
 
-class Recorder:
-    def __init__(self, target_url: str, headless: bool = False, poll_interval: float = 0.4,
-                 enable_live_view: bool = True):
-        self.target_url = target_url
-        self.headless = headless
-        self.poll_interval = poll_interval
-        self.session = None  # BrowserSession (playwright + browser + context) - only ever touched on _worker's thread
-        self.page = None     # Playwright Page for the ORIGINAL tab (index 0) - only ever touched on _worker's thread
-        self.actions = []    # accumulated raw actions
-        self._lock = threading.Lock()
-        self._js_source = INJECTOR_PATH.read_text()
+  window.__recordedQueue = loadPersistedQueue();
 
-        # Multi-page bookkeeping (popups / new tabs / new windows) - all
-        # only ever touched on the worker thread, same as self.page/session.
-        # Each entry: {"page": <Page>, "index": int, "closed": bool}
-        self._pages = []
-        self._opener_of = {}   # page_index -> the page_index that was active when it was opened (or None for index 0)
-        self._active_index = 0  # index of the page we currently consider "in focus" (last one with recorded activity)
+  function cssEscape(s) {
+    return (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/([^a-zA-Z0-9_-])/g, '\\$1');
+  }
 
-        self._worker = None
-        self._ready_event = threading.Event()
-        self._stop_requested = threading.Event()
-        self._stopped_event = threading.Event()
-        self._start_error = None
+  function isUnique(selector) {
+    try {
+      return document.querySelectorAll(selector).length === 1;
+    } catch (e) {
+      return false;
+    }
+  }
 
-        # ---- live view (remote screencast + input forwarding) -----------
-        # Lets a browser that is NOT sitting in front of this machine (e.g.
-        # a hosted server with no desktop session, driven concurrently by
-        # several different users) see and control this recording via
-        # Chrome DevTools Protocol - see backend/api.py's /api/ws/record
-        # WebSocket, which bridges frames/input between here and the
-        # frontend's live-view widget. `_cdp`/frame-grabbing/input-dispatch
-        # only ever run on the SAME worker thread as everything else above
-        # (Playwright sync API constraint - see module docstring); the
-        # queues are what make it safe to hand frames/input across threads.
-        # Always tied to the ORIGINAL page (index 0) - see module docstring.
-        self.enable_live_view = enable_live_view
-        self._cdp = None
-        self._frame_queue: "queue.Queue[str]" = queue.Queue(maxsize=2)  # small: always prefer the newest frame
-        self._input_queue: "queue.Queue[dict]" = queue.Queue()
+  function cssPath(el) {
+    if (!(el instanceof Element)) return null;
+    var path = [];
+    while (el && el.nodeType === Node.ELEMENT_NODE && el.tagName.toLowerCase() !== 'html') {
+      var selector = el.tagName.toLowerCase();
+      if (el.id) {
+        selector = '#' + cssEscape(el.id);
+        path.unshift(selector);
+        break;
+      } else {
+        var sib = el, nth = 1;
+        while ((sib = sib.previousElementSibling)) {
+          if (sib.tagName === el.tagName) nth++;
+        }
+        selector += ':nth-of-type(' + nth + ')';
+      }
+      path.unshift(selector);
+      el = el.parentElement;
+    }
+    return path.join(' > ');
+  }
 
-    # ---- lifecycle -------------------------------------------------
-    def start(self):
-        """
-        Safe to call from any thread. Spins up the dedicated worker thread
-        that owns the browser (and does all the polling) for the rest of
-        this Recorder's life, and blocks (from the caller's thread) until
-        the browser is actually up and navigated, or raises whatever error
-        the worker hit while launching.
-        """
-        self._worker = threading.Thread(target=self._run, daemon=True)
-        self._worker.start()
-        if not self._ready_event.wait(timeout=30):
-            raise TimeoutError("Timed out waiting for the recorder's browser to launch")
-        if self._start_error is not None:
-            raise self._start_error
-        return self
+  function xpathOf(el) {
+    if (el.id) return '//*[@id="' + el.id + '"]';
+    var parts = [];
+    while (el && el.nodeType === Node.ELEMENT_NODE) {
+      var idx = 1;
+      var sib = el.previousElementSibling;
+      while (sib) {
+        if (sib.tagName === el.tagName) idx++;
+        sib = sib.previousElementSibling;
+      }
+      parts.unshift(el.tagName.toLowerCase() + '[' + idx + ']');
+      el = el.parentElement;
+    }
+    return '/' + parts.join('/');
+  }
 
-    # ---- multi-page / dialog / frame plumbing -----------------------
-    def _attach_page(self, page, index: int):
-        """Wires a Playwright Page (the original one, or a popup/new tab/new
-        window Playwright reported) so it's captured the same way as the
-        main page: re-injects the capture script on every navigation, and
-        auto-handles native dialogs. Safe to call for index 0 too."""
-        try:
-            page.add_init_script(self._js_source)
-        except Exception:
-            pass
-        page.on("dialog", lambda dialog, i=index: self._on_dialog(dialog, i))
-        # BUG-PRONE PATTERN AVOIDED: Playwright's "close" event calls the
-        # handler WITH the Page itself as a positional argument (unlike
-        # what you might assume from the JS API) - a lambda capturing
-        # `index` via a default value while ALSO accepting that positional
-        # arg under the SAME parameter name would silently receive the
-        # (now-closed) Page object instead of the intended int index,
-        # which then blows up json.dumps() in save_recording_json with
-        # "Object of type Page is not JSON serializable". Giving the
-        # incoming argument its own distinct name avoids that collision.
-        page.on("close", lambda closed_page, i=index: self._on_page_closed(i))
+  function textXPath(el) {
+    var text = (el.innerText || el.textContent || '').trim();
+    if (!text || text.length > 60) return null;
+    var tag = el.tagName.toLowerCase();
+    return "//" + tag + "[normalize-space(.)=\"" + text.replace(/"/g, '') + "\"]";
+  }
 
-    def _on_dialog(self, dialog, page_index: int):
-        """Native alert/confirm/prompt/beforeunload dialogs suspend the page
-        until accepted/dismissed - and once ANY listener is registered,
-        Playwright's own default auto-dismiss no longer applies, so this
-        MUST resolve the dialog itself or recording would hang the instant
-        the target app shows one. Always accepts (using the dialog's own
-        default value for prompts) and logs what happened as a synthetic
-        "dialog" action so the generated replay can do the same and the
-        exit report shows it occurred."""
-        try:
-            with self._lock:
-                self.actions.append({
-                    "ts": int(time.time() * 1000),
-                    "action": "dialog",
-                    "value": dialog.message,
-                    "dialog_type": dialog.type,
-                    "element": {"tag": "dialog", "type": dialog.type, "text": dialog.message,
-                                "placeholder": "", "name": "", "ariaLabel": ""},
-                    "locators": [],
-                    "url": None,
-                    "page_index": page_index,
-                    "frame_path": [],
-                })
-        finally:
-            try:
-                dialog.accept()
-            except Exception:
-                try:
-                    dialog.dismiss()
-                except Exception:
-                    pass
+  function isUniqueXPath(xpath) {
+    try {
+      var result = document.evaluate('count(' + xpath + ')', document, null, XPathResult.NUMBER_TYPE, null);
+      return result.numberValue === 1;
+    } catch (e) {
+      return false;
+    }
+  }
 
-    def _on_new_page(self, new_page):
-        """Fired by the browser CONTEXT (not a single page) whenever ANY
-        page/tab/window opens under it - a target="_blank" link, a
-        window.open() call, "open link in new tab", etc. Assigns it the
-        next index, records a synthetic "new_window" action immediately
-        (before the new page has even finished loading - its URL gets
-        picked up naturally on the next poll once it's flushed for the
-        first time), and starts capturing/polling it exactly like the
-        original page."""
-        with self._lock:
-            index = len(self._pages)
-            opener_index = self._active_index
-            self._pages.append({"page": new_page, "index": index, "closed": False})
-            self._opener_of[index] = opener_index
-            self.actions.append({
-                "ts": int(time.time() * 1000),
-                "action": "new_window",
-                "value": None,
-                "element": {"tag": "window", "type": "", "text": "", "placeholder": "", "name": "", "ariaLabel": ""},
-                "locators": [],
-                "url": None,
-                "page_index": index,
-                "opener_page_index": opener_index,
-                "frame_path": [],
-            })
-            self._active_index = index
-        self._attach_page(new_page, index)
+  function ancestorTextXPath(el) {
+    // Radio/checkbox inputs usually have NO text content of their own - the
+    // visible option label lives on a wrapping component instead (e.g.
+    // Angular Material's <mat-radio-button>/<mat-checkbox>, or a plain
+    // wrapping <label>), so textXPath(el) above returns null for them. That
+    // leaves the input's auto-generated id (e.g. Angular's "mat-radio-9-input")
+    // as the only usable locator - and that id is NOT stable across page
+    // loads, since frameworks like Angular/React generate it from a global
+    // counter that depends on everything else rendered earlier on the page.
+    // Climbing to the nearest wrapper with short, meaningful text and
+    // anchoring an XPath on THAT text (then navigating back down to the
+    // input) gives a locator based on what a real user actually sees - e.g.
+    // //mat-radio-button[normalize-space(.)="Yes"]//input - which stays
+    // correct regardless of what id Angular happens to generate this time.
+    if (!(el.tagName === 'INPUT' && (el.type === 'radio' || el.type === 'checkbox'))) return null;
+    var wrapper = el.closest('mat-radio-button, mat-checkbox, [role="radio"], [role="checkbox"], label') || el.parentElement;
+    var depth = 0;
+    while (wrapper && depth < 4) {
+      var text = (wrapper.innerText || wrapper.textContent || '').trim();
+      if (text && text.length <= 60) {
+        var tag = wrapper.tagName.toLowerCase();
+        var xp = "//" + tag + "[normalize-space(.)=\"" + text.replace(/"/g, '') + "\"]//input[@type=\"" + el.type + "\"]";
+        if (isUniqueXPath(xp)) return xp;
+      }
+      wrapper = wrapper.parentElement;
+      depth++;
+    }
+    return null;
+  }
 
-    def _on_page_closed(self, page_index: int):
-        """Fired when a tab/window closes (popup dismissed, user closes it,
-        etc). Marks it closed (so polling stops touching it) and records a
-        synthetic "window_closed" action tagged with the tab/window it was
-        opened FROM, so replay knows which one to switch back to."""
-        with self._lock:
-            for entry in self._pages:
-                if entry["index"] == page_index:
-                    entry["closed"] = True
-            opener_index = self._opener_of.get(page_index, 0)
-            self.actions.append({
-                "ts": int(time.time() * 1000),
-                "action": "window_closed",
-                "value": None,
-                "element": {"tag": "window", "type": "", "text": "", "placeholder": "", "name": "", "ariaLabel": ""},
-                "locators": [],
-                "url": None,
-                "page_index": page_index,
-                "opener_page_index": opener_index,
-                "frame_path": [],
-            })
-            self._active_index = opener_index
+  function buildLocators(el) {
+    var locs = [];
 
-    def _frame_path_for(self, frame) -> list:
-        """Builds the list of CSS selectors (outermost -> innermost) needed
-        to drill from the top of the page down to `frame` via nested
-        <iframe>/<frame> elements - e.g. ['#billing-iframe', 'iframe.step2']
-        means "the iframe found at #billing-iframe, and inside THAT
-        document, the iframe found at .step2". Used to tag actions that
-        happened inside an iframe so replay can resolve them the same way
-        (see page.tmpl's BasePage._root_for). Best-effort: if a selector
-        can't be computed for some ancestor (detached mid-navigation,
-        cross-origin quirk, etc.) falls back to a generic 'iframe' selector
-        rather than dropping the action's frame context entirely."""
-        chain = []
-        cur = frame
-        try:
-            while cur is not None and cur.parent_frame is not None:
-                parent = cur.parent_frame
-                selector = None
-                try:
-                    handle = cur.frame_element()
-                    selector = parent.evaluate(
-                        "(el) => (window.__recorderCssPathFor && el) ? window.__recorderCssPathFor(el) : null",
-                        handle,
-                    )
-                except Exception:
-                    selector = None
-                chain.append(selector or "iframe")
-                cur = parent
-        except Exception:
-            pass
-        chain.reverse()
-        return chain
+    if (el.getAttribute('data-testid')) {
+      var v = el.getAttribute('data-testid');
+      var sel = '[data-testid="' + cssEscape(v) + '"]';
+      if (isUnique(sel)) locs.push({ strategy: 'CSS', value: sel, note: 'data-testid' });
+    }
+    if (el.id) {
+      var idSel = '#' + cssEscape(el.id);
+      if (isUnique(idSel)) locs.push({ strategy: 'ID', value: el.id });
+    }
+    if (el.name) {
+      var nameSel = '[name="' + cssEscape(el.name) + '"]';
+      if (isUnique(nameSel)) locs.push({ strategy: 'NAME', value: el.name });
+    }
+    if (el.getAttribute('aria-label')) {
+      var al = el.getAttribute('aria-label');
+      var alSel = '[aria-label="' + cssEscape(al) + '"]';
+      if (isUnique(alSel)) locs.push({ strategy: 'CSS', value: alSel, note: 'aria-label' });
+    }
+    if (el.getAttribute('placeholder')) {
+      var ph = el.getAttribute('placeholder');
+      var phSel = '[placeholder="' + cssEscape(ph) + '"]';
+      if (isUnique(phSel)) locs.push({ strategy: 'CSS', value: phSel, note: 'placeholder' });
+    }
+    var txp = textXPath(el);
+    if (txp) locs.push({ strategy: 'XPATH', value: txp, note: 'text' });
 
-    def _flush_once(self):
-        """Pulls whatever the injected script has queued since the last
-        flush, from EVERY tracked page and EVERY frame within each page (not
-        just the main frame of the original page - see module docstring).
-        Must only ever be called from the worker thread."""
-        for entry in list(self._pages):
-            if entry["closed"]:
-                continue
-            page = entry["page"]
-            index = entry["index"]
-            try:
-                frames = list(page.frames)
-            except Exception:
-                continue
-            main_frame = None
-            try:
-                main_frame = page.main_frame
-            except Exception:
-                pass
-            for frame in frames:
-                try:
-                    new_items = frame.evaluate(
-                        "() => window.__flushActions ? window.__flushActions() : []"
-                    )
-                except Exception:
-                    continue
-                if not new_items:
-                    continue
-                frame_path = [] if frame == main_frame else self._frame_path_for(frame)
-                for item in new_items:
-                    item["page_index"] = index
-                    item["frame_path"] = frame_path
-                with self._lock:
-                    self.actions.extend(new_items)
-                self._active_index = index
+    var atxp = ancestorTextXPath(el);
+    if (atxp) locs.push({ strategy: 'XPATH', value: atxp, note: 'text' });
 
-    # ---- live view: screencast (server -> viewer) --------------------
-    def _start_screencast(self):
-        """Best-effort: if CDP screencast can't be started (older browser,
-        channel quirk, whatever), the recording continues exactly as
-        before, just without a live remote view. Must only run on the
-        worker thread (creates a CDP session bound to self.page - the
-        ORIGINAL page, index 0; see module docstring)."""
-        try:
-            self._cdp = self.page.context.new_cdp_session(self.page)
-            self._cdp.on("Page.screencastFrame", self._on_screencast_frame)
-            self._cdp.send("Page.startScreencast", {
-                "format": "jpeg", "quality": 60,
-                "maxWidth": self.page.viewport_size["width"] if self.page.viewport_size else 1440,
-                "maxHeight": self.page.viewport_size["height"] if self.page.viewport_size else 900,
-                "everyNthFrame": 1,
-            })
-        except Exception:
-            self._cdp = None
+    var cp = cssPath(el);
+    if (cp) locs.push({ strategy: 'CSS', value: cp, note: 'generated-path' });
 
-    def _on_screencast_frame(self, params: dict):
-        """CDP event handler - fires on Playwright's internal dispatch
-        thread, NOT necessarily the worker thread, so this only ever
-        touches the thread-safe queue (never self.page directly, other
-        than the required frame ack)."""
-        try:
-            self._cdp.send("Page.screencastFrameAck", {"sessionId": params["sessionId"]})
-        except Exception:
-            pass
-        data = params.get("data")  # base64-encoded JPEG, ready to hand straight to a client
-        if not data:
-            return
-        try:
-            self._frame_queue.get_nowait()  # drop the previous frame if the viewer hasn't read it yet
-        except queue.Empty:
-            pass
-        try:
-            self._frame_queue.put_nowait(data)
-        except queue.Full:
-            pass
+    var xp = xpathOf(el);
+    if (xp) locs.push({ strategy: 'XPATH', value: xp, note: 'generated-path' });
 
-    def get_frame(self, timeout: float = 1.0) -> "str | None":
-        """Blocking pull of the latest screencast frame (base64 JPEG), for
-        a caller on ITS OWN thread (see backend/api.py's WS handler, which
-        calls this via asyncio.to_thread). Returns None on timeout, which
-        just means "nothing new yet" - not an error."""
-        try:
-            return self._frame_queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
+    return locs;
+  }
 
-    # ---- live view: input forwarding (viewer -> server) ---------------
-    def queue_input(self, event: dict):
-        """Safe to call from any thread (e.g. the WS handler's async
-        context) - just enqueues; the actual CDP dispatch happens on the
-        worker thread in _drain_input_queue below."""
-        self._input_queue.put(event)
+  function describe(el) {
+    return {
+      tag: el.tagName.toLowerCase(),
+      type: el.getAttribute('type') || '',
+      text: (el.innerText || el.textContent || '').trim().slice(0, 60),
+      placeholder: el.getAttribute('placeholder') || '',
+      name: el.name || '',
+      ariaLabel: el.getAttribute('aria-label') || ''
+    };
+  }
 
-    def _drain_input_queue(self):
-        """Must only run on the worker thread. Applies every queued input
-        event since the last poll tick."""
-        while True:
-            try:
-                event = self._input_queue.get_nowait()
-            except queue.Empty:
-                return
-            self._dispatch_input(event)
+  function record(action, el, value) {
+    window.__recordedQueue.push({
+      ts: Date.now(),
+      action: action,
+      value: value === undefined ? null : value,
+      element: describe(el),
+      locators: buildLocators(el),
+      url: window.location.href
+    });
+    persistQueue();
+  }
 
-    def _dispatch_input(self, event: dict):
-        if self._cdp is None:
-            return
-        kind = event.get("type")
-        try:
-            if kind in ("mousePressed", "mouseReleased", "mouseMoved", "mouseWheel"):
-                params = {
-                    "type": kind,
-                    "x": event.get("x", 0), "y": event.get("y", 0),
-                    "button": event.get("button", "left"),
-                    "clickCount": event.get("clickCount", 1),
-                }
-                if kind == "mouseWheel":
-                    params["deltaX"] = event.get("deltaX", 0)
-                    params["deltaY"] = event.get("deltaY", 0)
-                self._cdp.send("Input.dispatchMouseEvent", params)
-            elif kind == "insertText":
-                # Typed characters go through Input.insertText rather than
-                # raw key events - far more reliable for actually landing
-                # text in a field over CDP, and the existing
-                # recorder_injector.js still sees the resulting real
-                # 'input'/'change' DOM events exactly as if it were typed
-                # locally, so action capture is unaffected.
-                self._cdp.send("Input.insertText", {"text": event.get("text", "")})
-            elif kind in ("keyDown", "keyUp", "rawKeyDown"):
-                # Non-printable / control keys (Backspace, Enter, Tab,
-                # arrows, Escape, Ctrl/Alt combos, ...) that insertText
-                # can't express.
-                self._cdp.send("Input.dispatchKeyEvent", {
-                    "type": kind,
-                    "key": event.get("key", ""),
-                    "code": event.get("code", ""),
-                    "windowsVirtualKeyCode": event.get("keyCode", 0),
-                    "nativeVirtualKeyCode": event.get("keyCode", 0),
-                })
-        except Exception:
-            pass  # a dropped input event shouldn't crash the recording
+  document.addEventListener('click', function (e) {
+    var el = e.target;
+    if (!el || el === document || el === document.body) return;
+    // walk up to nearest clickable-ish element if the click landed on an inline text node wrapper.
+    // Includes radio/checkbox inputs and <label> so clicks on custom-styled radio/checkbox UIs
+    // (where the visible click target is a label or wrapping span, not the native input) still
+    // resolve to the actual underlying <input>.
+    var clickable = el.closest(
+      'button, a, [role="button"], input[type="submit"], input[type="button"], ' +
+      'input[type="radio"], input[type="checkbox"], label, [onclick]'
+    ) || el;
 
-    def _run(self):
-        """Runs entirely on the dedicated worker thread - every Playwright call in
-        this Recorder's lifetime happens here, so nothing about it needs to be
-        thread-safe on its own, and it's the ONLY thread that ever touches
-        self.page/self.session/self._pages."""
-        try:
-            self.session = launch_browser(headless=self.headless)
-            self.page = self.session.new_page()
-            self._pages = [{"page": self.page, "index": 0, "closed": False}]
-            self._opener_of = {0: None}
-            self._active_index = 0
+    if (clickable.tagName && clickable.tagName.toLowerCase() === 'label') {
+      var forId = clickable.getAttribute('for');
+      var resolved = forId ? document.getElementById(forId) : clickable.querySelector('input, select');
+      if (resolved) clickable = resolved;
+    }
 
-            # Catches EVERY page/tab/window opened under this browser context
-            # from here on - popups, target="_blank" links, window.open().
-            self.session.context.on("page", self._on_new_page)
+    if (clickable.tagName === 'INPUT' && (clickable.type === 'radio' || clickable.type === 'checkbox')) {
+      // The browser applies the click's default action (actually flipping
+      // .checked) AFTER all capture/bubble listeners have run, so reading
+      // clickable.checked synchronously here would still see the OLD value.
+      // Deferring to the next tick lets us record the RESULTING checked
+      // state as this action's value - the generated replay step then uses
+      // that as an explicit target state (Playwright's check()/uncheck())
+      // instead of a blind click, so replay can never double-toggle it.
+      var target = clickable;
+      setTimeout(function () {
+        record('click', target, target.checked);
+      }, 0);
+      return;
+    }
 
-            # Re-inject the capture script on every new document (survives
-            # navigation/SPA reloads, and every child iframe too - see module
-            # docstring) - also wires up dialog auto-handling for this page.
-            self._attach_page(self.page, 0)
-            self.page.goto(self.target_url)
-            if self.enable_live_view:
-                self._start_screencast()
-        except Exception as e:
-            self._start_error = e
-            self._ready_event.set()
-            return
+    record('click', clickable);
+  }, true);
 
-        self._ready_event.set()
+  document.addEventListener('change', function (e) {
+    var el = e.target;
+    if (!el) return;
+    var tag = el.tagName.toLowerCase();
 
-        # Poll for newly captured actions until stop() asks us to shut down.
-        # page.wait_for_timeout() is a real Playwright call (unlike
-        # time.sleep()/queue.get()), so it also keeps Playwright's own
-        # internal dispatch pumped correctly while we wait.
-        while not self._stop_requested.is_set():
-            self._flush_once()
-            self._drain_input_queue()
-            try:
-                self.page.wait_for_timeout(self.poll_interval * 1000)
-            except Exception:
-                break
+    if (tag === 'select') {
+      var opt = el.options[el.selectedIndex];
+      record('select', el, opt ? opt.text.trim() : el.value);
+      return;
+    }
+    if (tag === 'input' && (el.type === 'radio' || el.type === 'checkbox')) {
+      // handled by the click listener above (clicking IS the interaction for these;
+      // recording it again here would create a duplicate/redundant step)
+      return;
+    }
+    if (tag === 'input' || tag === 'textarea') {
+      record('type', el, el.value);
+    }
+  }, true);
 
-        # final flush + teardown, still on this same worker thread
-        self._flush_once()
-        if self.session:
-            self.session.close()
+  // Capture keyboard-driven actions (Enter to submit, Backspace to clear/edit,
+  // Arrow Up/Down to move through suggestion lists, Ctrl combos, function keys,
+  // etc.) separately from typed text, since these are user-initiated key presses
+  // rather than a change to the field's value.
+  //
+  // CTRL+C / CTRL+V / CTRL+X are deliberately NOT recorded here - they're
+  // captured with richer data (the actual copied/pasted text and the source/
+  // target element) by the dedicated copy/cut/paste listeners below instead,
+  // so recording them again here would just be a redundant, value-less entry.
+  var SIMPLE_KEY_MAP = {
+    'Enter': 'ENTER',
+    'Backspace': 'BACKSPACE',
+    'Escape': 'ESCAPE',
+    'Delete': 'DELETE',
+    ' ': 'SPACE',
+    'Spacebar': 'SPACE',
+    'ArrowUp': 'ARROW_UP',
+    'ArrowDown': 'ARROW_DOWN',
+    'ArrowLeft': 'ARROW_LEFT',
+    'ArrowRight': 'ARROW_RIGHT',
+    'Home': 'HOME',
+    'End': 'END'
+  };
+  for (var _f = 1; _f <= 12; _f++) SIMPLE_KEY_MAP['F' + _f] = 'F' + _f;
 
-        self._stopped_event.set()
+  // Ctrl/Cmd combos recorded generically as a single keypress action (so
+  // playback can literally re-press them via Playwright). 'c'/'v'/'x' are
+  // excluded here on purpose - see note above.
+  var CTRL_COMBO_MAP = {
+    'a': 'CTRL+A',
+    'p': 'CTRL+P',
+    's': 'CTRL+S'
+  };
 
-    def stop(self, timeout: float = 15) -> list:
-        """Safe to call from any thread. Signals the worker thread to flush and
-        tear down the browser, and waits (up to `timeout` seconds) for that to
-        finish. `timeout` is lowered by callers racing a hard deadline - e.g.
-        shutdown_guard.py gives itself only a few seconds to clean up before
-        Windows force-kills the process after a closed terminal window."""
-        if self._worker is not None and self._worker.is_alive():
-            self._stop_requested.set()
-            self._stopped_event.wait(timeout=timeout)
+  function keyComboLabel(e) {
+    var key = e.key;
+    var ctrlLike = e.ctrlKey || e.metaKey;
 
-        # Merge same-element 'type' actions that fired within a short window
-        # of each other (see coalesce_consecutive_types's docstring - mainly
-        # for masked/native date inputs firing more than one change event
-        # per user edit) - best-effort, and runs BEFORE variable annotation
-        # below so {{var}} correlation sees the final, de-duplicated values.
-        try:
-            from recorder.variable_capture import coalesce_consecutive_types
-            with self._lock:
-                self.actions = coalesce_consecutive_types(self.actions)
-        except Exception:
-            pass
+    if (ctrlLike && !e.altKey) {
+      var combo = CTRL_COMBO_MAP[(key || '').toLowerCase()];
+      if (combo) return combo;
+      if (['c', 'v', 'x'].indexOf((key || '').toLowerCase()) !== -1) return null;
+    }
+    if (e.shiftKey && key === 'Tab') return 'SHIFT+TAB';
+    if (!ctrlLike && !e.altKey) {
+      if (key === 'Tab') return 'TAB';
+      return SIMPLE_KEY_MAP[key] || null;
+    }
+    return null;
+  }
 
-        # Enrich copy/paste actions with the Capture -> Store -> Reuse
-        # variable metadata (see recorder/variable_capture.py) - best-effort:
-        # if this module is missing for some reason, recording still works
-        # exactly as before, just without the {{var}} correlation.
-        try:
-            from recorder.variable_capture import annotate_variables
-            with self._lock:
-                self.actions = annotate_variables(self.actions)
-        except Exception:
-            pass
+  document.addEventListener('keydown', function (e) {
+    var el = e.target;
+    if (!el) return;
+    var label = keyComboLabel(e);
+    if (label) {
+      record('keypress', el, label);
+    }
+  }, true);
 
-        return self.actions
+  // Real-time copy/cut/paste capture: records not just THAT a copy/paste
+  // happened, but the actual text value and the source (copy/cut) or target
+  // (paste) element, so the variable Capture -> Store -> Reuse pipeline (see
+  // recorder/variable_capture.py) can later recognize "this pasted value is
+  // the same one copied earlier from that generated-username field" and turn
+  // it into a {{username}}-style placeholder instead of baking in the
+  // literal string.
+  function selectedTextFrom(el) {
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') &&
+        typeof el.selectionStart === 'number' && el.selectionStart !== el.selectionEnd) {
+      return el.value.substring(el.selectionStart, el.selectionEnd);
+    }
+    var sel = window.getSelection();
+    return sel ? sel.toString() : '';
+  }
 
-    def save(self, out_dir: str = "recordings", name: str = None) -> str:
-        """
-        `name` is the user-provided label for this recording (e.g. a
-        transaction number or flow name, entered in the frontend) - used as
-        a human-readable filename prefix so it's identifiable in the "Run
-        Saved Recording" list, and stored as "recording_name" in the JSON
-        (see runner/run_recording.py, which prefers it over the raw
-        timestamp for the transaction name / exit report). Falls back to a
-        plain timestamped filename if no name was given, unchanged from
-        before.
-        """
-        with self._lock:
-            actions_snapshot = list(self.actions)
-        return save_recording_json(self.target_url, actions_snapshot, out_dir=out_dir, name=name)
+  function recordCopyLike() {
+    var el = document.activeElement;
+    var text = selectedTextFrom(el);
+    if (!text) return;
+    record('copy', (el instanceof Element) ? el : document.body, text);
+  }
 
+  document.addEventListener('copy', recordCopyLike, true);
+  document.addEventListener('cut', recordCopyLike, true);
 
-if __name__ == "__main__":
-    import argparse
-    import time
-    parser = argparse.ArgumentParser(description="Record a browser session")
-    parser.add_argument("--url", required=True)
-    parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--seconds", type=int, default=None, help="auto-stop after N seconds (omit to record until Ctrl+C)")
-    args = parser.parse_args()
+  document.addEventListener('paste', function (e) {
+    var el = e.target;
+    var text = '';
+    try {
+      text = (e.clipboardData || window.clipboardData).getData('text');
+    } catch (err) { /* clipboard not readable here - resolved at build/runtime instead */ }
+    record('paste', el, text);
+  }, true);
 
-    rec = Recorder(args.url, headless=args.headless).start()
-    print("Recording started. Interact with the browser window.")
-    try:
-        if args.seconds:
-            time.sleep(args.seconds)
-        else:
-            input("Press ENTER to stop recording...\n")
-    except KeyboardInterrupt:
-        pass
-    rec.stop()
-    path = rec.save()
-    print(f"Saved recording to {path}")
+  window.__flushActions = function () {
+    var q = window.__recordedQueue;
+    window.__recordedQueue = [];
+    persistQueue();
+    return q;
+  };
+
+  // Exposed so the Python side (recorder/recorder.py) can compute a stable
+  // CSS path for an <iframe>/<frame> DOM ELEMENT from *inside the PARENT
+  // frame's context* (Playwright's Frame.frame_element() returns that
+  // element handle, but it has to be evaluated against the parent frame,
+  // not the iframe's own document) - this is how mainframe/iframe support
+  // builds a "frame_path" (a chain of selectors from the top page down to
+  // the frame an action happened in) without needing any new JS of its
+  // own; it just reuses the same cssPath() this file already uses for
+  // in-page elements. See Recorder._frame_path_for.
+  window.__recorderCssPathFor = cssPath;
+})();
