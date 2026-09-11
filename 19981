@@ -1,304 +1,313 @@
 import { useEffect, useState } from "react";
-import Head from "next/head";
-import Layout from "@/components/Layout";
-import RequireAuth from "@/components/RequireAuth";
-import { adminApi } from "@/lib/api";
+import { api } from "@/lib/api";
+import { useAuth } from "@/context/AuthContext";
+import { buildReportText, buildReportHtml, downloadBlob, openReportInBrowser } from "@/lib/report";
+import { ReportDonut, StepSequenceBar } from "@/components/ReportCharts";
 import {
   Button,
   Callout,
+  Checkbox,
   DataTable,
+  Disclosure,
   Field,
+  Metric,
   Panel,
   PanelHeader,
   Select,
+  Spinner,
   StatusBadge,
   TextInput,
 } from "@/components/ui";
 
-const emptyForm = { username: "", first_name: "", last_name: "", department_code: "", email: "", temp_password: "", role: "user" };
+export default function RunSavedTab() {
+  const { user } = useAuth();
 
-export default function AdminUsersPage() {
-  const [users, setUsers] = useState([]);
-  const [loadError, setLoadError] = useState(null);
-  const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState("");
-  const [roleFilter, setRoleFilter] = useState("");
+  const [recordings, setRecordings] = useState([]);
+  const [recordingsError, setRecordingsError] = useState(null);
+  const [selectedRecFile, setSelectedRecFile] = useState("");
+  const [runHeadless, setRunHeadless] = useState(false);
 
-  const [mode, setMode] = useState("create"); // "create" | "edit"
-  const [form, setForm] = useState(emptyForm);
-  const [editingUserId, setEditingUserId] = useState(null);
-  const [formBusy, setFormBusy] = useState(false);
-  const [formError, setFormError] = useState(null);
-  const [createdCredential, setCreatedCredential] = useState(null); // { username, temp_password }
+  // ---- test data (editable, shown before running - see generator/test_data.py) ----
+  const [testData, setTestData] = useState([]);
+  const [testDataLoading, setTestDataLoading] = useState(false);
+  const [testDataError, setTestDataError] = useState(null);
+  const [editValues, setEditValues] = useState({}); // { [action index]: current input value }
+  const [savingData, setSavingData] = useState(false);
+  const [saveDataNotice, setSaveDataNotice] = useState(null);
+  const [saveDataError, setSaveDataError] = useState(null);
 
-  const [rowBusyId, setRowBusyId] = useState(null);
-  const [rowNotice, setRowNotice] = useState(null);
+  const [runBusy, setRunBusy] = useState(false);
+  const [runError, setRunError] = useState(null);
+  const [report, setReport] = useState(null);
 
-  async function loadUsers() {
+  async function loadRecordings() {
     try {
-      const data = await adminApi.listUsers({ search, status: statusFilter, role: roleFilter });
-      setUsers(data);
-      setLoadError(null);
+      const r = await api.getRecordings();
+      setRecordings(r);
+      setRecordingsError(null);
+      if (r.length && !selectedRecFile) setSelectedRecFile(r[0].file);
     } catch (e) {
-      setLoadError(e.detail || e.message);
+      setRecordingsError(e.detail || e.message);
     }
   }
 
   useEffect(() => {
-    loadUsers();
+    loadRecordings();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search, statusFilter, roleFilter]);
+  }, []);
 
-  function startCreate() {
-    setMode("create");
-    setEditingUserId(null);
-    setForm(emptyForm);
-    setFormError(null);
-    setCreatedCredential(null);
-  }
-
-  function startEdit(u) {
-    setMode("edit");
-    setEditingUserId(u.user_id);
-    setForm({
-      username: u.username,
-      first_name: u.first_name,
-      last_name: u.last_name,
-      department_code: u.department_code || "",
-      email: u.email || "",
-      temp_password: "",
-      role: u.role,
-    });
-    setFormError(null);
-    setCreatedCredential(null);
-  }
-
-  async function handleSubmit(e) {
-    e.preventDefault();
-    setFormError(null);
-    setFormBusy(true);
+  async function loadTestData(file) {
+    setTestDataLoading(true);
+    setTestDataError(null);
+    setSaveDataNotice(null);
+    setSaveDataError(null);
     try {
-      if (mode === "create") {
-        const created = await adminApi.createUser({
-          username: form.username,
-          first_name: form.first_name,
-          last_name: form.last_name,
-          department_code: form.department_code,
-          email: form.email || undefined,
-          temp_password: form.temp_password,
-          role: form.role,
-        });
-        setCreatedCredential({ username: created.username, temp_password: created.temp_password });
-        setForm(emptyForm);
-        await loadUsers();
-      } else {
-        await adminApi.updateUser(editingUserId, {
-          first_name: form.first_name,
-          last_name: form.last_name,
-          department_code: form.department_code,
-          email: form.email || undefined,
-          role: form.role,
-        });
-        await loadUsers();
-        startCreate();
+      const data = await api.getRecordingTestData(file);
+      setTestData(data.fields);
+      setEditValues(Object.fromEntries(data.fields.map((f) => [f.index, f.value])));
+    } catch (e) {
+      setTestData([]);
+      setEditValues({});
+      setTestDataError(e.detail || e.message);
+    } finally {
+      setTestDataLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    setReport(null); // a different recording's exit report shouldn't linger once you switch
+    if (selectedRecFile) loadTestData(selectedRecFile);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedRecFile]);
+
+  function updateValue(index, value) {
+    setEditValues((prev) => ({ ...prev, [index]: value }));
+    setSaveDataNotice(null);
+  }
+
+  async function saveTestDataOnly() {
+    setSavingData(true);
+    setSaveDataError(null);
+    setSaveDataNotice(null);
+    try {
+      const data = await api.updateRecordingTestData(selectedRecFile, editValues);
+      setTestData(data.fields);
+      setSaveDataNotice("Test data saved - future runs of this recording will use these values too.");
+    } catch (e) {
+      setSaveDataError(e.detail || e.message);
+    } finally {
+      setSavingData(false);
+    }
+  }
+
+  async function handleRun() {
+    if (!selectedRecFile) return;
+    setRunError(null);
+    setRunBusy(true);
+    try {
+      // Whatever is currently in the grid is what gets run - saved to the
+      // recording first (so it's also the new baseline for next time),
+      // then executed. No separate "save" step required.
+      if (testData.length > 0) {
+        await api.updateRecordingTestData(selectedRecFile, editValues);
       }
-    } catch (err) {
-      setFormError(err.detail || err.message);
+      const r = await api.runRecording(selectedRecFile, runHeadless);
+      setReport(r);
+    } catch (e) {
+      setRunError(e.detail || e.message);
     } finally {
-      setFormBusy(false);
-    }
-  }
-
-  async function handleResetPassword(u) {
-    setRowBusyId(u.user_id);
-    setRowNotice(null);
-    try {
-      const res = await adminApi.resetPassword(u.user_id);
-      setRowNotice({ tone: "success", text: `New temp password for ${u.username}: ${res.temp_password}` });
-    } catch (err) {
-      setRowNotice({ tone: "error", text: err.detail || err.message });
-    } finally {
-      setRowBusyId(null);
-    }
-  }
-
-  async function handleDelete(u) {
-    if (!window.confirm(`Deactivate and delete ${u.username}? They will no longer be able to log in.`)) return;
-    setRowBusyId(u.user_id);
-    setRowNotice(null);
-    try {
-      await adminApi.deleteUser(u.user_id);
-      setRowNotice({ tone: "success", text: `${u.username} deleted.` });
-      await loadUsers();
-    } catch (err) {
-      setRowNotice({ tone: "error", text: err.detail || err.message });
-    } finally {
-      setRowBusyId(null);
-    }
-  }
-
-  async function handleToggleStatus(u) {
-    setRowBusyId(u.user_id);
-    setRowNotice(null);
-    try {
-      await adminApi.updateUser(u.user_id, { status: u.status === "Active" ? "Inactive" : "Active" });
-      await loadUsers();
-    } catch (err) {
-      setRowNotice({ tone: "error", text: err.detail || err.message });
-    } finally {
-      setRowBusyId(null);
+      setRunBusy(false);
     }
   }
 
   return (
-    <RequireAuth adminOnly>
-      <Layout>
-        <Head>
-          <title>Manage users - AI Test Recorder</title>
-        </Head>
+    <div className="grid min-w-0 gap-6 lg:grid-cols-[360px_1fr]">
+      <Panel>
+        <PanelHeader title="Run a saved recording" caption="Pick a recording, review/edit its test data, then run it." />
+        <div className="space-y-4 px-5 py-5">
+          <Callout>
+            Running as <strong>{user?.first_name} {user?.last_name}</strong> ({user?.username}). Every run is logged
+            against your account.
+          </Callout>
 
-        <div className="mb-6 flex items-center justify-between">
-          <h1 className="text-2xl font-semibold tracking-tight text-ink">Users</h1>
+          {recordingsError && <Callout tone="error">Could not load recordings: {recordingsError}</Callout>}
+
+          {recordings.length === 0 ? (
+            <Callout>No saved recordings found yet. Record one in the &ldquo;Record &amp; Generate&rdquo; tab first.</Callout>
+          ) : (
+            <>
+              <Field label="Saved recording">
+                <Select value={selectedRecFile} onChange={(e) => setSelectedRecFile(e.target.value)}>
+                  {recordings.map((r) => (
+                    <option key={r.file} value={r.file}>
+                      {r.name} — {r.target_url} ({r.action_count} actions)
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+
+              <Checkbox label="headless" checked={runHeadless} onChange={setRunHeadless} />
+
+              <Button onClick={handleRun} disabled={runBusy} className="w-full">
+                {runBusy ? "Running..." : "Run recording"}
+              </Button>
+
+              {runBusy && <Spinner label="Running the saved recording..." />}
+              {runError && <Callout tone="error">Run failed: {runError}</Callout>}
+            </>
+          )}
         </div>
+      </Panel>
 
-        <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
+      <div className="min-w-0 space-y-4">
+        {selectedRecFile && (
           <Panel>
-            <PanelHeader
-              title={mode === "create" ? "Create user" : `Edit ${form.username}`}
-              caption={mode === "create" ? "Set up a new account. A temp password is generated if you leave it blank." : "Username can't be changed."}
-            />
-            <form className="space-y-4 px-5 py-5" onSubmit={handleSubmit}>
-              {formError && <Callout tone="error">{formError}</Callout>}
-              {createdCredential && (
-                <Callout tone="success">
-                  Created <strong>{createdCredential.username}</strong>. Temp password (shown once):{" "}
-                  <code className="rounded-sm bg-white px-1.5 py-0.5 font-mono">{createdCredential.temp_password}</code>
-                </Callout>
-              )}
-
-              <Field label="Username / ADID">
-                <TextInput
-                  value={form.username}
-                  onChange={(e) => setForm({ ...form, username: e.target.value })}
-                  disabled={mode === "edit"}
-                  required
-                />
-              </Field>
-              <Field label="First name">
-                <TextInput value={form.first_name} onChange={(e) => setForm({ ...form, first_name: e.target.value })} required />
-              </Field>
-              <Field label="Last name">
-                <TextInput value={form.last_name} onChange={(e) => setForm({ ...form, last_name: e.target.value })} required />
-              </Field>
-              <Field label="Department code">
-                <TextInput value={form.department_code} onChange={(e) => setForm({ ...form, department_code: e.target.value })} />
-              </Field>
-              <Field label="Email">
-                <TextInput type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
-              </Field>
-              {mode === "create" && (
-                <Field label="Temp password" hint="Leave blank to auto-generate a strong one.">
-                  <TextInput value={form.temp_password} onChange={(e) => setForm({ ...form, temp_password: e.target.value })} />
-                </Field>
-              )}
-              <Field label="Role">
-                <Select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })}>
-                  <option value="user">User</option>
-                  <option value="admin">Admin</option>
-                </Select>
-              </Field>
-
-              <div className="flex gap-2">
-                <Button type="submit" disabled={formBusy} className="flex-1">
-                  {formBusy ? "Saving..." : mode === "create" ? "Create user" : "Save changes"}
+            <div className="flex items-center justify-between border-b border-line px-5 py-4">
+              <div>
+                <h2 className="text-sm font-semibold text-ink">Test data</h2>
+                <p className="mt-0.5 text-xs text-muted">
+                  The values this recording types/selects when it runs. Edit anything below, then hit{" "}
+                  <strong>Run recording</strong> - no need to download or re-upload the Excel report; changes save
+                  straight into this recording.
+                </p>
+              </div>
+              {testData.length > 0 && (
+                <Button variant="secondary" onClick={saveTestDataOnly} disabled={savingData}>
+                  {savingData ? "Saving..." : "Save without running"}
                 </Button>
-                {mode === "edit" && (
-                  <Button type="button" variant="secondary" onClick={startCreate}>
-                    Cancel
-                  </Button>
-                )}
-              </div>
-            </form>
-          </Panel>
+              )}
+            </div>
+            <div className="px-5 py-4">
+              {testDataLoading && <Spinner label="Loading test data..." />}
+              {testDataError && <Callout tone="error">{testDataError}</Callout>}
+              {saveDataError && <Callout tone="error">{saveDataError}</Callout>}
+              {saveDataNotice && <Callout tone="success">{saveDataNotice}</Callout>}
 
-          <div>
-            <Panel>
-              <div className="flex flex-wrap items-center gap-3 border-b border-line px-5 py-4">
-                <TextInput
-                  placeholder="Search name, username, email..."
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  className="max-w-xs"
-                />
-                <Select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="max-w-[160px]">
-                  <option value="">All statuses</option>
-                  <option value="Active">Active</option>
-                  <option value="Inactive">Inactive</option>
-                  <option value="Deleted">Deleted</option>
-                </Select>
-                <Select value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)} className="max-w-[140px]">
-                  <option value="">All roles</option>
-                  <option value="user">User</option>
-                  <option value="admin">Admin</option>
-                </Select>
-              </div>
+              {!testDataLoading && !testDataError && testData.length === 0 && (
+                <p className="text-sm text-muted">
+                  This recording has no typed or selected values to edit (e.g. it's clicks/navigation only).
+                </p>
+              )}
 
-              <div className="px-5 py-5">
-                {loadError && <Callout tone="error">{loadError}</Callout>}
-                {rowNotice && <div className="mb-3"><Callout tone={rowNotice.tone}>{rowNotice.text}</Callout></div>}
-
+              {testData.length > 0 && (
                 <DataTable
                   columns={[
-                    { key: "name", label: "Name" },
-                    { key: "username", label: "Username", mono: true },
-                    { key: "department", label: "Dept" },
-                    { key: "role", label: "Role" },
-                    { key: "status", label: "Status" },
-                    { key: "last_login", label: "Last login", mono: true },
-                    { key: "actions", label: "" },
+                    { key: "label", label: "Field" },
+                    { key: "action", label: "Type", mono: true },
+                    { key: "value", label: "Value" },
                   ]}
-                  rows={users.map((u) => ({
-                    name: `${u.first_name} ${u.last_name}`,
-                    username: u.username,
-                    department: u.department_code || "—",
-                    role: u.role,
-                    status: <StatusBadge status={u.status === "Active" ? "Success" : u.status === "Deleted" ? "Failed" : "Undefined"} />,
-                    last_login: u.last_login_at ? new Date(u.last_login_at).toLocaleString() : "never",
-                    actions: (
-                      <div className="flex flex-wrap gap-2">
-                        <button className="text-xs font-medium text-brand-blue hover:underline" onClick={() => startEdit(u)}>
-                          Edit
-                        </button>
-                        <button
-                          className="text-xs font-medium text-signal-slate hover:underline disabled:opacity-40"
-                          disabled={rowBusyId === u.user_id}
-                          onClick={() => handleResetPassword(u)}
-                        >
-                          Reset pw
-                        </button>
-                        <button
-                          className="text-xs font-medium text-signal-amber hover:underline disabled:opacity-40"
-                          disabled={rowBusyId === u.user_id}
-                          onClick={() => handleToggleStatus(u)}
-                        >
-                          {u.status === "Active" ? "Deactivate" : "Activate"}
-                        </button>
-                        <button
-                          className="text-xs font-medium text-signal-rust hover:underline disabled:opacity-40"
-                          disabled={rowBusyId === u.user_id}
-                          onClick={() => handleDelete(u)}
-                        >
-                          Delete
-                        </button>
-                      </div>
+                  rows={testData.map((f) => ({
+                    label: f.label,
+                    action: f.action,
+                    value: (
+                      <TextInput
+                        value={editValues[f.index] ?? ""}
+                        onChange={(e) => updateValue(f.index, e.target.value)}
+                      />
                     ),
                   }))}
                 />
+              )}
+            </div>
+          </Panel>
+        )}
+
+        {report && (
+          <Panel>
+            <PanelHeader title="Exit report" caption={`Transaction #${report.transaction_id} · ${report.date_time} UTC`} />
+            <div className="min-w-0 space-y-6 px-5 py-5">
+              {/* ---- Graphical summary: donut + step-sequence strip + metrics ---- */}
+              <div className="flex flex-wrap items-center gap-6 rounded-sm border border-line bg-rail/60 p-4">
+                <ReportDonut passed={report.passed_count} failed={report.failed_count} />
+                <div className="min-w-0 flex-1 space-y-3">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <StatusBadge status={report.status} />
+                    <span className="text-sm text-muted">
+                      Run by <strong className="font-medium text-ink">{report.user}</strong>
+                    </span>
+                  </div>
+                  <StepSequenceBar steps={report.steps} />
+                  <div className="grid grid-cols-3 gap-2 sm:max-w-sm">
+                    <Metric label="Steps" value={report.step_count} />
+                    <Metric label="Passed" value={report.passed_count} />
+                    <Metric label="Failed" value={report.failed_count} />
+                  </div>
+                </div>
               </div>
-            </Panel>
-          </div>
-        </div>
-      </Layout>
-    </RequireAuth>
+
+              <div className="min-w-0">
+                <h3 className="mb-2 text-sm font-semibold text-ink">Automation log</h3>
+                <DataTable
+                  columns={[
+                    { key: "n", label: "#" },
+                    { key: "step", label: "Playwright step" },
+                    { key: "status", label: "Status" },
+                    { key: "error", label: "Error", mono: true },
+                  ]}
+                  rows={report.steps.map((s, i) => ({
+                    n: i + 1,
+                    step: s.step_name,
+                    status: <StatusBadge status={s.status} />,
+                    error: s.error_message || "",
+                  }))}
+                />
+              </div>
+
+              <Disclosure title={`Files produced (${report.files.length})`}>
+                <DataTable
+                  columns={[
+                    { key: "file_name", label: "File" },
+                    { key: "folder_path", label: "Folder", mono: true },
+                  ]}
+                  rows={report.files.map((f) => ({ file_name: f.file_name, folder_path: f.folder_path }))}
+                />
+              </Disclosure>
+
+              <Disclosure title="Raw Behave output">
+                <pre className="max-h-96 w-full min-w-0 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-[#0B1A33] p-4 font-mono text-xs text-[#D7E1EF] scroll-thin">
+                  {report.raw_output}
+                </pre>
+              </Disclosure>
+
+              <div className="flex flex-wrap gap-2">
+                <Button onClick={() => openReportInBrowser(report)}>Open report in browser</Button>
+                <Button
+                  variant="secondary"
+                  onClick={() =>
+                    downloadBlob(
+                      `transaction_${report.transaction_id}_exit_report.html`,
+                      buildReportHtml(report),
+                      "text/html"
+                    )
+                  }
+                >
+                  Download (.html)
+                </Button>
+                <Button
+                  variant="secondary"
+                  onClick={() =>
+                    downloadBlob(
+                      `transaction_${report.transaction_id}_exit_report.txt`,
+                      buildReportText(report),
+                      "text/plain"
+                    )
+                  }
+                >
+                  Download (.txt)
+                </Button>
+              </div>
+            </div>
+          </Panel>
+        )}
+
+        {!selectedRecFile && (
+          <Panel>
+            <div className="px-5 py-10 text-center text-sm text-muted">
+              Pick a saved recording to review its test data and run it.
+            </div>
+          </Panel>
+        )}
+      </div>
+    </div>
   );
 }
