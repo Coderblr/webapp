@@ -1,384 +1,183 @@
-"""
-Everything here requires an admin (get_current_admin). This is the "admin
-can keep an eye on every user" surface:
+import { getToken } from "@/lib/auth-storage";
 
-  User management     POST/GET/PUT/DELETE /api/admin/users, reset-password
-  Live sessions        GET /api/admin/sessions, POST .../revoke
-  Activity monitor     GET /api/admin/activity (+ /export as CSV)
-  Dashboard stats       GET /api/admin/dashboard/stats
-"""
-from __future__ import annotations
-import asyncio
-import csv
-import io
-from datetime import datetime, timedelta
-from typing import Optional
+export const API_BASE =
+  (process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000").replace(/\/$/, "");
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Query
-from fastapi.responses import StreamingResponse
+// ws:// (http) or wss:// (https) - mirrors API_BASE's scheme so the live
+// recording view works the same in local dev and behind a TLS-terminating
+// reverse proxy in production, without a separate env var to keep in sync.
+export const WS_BASE = API_BASE.replace(/^http/, "ws");
 
-from database.db import get_session
-from database import repository as repo
-from runner import transaction_store
-from backend import recording_sessions, agent_registry
-from auth.dependencies import get_current_admin, get_client_ip, CurrentUser
-from auth.security import hash_password, generate_temp_password, validate_password_strength
-from auth.config import IDLE_TIMEOUT_MINUTES
-from auth.schemas import CreateUserRequest, UpdateUserRequest, ResetPasswordRequest, UserOut, CreateUserResponse
+export class ApiError extends Error {
+  constructor(detail, status) {
+    super(detail);
+    this.detail = detail;
+    this.status = status;
+  }
+}
 
-router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(get_current_admin)])
+// Registered by AuthContext so any 401 anywhere (idle timeout, revoked
+// session, expired token, ...) immediately drops the user back to /login
+// instead of leaving them staring at a broken page.
+let unauthorizedHandler = null;
+export function setUnauthorizedHandler(fn) {
+  unauthorizedHandler = fn;
+}
 
+async function request(path, init, { auth = true } = {}) {
+  const headers = { "Content-Type": "application/json", ...(init && init.headers) };
+  if (auth) {
+    const token = getToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+  }
 
-def _user_out(user) -> UserOut:
-    return UserOut.model_validate(user)
+  let res;
+  try {
+    res = await fetch(`${API_BASE}${path}`, { ...init, headers, cache: "no-store" });
+  } catch (e) {
+    throw new ApiError(`Could not reach the backend at ${API_BASE}. Is it running? (${e.message})`, 0);
+  }
 
+  if (res.status === 401 && auth) {
+    let detail = "Session expired - please log in again.";
+    try {
+      const body = await res.json();
+      detail = body.detail || detail;
+    } catch {
+      /* no body */
+    }
+    if (unauthorizedHandler) unauthorizedHandler(detail);
+    throw new ApiError(detail, 401);
+  }
 
-# ---- Users ------------------------------------------------------------------
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      detail = body.detail || detail;
+    } catch {
+      /* no body */
+    }
+    throw new ApiError(detail, res.status);
+  }
 
-@router.post("/users", response_model=CreateUserResponse)
-def create_user(req: CreateUserRequest, request: Request, admin: CurrentUser = Depends(get_current_admin)):
-    ip = get_client_ip(request)
-    with get_session() as db:
-        if repo.get_user_by_username(db, req.username):
-            raise HTTPException(status_code=400, detail=f"Username/ADID '{req.username}' already exists.")
+  const contentType = res.headers.get("content-type") || "";
+  if (res.status === 204) return undefined;
+  if (contentType.includes("text/csv")) return res.text();
+  return res.json();
+}
 
-        temp_password = req.temp_password.strip() or generate_temp_password()
-        error = validate_password_strength(temp_password)
-        if error:
-            raise HTTPException(status_code=400, detail=f"Temp password: {error}")
+// ---------------------------------------------------------------------------
+// Auth (no token required for /login)
+// ---------------------------------------------------------------------------
 
-        user = repo.create_user_account(
-            db,
-            username=req.username,
-            first_name=req.first_name,
-            last_name=req.last_name,
-            department_code=req.department_code,
-            email=req.email,
-            password_hash=hash_password(temp_password),
-            role=req.role,
-        )
-        repo.log_activity(
-            db, user_id=admin.user_id, session_id=admin.session_id, action="USER_CREATED", status="SUCCESS",
-            details={"created_user_id": user.user_id, "username": user.username, "role": user.role},
-            endpoint="/api/admin/users", ip_address=ip,
-        )
-        out = _user_out(user).model_dump()
-        out["temp_password"] = temp_password  # only ever returned once, right after creation
-        return out
+export const authApi = {
+  login: (username, password) =>
+    request("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }, { auth: false }),
 
+  changePassword: (current_password, new_password, confirm_password) =>
+    request("/api/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({ current_password, new_password, confirm_password }),
+    }),
 
-@router.get("/users")
-def list_users(
-    status: Optional[str] = Query(default=None),
-    role: Optional[str] = Query(default=None),
-    search: Optional[str] = Query(default=None),
-):
-    with get_session() as db:
-        users = repo.list_user_accounts(db, status=status, role=role, search=search)
-        return [_user_out(u) for u in users]
+  logout: () => request("/api/auth/logout", { method: "POST" }),
 
+  me: () => request("/api/auth/me"),
 
-@router.get("/users/{user_id}", response_model=UserOut)
-def get_user(user_id: int):
-    with get_session() as db:
-        user = repo.get_user(db, user_id)
-        if user is None:
-            raise HTTPException(status_code=404, detail="User not found.")
-        return _user_out(user)
+  // SSO - not implemented on the backend yet (see auth/providers.py), but
+  // the plumbing is real: sso_status() tells the login page whether to
+  // treat the "Sign in with SSO" button as live or "coming soon", and
+  // ssoLoginUrl() is where it navigates to once it is.
+  ssoStatus: () => request("/api/auth/sso/status", undefined, { auth: false }),
+  ssoLoginUrl: () => `${API_BASE}/api/auth/sso/login`,
+};
 
+// ---------------------------------------------------------------------------
+// Profile
+// ---------------------------------------------------------------------------
 
-@router.put("/users/{user_id}", response_model=UserOut)
-def update_user(user_id: int, req: UpdateUserRequest, request: Request, admin: CurrentUser = Depends(get_current_admin)):
-    ip = get_client_ip(request)
-    with get_session() as db:
-        user = repo.update_user_account(
-            db, user_id,
-            first_name=req.first_name, last_name=req.last_name, department_code=req.department_code,
-            email=req.email, role=req.role, status=req.status,
-        )
-        if user is None:
-            raise HTTPException(status_code=404, detail="User not found.")
-        repo.log_activity(
-            db, user_id=admin.user_id, session_id=admin.session_id, action="USER_UPDATED", status="SUCCESS",
-            details={"updated_user_id": user_id, **req.model_dump(exclude_none=True)},
-            endpoint=f"/api/admin/users/{user_id}", ip_address=ip,
-        )
-        return _user_out(user)
+export const profileApi = {
+  get: () => request("/api/profile/me"),
+  update: (body) => request("/api/profile/me", { method: "PUT", body: JSON.stringify(body) }),
+  activity: (limit = 100) => request(`/api/profile/activity?limit=${limit}`),
+  exportActivityUrl: () => `${API_BASE}/api/profile/activity/export`,
+};
 
+// ---------------------------------------------------------------------------
+// Admin
+// ---------------------------------------------------------------------------
 
-@router.delete("/users/{user_id}")
-def delete_user(user_id: int, request: Request, admin: CurrentUser = Depends(get_current_admin)):
-    if user_id == admin.user_id:
-        raise HTTPException(status_code=400, detail="You cannot delete your own account.")
-    ip = get_client_ip(request)
-    with get_session() as db:
-        user = repo.soft_delete_user(db, user_id)
-        if user is None:
-            raise HTTPException(status_code=404, detail="User not found.")
-        repo.revoke_all_sessions_for_user(db, user_id, reason="account_deleted")
-        repo.log_activity(
-            db, user_id=admin.user_id, session_id=admin.session_id, action="USER_DELETED", status="SUCCESS",
-            details={"deleted_user_id": user_id, "username": user.username},
-            endpoint=f"/api/admin/users/{user_id}", ip_address=ip,
-        )
-        return {"ok": True}
+function toQuery(params) {
+  const qs = new URLSearchParams(
+    Object.fromEntries(Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== ""))
+  ).toString();
+  return qs ? `?${qs}` : "";
+}
 
+export const adminApi = {
+  createUser: (body) => request("/api/admin/users", { method: "POST", body: JSON.stringify(body) }),
+  listUsers: (params = {}) => request(`/api/admin/users${toQuery(params)}`),
+  getUser: (id) => request(`/api/admin/users/${id}`),
+  updateUser: (id, body) => request(`/api/admin/users/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteUser: (id) => request(`/api/admin/users/${id}`, { method: "DELETE" }),
+  resetPassword: (id, temp_password = "") =>
+    request(`/api/admin/users/${id}/reset-password`, { method: "POST", body: JSON.stringify({ temp_password }) }),
 
-@router.post("/users/{user_id}/reset-password")
-def reset_password(user_id: int, req: ResetPasswordRequest, request: Request, admin: CurrentUser = Depends(get_current_admin)):
-    ip = get_client_ip(request)
-    temp_password = req.temp_password.strip() or generate_temp_password()
-    error = validate_password_strength(temp_password)
-    if error:
-        raise HTTPException(status_code=400, detail=f"Temp password: {error}")
-    with get_session() as db:
-        user = repo.set_user_password(db, user_id, hash_password(temp_password), must_change_password=True)
-        if user is None:
-            raise HTTPException(status_code=404, detail="User not found.")
-        repo.revoke_all_sessions_for_user(db, user_id, reason="password_reset")
-        repo.log_activity(
-            db, user_id=admin.user_id, session_id=admin.session_id, action="PASSWORD_RESET_BY_ADMIN", status="SUCCESS",
-            details={"target_user_id": user_id, "username": user.username},
-            endpoint=f"/api/admin/users/{user_id}/reset-password", ip_address=ip,
-        )
-        return {"ok": True, "temp_password": temp_password}
+  listSessions: () => request("/api/admin/sessions"),
+  revokeSession: (sessionId) => request(`/api/admin/sessions/${sessionId}/revoke`, { method: "POST" }),
 
+  listAgents: () => request("/api/admin/agents"),
+  disconnectAgent: (agentId) => request(`/api/admin/agents/${agentId}/disconnect`, { method: "POST" }),
+  resetAgent: (agentId) => request(`/api/admin/agents/${agentId}/reset`, { method: "POST" }),
 
-# ---- Live sessions ("who's online") ------------------------------------------
+  listActivity: (params = {}) => request(`/api/admin/activity${toQuery(params)}`),
+  exportActivityUrl: (params = {}) => `${API_BASE}/api/admin/activity/export${toQuery(params)}`,
 
-@router.get("/agents")
-def list_connected_agents():
-    """Per-installation visibility (spec: agent_id, user_id, status,
-    hostname, version, last_seen, connected_at) - one row per currently
-    registered desktop agent, across every user, not just the caller's
-    own. A stale (missed-heartbeat) connection is flagged rather than
-    silently listed as healthy - see agent_registry.is_stale."""
-    connections = agent_registry.list_agents()
-    with get_session() as db:
-        users_by_id = {u.user_id: u for u in repo.list_users(db)}
-        out = []
-        for conn in connections:
-            user = users_by_id.get(conn.user_id)
-            out.append({
-                "agent_id": conn.agent_id,
-                "user_id": conn.user_id,
-                "username": user.username if user else "unknown",
-                "full_name": f"{user.first_name} {user.last_name}".strip() if user else "unknown",
-                "hostname": conn.hostname,
-                "version": conn.version,
-                "busy": conn.busy,
-                "connected_at": conn.connected_at,
-                "last_seen": conn.last_seen,
-                "stale": agent_registry.is_stale(conn),
-            })
-        return out
+  dashboardStats: () => request("/api/admin/dashboard/stats"),
+};
 
+// ---------------------------------------------------------------------------
+// Recorder tool endpoints (unchanged shapes, now all auth-required)
+// ---------------------------------------------------------------------------
 
-@router.post("/agents/{agent_id}/reset")
-async def reset_agent(agent_id: str, request: Request, admin: CurrentUser = Depends(get_current_admin)):
-    """Sends CLOSE_BROWSER to a specific agent - closes any stray browser
-    and clears its internal `busy` flag (see local_agent/command_handler.py).
+// ---------------------------------------------------------------------------
+// Local agent (desktop app) - see backend/agent_registry.py
+// ---------------------------------------------------------------------------
 
-    This exists specifically because /disconnect above does NOT fix a
-    stuck-busy agent: CommandHandler (and its `busy` flag) is created once
-    per agent PROCESS lifetime (see local_agent/client.py), not per
-    connection, so force-closing the WebSocket just makes the agent
-    reconnect with the same stuck state. If a recording/test genuinely
-    never reached its own cleanup (browser closed manually outside the
-    app, a crash, or - before AGENT_TEST_TIMEOUT_SECONDS was tuned up -
-    the backend giving up on a slow-but-still-running execution) the
-    agent shows "Agent is busy with another recording/test execution" for
-    every future action until this is called (or the whole agent process
-    is restarted by hand) - this is the built-in fix instead of that."""
-    conn = agent_registry.get_by_agent_id(agent_id)
-    if conn is None:
-        raise HTTPException(status_code=404, detail="Agent not connected.")
-    ip = get_client_ip(request)
-    try:
-        response = await agent_registry.send_command(conn, "CLOSE_BROWSER", {}, timeout=15)
-    except (asyncio.TimeoutError, ConnectionError) as e:
-        raise HTTPException(status_code=502, detail=f"Agent did not respond to reset: {e}")
-    conn.busy = False
-    with get_session() as db:
-        repo.log_activity(
-            db, user_id=admin.user_id, session_id=admin.session_id, action="AGENT_RESET_BY_ADMIN",
-            status="SUCCESS", details={"agent_id": agent_id, "target_user_id": conn.user_id},
-            endpoint=f"/api/admin/agents/{agent_id}/reset", ip_address=ip,
-        )
-    return {"ok": response.get("ok", True)}
+export const agentApi = {
+  status: () => request("/api/agent/status"),
+};
 
+export const api = {
+  getApplications: () => request("/api/applications"),
 
-@router.post("/agents/{agent_id}/disconnect")
-async def disconnect_agent(agent_id: str, request: Request, admin: CurrentUser = Depends(get_current_admin)):
-    """Force-closes a specific agent's WebSocket connection - the desktop
-    app's own reconnect loop (local_agent/connection_manager.py) will
-    immediately try to reconnect, so this is a "kick and let it come back"
-    action, not a permanent ban (use the Users/Sessions pages to actually
-    revoke access if that's the intent).
+  startRecording: (body) => request("/api/start", { method: "POST", body: JSON.stringify(body) }),
 
-    NOTE: this does NOT clear a stuck `busy` flag - see /reset above for
-    that; CommandHandler's busy state survives a reconnect since it's
-    scoped to the agent process, not the connection."""
-    conn = agent_registry.get_by_agent_id(agent_id)
-    if conn is None:
-        raise HTTPException(status_code=404, detail="Agent not connected.")
-    ip = get_client_ip(request)
-    try:
-        await conn.websocket.close(code=1000, reason="Disconnected by admin")
-    except Exception:
-        pass
-    agent_registry.unregister(agent_id)
-    with get_session() as db:
-        repo.log_activity(
-            db, user_id=admin.user_id, session_id=admin.session_id, action="AGENT_DISCONNECTED_BY_ADMIN",
-            status="SUCCESS", details={"agent_id": agent_id, "target_user_id": conn.user_id},
-            endpoint=f"/api/admin/agents/{agent_id}/disconnect", ip_address=ip,
-        )
-    return {"ok": True}
+  getStatus: () => request("/api/status"),
 
+  stopAndSave: () => request("/api/stop_and_save", { method: "POST" }),
 
-@router.get("/sessions")
-def list_sessions():
-    """Includes `recording_active` per session - see
-    backend/recording_sessions.py - so an admin can see not just who's
-    logged in, but who's actively recording a flow right now."""
-    with get_session() as db:
-        idle_cutoff = datetime.utcnow() - timedelta(minutes=IDLE_TIMEOUT_MINUTES)
-        sessions = repo.list_active_sessions(db, idle_cutoff)
-        out = []
-        for s in sessions:
-            user = repo.get_user(db, s.user_id)
-            state = recording_sessions.get_state(s.session_id, s.user_id)
-            out.append({
-                "session_id": s.session_id,
-                "user_id": s.user_id,
-                "username": user.username if user else "unknown",
-                "full_name": f"{user.first_name} {user.last_name}".strip() if user else "unknown",
-                "role": user.role if user else "unknown",
-                "created_at": s.created_at.isoformat(),
-                "last_activity_at": s.last_activity_at.isoformat(),
-                "idle_seconds": int((datetime.utcnow() - s.last_activity_at).total_seconds()),
-                "ip_address": s.ip_address,
-                "user_agent": s.user_agent,
-                "recording_active": state.get("recorder") is not None,
-            })
-        return out
+  // Discards the current recording without saving/generating anything -
+  // for abandoning one mid-flow.
+  stopRecording: () => request("/api/stop", { method: "POST" }),
 
+  runCheck: (headless) => request("/api/run", { method: "POST", body: JSON.stringify({ headless }) }),
 
-@router.post("/sessions/{session_id}/revoke")
-def revoke_session(session_id: str, request: Request, admin: CurrentUser = Depends(get_current_admin)):
-    ip = get_client_ip(request)
-    with get_session() as db:
-        sess = repo.revoke_session(db, session_id, reason="admin_revoked")
-        if sess is None:
-            raise HTTPException(status_code=404, detail="Session not found.")
-        repo.log_activity(
-            db, user_id=admin.user_id, session_id=admin.session_id, action="SESSION_REVOKED", status="SUCCESS",
-            details={"revoked_session_id": session_id, "target_user_id": sess.user_id},
-            endpoint=f"/api/admin/sessions/{session_id}/revoke", ip_address=ip,
-        )
-        return {"ok": True}
+  getRecordings: () => request("/api/recordings"),
 
+  // Editable test-data grid shown before running a saved recording (see
+  // generator/test_data.py) - lets a user change typed/selected values
+  // right in the browser instead of downloading the Excel report, editing
+  // it, and re-uploading. Edits persist into the recording file itself.
+  getRecordingTestData: (file) => request(`/api/recordings/data?${new URLSearchParams({ file })}`),
+  updateRecordingTestData: (file, values) =>
+    request(`/api/recordings/data?${new URLSearchParams({ file })}`, {
+      method: "PUT",
+      body: JSON.stringify({ values }),
+    }),
 
-# ---- Activity monitor -------------------------------------------------------
-
-def _parse_activity_filters(user_id, action, since, until):
-    since_dt = datetime.fromisoformat(since) if since else None
-    until_dt = datetime.fromisoformat(until) if until else None
-    return user_id, action, since_dt, until_dt
-
-
-@router.get("/activity")
-def list_activity(
-    user_id: Optional[int] = Query(default=None),
-    action: Optional[str] = Query(default=None),
-    since: Optional[str] = Query(default=None, description="ISO date/time"),
-    until: Optional[str] = Query(default=None, description="ISO date/time"),
-    limit: int = Query(default=200, le=2000),
-):
-    uid, act, since_dt, until_dt = _parse_activity_filters(user_id, action, since, until)
-    with get_session() as db:
-        rows = repo.list_activity(db, user_id=uid, action=act, since=since_dt, until=until_dt, limit=limit)
-        users_by_id = {u.user_id: u for u in repo.list_users(db)}
-        return [
-            {
-                "id": r.id,
-                "user_id": r.user_id,
-                "username": users_by_id[r.user_id].username if r.user_id in users_by_id else None,
-                "action": r.action,
-                "status": r.status,
-                "details": r.details,
-                "endpoint": r.endpoint,
-                "ip_address": r.ip_address,
-                "timestamp": r.timestamp.isoformat(),
-            }
-            for r in rows
-        ]
-
-
-@router.get("/activity/export")
-def export_activity(
-    user_id: Optional[int] = Query(default=None),
-    action: Optional[str] = Query(default=None),
-    since: Optional[str] = Query(default=None),
-    until: Optional[str] = Query(default=None),
-):
-    uid, act, since_dt, until_dt = _parse_activity_filters(user_id, action, since, until)
-    with get_session() as db:
-        rows = repo.list_activity(db, user_id=uid, action=act, since=since_dt, until=until_dt, limit=5000)
-        users_by_id = {u.user_id: u for u in repo.list_users(db)}
-
-        buf = io.StringIO()
-        writer = csv.writer(buf)
-        writer.writerow(["id", "timestamp", "username", "action", "status", "endpoint", "ip_address", "details"])
-        for r in rows:
-            writer.writerow([
-                r.id, r.timestamp.isoformat(),
-                users_by_id[r.user_id].username if r.user_id in users_by_id else "",
-                r.action, r.status, r.endpoint or "", r.ip_address or "", r.details or "",
-            ])
-        buf.seek(0)
-        return StreamingResponse(
-            iter([buf.getvalue()]),
-            media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=activity_export.csv"},
-        )
-
-
-# ---- Dashboard stats ---------------------------------------------------------
-
-@router.get("/dashboard/stats")
-def dashboard_stats():
-    with get_session() as db:
-        idle_cutoff = datetime.utcnow() - timedelta(minutes=IDLE_TIMEOUT_MINUTES)
-        active_sessions = repo.list_active_sessions(db, idle_cutoff)
-        users_by_status = repo.count_users_by_status(db)
-        today = datetime.utcnow().date()
-        today_start = datetime(today.year, today.month, today.day)
-
-        # Recording-run counts come from transactions/*.json, not the
-        # database - see runner/transaction_store.py.
-        txns_today = transaction_store.count_transactions_since(today_start)
-        txns_success_today = transaction_store.count_transactions_since(today_start, status="Success")
-
-        recent_activity = repo.list_activity(db, limit=15)
-        users_by_id = {u.user_id: u for u in repo.list_users(db)}
-
-        return {
-            "total_users": sum(users_by_status.values()),
-            "active_users": users_by_status.get("Active", 0),
-            "inactive_users": users_by_status.get("Inactive", 0),
-            "online_now": len(active_sessions),
-            "recording_now": recording_sessions.count_active_recordings(),
-            "runs_today": txns_today,
-            "runs_success_today": txns_success_today,
-            "recent_activity": [
-                {
-                    "username": users_by_id[r.user_id].username if r.user_id in users_by_id else None,
-                    "action": r.action,
-                    "status": r.status,
-                    "timestamp": r.timestamp.isoformat(),
-                }
-                for r in recent_activity
-            ],
-        }
+  // No more user_id - a saved recording always runs as whoever is logged in.
+  runRecording: (recording_file, headless) =>
+    request("/api/run_recording", { method: "POST", body: JSON.stringify({ recording_file, headless }) }),
+};
