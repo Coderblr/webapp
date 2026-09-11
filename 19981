@@ -1,155 +1,302 @@
 import { useEffect, useState } from "react";
 import Head from "next/head";
-import Link from "next/link";
 import Layout from "@/components/Layout";
 import RequireAuth from "@/components/RequireAuth";
-import { useAuth } from "@/context/AuthContext";
-import { adminApi, profileApi } from "@/lib/api";
-import { Callout, DataTable, Metric, Panel, PanelHeader, StatusBadge } from "@/components/ui";
+import { adminApi } from "@/lib/api";
+import {
+  Button,
+  Callout,
+  DataTable,
+  Field,
+  Panel,
+  PanelHeader,
+  Select,
+  StatusBadge,
+  TextInput,
+} from "@/components/ui";
 
-function greeting() {
-  const h = new Date().getHours();
-  if (h < 12) return "Good morning";
-  if (h < 17) return "Good afternoon";
-  return "Good evening";
-}
+const emptyForm = { username: "", first_name: "", last_name: "", department_code: "", email: "", temp_password: "", role: "user" };
 
-function ActionCard({ href, title, description, accent }) {
-  return (
-    <Link
-      href={href}
-      className="group block rounded-sm border border-line bg-panel p-5 shadow-crisp transition-colors hover:border-brand-blue"
-    >
-      <div className={`mb-3 h-1.5 w-8 rounded-full ${accent}`} />
-      <h3 className="text-sm font-semibold text-ink group-hover:text-brand-blueDark">{title}</h3>
-      <p className="mt-1.5 text-sm text-muted">{description}</p>
-    </Link>
-  );
-}
+export default function AdminUsersPage() {
+  const [users, setUsers] = useState([]);
+  const [loadError, setLoadError] = useState(null);
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+  const [roleFilter, setRoleFilter] = useState("");
 
-export default function DashboardPage() {
-  const { user } = useAuth();
-  const [myActivity, setMyActivity] = useState([]);
-  const [myActivityError, setMyActivityError] = useState(null);
-  const [stats, setStats] = useState(null);
-  const [statsError, setStatsError] = useState(null);
+  const [mode, setMode] = useState("create"); // "create" | "edit"
+  const [form, setForm] = useState(emptyForm);
+  const [editingUserId, setEditingUserId] = useState(null);
+  const [formBusy, setFormBusy] = useState(false);
+  const [formError, setFormError] = useState(null);
+  const [createdCredential, setCreatedCredential] = useState(null); // { username, temp_password }
+
+  const [rowBusyId, setRowBusyId] = useState(null);
+  const [rowNotice, setRowNotice] = useState(null);
+
+  async function loadUsers() {
+    try {
+      const data = await adminApi.listUsers({ search, status: statusFilter, role: roleFilter });
+      setUsers(data);
+      setLoadError(null);
+    } catch (e) {
+      setLoadError(e.detail || e.message);
+    }
+  }
 
   useEffect(() => {
-    profileApi
-      .activity(8)
-      .then(setMyActivity)
-      .catch((e) => setMyActivityError(e.detail || e.message));
+    loadUsers();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search, statusFilter, roleFilter]);
 
-    if (user && user.role === "admin") {
-      adminApi
-        .dashboardStats()
-        .then(setStats)
-        .catch((e) => setStatsError(e.detail || e.message));
+  function startCreate() {
+    setMode("create");
+    setEditingUserId(null);
+    setForm(emptyForm);
+    setFormError(null);
+    setCreatedCredential(null);
+  }
+
+  function startEdit(u) {
+    setMode("edit");
+    setEditingUserId(u.user_id);
+    setForm({
+      username: u.username,
+      first_name: u.first_name,
+      last_name: u.last_name,
+      department_code: u.department_code || "",
+      email: u.email || "",
+      temp_password: "",
+      role: u.role,
+    });
+    setFormError(null);
+    setCreatedCredential(null);
+  }
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setFormError(null);
+    setFormBusy(true);
+    try {
+      if (mode === "create") {
+        const created = await adminApi.createUser({
+          username: form.username,
+          first_name: form.first_name,
+          last_name: form.last_name,
+          department_code: form.department_code,
+          email: form.email || undefined,
+          temp_password: form.temp_password,
+          role: form.role,
+        });
+        setCreatedCredential({ username: created.username, temp_password: created.temp_password });
+        setForm(emptyForm);
+        await loadUsers();
+      } else {
+        await adminApi.updateUser(editingUserId, {
+          first_name: form.first_name,
+          last_name: form.last_name,
+          department_code: form.department_code,
+          email: form.email || undefined,
+          role: form.role,
+        });
+        await loadUsers();
+        startCreate();
+      }
+    } catch (err) {
+      setFormError(err.detail || err.message);
+    } finally {
+      setFormBusy(false);
     }
-  }, [user]);
+  }
+
+  async function handleResetPassword(u) {
+    setRowBusyId(u.user_id);
+    setRowNotice(null);
+    try {
+      const res = await adminApi.resetPassword(u.user_id);
+      setRowNotice({ tone: "success", text: `New temp password for ${u.username}: ${res.temp_password}` });
+    } catch (err) {
+      setRowNotice({ tone: "error", text: err.detail || err.message });
+    } finally {
+      setRowBusyId(null);
+    }
+  }
+
+  async function handleDelete(u) {
+    if (!window.confirm(`Deactivate and delete ${u.username}? They will no longer be able to log in.`)) return;
+    setRowBusyId(u.user_id);
+    setRowNotice(null);
+    try {
+      await adminApi.deleteUser(u.user_id);
+      setRowNotice({ tone: "success", text: `${u.username} deleted.` });
+      await loadUsers();
+    } catch (err) {
+      setRowNotice({ tone: "error", text: err.detail || err.message });
+    } finally {
+      setRowBusyId(null);
+    }
+  }
+
+  async function handleToggleStatus(u) {
+    setRowBusyId(u.user_id);
+    setRowNotice(null);
+    try {
+      await adminApi.updateUser(u.user_id, { status: u.status === "Active" ? "Inactive" : "Active" });
+      await loadUsers();
+    } catch (err) {
+      setRowNotice({ tone: "error", text: err.detail || err.message });
+    } finally {
+      setRowBusyId(null);
+    }
+  }
 
   return (
-    <RequireAuth>
+    <RequireAuth adminOnly>
       <Layout>
         <Head>
-          <title>Dashboard - AI Test Recorder</title>
+          <title>Manage users - AI Test Recorder</title>
         </Head>
 
-        <div className="mb-8">
-          <h1 className="text-2xl font-semibold tracking-tight text-ink">
-            {greeting()}, {user?.first_name || "there"}.
-          </h1>
-          <p className="mt-1 text-sm text-muted">
-            Here&rsquo;s what&rsquo;s happening with your test recordings.
-          </p>
+        <div className="mb-6 flex items-center justify-between">
+          <h1 className="text-2xl font-semibold tracking-tight text-ink">Users</h1>
         </div>
 
-        <div className="mb-8 grid gap-4 sm:grid-cols-3">
-          <ActionCard
-            href="/tool"
-            title="Record a new session"
-            description="Capture clicks and typing on any app, then generate a Behave + Playwright suite."
-            accent="bg-brand-blue"
-          />
-          <ActionCard
-            href="/tool"
-            title="Run a saved recording"
-            description="Re-run something you already recorded and get a full exit report."
-            accent="bg-brand-gold"
-          />
-          <ActionCard
-            href="/profile"
-            title="Your profile & activity"
-            description="Update your details and review everything you've done in the tool."
-            accent="bg-signal-slate"
-          />
-        </div>
-
-        {user?.role === "admin" && (
-          <div className="mb-8">
-            <div className="mb-3 flex items-center justify-between">
-              <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Platform overview</h2>
-              <Link href="/admin/users" className="text-sm font-medium text-brand-blue hover:text-brand-blueDark">
-                Manage users &rarr;
-              </Link>
-            </div>
-            {statsError && <Callout tone="error">Could not load platform stats: {statsError}</Callout>}
-            {stats && (
-              <>
-                <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-                  <Metric label="Total users" value={stats.total_users} />
-                  <Metric label="Online now" value={stats.online_now} />
-                  <Metric label="Runs today" value={stats.runs_today} />
-                  <Metric label="Passed today" value={stats.runs_success_today} />
-                </div>
-                <Panel className="mt-4">
-                  <PanelHeader title="Recent activity across all users" />
-                  <div className="px-5 py-4">
-                    <DataTable
-                      columns={[
-                        { key: "username", label: "User" },
-                        { key: "action", label: "Action", mono: true },
-                        { key: "status", label: "Status" },
-                        { key: "timestamp", label: "When", mono: true },
-                      ]}
-                      rows={stats.recent_activity.map((a) => ({
-                        username: a.username || "—",
-                        action: a.action,
-                        status: <StatusBadge status={a.status === "SUCCESS" ? "Success" : "Failed"} />,
-                        timestamp: new Date(a.timestamp).toLocaleString(),
-                      }))}
-                    />
-                  </div>
-                </Panel>
-              </>
-            )}
-          </div>
-        )}
-
-        <div>
-          <div className="mb-3 flex items-center justify-between">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Your recent activity</h2>
-            <Link href="/profile" className="text-sm font-medium text-brand-blue hover:text-brand-blueDark">
-              View all &rarr;
-            </Link>
-          </div>
-          {myActivityError && <Callout tone="error">Could not load your activity: {myActivityError}</Callout>}
+        <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
           <Panel>
-            <div className="px-5 py-4">
-              <DataTable
-                columns={[
-                  { key: "action", label: "Action", mono: true },
-                  { key: "status", label: "Status" },
-                  { key: "timestamp", label: "When", mono: true },
-                ]}
-                rows={myActivity.map((a) => ({
-                  action: a.action,
-                  status: <StatusBadge status={a.status === "SUCCESS" ? "Success" : "Failed"} />,
-                  timestamp: new Date(a.timestamp).toLocaleString(),
-                }))}
-              />
-            </div>
+            <PanelHeader
+              title={mode === "create" ? "Create user" : `Edit ${form.username}`}
+              caption={mode === "create" ? "Set up a new account. A temp password is generated if you leave it blank." : "Username can't be changed."}
+            />
+            <form className="space-y-4 px-5 py-5" onSubmit={handleSubmit}>
+              {formError && <Callout tone="error">{formError}</Callout>}
+              {createdCredential && (
+                <Callout tone="success">
+                  Created <strong>{createdCredential.username}</strong>. Temp password (shown once):{" "}
+                  <code className="rounded-sm bg-white px-1.5 py-0.5 font-mono">{createdCredential.temp_password}</code>
+                </Callout>
+              )}
+
+              <Field label="Username / ADID">
+                <TextInput
+                  value={form.username}
+                  onChange={(e) => setForm({ ...form, username: e.target.value })}
+                  disabled={mode === "edit"}
+                  required
+                />
+              </Field>
+              <Field label="First name">
+                <TextInput value={form.first_name} onChange={(e) => setForm({ ...form, first_name: e.target.value })} required />
+              </Field>
+              <Field label="Last name">
+                <TextInput value={form.last_name} onChange={(e) => setForm({ ...form, last_name: e.target.value })} required />
+              </Field>
+              <Field label="Department code">
+                <TextInput value={form.department_code} onChange={(e) => setForm({ ...form, department_code: e.target.value })} />
+              </Field>
+              <Field label="Email">
+                <TextInput type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
+              </Field>
+              {mode === "create" && (
+                <Field label="Temp password" hint="Leave blank to auto-generate a strong one.">
+                  <TextInput value={form.temp_password} onChange={(e) => setForm({ ...form, temp_password: e.target.value })} />
+                </Field>
+              )}
+              <Field label="Role">
+                <Select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })}>
+                  <option value="user">User</option>
+                  <option value="admin">Admin</option>
+                </Select>
+              </Field>
+
+              <div className="flex gap-2">
+                <Button type="submit" disabled={formBusy} className="flex-1">
+                  {formBusy ? "Saving..." : mode === "create" ? "Create user" : "Save changes"}
+                </Button>
+                {mode === "edit" && (
+                  <Button type="button" variant="secondary" onClick={startCreate}>
+                    Cancel
+                  </Button>
+                )}
+              </div>
+            </form>
           </Panel>
+
+          <div>
+            <Panel>
+              <div className="flex flex-wrap items-center gap-3 border-b border-line px-5 py-4">
+                <TextInput
+                  placeholder="Search name, username, email..."
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  className="max-w-xs"
+                />
+                <Select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="max-w-[160px]">
+                  <option value="">All statuses</option>
+                  <option value="Active">Active</option>
+                  <option value="Inactive">Inactive</option>
+                  <option value="Deleted">Deleted</option>
+                </Select>
+                <Select value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)} className="max-w-[140px]">
+                  <option value="">All roles</option>
+                  <option value="user">User</option>
+                  <option value="admin">Admin</option>
+                </Select>
+              </div>
+
+              <div className="px-5 py-5">
+                {loadError && <Callout tone="error">{loadError}</Callout>}
+                {rowNotice && <div className="mb-3"><Callout tone={rowNotice.tone}>{rowNotice.text}</Callout></div>}
+
+                <DataTable
+                  columns={[
+                    { key: "name", label: "Name" },
+                    { key: "username", label: "Username", mono: true },
+                    { key: "department", label: "Dept" },
+                    { key: "role", label: "Role" },
+                    { key: "status", label: "Status" },
+                    { key: "last_login", label: "Last login", mono: true },
+                    { key: "actions", label: "" },
+                  ]}
+                  rows={users.map((u) => ({
+                    name: `${u.first_name} ${u.last_name}`,
+                    username: u.username,
+                    department: u.department_code || "—",
+                    role: u.role,
+                    status: <StatusBadge status={u.status === "Active" ? "Success" : u.status === "Deleted" ? "Failed" : "Undefined"} />,
+                    last_login: u.last_login_at ? new Date(u.last_login_at).toLocaleString() : "never",
+                    actions: (
+                      <div className="flex flex-wrap gap-2">
+                        <button className="text-xs font-medium text-brand-blue hover:underline" onClick={() => startEdit(u)}>
+                          Edit
+                        </button>
+                        <button
+                          className="text-xs font-medium text-signal-slate hover:underline disabled:opacity-40"
+                          disabled={rowBusyId === u.user_id}
+                          onClick={() => handleResetPassword(u)}
+                        >
+                          Reset pw
+                        </button>
+                        <button
+                          className="text-xs font-medium text-signal-amber hover:underline disabled:opacity-40"
+                          disabled={rowBusyId === u.user_id}
+                          onClick={() => handleToggleStatus(u)}
+                        >
+                          {u.status === "Active" ? "Deactivate" : "Activate"}
+                        </button>
+                        <button
+                          className="text-xs font-medium text-signal-rust hover:underline disabled:opacity-40"
+                          disabled={rowBusyId === u.user_id}
+                          onClick={() => handleDelete(u)}
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    ),
+                  }))}
+                />
+              </div>
+            </Panel>
+          </div>
         </div>
       </Layout>
     </RequireAuth>
