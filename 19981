@@ -1,183 +1,172 @@
-import { getToken } from "@/lib/auth-storage";
+import { useCallback, useEffect, useState } from "react";
+import Head from "next/head";
+import Layout from "@/components/Layout";
+import RequireAuth from "@/components/RequireAuth";
+import { adminApi } from "@/lib/api";
+import { Button, Callout, DataTable, Panel, PanelHeader } from "@/components/ui";
 
-export const API_BASE =
-  (process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000").replace(/\/$/, "");
-
-// ws:// (http) or wss:// (https) - mirrors API_BASE's scheme so the live
-// recording view works the same in local dev and behind a TLS-terminating
-// reverse proxy in production, without a separate env var to keep in sync.
-export const WS_BASE = API_BASE.replace(/^http/, "ws");
-
-export class ApiError extends Error {
-  constructor(detail, status) {
-    super(detail);
-    this.detail = detail;
-    this.status = status;
-  }
+function timeAgoLabel(unixSeconds) {
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000 - unixSeconds));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ago`;
 }
 
-// Registered by AuthContext so any 401 anywhere (idle timeout, revoked
-// session, expired token, ...) immediately drops the user back to /login
-// instead of leaving them staring at a broken page.
-let unauthorizedHandler = null;
-export function setUnauthorizedHandler(fn) {
-  unauthorizedHandler = fn;
-}
+export default function AdminAgentsPage() {
+  const [agents, setAgents] = useState([]);
+  const [error, setError] = useState(null);
+  const [busyId, setBusyId] = useState(null);
+  const [notice, setNotice] = useState(null);
 
-async function request(path, init, { auth = true } = {}) {
-  const headers = { "Content-Type": "application/json", ...(init && init.headers) };
-  if (auth) {
-    const token = getToken();
-    if (token) headers.Authorization = `Bearer ${token}`;
-  }
-
-  let res;
-  try {
-    res = await fetch(`${API_BASE}${path}`, { ...init, headers, cache: "no-store" });
-  } catch (e) {
-    throw new ApiError(`Could not reach the backend at ${API_BASE}. Is it running? (${e.message})`, 0);
-  }
-
-  if (res.status === 401 && auth) {
-    let detail = "Session expired - please log in again.";
+  const load = useCallback(async () => {
     try {
-      const body = await res.json();
-      detail = body.detail || detail;
-    } catch {
-      /* no body */
+      setAgents(await adminApi.listAgents());
+      setError(null);
+    } catch (e) {
+      setError(e.detail || e.message);
     }
-    if (unauthorizedHandler) unauthorizedHandler(detail);
-    throw new ApiError(detail, 401);
-  }
+  }, []);
 
-  if (!res.ok) {
-    let detail = `${res.status} ${res.statusText}`;
+  useEffect(() => {
+    load();
+    const interval = setInterval(load, 10000); // this is a "who's connected right now" view
+    return () => clearInterval(interval);
+  }, [load]);
+
+  async function handleDisconnect(agent) {
+    if (!window.confirm(`Disconnect ${agent.full_name}'s desktop agent (${agent.hostname})? It will try to reconnect automatically.`)) {
+      return;
+    }
+    setBusyId(agent.agent_id);
+    setNotice(null);
     try {
-      const body = await res.json();
-      detail = body.detail || detail;
-    } catch {
-      /* no body */
+      await adminApi.disconnectAgent(agent.agent_id);
+      setNotice({ tone: "success", text: `Disconnected ${agent.hostname} - it will reconnect on its own if it's still running.` });
+      await load();
+    } catch (err) {
+      setNotice({ tone: "error", text: err.detail || err.message });
+    } finally {
+      setBusyId(null);
     }
-    throw new ApiError(detail, res.status);
   }
 
-  const contentType = res.headers.get("content-type") || "";
-  if (res.status === 204) return undefined;
-  if (contentType.includes("text/csv")) return res.text();
-  return res.json();
+  async function handleReset(agent) {
+    if (
+      !window.confirm(
+        `Reset ${agent.full_name}'s desktop agent (${agent.hostname})? This closes any browser it has open and clears a stuck "busy" state. ` +
+          `Use this if it shows "busy" but isn't actually recording/running anything - unlike Disconnect, this actually clears that.`
+      )
+    ) {
+      return;
+    }
+    setBusyId(agent.agent_id);
+    setNotice(null);
+    try {
+      await adminApi.resetAgent(agent.agent_id);
+      setNotice({ tone: "success", text: `Reset ${agent.hostname} - it should now show as idle.` });
+      await load();
+    } catch (err) {
+      setNotice({ tone: "error", text: err.detail || err.message });
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  const onlineCount = agents.filter((a) => !a.stale).length;
+
+  return (
+    <RequireAuth adminOnly>
+      <Layout>
+        <Head>
+          <title>Desktop agents - AI Test Recorder</title>
+        </Head>
+
+        <div className="mb-6 flex items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight text-ink">Desktop agents</h1>
+            <p className="mt-1 text-sm text-muted">
+              Every user's local desktop agent connection, refreshed every 10 seconds - this is what actually runs
+              recordings and tests on each person's own PC.
+            </p>
+          </div>
+          <Button variant="secondary" onClick={load}>
+            Refresh now
+          </Button>
+        </div>
+
+        {error && <Callout tone="error">{error}</Callout>}
+        {notice && (
+          <div className="mb-4">
+            <Callout tone={notice.tone}>{notice.text}</Callout>
+          </div>
+        )}
+
+        <Panel>
+          <PanelHeader title={`${onlineCount} online${agents.length !== onlineCount ? ` / ${agents.length} total` : ""}`} />
+          <div className="px-5 py-5">
+            {agents.length === 0 && !error && (
+              <p className="text-sm text-muted">No desktop agents have connected yet.</p>
+            )}
+            {agents.length > 0 && (
+              <DataTable
+                columns={[
+                  { key: "user", label: "User" },
+                  { key: "username", label: "Username", mono: true },
+                  { key: "hostname", label: "Hostname", mono: true },
+                  { key: "version", label: "Version", mono: true },
+                  { key: "status", label: "Status" },
+                  { key: "busy", label: "Busy" },
+                  { key: "last_seen", label: "Last heartbeat", mono: true },
+                  { key: "actions", label: "" },
+                ]}
+                rows={agents.map((a) => ({
+                  user: a.full_name,
+                  username: a.username,
+                  hostname: a.hostname || "—",
+                  version: a.version || "—",
+                  status: a.stale ? (
+                    <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-signal-rust">
+                      <span className="h-1.5 w-1.5 rounded-full bg-signal-rust" />
+                      Stale
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-signal-tealDark">
+                      <span className="pulse-dot h-1.5 w-1.5 rounded-full bg-signal-teal" />
+                      Online
+                    </span>
+                  ),
+                  busy: a.busy ? (
+                    <span className="text-xs font-medium text-signal-amber">Recording/running</span>
+                  ) : (
+                    <span className="text-xs text-muted">Idle</span>
+                  ),
+                  last_seen: timeAgoLabel(a.last_seen),
+                  actions: (
+                    <div className="flex gap-3">
+                      <button
+                        className="text-xs font-medium text-brand-blue hover:underline disabled:opacity-40"
+                        disabled={busyId === a.agent_id}
+                        onClick={() => handleReset(a)}
+                      >
+                        Reset
+                      </button>
+                      <button
+                        className="text-xs font-medium text-signal-rust hover:underline disabled:opacity-40"
+                        disabled={busyId === a.agent_id}
+                        onClick={() => handleDisconnect(a)}
+                      >
+                        Disconnect
+                      </button>
+                    </div>
+                  ),
+                }))}
+              />
+            )}
+          </div>
+        </Panel>
+      </Layout>
+    </RequireAuth>
+  );
 }
-
-// ---------------------------------------------------------------------------
-// Auth (no token required for /login)
-// ---------------------------------------------------------------------------
-
-export const authApi = {
-  login: (username, password) =>
-    request("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }, { auth: false }),
-
-  changePassword: (current_password, new_password, confirm_password) =>
-    request("/api/auth/change-password", {
-      method: "POST",
-      body: JSON.stringify({ current_password, new_password, confirm_password }),
-    }),
-
-  logout: () => request("/api/auth/logout", { method: "POST" }),
-
-  me: () => request("/api/auth/me"),
-
-  // SSO - not implemented on the backend yet (see auth/providers.py), but
-  // the plumbing is real: sso_status() tells the login page whether to
-  // treat the "Sign in with SSO" button as live or "coming soon", and
-  // ssoLoginUrl() is where it navigates to once it is.
-  ssoStatus: () => request("/api/auth/sso/status", undefined, { auth: false }),
-  ssoLoginUrl: () => `${API_BASE}/api/auth/sso/login`,
-};
-
-// ---------------------------------------------------------------------------
-// Profile
-// ---------------------------------------------------------------------------
-
-export const profileApi = {
-  get: () => request("/api/profile/me"),
-  update: (body) => request("/api/profile/me", { method: "PUT", body: JSON.stringify(body) }),
-  activity: (limit = 100) => request(`/api/profile/activity?limit=${limit}`),
-  exportActivityUrl: () => `${API_BASE}/api/profile/activity/export`,
-};
-
-// ---------------------------------------------------------------------------
-// Admin
-// ---------------------------------------------------------------------------
-
-function toQuery(params) {
-  const qs = new URLSearchParams(
-    Object.fromEntries(Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== ""))
-  ).toString();
-  return qs ? `?${qs}` : "";
-}
-
-export const adminApi = {
-  createUser: (body) => request("/api/admin/users", { method: "POST", body: JSON.stringify(body) }),
-  listUsers: (params = {}) => request(`/api/admin/users${toQuery(params)}`),
-  getUser: (id) => request(`/api/admin/users/${id}`),
-  updateUser: (id, body) => request(`/api/admin/users/${id}`, { method: "PUT", body: JSON.stringify(body) }),
-  deleteUser: (id) => request(`/api/admin/users/${id}`, { method: "DELETE" }),
-  resetPassword: (id, temp_password = "") =>
-    request(`/api/admin/users/${id}/reset-password`, { method: "POST", body: JSON.stringify({ temp_password }) }),
-
-  listSessions: () => request("/api/admin/sessions"),
-  revokeSession: (sessionId) => request(`/api/admin/sessions/${sessionId}/revoke`, { method: "POST" }),
-
-  listAgents: () => request("/api/admin/agents"),
-  disconnectAgent: (agentId) => request(`/api/admin/agents/${agentId}/disconnect`, { method: "POST" }),
-  resetAgent: (agentId) => request(`/api/admin/agents/${agentId}/reset`, { method: "POST" }),
-
-  listActivity: (params = {}) => request(`/api/admin/activity${toQuery(params)}`),
-  exportActivityUrl: (params = {}) => `${API_BASE}/api/admin/activity/export${toQuery(params)}`,
-
-  dashboardStats: () => request("/api/admin/dashboard/stats"),
-};
-
-// ---------------------------------------------------------------------------
-// Recorder tool endpoints (unchanged shapes, now all auth-required)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Local agent (desktop app) - see backend/agent_registry.py
-// ---------------------------------------------------------------------------
-
-export const agentApi = {
-  status: () => request("/api/agent/status"),
-};
-
-export const api = {
-  getApplications: () => request("/api/applications"),
-
-  startRecording: (body) => request("/api/start", { method: "POST", body: JSON.stringify(body) }),
-
-  getStatus: () => request("/api/status"),
-
-  stopAndSave: () => request("/api/stop_and_save", { method: "POST" }),
-
-  // Discards the current recording without saving/generating anything -
-  // for abandoning one mid-flow.
-  stopRecording: () => request("/api/stop", { method: "POST" }),
-
-  runCheck: (headless) => request("/api/run", { method: "POST", body: JSON.stringify({ headless }) }),
-
-  getRecordings: () => request("/api/recordings"),
-
-  // Editable test-data grid shown before running a saved recording (see
-  // generator/test_data.py) - lets a user change typed/selected values
-  // right in the browser instead of downloading the Excel report, editing
-  // it, and re-uploading. Edits persist into the recording file itself.
-  getRecordingTestData: (file) => request(`/api/recordings/data?${new URLSearchParams({ file })}`),
-  updateRecordingTestData: (file, values) =>
-    request(`/api/recordings/data?${new URLSearchParams({ file })}`, {
-      method: "PUT",
-      body: JSON.stringify({ values }),
-    }),
-
-  // No more user_id - a saved recording always runs as whoever is logged in.
-  runRecording: (recording_file, headless) =>
-    request("/api/run_recording", { method: "POST", body: JSON.stringify({ recording_file, headless }) }),
-};
