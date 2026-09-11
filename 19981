@@ -1,225 +1,384 @@
-// Builds the exit report client-side from the same JSON the API already
-// returns (POST /api/run_recording) - no extra backend endpoint needed,
-// and it works identically whether the report is opened in a new browser
-// tab or downloaded as a file.
+"""
+Everything here requires an admin (get_current_admin). This is the "admin
+can keep an eye on every user" surface:
 
-export function buildReportText(report) {
-  const line = "=".repeat(72);
-  const dash = "-".repeat(72);
-  const lines = [
-    line,
-    "AI TEST RECORDER - EXIT REPORT",
-    line,
-    `Transaction ID : ${report.transaction_id}`,
-    `Recording      : ${report.transaction_name}`,
-    `Run by         : ${report.user}`,
-    `Run at (UTC)   : ${report.date_time}`,
-    `Overall Status : ${report.status}`,
-    dash,
-    `${"#".padEnd(4)}${"Playwright Step".padEnd(50)}${"Status".padEnd(10)}`,
-    dash,
-  ];
-  report.steps.forEach((s, i) => {
-    lines.push(`${String(i + 1).padEnd(4)}${s.step_name.slice(0, 48).padEnd(50)}${s.status.padEnd(10)}`);
-    if (s.error_message) lines.push(`     -> ERROR: ${s.error_message}`);
-  });
-  lines.push(dash, `Passed: ${report.passed_count}   Failed: ${report.failed_count}   Total: ${report.step_count}`, line);
-  return lines.join("\n");
-}
+  User management     POST/GET/PUT/DELETE /api/admin/users, reset-password
+  Live sessions        GET /api/admin/sessions, POST .../revoke
+  Activity monitor     GET /api/admin/activity (+ /export as CSV)
+  Dashboard stats       GET /api/admin/dashboard/stats
+"""
+from __future__ import annotations
+import asyncio
+import csv
+import io
+from datetime import datetime, timedelta
+from typing import Optional
 
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from fastapi.responses import StreamingResponse
 
-// A hand-rolled SVG donut chart (no charting library) so the report stays
-// a single, self-contained HTML file that opens correctly straight from
-// disk or a blob URL, with no external script/CSS dependency to fetch.
-// Colors match the app's SBI-inspired palette (see tailwind.config.js) -
-// hardcoded here since a standalone exported file has no Tailwind to draw
-// on.
-function donutChartSvg(passed, failed) {
-  const total = passed + failed || 1;
-  const radius = 70;
-  const circumference = 2 * Math.PI * radius;
-  const passedLen = (passed / total) * circumference;
-  const passedPct = Math.round((passed / total) * 100);
+from database.db import get_session
+from database import repository as repo
+from runner import transaction_store
+from backend import recording_sessions, agent_registry
+from auth.dependencies import get_current_admin, get_client_ip, CurrentUser
+from auth.security import hash_password, generate_temp_password, validate_password_strength
+from auth.config import IDLE_TIMEOUT_MINUTES
+from auth.schemas import CreateUserRequest, UpdateUserRequest, ResetPasswordRequest, UserOut, CreateUserResponse
 
-  return `
-    <svg viewBox="0 0 180 180" width="180" height="180" role="img" aria-label="Passed vs failed steps">
-      <circle cx="90" cy="90" r="${radius}" fill="none" stroke="#F4D9D6" stroke-width="20" />
-      <circle cx="90" cy="90" r="${radius}" fill="none" stroke="#B3271E" stroke-width="20"
-        stroke-dasharray="${circumference} ${circumference}" transform="rotate(-90 90 90)" />
-      <circle cx="90" cy="90" r="${radius}" fill="none" stroke="#1E8A5F" stroke-width="20"
-        stroke-dasharray="${passedLen} ${circumference - passedLen}" transform="rotate(-90 90 90)" />
-      <text x="90" y="86" text-anchor="middle" font-size="30" font-weight="700" fill="#0B1E3D"
-        font-family="ui-monospace, Consolas, monospace">${passedPct}%</text>
-      <text x="90" y="106" text-anchor="middle" font-size="12" fill="#5B6B85"
-        font-family="Segoe UI, -apple-system, sans-serif">passed</text>
-    </svg>`;
-}
+router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(get_current_admin)])
 
-// A compact strip of one colored segment per step, in order - lets a
-// reader spot at a glance roughly where in a long run things started
-// failing, before even reading the table below it.
-function stepSequenceBarHtml(steps) {
-  if (!steps || steps.length === 0) return "";
-  const segments = steps
-    .map((s, i) => {
-      const color = s.status === "Passed" ? "#1E8A5F" : "#B3271E";
-      const title = `#${i + 1} ${escapeHtml(s.step_name)} — ${escapeHtml(s.status)}`;
-      return `<div title="${title}" style="flex:1;background:${color};height:100%;"></div>`;
-    })
-    .join("");
-  return `<div style="display:flex;gap:1px;height:12px;width:100%;border-radius:999px;overflow:hidden;border:1px solid #D8E1EF;background:#D8E1EF;margin:14px 0 4px;">${segments}</div>`;
-}
 
-export function buildReportHtml(report) {
-  const overallOk = report.status === "Success";
+def _user_out(user) -> UserOut:
+    return UserOut.model_validate(user)
 
-  const stepRows = report.steps
-    .map((s, i) => {
-      const ok = s.status === "Passed";
-      return `
-        <tr>
-          <td>${i + 1}</td>
-          <td>${escapeHtml(s.step_name)}</td>
-          <td><span class="badge ${ok ? "badge-pass" : "badge-fail"}">${escapeHtml(s.status)}</span></td>
-          <td class="mono">${escapeHtml(s.error_message || "")}</td>
-        </tr>`;
-    })
-    .join("");
 
-  const fileRows = (report.files || [])
-    .map((f) => `<tr><td>${escapeHtml(f.file_name)}</td><td class="mono">${escapeHtml(f.folder_path)}</td></tr>`)
-    .join("");
+# ---- Users ------------------------------------------------------------------
 
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Exit Report - Transaction #${report.transaction_id}</title>
-<style>
-  :root { color-scheme: light; }
-  * { box-sizing: border-box; }
-  body {
-    font-family: "Segoe UI", -apple-system, Inter, sans-serif;
-    background: #F4F7FC; color: #0B1E3D; margin: 0; padding: 0;
-  }
-  .topbar {
-    background: linear-gradient(90deg, #0E2A66 0%, #163C8C 60%, #1B4CA6 100%);
-    color: #fff; padding: 14px 24px; display: flex; align-items: center; gap: 10px;
-  }
-  .topbar .mark {
-    width: 28px; height: 28px; border-radius: 6px; background: rgba(255,255,255,0.15);
-    display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 13px;
-    border: 1px solid rgba(255,255,255,0.35);
-  }
-  .topbar .name { font-weight: 600; font-size: 14px; letter-spacing: .01em; }
-  .topbar .tag { font-size: 11px; color: rgba(255,255,255,0.75); margin-left: auto; }
-  .wrap { max-width: 900px; margin: 0 auto; padding: 32px 24px 40px; }
-  h1 { font-size: 20px; margin: 0 0 4px; }
-  h2 { font-size: 14px; margin: 0 0 14px; }
-  .sub { color: #5B6B85; font-size: 13px; margin-bottom: 24px; word-break: break-word; }
-  .card { background: #fff; border: 1px solid #D8E1EF; border-radius: 6px; padding: 24px; margin-bottom: 20px; }
-  .top { display: flex; align-items: center; gap: 32px; flex-wrap: wrap; }
-  .top-detail { flex: 1; min-width: 260px; }
-  .metrics { display: grid; grid-template-columns: repeat(2, minmax(120px, 1fr)); gap: 12px; margin-top: 10px; }
-  .metric { border: 1px solid #D8E1EF; padding: 12px 14px; border-radius: 6px; }
-  .metric .n { font-family: ui-monospace, Consolas, monospace; font-size: 22px; font-weight: 600; }
-  .metric .l { font-size: 11px; text-transform: uppercase; color: #5B6B85; letter-spacing: .04em; margin-top: 2px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #D8E1EF; vertical-align: top; word-break: break-word; }
-  th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #5B6B85; background: #EAF1FA; }
-  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
-  .badge {
-    display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px;
-    font-weight: 600; text-transform: uppercase; border: 1px solid transparent;
-  }
-  .badge-pass { background: #E4F5EC; color: #146342; border-color: rgba(30,138,95,.35); }
-  .badge-fail { background: #FBE8E6; color: #B3271E; border-color: rgba(179,39,30,.35); }
-  .status-pill { display: inline-flex; padding: 5px 14px; border-radius: 4px; font-weight: 700; font-size: 13px; text-transform: uppercase; }
-  pre {
-    white-space: pre-wrap; word-break: break-word; background: #0B1A33; color: #D7E1EF;
-    padding: 16px; border-radius: 6px; font-size: 12px; overflow: auto; margin: 0; max-height: 420px;
-  }
-  @media print { .topbar { -webkit-print-color-adjust: exact; print-color-adjust: exact; } body { background: #fff; } .card { border: none; box-shadow: none; } }
-</style>
-</head>
-<body>
-  <div class="topbar">
-    <div class="mark">SBI</div>
-    <div class="name">AI Test Recorder</div>
-    <div class="tag">State Bank of India — Internal Use</div>
-  </div>
-  <div class="wrap">
-    <h1>Exit Report</h1>
-    <div class="sub">
-      Transaction #${report.transaction_id} &middot; ${escapeHtml(report.transaction_name)} &middot;
-      run by ${escapeHtml(report.user)} &middot; ${escapeHtml(report.date_time)} UTC
-    </div>
+@router.post("/users", response_model=CreateUserResponse)
+def create_user(req: CreateUserRequest, request: Request, admin: CurrentUser = Depends(get_current_admin)):
+    ip = get_client_ip(request)
+    with get_session() as db:
+        if repo.get_user_by_username(db, req.username):
+            raise HTTPException(status_code=400, detail=f"Username/ADID '{req.username}' already exists.")
 
-    <div class="card top">
-      ${donutChartSvg(report.passed_count, report.failed_count)}
-      <div class="top-detail">
-        <span class="status-pill ${overallOk ? "badge-pass" : "badge-fail"}">${escapeHtml(report.status)}</span>
-        ${stepSequenceBarHtml(report.steps)}
-        <div class="metrics">
-          <div class="metric"><div class="n">${report.step_count}</div><div class="l">Steps</div></div>
-          <div class="metric"><div class="n">${report.passed_count}</div><div class="l">Passed</div></div>
-          <div class="metric"><div class="n">${report.failed_count}</div><div class="l">Failed</div></div>
-        </div>
-      </div>
-    </div>
+        temp_password = req.temp_password.strip() or generate_temp_password()
+        error = validate_password_strength(temp_password)
+        if error:
+            raise HTTPException(status_code=400, detail=f"Temp password: {error}")
 
-    <div class="card">
-      <h2>Automation log</h2>
-      <table>
-        <colgroup><col style="width:36px"><col><col style="width:100px"><col style="width:32%"></colgroup>
-        <thead><tr><th>#</th><th>Playwright step</th><th>Status</th><th>Error</th></tr></thead>
-        <tbody>${stepRows}</tbody>
-      </table>
-    </div>
+        user = repo.create_user_account(
+            db,
+            username=req.username,
+            first_name=req.first_name,
+            last_name=req.last_name,
+            department_code=req.department_code,
+            email=req.email,
+            password_hash=hash_password(temp_password),
+            role=req.role,
+        )
+        repo.log_activity(
+            db, user_id=admin.user_id, session_id=admin.session_id, action="USER_CREATED", status="SUCCESS",
+            details={"created_user_id": user.user_id, "username": user.username, "role": user.role},
+            endpoint="/api/admin/users", ip_address=ip,
+        )
+        out = _user_out(user).model_dump()
+        out["temp_password"] = temp_password  # only ever returned once, right after creation
+        return out
 
-    ${
-      fileRows
-        ? `<div class="card">
-      <h2>Files produced</h2>
-      <table><thead><tr><th>File</th><th>Folder</th></tr></thead><tbody>${fileRows}</tbody></table>
-    </div>`
-        : ""
-    }
 
-    <div class="card">
-      <h2>Raw Behave output</h2>
-      <pre>${escapeHtml(report.raw_output || "")}</pre>
-    </div>
-  </div>
-</body>
-</html>`;
-}
+@router.get("/users")
+def list_users(
+    status: Optional[str] = Query(default=None),
+    role: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None),
+):
+    with get_session() as db:
+        users = repo.list_user_accounts(db, status=status, role=role, search=search)
+        return [_user_out(u) for u in users]
 
-export function downloadBlob(filename, content, mimeType) {
-  const blob = new Blob([content], { type: mimeType });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
 
-/** Opens the HTML report directly in a new browser tab (Chrome/Edge -
- * whichever the user is already in), rather than downloading it first. */
-export function openReportInBrowser(report) {
-  const html = buildReportHtml(report);
-  const blob = new Blob([html], { type: "text/html" });
-  const url = URL.createObjectURL(blob);
-  window.open(url, "_blank", "noopener,noreferrer");
-  // Give the new tab time to actually load the blob before revoking it.
-  setTimeout(() => URL.revokeObjectURL(url), 60_000);
-}
+@router.get("/users/{user_id}", response_model=UserOut)
+def get_user(user_id: int):
+    with get_session() as db:
+        user = repo.get_user(db, user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found.")
+        return _user_out(user)
+
+
+@router.put("/users/{user_id}", response_model=UserOut)
+def update_user(user_id: int, req: UpdateUserRequest, request: Request, admin: CurrentUser = Depends(get_current_admin)):
+    ip = get_client_ip(request)
+    with get_session() as db:
+        user = repo.update_user_account(
+            db, user_id,
+            first_name=req.first_name, last_name=req.last_name, department_code=req.department_code,
+            email=req.email, role=req.role, status=req.status,
+        )
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found.")
+        repo.log_activity(
+            db, user_id=admin.user_id, session_id=admin.session_id, action="USER_UPDATED", status="SUCCESS",
+            details={"updated_user_id": user_id, **req.model_dump(exclude_none=True)},
+            endpoint=f"/api/admin/users/{user_id}", ip_address=ip,
+        )
+        return _user_out(user)
+
+
+@router.delete("/users/{user_id}")
+def delete_user(user_id: int, request: Request, admin: CurrentUser = Depends(get_current_admin)):
+    if user_id == admin.user_id:
+        raise HTTPException(status_code=400, detail="You cannot delete your own account.")
+    ip = get_client_ip(request)
+    with get_session() as db:
+        user = repo.soft_delete_user(db, user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found.")
+        repo.revoke_all_sessions_for_user(db, user_id, reason="account_deleted")
+        repo.log_activity(
+            db, user_id=admin.user_id, session_id=admin.session_id, action="USER_DELETED", status="SUCCESS",
+            details={"deleted_user_id": user_id, "username": user.username},
+            endpoint=f"/api/admin/users/{user_id}", ip_address=ip,
+        )
+        return {"ok": True}
+
+
+@router.post("/users/{user_id}/reset-password")
+def reset_password(user_id: int, req: ResetPasswordRequest, request: Request, admin: CurrentUser = Depends(get_current_admin)):
+    ip = get_client_ip(request)
+    temp_password = req.temp_password.strip() or generate_temp_password()
+    error = validate_password_strength(temp_password)
+    if error:
+        raise HTTPException(status_code=400, detail=f"Temp password: {error}")
+    with get_session() as db:
+        user = repo.set_user_password(db, user_id, hash_password(temp_password), must_change_password=True)
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found.")
+        repo.revoke_all_sessions_for_user(db, user_id, reason="password_reset")
+        repo.log_activity(
+            db, user_id=admin.user_id, session_id=admin.session_id, action="PASSWORD_RESET_BY_ADMIN", status="SUCCESS",
+            details={"target_user_id": user_id, "username": user.username},
+            endpoint=f"/api/admin/users/{user_id}/reset-password", ip_address=ip,
+        )
+        return {"ok": True, "temp_password": temp_password}
+
+
+# ---- Live sessions ("who's online") ------------------------------------------
+
+@router.get("/agents")
+def list_connected_agents():
+    """Per-installation visibility (spec: agent_id, user_id, status,
+    hostname, version, last_seen, connected_at) - one row per currently
+    registered desktop agent, across every user, not just the caller's
+    own. A stale (missed-heartbeat) connection is flagged rather than
+    silently listed as healthy - see agent_registry.is_stale."""
+    connections = agent_registry.list_agents()
+    with get_session() as db:
+        users_by_id = {u.user_id: u for u in repo.list_users(db)}
+        out = []
+        for conn in connections:
+            user = users_by_id.get(conn.user_id)
+            out.append({
+                "agent_id": conn.agent_id,
+                "user_id": conn.user_id,
+                "username": user.username if user else "unknown",
+                "full_name": f"{user.first_name} {user.last_name}".strip() if user else "unknown",
+                "hostname": conn.hostname,
+                "version": conn.version,
+                "busy": conn.busy,
+                "connected_at": conn.connected_at,
+                "last_seen": conn.last_seen,
+                "stale": agent_registry.is_stale(conn),
+            })
+        return out
+
+
+@router.post("/agents/{agent_id}/reset")
+async def reset_agent(agent_id: str, request: Request, admin: CurrentUser = Depends(get_current_admin)):
+    """Sends CLOSE_BROWSER to a specific agent - closes any stray browser
+    and clears its internal `busy` flag (see local_agent/command_handler.py).
+
+    This exists specifically because /disconnect above does NOT fix a
+    stuck-busy agent: CommandHandler (and its `busy` flag) is created once
+    per agent PROCESS lifetime (see local_agent/client.py), not per
+    connection, so force-closing the WebSocket just makes the agent
+    reconnect with the same stuck state. If a recording/test genuinely
+    never reached its own cleanup (browser closed manually outside the
+    app, a crash, or - before AGENT_TEST_TIMEOUT_SECONDS was tuned up -
+    the backend giving up on a slow-but-still-running execution) the
+    agent shows "Agent is busy with another recording/test execution" for
+    every future action until this is called (or the whole agent process
+    is restarted by hand) - this is the built-in fix instead of that."""
+    conn = agent_registry.get_by_agent_id(agent_id)
+    if conn is None:
+        raise HTTPException(status_code=404, detail="Agent not connected.")
+    ip = get_client_ip(request)
+    try:
+        response = await agent_registry.send_command(conn, "CLOSE_BROWSER", {}, timeout=15)
+    except (asyncio.TimeoutError, ConnectionError) as e:
+        raise HTTPException(status_code=502, detail=f"Agent did not respond to reset: {e}")
+    conn.busy = False
+    with get_session() as db:
+        repo.log_activity(
+            db, user_id=admin.user_id, session_id=admin.session_id, action="AGENT_RESET_BY_ADMIN",
+            status="SUCCESS", details={"agent_id": agent_id, "target_user_id": conn.user_id},
+            endpoint=f"/api/admin/agents/{agent_id}/reset", ip_address=ip,
+        )
+    return {"ok": response.get("ok", True)}
+
+
+@router.post("/agents/{agent_id}/disconnect")
+async def disconnect_agent(agent_id: str, request: Request, admin: CurrentUser = Depends(get_current_admin)):
+    """Force-closes a specific agent's WebSocket connection - the desktop
+    app's own reconnect loop (local_agent/connection_manager.py) will
+    immediately try to reconnect, so this is a "kick and let it come back"
+    action, not a permanent ban (use the Users/Sessions pages to actually
+    revoke access if that's the intent).
+
+    NOTE: this does NOT clear a stuck `busy` flag - see /reset above for
+    that; CommandHandler's busy state survives a reconnect since it's
+    scoped to the agent process, not the connection."""
+    conn = agent_registry.get_by_agent_id(agent_id)
+    if conn is None:
+        raise HTTPException(status_code=404, detail="Agent not connected.")
+    ip = get_client_ip(request)
+    try:
+        await conn.websocket.close(code=1000, reason="Disconnected by admin")
+    except Exception:
+        pass
+    agent_registry.unregister(agent_id)
+    with get_session() as db:
+        repo.log_activity(
+            db, user_id=admin.user_id, session_id=admin.session_id, action="AGENT_DISCONNECTED_BY_ADMIN",
+            status="SUCCESS", details={"agent_id": agent_id, "target_user_id": conn.user_id},
+            endpoint=f"/api/admin/agents/{agent_id}/disconnect", ip_address=ip,
+        )
+    return {"ok": True}
+
+
+@router.get("/sessions")
+def list_sessions():
+    """Includes `recording_active` per session - see
+    backend/recording_sessions.py - so an admin can see not just who's
+    logged in, but who's actively recording a flow right now."""
+    with get_session() as db:
+        idle_cutoff = datetime.utcnow() - timedelta(minutes=IDLE_TIMEOUT_MINUTES)
+        sessions = repo.list_active_sessions(db, idle_cutoff)
+        out = []
+        for s in sessions:
+            user = repo.get_user(db, s.user_id)
+            state = recording_sessions.get_state(s.session_id, s.user_id)
+            out.append({
+                "session_id": s.session_id,
+                "user_id": s.user_id,
+                "username": user.username if user else "unknown",
+                "full_name": f"{user.first_name} {user.last_name}".strip() if user else "unknown",
+                "role": user.role if user else "unknown",
+                "created_at": s.created_at.isoformat(),
+                "last_activity_at": s.last_activity_at.isoformat(),
+                "idle_seconds": int((datetime.utcnow() - s.last_activity_at).total_seconds()),
+                "ip_address": s.ip_address,
+                "user_agent": s.user_agent,
+                "recording_active": state.get("recorder") is not None,
+            })
+        return out
+
+
+@router.post("/sessions/{session_id}/revoke")
+def revoke_session(session_id: str, request: Request, admin: CurrentUser = Depends(get_current_admin)):
+    ip = get_client_ip(request)
+    with get_session() as db:
+        sess = repo.revoke_session(db, session_id, reason="admin_revoked")
+        if sess is None:
+            raise HTTPException(status_code=404, detail="Session not found.")
+        repo.log_activity(
+            db, user_id=admin.user_id, session_id=admin.session_id, action="SESSION_REVOKED", status="SUCCESS",
+            details={"revoked_session_id": session_id, "target_user_id": sess.user_id},
+            endpoint=f"/api/admin/sessions/{session_id}/revoke", ip_address=ip,
+        )
+        return {"ok": True}
+
+
+# ---- Activity monitor -------------------------------------------------------
+
+def _parse_activity_filters(user_id, action, since, until):
+    since_dt = datetime.fromisoformat(since) if since else None
+    until_dt = datetime.fromisoformat(until) if until else None
+    return user_id, action, since_dt, until_dt
+
+
+@router.get("/activity")
+def list_activity(
+    user_id: Optional[int] = Query(default=None),
+    action: Optional[str] = Query(default=None),
+    since: Optional[str] = Query(default=None, description="ISO date/time"),
+    until: Optional[str] = Query(default=None, description="ISO date/time"),
+    limit: int = Query(default=200, le=2000),
+):
+    uid, act, since_dt, until_dt = _parse_activity_filters(user_id, action, since, until)
+    with get_session() as db:
+        rows = repo.list_activity(db, user_id=uid, action=act, since=since_dt, until=until_dt, limit=limit)
+        users_by_id = {u.user_id: u for u in repo.list_users(db)}
+        return [
+            {
+                "id": r.id,
+                "user_id": r.user_id,
+                "username": users_by_id[r.user_id].username if r.user_id in users_by_id else None,
+                "action": r.action,
+                "status": r.status,
+                "details": r.details,
+                "endpoint": r.endpoint,
+                "ip_address": r.ip_address,
+                "timestamp": r.timestamp.isoformat(),
+            }
+            for r in rows
+        ]
+
+
+@router.get("/activity/export")
+def export_activity(
+    user_id: Optional[int] = Query(default=None),
+    action: Optional[str] = Query(default=None),
+    since: Optional[str] = Query(default=None),
+    until: Optional[str] = Query(default=None),
+):
+    uid, act, since_dt, until_dt = _parse_activity_filters(user_id, action, since, until)
+    with get_session() as db:
+        rows = repo.list_activity(db, user_id=uid, action=act, since=since_dt, until=until_dt, limit=5000)
+        users_by_id = {u.user_id: u for u in repo.list_users(db)}
+
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["id", "timestamp", "username", "action", "status", "endpoint", "ip_address", "details"])
+        for r in rows:
+            writer.writerow([
+                r.id, r.timestamp.isoformat(),
+                users_by_id[r.user_id].username if r.user_id in users_by_id else "",
+                r.action, r.status, r.endpoint or "", r.ip_address or "", r.details or "",
+            ])
+        buf.seek(0)
+        return StreamingResponse(
+            iter([buf.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=activity_export.csv"},
+        )
+
+
+# ---- Dashboard stats ---------------------------------------------------------
+
+@router.get("/dashboard/stats")
+def dashboard_stats():
+    with get_session() as db:
+        idle_cutoff = datetime.utcnow() - timedelta(minutes=IDLE_TIMEOUT_MINUTES)
+        active_sessions = repo.list_active_sessions(db, idle_cutoff)
+        users_by_status = repo.count_users_by_status(db)
+        today = datetime.utcnow().date()
+        today_start = datetime(today.year, today.month, today.day)
+
+        # Recording-run counts come from transactions/*.json, not the
+        # database - see runner/transaction_store.py.
+        txns_today = transaction_store.count_transactions_since(today_start)
+        txns_success_today = transaction_store.count_transactions_since(today_start, status="Success")
+
+        recent_activity = repo.list_activity(db, limit=15)
+        users_by_id = {u.user_id: u for u in repo.list_users(db)}
+
+        return {
+            "total_users": sum(users_by_status.values()),
+            "active_users": users_by_status.get("Active", 0),
+            "inactive_users": users_by_status.get("Inactive", 0),
+            "online_now": len(active_sessions),
+            "recording_now": recording_sessions.count_active_recordings(),
+            "runs_today": txns_today,
+            "runs_success_today": txns_success_today,
+            "recent_activity": [
+                {
+                    "username": users_by_id[r.user_id].username if r.user_id in users_by_id else None,
+                    "action": r.action,
+                    "status": r.status,
+                    "timestamp": r.timestamp.isoformat(),
+                }
+                for r in recent_activity
+            ],
+        }
