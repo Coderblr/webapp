@@ -1,136 +1,149 @@
 """
-Turns raw "copy"/"paste" actions captured by the injected JS (see
-recorder/recorder_injector.js's copy/cut/paste listeners) into the
-Capture -> Store -> Reuse variable pipeline:
-
-  1. A "copy" action's source field gets a stable {{name}} placeholder
-     derived from its label, e.g. a field labeled "Generated Username"
-     becomes {{username}}, "Generated Application ID" becomes
-     {{application_id}}.
-  2. Any LATER "paste" (or manually retyped "type") action whose recorded
-     value exactly matches a previously copied value is tagged with that
-     same placeholder, so the generator (generator/build.py) can emit a
-     step that resolves it from the LIVE value captured earlier in that
-     same run (see runner/variables.py) instead of a hard-coded literal.
-
-This module only ADDS optional keys to the action dicts it's given
-("captured_as" on copy actions, "resolved_var" on paste/type actions) - it
-never removes or rewrites an existing key, so recordings without any
-copy/paste in them (or JSON built before this feature existed) round-trip
-completely unchanged. It's also idempotent: running it twice on the same
-actions list keeps the same names, so generator/build.py can safely call it
-again as a safety net for recordings that were produced without going
-through Recorder.stop()'s hook.
+Turns the raw locator candidates captured by the injected JS into an
+ordered, deduplicated list of (strategy, value) pairs that the generated
+Page Object will try in order at runtime. Keeping multiple strategies per
+element (instead of a single selector) is what makes the recorded tests
+resilient - if the top strategy breaks (e.g. an id gets removed), the
+page object automatically falls back to the next one before ever
+resorting to the self-healing agent.
 """
 from __future__ import annotations
-from typing import Dict, List
+import re
+from typing import List, Dict
 
-# Words stripped from a source field's label before it becomes a variable
-# name, e.g. "Generated Username" -> "username", "Generated Application ID"
-# -> "application_id".
-_STOPWORDS = {
-    "generated", "generate", "new", "auto", "your", "the", "a", "an",
-    "current", "this", "field", "value", "display", "label", "output",
-}
+# Highest priority first. "note" hints are used to break ties when two
+# candidates share the same locator strategy.
+PRIORITY = [
+    ("CSS", "data-testid"),
+    ("ID", None),
+    ("NAME", None),
+    ("CSS", "aria-label"),
+    ("CSS", "placeholder"),
+    ("XPATH", "text"),
+    ("CSS", "generated-path"),
+    ("XPATH", "generated-path"),
+]
 
-
-def _locator_identity(action: Dict):
-    """A stable-ish key for 'is this the same physical element' - prefers the
-    first (highest-priority) captured locator, since two different actions
-    on the SAME element should always agree on it; falls back to the
-    element description for the rare case no locator was captured at all."""
-    locs = action.get("locators") or []
-    if locs:
-        top = locs[0]
-        return (top.get("strategy"), top.get("value"))
-    el = action.get("element") or {}
-    return (el.get("tag"), el.get("name"), el.get("placeholder"), el.get("ariaLabel"))
-
-
-def coalesce_consecutive_types(actions: List[Dict], window_ms: int = 3000) -> List[Dict]:
-    """
-    Merges a 'type' action into the immediately preceding one if both target
-    the SAME element and happened within `window_ms` of each other, keeping
-    the LATER value. Native/masked inputs (date pickers especially) commonly
-    fire more than one 'change' event for what the user experienced as ONE
-    edit - e.g. the browser reformatting "01092026" into "01/09/2026" right
-    after typing, or a native date picker's day/month/year segments each
-    firing their own change - which otherwise shows up as two separate,
-    confusingly-duplicated "enters X into Y" steps for the same field.
-    Only ADJACENT same-element 'type' actions are merged - an intervening
-    click/keypress/other action on something else breaks the chain, since
-    that's very likely a deliberate second visit to the field rather than
-    the same edit settling.
-    """
-    merged: List[Dict] = []
-    for action in actions:
-        if (
-            action.get("action") == "type"
-            and merged
-            and merged[-1].get("action") == "type"
-            and _locator_identity(action) == _locator_identity(merged[-1])
-            and (action.get("ts", 0) - merged[-1].get("ts", 0)) <= window_ms
-        ):
-            merged[-1] = {
-                **merged[-1],
-                "value": action.get("value"),
-                "ts": action.get("ts"),
-                "locators": action.get("locators") or merged[-1].get("locators"),
-            }
-            continue
-        merged.append(action)
-    return merged
+# Ids that LOOK author-assigned (e.g. id="submit-button") are a great, stable
+# locator. Ids that look like they were auto-generated by a framework's
+# internal counter are NOT - the same element can get a different id on the
+# next page load depending on everything else rendered before it, which is
+# exactly what breaks replay for e.g. Angular Material's
+# id="mat-radio-9-input" or React 18's useId() ids like ":r1a:". These are
+# deprioritized (tried LAST, after even the generated CSS/XPath path)
+# instead of trusted as a top-priority strategy the way a real id normally
+# would be.
+_UNSTABLE_ID_PATTERNS = [
+    re.compile(r"^mat-[\w-]+-\d+(-\w+)?$", re.I),   # Angular Material: mat-radio-9-input, mat-checkbox-3-input
+    re.compile(r"^cdk-[\w-]*\d+$", re.I),           # Angular CDK overlay/portal ids
+    re.compile(r"^:r[0-9a-z]+:$"),                  # React 18 useId(): :r1a:
+    re.compile(r"^ember\d+$", re.I),                # Ember
+    re.compile(r"^react-select-\d+-", re.I),        # react-select
+    re.compile(r"^mui-\d+$", re.I),                 # MUI
+    re.compile(r"^ng-\w+-\d+$", re.I),              # generic Angular-generated
+]
 
 
-def derive_variable_name(element: Dict, used_names: set) -> str:
-    """Heuristic, LLM-free variable-name generator for a copy source element."""
+def looks_like_unstable_id(value: str) -> bool:
+    return any(p.match(value) for p in _UNSTABLE_ID_PATTERNS)
+
+
+def order_locators(raw_locators: List[Dict]) -> List[Dict]:
+    """Sort raw locator candidates by robustness priority and drop exact dupes."""
+    seen = set()
+    ranked = []
+    for pref_strategy, pref_note in PRIORITY:
+        for loc in raw_locators:
+            if loc["strategy"] != pref_strategy:
+                continue
+            if pref_note and loc.get("note") != pref_note:
+                continue
+            if not pref_note and loc.get("note") not in (None, ""):
+                continue
+            if pref_strategy == "ID" and looks_like_unstable_id(loc["value"]):
+                continue  # handled in the deprioritized pass below instead
+            key = (loc["strategy"], loc["value"])
+            if key in seen:
+                continue
+            seen.add(key)
+            ranked.append(loc)
+
+    # deprioritized: ids that look framework-auto-generated (see above)
+    for loc in raw_locators:
+        if loc["strategy"] == "ID" and looks_like_unstable_id(loc["value"]):
+            key = (loc["strategy"], loc["value"])
+            if key not in seen:
+                seen.add(key)
+                ranked.append(loc)
+
+    # append anything not matched above (shouldn't normally happen)
+    for loc in raw_locators:
+        key = (loc["strategy"], loc["value"])
+        if key not in seen:
+            seen.add(key)
+            ranked.append(loc)
+    return ranked
+
+
+def suggest_element_name(action_record: Dict, used_names: set) -> str:
+    """Heuristic, LLM-free fallback name generator (used if no LLM key is configured)."""
+    el = action_record["element"]
+    action = action_record["action"]
+    el_type = (el.get("type") or "").lower()
+
     base = (
-        element.get("ariaLabel")
-        or element.get("placeholder")
-        or element.get("name")
-        or element.get("text")
-        or element.get("tag")
-        or "value"
+        el.get("ariaLabel")
+        or el.get("placeholder")
+        or el.get("name")
+        or el.get("text")
+        or el.get("tag")
+        or "element"
     )
-    tokens = "".join(c if c.isalnum() else " " for c in base.lower()).split()
-    filtered = [t for t in tokens if t not in _STOPWORDS]
-    tokens = filtered or tokens or ["value"]
-    name = "_".join(tokens)[:40].strip("_") or "value"
+    slug = "".join(c if c.isalnum() else "_" for c in base.lower()).strip("_")
+    slug = "_".join(filter(None, slug.split("_")))[:40] or "element"
 
-    candidate = name
+    if action == "type" and not slug.endswith("_input"):
+        slug += "_input"
+    elif action == "select" and not slug.endswith("_dropdown"):
+        slug += "_dropdown"
+    elif action == "keypress" and not slug.endswith("_field"):
+        slug += "_field"
+    elif action == "copy" and not slug.endswith("_source"):
+        slug += "_source"
+    elif action == "paste" and not slug.endswith("_input"):
+        slug += "_input"
+    elif action == "click":
+        if el_type == "radio" and not slug.endswith("_radio"):
+            slug += "_radio"
+        elif el_type == "checkbox" and not slug.endswith("_checkbox"):
+            slug += "_checkbox"
+        elif el.get("tag") in ("button", "a") and not slug.endswith("_button"):
+            slug += "_button"
+
+    name = slug
     n = 2
-    while candidate in used_names:
-        candidate = f"{name}_{n}"
+    while name in used_names:
+        name = f"{slug}_{n}"
         n += 1
-    used_names.add(candidate)
-    return candidate
+    used_names.add(name)
+    return name
 
 
-def annotate_variables(actions: List[Dict]) -> List[Dict]:
-    """
-    Walks the recording in order and stamps "captured_as" / "resolved_var"
-    onto the relevant action dicts in place (and also returns the list, for
-    convenience). See module docstring for the full behavior.
-    """
-    used_names: set = set()
-    captured_values: Dict[str, str] = {}  # copied text -> variable name
-
-    for action in actions:
-        kind = action.get("action")
-        value = action.get("value")
-
-        if kind in ("copy", "ocr_capture") and value:
-            var_name = action.get("captured_as") or captured_values.get(value)
-            if var_name:
-                used_names.add(var_name)
-            else:
-                var_name = derive_variable_name(action.get("element", {}), used_names)
-            captured_values[value] = var_name
-            action["captured_as"] = var_name
-
-        elif kind in ("paste", "type") and value:
-            var_name = action.get("resolved_var") or captured_values.get(value)
-            if var_name:
-                action["resolved_var"] = var_name
-
-    return actions
+def selector_for(strategy: str, value: str) -> str:
+    """Turns a captured (strategy, value) pair into a Playwright selector
+    string - kept behaviorally identical to
+    generator/templates/page.tmpl's own _selector_for (duplicated there
+    deliberately, so the generated recorded_page.py stays a self-contained
+    file with no runtime import dependency on this package). This copy is
+    for non-generated, in-process code that needs the same mapping - e.g.
+    recorder/recorder.py resolving an element to screenshot for an OCR
+    capture request during recording itself."""
+    if strategy == "ID":
+        return f'css=[id="{value}"]'
+    if strategy == "NAME":
+        return f'css=[name="{value}"]'
+    if strategy == "CSS":
+        return f"css={value}"
+    if strategy == "XPATH":
+        return f"xpath={value}"
+    raise ValueError(f"Unknown locator strategy '{strategy}'")
