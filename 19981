@@ -1,673 +1,328 @@
 """
-Playwright-driven recorder. Launches a real browser against the target
-application, injects the capture script so it survives navigations, and
-polls it for newly captured click/type actions until the user stops the
-recording. Produces a raw JSON recording that the generator/agent layer
-turns into feature/steps/page files.
+Takes a raw recording (list of actions from recorder.Recorder) and produces:
+  - output/features/recorded.feature
+  - output/features/steps/recorded_steps.py
+  - output/features/environment.py   (copied static file, see runner/environment.py)
+  - output/pages/recorded_page.py
+  - output/pages/locators.json
 
-Threading note (important): Playwright's SYNC API is NOT thread-safe - a
-Page/Browser/BrowserContext may only be used from the single thread that
-created it. `start()`/`stop()` may be called from any thread (e.g. a
-FastAPI request handler launches on one thread and stops from another),
-but everything that actually touches the browser (launch, polling,
-navigation, closing) runs on ONE dedicated worker thread owned by this
-Recorder - `start()`/`stop()` hand work off to that thread instead of
-calling Playwright directly from the caller's thread.
-
-An earlier version of this module polled from a SECOND background thread
-on a timer - that violated the rule above and silently broke capture
-(every poll call failed and was swallowed by a broad except). A version
-after that tried pushing actions from the page via
-`page.expose_function()` instead of polling - but Playwright's sync API
-only actually dispatches an exposed-function callback back to Python while
-the owning thread is blocked inside an actual Playwright call (e.g.
-`page.wait_for_timeout()`); a thread idling on a plain Python primitive
-like `queue.Queue.get()` never gets the callback delivered, so nothing
-was captured that way either. This version polls `page.evaluate()` in a
-loop, but - critically - that loop runs on the SAME worker thread that
-created the page, using `page.wait_for_timeout()` as the sleep so the
-loop is both safe (no cross-thread calls) and self-pumping.
-
-Live view (remote recording): the same worker thread also drives an
-optional CDP screencast (frames out) and input-forwarding (events in) -
-see `_start_screencast`/`_on_screencast_frame`/`queue_input`/
-`_drain_input_queue` below - so a hosted, headless recording can still be
-watched and controlled from a browser that isn't sitting at this machine.
-Frames/input cross the thread boundary via plain `queue.Queue`s, which
-*are* thread-safe, unlike Playwright's own API. The screencast always
-follows the ORIGINAL page (index 0 below) - a live view is inherently a
-single picture, so a popup opening doesn't change what's being streamed.
-
-Multi-page / multi-frame / dialog support (popups, target="_blank" links,
-window.open() new tabs/windows, and native alert/confirm/prompt dialogs):
-
-  - Every Playwright Page this Recorder ever sees (the original page, plus
-    any popup/new-tab/new-window Playwright reports via the browser
-    CONTEXT's "page" event) gets the SAME injector script and is polled
-    every tick alongside the original page - not just the one that was
-    open when recording started. Each flushed action is tagged with
-    "page_index" (0 = the original page, 1/2/... in creation order) so the
-    generator/replay side knows which browser tab/window it belongs to.
-  - A synthetic "new_window" action is recorded the instant a new page is
-    detected (before it's even finished loading), and "window_closed" the
-    instant one closes - both tagged with "opener_page_index" so replay
-    can switch back to whichever tab/window was active before/after.
-  - Native browser dialogs (alert/confirm/prompt/beforeunload) are
-    auto-accepted (Playwright hangs the page otherwise, since registering
-    ANY "dialog" listener switches off Playwright's own default
-    auto-dismiss) and logged as a synthetic "dialog" action so replay can
-    do the same and the exit report shows it happened.
-  - Frames/iframes: Playwright's `page.add_init_script()` already runs the
-    injector in every child frame too (not just the main document), so
-    clicks/types inside a same-origin iframe are captured by that frame's
-    own isolated copy of the script automatically - the gap was that
-    `page.evaluate()` only ever drains the MAIN frame's queue. This version
-    polls `page.frames` and drains each one, and (for any non-main frame)
-    computes a "frame_path" - a list of CSS selectors locating the chain of
-    <iframe> elements from the top page down to that frame - via
-    `Frame.frame_element()` plus the injector's exposed
-    `window.__recorderCssPathFor` helper, evaluated in each ancestor
-    frame's own context. See `_frame_path_for`.
+This is deterministic scaffolding; the only place an LLM is optionally
+consulted is agent/step_namer.py (naming elements + phrasing steps).
 """
 from __future__ import annotations
 import json
-import logging
-import queue
-import threading
-import time
+import math
+import shutil
 from pathlib import Path
 from datetime import datetime
 
-try:
-    from recorder.browser_factory import launch_browser
-except ImportError:
-    # allows `python recorder/recorder.py` to be run directly too
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from recorder.browser_factory import launch_browser
+from jinja2 import Environment, FileSystemLoader
 
-INJECTOR_PATH = Path(__file__).parent / "recorder_injector.js"
-logger = logging.getLogger(__name__)
+from recorder.locator_strategy import order_locators
+from agent.step_namer import name_step, key_label
 
+TEMPLATES_DIR = Path(__file__).parent / "templates"
+ROOT = Path(__file__).parent.parent
 
-def _json_safe_default(obj):
-    """
-    Passed as json.dumps()'s `default=` in save_recording_json below - a
-    last line of defense so a bug that leaks a live Playwright object
-    (Page, Frame, ElementHandle, etc.) into an action dict logs a clear
-    warning and coerces it to a string instead of crashing the WHOLE save
-    (and therefore losing the entire recording) with an opaque
-    "TypeError: Object of type Page is not JSON serializable" - which is
-    exactly what a closure bug in an event handler could produce (see
-    _attach_page's comment on the "close" event) and is worth guarding
-    against structurally, not just fixing the one instance of it.
-    """
-    logger.warning(
-        "Non-JSON-serializable value %r (%s) found while saving a recording - "
-        "coercing it to a string. This usually means a Playwright object leaked "
-        "into an action dict (a real bug worth reporting) rather than a plain "
-        "value; the recording is still saved, but check logs/error.log's "
-        "context around this warning.",
-        obj, type(obj).__name__,
-    )
-    return str(obj)
+# Floor for the measured recording-to-recording wait, so two actions that
+# happened to be recorded a fraction of a second apart don't generate an
+# unrealistically tight timeout.
+MIN_WAIT_SECONDS = 5
+# Used when no timing data is available at all (e.g. a hand-built recording).
+DEFAULT_WAIT_SECONDS = 10
 
 
-def _slugify(name: str, max_len: int = 50) -> str:
-    """Turns a free-typed recording name (e.g. "TXN-4521 / New Loan Application")
-    into a filesystem-safe filename fragment."""
-    cleaned = "".join(c if c.isalnum() else "_" for c in name.strip())
-    cleaned = "_".join(filter(None, cleaned.split("_")))
-    return cleaned[:max_len] or "recording"
+def build_artifacts(recording: dict, llm=None, output_dir: str = "output", mask_passwords: bool = True) -> dict:
+    out = Path(output_dir)
+    (out / "features" / "steps").mkdir(parents=True, exist_ok=True)
+    (out / "pages").mkdir(parents=True, exist_ok=True)
 
+    target_url = recording["target_url"]
+    actions = recording["actions"]
 
-def save_recording_json(target_url: str, actions: list, out_dir: str = "recordings", name: str = None) -> str:
-    """Writes a recording JSON in the exact shape/naming convention
-    Recorder.save() below uses - factored out so a recording captured by a
-    LOCAL AGENT (see backend/api.py's agent-mode /api/stop_and_save, and
-    local_agent/recording_manager.py) can be persisted server-side
-    identically to one captured by this process's own Recorder, with no
-    special-casing anywhere downstream (generator/build.py,
-    runner/run_recording.py, the "Run Saved Recording" list, etc. don't
-    know or care which path produced the file)."""
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{_slugify(name)}_{ts}.json" if name and name.strip() else f"recording_{ts}.json"
-    path = Path(out_dir) / filename
-    payload = {
-        "target_url": target_url,
-        "recorded_at": ts,
-        "recording_name": name.strip() if name and name.strip() else None,
-        "actions": actions,
-    }
-    path.write_text(json.dumps(payload, indent=2, default=_json_safe_default))
-    return str(path)
-
-
-class Recorder:
-    def __init__(self, target_url: str, headless: bool = False, poll_interval: float = 0.4,
-                 enable_live_view: bool = True):
-        self.target_url = target_url
-        self.headless = headless
-        self.poll_interval = poll_interval
-        self.session = None  # BrowserSession (playwright + browser + context) - only ever touched on _worker's thread
-        self.page = None     # Playwright Page for the ORIGINAL tab (index 0) - only ever touched on _worker's thread
-        self.actions = []    # accumulated raw actions
-        self._lock = threading.Lock()
-        self._js_source = INJECTOR_PATH.read_text()
-
-        # Multi-page bookkeeping (popups / new tabs / new windows) - all
-        # only ever touched on the worker thread, same as self.page/session.
-        # Each entry: {"page": <Page>, "index": int, "closed": bool}
-        self._pages = []
-        self._opener_of = {}   # page_index -> the page_index that was active when it was opened (or None for index 0)
-        self._active_index = 0  # index of the page we currently consider "in focus" (last one with recorded activity)
-
-        self._worker = None
-        self._ready_event = threading.Event()
-        self._stop_requested = threading.Event()
-        self._stopped_event = threading.Event()
-        self._start_error = None
-
-        # ---- live view (remote screencast + input forwarding) -----------
-        # Lets a browser that is NOT sitting in front of this machine (e.g.
-        # a hosted server with no desktop session, driven concurrently by
-        # several different users) see and control this recording via
-        # Chrome DevTools Protocol - see backend/api.py's /api/ws/record
-        # WebSocket, which bridges frames/input between here and the
-        # frontend's live-view widget. `_cdp`/frame-grabbing/input-dispatch
-        # only ever run on the SAME worker thread as everything else above
-        # (Playwright sync API constraint - see module docstring); the
-        # queues are what make it safe to hand frames/input across threads.
-        # Always tied to the ORIGINAL page (index 0) - see module docstring.
-        self.enable_live_view = enable_live_view
-        self._cdp = None
-        self._frame_queue: "queue.Queue[str]" = queue.Queue(maxsize=2)  # small: always prefer the newest frame
-        self._input_queue: "queue.Queue[dict]" = queue.Queue()
-
-    # ---- lifecycle -------------------------------------------------
-    def start(self):
-        """
-        Safe to call from any thread. Spins up the dedicated worker thread
-        that owns the browser (and does all the polling) for the rest of
-        this Recorder's life, and blocks (from the caller's thread) until
-        the browser is actually up and navigated, or raises whatever error
-        the worker hit while launching.
-        """
-        self._worker = threading.Thread(target=self._run, daemon=True)
-        self._worker.start()
-        if not self._ready_event.wait(timeout=30):
-            raise TimeoutError("Timed out waiting for the recorder's browser to launch")
-        if self._start_error is not None:
-            raise self._start_error
-        return self
-
-    # ---- multi-page / dialog / frame plumbing -----------------------
-    def _attach_page(self, page, index: int):
-        """Wires a Playwright Page (the original one, or a popup/new tab/new
-        window Playwright reported) so it's captured the same way as the
-        main page: re-injects the capture script on every navigation, and
-        auto-handles native dialogs. Safe to call for index 0 too."""
-        try:
-            page.add_init_script(self._js_source)
-        except Exception:
-            pass
-        page.on("dialog", lambda dialog, i=index: self._on_dialog(dialog, i))
-        # BUG-PRONE PATTERN AVOIDED: Playwright's "close" event calls the
-        # handler WITH the Page itself as a positional argument (unlike
-        # what you might assume from the JS API) - a lambda capturing
-        # `index` via a default value while ALSO accepting that positional
-        # arg under the SAME parameter name would silently receive the
-        # (now-closed) Page object instead of the intended int index,
-        # which then blows up json.dumps() in save_recording_json with
-        # "Object of type Page is not JSON serializable". Giving the
-        # incoming argument its own distinct name avoids that collision.
-        page.on("close", lambda closed_page, i=index: self._on_page_closed(i))
-
-    def _on_dialog(self, dialog, page_index: int):
-        """Native alert/confirm/prompt/beforeunload dialogs suspend the page
-        until accepted/dismissed - and once ANY listener is registered,
-        Playwright's own default auto-dismiss no longer applies, so this
-        MUST resolve the dialog itself or recording would hang the instant
-        the target app shows one. Always accepts (using the dialog's own
-        default value for prompts) and logs what happened as a synthetic
-        "dialog" action so the generated replay can do the same and the
-        exit report shows it occurred."""
-        try:
-            with self._lock:
-                self.actions.append({
-                    "ts": int(time.time() * 1000),
-                    "action": "dialog",
-                    "value": dialog.message,
-                    "dialog_type": dialog.type,
-                    "element": {"tag": "dialog", "type": dialog.type, "text": dialog.message,
-                                "placeholder": "", "name": "", "ariaLabel": ""},
-                    "locators": [],
-                    "url": None,
-                    "page_index": page_index,
-                    "frame_path": [],
-                })
-        finally:
-            try:
-                dialog.accept()
-            except Exception:
-                try:
-                    dialog.dismiss()
-                except Exception:
-                    pass
-
-    def _on_new_page(self, new_page):
-        """Fired by the browser CONTEXT (not a single page) whenever ANY
-        page/tab/window opens under it - a target="_blank" link, a
-        window.open() call, "open link in new tab", etc. Assigns it the
-        next index, records a synthetic "new_window" action immediately
-        (before the new page has even finished loading - its URL gets
-        picked up naturally on the next poll once it's flushed for the
-        first time), and starts capturing/polling it exactly like the
-        original page."""
-        with self._lock:
-            index = len(self._pages)
-            opener_index = self._active_index
-            self._pages.append({"page": new_page, "index": index, "closed": False})
-            self._opener_of[index] = opener_index
-            self.actions.append({
-                "ts": int(time.time() * 1000),
-                "action": "new_window",
-                "value": None,
-                "element": {"tag": "window", "type": "", "text": "", "placeholder": "", "name": "", "ariaLabel": ""},
-                "locators": [],
-                "url": None,
-                "page_index": index,
-                "opener_page_index": opener_index,
-                "frame_path": [],
-            })
-            self._active_index = index
-        self._attach_page(new_page, index)
-
-    def _on_page_closed(self, page_index: int):
-        """Fired when a tab/window closes (popup dismissed, user closes it,
-        etc). Marks it closed (so polling stops touching it) and records a
-        synthetic "window_closed" action tagged with the tab/window it was
-        opened FROM, so replay knows which one to switch back to."""
-        with self._lock:
-            for entry in self._pages:
-                if entry["index"] == page_index:
-                    entry["closed"] = True
-            opener_index = self._opener_of.get(page_index, 0)
-            self.actions.append({
-                "ts": int(time.time() * 1000),
-                "action": "window_closed",
-                "value": None,
-                "element": {"tag": "window", "type": "", "text": "", "placeholder": "", "name": "", "ariaLabel": ""},
-                "locators": [],
-                "url": None,
-                "page_index": page_index,
-                "opener_page_index": opener_index,
-                "frame_path": [],
-            })
-            self._active_index = opener_index
-
-    def _frame_path_for(self, frame) -> list:
-        """Builds the list of CSS selectors (outermost -> innermost) needed
-        to drill from the top of the page down to `frame` via nested
-        <iframe>/<frame> elements - e.g. ['#billing-iframe', 'iframe.step2']
-        means "the iframe found at #billing-iframe, and inside THAT
-        document, the iframe found at .step2". Used to tag actions that
-        happened inside an iframe so replay can resolve them the same way
-        (see page.tmpl's BasePage._root_for). Best-effort: if a selector
-        can't be computed for some ancestor (detached mid-navigation,
-        cross-origin quirk, etc.) falls back to a generic 'iframe' selector
-        rather than dropping the action's frame context entirely."""
-        chain = []
-        cur = frame
-        try:
-            while cur is not None and cur.parent_frame is not None:
-                parent = cur.parent_frame
-                selector = None
-                try:
-                    handle = cur.frame_element()
-                    selector = parent.evaluate(
-                        "(el) => (window.__recorderCssPathFor && el) ? window.__recorderCssPathFor(el) : null",
-                        handle,
-                    )
-                except Exception:
-                    selector = None
-                chain.append(selector or "iframe")
-                cur = parent
-        except Exception:
-            pass
-        chain.reverse()
-        return chain
-
-    def _process_ocr_request(self, frame, item: dict) -> None:
-        """Resolves the element the user right-clicked (see
-        recorder_injector.js's showOcrMenu/recordOcrCaptureRequest), takes
-        a fresh screenshot of just that element, and runs OCR on it - the
-        other half of recorder_injector.js's custom "Capture text with
-        OCR" context-menu item. Mutates `item` in place, turning the
-        request into a proper "ocr_capture" action with the extracted
-        text (or a clear error) - matching the same {"action",
-        "captured_as", "value", ...} shape recorder/variable_capture.py
-        already knows how to correlate for "copy" actions (extended there
-        to also recognize "ocr_capture" - see that module), so the
-        existing Capture -> Store -> Reuse {{var}} pipeline picks this up
-        for free downstream.
-
-        Runs synchronously on the worker thread (the same one that owns
-        the page - required, see this file's module docstring), so by the
-        time this action is added to self.actions the OCR result is
-        already known - no async round trip needed."""
-        var_name = item.get("requested_var_name") or "ocr_value"
-        locators = item.get("locators") or []
-        item["action"] = "ocr_capture"
-        item["captured_as"] = var_name
-
-        if not locators:
-            item["value"] = None
-            item["ocr_error"] = "No locator could be captured for the clicked element."
-            logger.warning(f"OCR capture for {{{{{var_name}}}}} failed: no locator captured")
-            return
-
-        from recorder.locator_strategy import selector_for
-        from recorder.ocr_engine import extract_text_from_png_bytes
-
-        extracted_text = None
-        last_error = None
-        # Same "try every captured locator strategy in priority order until
-        # one resolves" pattern used everywhere else (see page.tmpl) -
-        # robust against the top-priority one just happening not to match
-        # (e.g. a data-testid that's actually on a wrapper, not the visible
-        # image itself).
-        for candidate in locators:
-            try:
-                selector = selector_for(candidate["strategy"], candidate["value"])
-                png_bytes = frame.locator(selector).first.screenshot(timeout=5000)
-                extracted_text = extract_text_from_png_bytes(png_bytes)
-                break
-            except Exception as e:
-                last_error = str(e)
-                continue
-
-        item["value"] = extracted_text
-        if extracted_text is None:
-            item["ocr_error"] = last_error or "OCR capture failed for an unknown reason."
-            logger.warning(f"OCR capture for {{{{{var_name}}}}} failed: {item['ocr_error']}")
-        else:
-            logger.info(f"OCR captured {{{{{var_name}}}}} = {extracted_text!r}")
-            # Best-effort: also put it on the browser's clipboard so the
-            # person recording can genuinely Ctrl+V it into the next field
-            # instead of retyping it by hand - matches what the injector's
-            # own confirmation alert tells them to expect.
-            try:
-                frame.evaluate(
-                    "(text) => { if (navigator.clipboard && navigator.clipboard.writeText) "
-                    "navigator.clipboard.writeText(text); }",
-                    extracted_text,
-                )
-            except Exception:
-                pass
-
-    def _flush_once(self):
-        """Pulls whatever the injected script has queued since the last
-        flush, from EVERY tracked page and EVERY frame within each page (not
-        just the main frame of the original page - see module docstring).
-        Must only ever be called from the worker thread."""
-        for entry in list(self._pages):
-            if entry["closed"]:
-                continue
-            page = entry["page"]
-            index = entry["index"]
-            try:
-                frames = list(page.frames)
-            except Exception:
-                continue
-            main_frame = None
-            try:
-                main_frame = page.main_frame
-            except Exception:
-                pass
-            for frame in frames:
-                try:
-                    new_items = frame.evaluate(
-                        "() => window.__flushActions ? window.__flushActions() : []"
-                    )
-                except Exception:
-                    continue
-                if not new_items:
-                    continue
-                frame_path = [] if frame == main_frame else self._frame_path_for(frame)
-                for item in new_items:
-                    item["page_index"] = index
-                    item["frame_path"] = frame_path
-                    if item.get("action") == "ocr_capture_request":
-                        self._process_ocr_request(frame, item)
-                with self._lock:
-                    self.actions.extend(new_items)
-                self._active_index = index
-
-    # ---- live view: screencast (server -> viewer) --------------------
-    def _start_screencast(self):
-        """Best-effort: if CDP screencast can't be started (older browser,
-        channel quirk, whatever), the recording continues exactly as
-        before, just without a live remote view. Must only run on the
-        worker thread (creates a CDP session bound to self.page - the
-        ORIGINAL page, index 0; see module docstring)."""
-        try:
-            self._cdp = self.page.context.new_cdp_session(self.page)
-            self._cdp.on("Page.screencastFrame", self._on_screencast_frame)
-            self._cdp.send("Page.startScreencast", {
-                "format": "jpeg", "quality": 60,
-                "maxWidth": self.page.viewport_size["width"] if self.page.viewport_size else 1440,
-                "maxHeight": self.page.viewport_size["height"] if self.page.viewport_size else 900,
-                "everyNthFrame": 1,
-            })
-        except Exception:
-            self._cdp = None
-
-    def _on_screencast_frame(self, params: dict):
-        """CDP event handler - fires on Playwright's internal dispatch
-        thread, NOT necessarily the worker thread, so this only ever
-        touches the thread-safe queue (never self.page directly, other
-        than the required frame ack)."""
-        try:
-            self._cdp.send("Page.screencastFrameAck", {"sessionId": params["sessionId"]})
-        except Exception:
-            pass
-        data = params.get("data")  # base64-encoded JPEG, ready to hand straight to a client
-        if not data:
-            return
-        try:
-            self._frame_queue.get_nowait()  # drop the previous frame if the viewer hasn't read it yet
-        except queue.Empty:
-            pass
-        try:
-            self._frame_queue.put_nowait(data)
-        except queue.Full:
-            pass
-
-    def get_frame(self, timeout: float = 1.0) -> "str | None":
-        """Blocking pull of the latest screencast frame (base64 JPEG), for
-        a caller on ITS OWN thread (see backend/api.py's WS handler, which
-        calls this via asyncio.to_thread). Returns None on timeout, which
-        just means "nothing new yet" - not an error."""
-        try:
-            return self._frame_queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
-
-    # ---- live view: input forwarding (viewer -> server) ---------------
-    def queue_input(self, event: dict):
-        """Safe to call from any thread (e.g. the WS handler's async
-        context) - just enqueues; the actual CDP dispatch happens on the
-        worker thread in _drain_input_queue below."""
-        self._input_queue.put(event)
-
-    def _drain_input_queue(self):
-        """Must only run on the worker thread. Applies every queued input
-        event since the last poll tick."""
-        while True:
-            try:
-                event = self._input_queue.get_nowait()
-            except queue.Empty:
-                return
-            self._dispatch_input(event)
-
-    def _dispatch_input(self, event: dict):
-        if self._cdp is None:
-            return
-        kind = event.get("type")
-        try:
-            if kind in ("mousePressed", "mouseReleased", "mouseMoved", "mouseWheel"):
-                params = {
-                    "type": kind,
-                    "x": event.get("x", 0), "y": event.get("y", 0),
-                    "button": event.get("button", "left"),
-                    "clickCount": event.get("clickCount", 1),
-                }
-                if kind == "mouseWheel":
-                    params["deltaX"] = event.get("deltaX", 0)
-                    params["deltaY"] = event.get("deltaY", 0)
-                self._cdp.send("Input.dispatchMouseEvent", params)
-            elif kind == "insertText":
-                # Typed characters go through Input.insertText rather than
-                # raw key events - far more reliable for actually landing
-                # text in a field over CDP, and the existing
-                # recorder_injector.js still sees the resulting real
-                # 'input'/'change' DOM events exactly as if it were typed
-                # locally, so action capture is unaffected.
-                self._cdp.send("Input.insertText", {"text": event.get("text", "")})
-            elif kind in ("keyDown", "keyUp", "rawKeyDown"):
-                # Non-printable / control keys (Backspace, Enter, Tab,
-                # arrows, Escape, Ctrl/Alt combos, ...) that insertText
-                # can't express.
-                self._cdp.send("Input.dispatchKeyEvent", {
-                    "type": kind,
-                    "key": event.get("key", ""),
-                    "code": event.get("code", ""),
-                    "windowsVirtualKeyCode": event.get("keyCode", 0),
-                    "nativeVirtualKeyCode": event.get("keyCode", 0),
-                })
-        except Exception:
-            pass  # a dropped input event shouldn't crash the recording
-
-    def _run(self):
-        """Runs entirely on the dedicated worker thread - every Playwright call in
-        this Recorder's lifetime happens here, so nothing about it needs to be
-        thread-safe on its own, and it's the ONLY thread that ever touches
-        self.page/self.session/self._pages."""
-        try:
-            self.session = launch_browser(headless=self.headless)
-            self.page = self.session.new_page()
-            self._pages = [{"page": self.page, "index": 0, "closed": False}]
-            self._opener_of = {0: None}
-            self._active_index = 0
-
-            # Catches EVERY page/tab/window opened under this browser context
-            # from here on - popups, target="_blank" links, window.open().
-            self.session.context.on("page", self._on_new_page)
-
-            # Re-inject the capture script on every new document (survives
-            # navigation/SPA reloads, and every child iframe too - see module
-            # docstring) - also wires up dialog auto-handling for this page.
-            self._attach_page(self.page, 0)
-            self.page.goto(self.target_url)
-            if self.enable_live_view:
-                self._start_screencast()
-        except Exception as e:
-            self._start_error = e
-            self._ready_event.set()
-            return
-
-        self._ready_event.set()
-
-        # Poll for newly captured actions until stop() asks us to shut down.
-        # page.wait_for_timeout() is a real Playwright call (unlike
-        # time.sleep()/queue.get()), so it also keeps Playwright's own
-        # internal dispatch pumped correctly while we wait.
-        while not self._stop_requested.is_set():
-            self._flush_once()
-            self._drain_input_queue()
-            try:
-                self.page.wait_for_timeout(self.poll_interval * 1000)
-            except Exception:
-                break
-
-        # final flush + teardown, still on this same worker thread
-        self._flush_once()
-        if self.session:
-            self.session.close()
-
-        self._stopped_event.set()
-
-    def stop(self, timeout: float = 15) -> list:
-        """Safe to call from any thread. Signals the worker thread to flush and
-        tear down the browser, and waits (up to `timeout` seconds) for that to
-        finish. `timeout` is lowered by callers racing a hard deadline - e.g.
-        shutdown_guard.py gives itself only a few seconds to clean up before
-        Windows force-kills the process after a closed terminal window."""
-        if self._worker is not None and self._worker.is_alive():
-            self._stop_requested.set()
-            self._stopped_event.wait(timeout=timeout)
-
-        # Merge same-element 'type' actions that fired within a short window
-        # of each other (see coalesce_consecutive_types's docstring - mainly
-        # for masked/native date inputs firing more than one change event
-        # per user edit) - best-effort, and runs BEFORE variable annotation
-        # below so {{var}} correlation sees the final, de-duplicated values.
-        try:
-            from recorder.variable_capture import coalesce_consecutive_types
-            with self._lock:
-                self.actions = coalesce_consecutive_types(self.actions)
-        except Exception:
-            pass
-
-        # Enrich copy/paste actions with the Capture -> Store -> Reuse
-        # variable metadata (see recorder/variable_capture.py) - best-effort:
-        # if this module is missing for some reason, recording still works
-        # exactly as before, just without the {{var}} correlation.
-        try:
-            from recorder.variable_capture import annotate_variables
-            with self._lock:
-                self.actions = annotate_variables(self.actions)
-        except Exception:
-            pass
-
-        return self.actions
-
-    def save(self, out_dir: str = "recordings", name: str = None) -> str:
-        """
-        `name` is the user-provided label for this recording (e.g. a
-        transaction number or flow name, entered in the frontend) - used as
-        a human-readable filename prefix so it's identifiable in the "Run
-        Saved Recording" list, and stored as "recording_name" in the JSON
-        (see runner/run_recording.py, which prefers it over the raw
-        timestamp for the transaction name / exit report). Falls back to a
-        plain timestamped filename if no name was given, unchanged from
-        before.
-        """
-        with self._lock:
-            actions_snapshot = list(self.actions)
-        return save_recording_json(self.target_url, actions_snapshot, out_dir=out_dir, name=name)
-
-
-if __name__ == "__main__":
-    import argparse
-    import time
-    parser = argparse.ArgumentParser(description="Record a browser session")
-    parser.add_argument("--url", required=True)
-    parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--seconds", type=int, default=None, help="auto-stop after N seconds (omit to record until Ctrl+C)")
-    args = parser.parse_args()
-
-    rec = Recorder(args.url, headless=args.headless).start()
-    print("Recording started. Interact with the browser window.")
+    # Best-effort: merge same-element 'type' actions that fired within a
+    # short window of each other (see coalesce_consecutive_types's docstring)
+    # in case this recording predates that fix, or was regenerated from a
+    # previously-saved recording. Runs BEFORE variable annotation below so
+    # {{var}} correlation sees the final, de-duplicated values.
     try:
-        if args.seconds:
-            time.sleep(args.seconds)
-        else:
-            input("Press ENTER to stop recording...\n")
-    except KeyboardInterrupt:
+        from recorder.variable_capture import coalesce_consecutive_types
+        actions = coalesce_consecutive_types(actions)
+    except Exception:
         pass
-    rec.stop()
-    path = rec.save()
-    print(f"Saved recording to {path}")
+
+    # Best-effort: derive/refresh the Capture -> Store -> Reuse {{var}} metadata
+    # (see recorder/variable_capture.py) in case this recording was produced
+    # before that hook existed in Recorder.stop(), or was built by hand. Safe
+    # to call even if it already ran - it's idempotent.
+    try:
+        from recorder.variable_capture import annotate_variables
+        actions = annotate_variables(actions)
+    except Exception:
+        pass
+
+    used_names = set()
+    steps = []
+    locators_map = {}
+    prev_ts = None
+
+    # Tracks which browser tab/window index (0 = the one the recording
+    # started on) replay currently considers "active", as we walk the
+    # recording in order - lets each real interactive step know whether it
+    # needs to switch tabs/windows first (see step["switch_to_page"] below),
+    # and lets a "new_window"/"window_closed" synthetic action fold its
+    # effect into the step it belongs with instead of needing its own.
+    current_page_index = 0
+
+    # Parallel to `actions` (NOT to `steps` - a "new_window" action folds
+    # into the PRECEDING step and produces no step of its own, so the two
+    # lists can differ in length) - used for the Excel report below, which
+    # needs one label per ACTION, including the synthetic ones.
+    excel_labels = []
+
+    for action in actions:
+        kind = action["action"]
+        page_index = action.get("page_index", 0)
+        frame_path = action.get("frame_path") or []
+
+        # Explicit wait: how long the app actually took, during recording, to
+        # reach the state this action needed (i.e. the gap between the
+        # previous recorded action and this one) - so a step that recorded
+        # slow (e.g. a 50s dashboard load) gets a matching wait_ready()
+        # timeout, while a fast one doesn't sit around waiting needlessly.
+        # Computed here (before the branches below) so it's available for
+        # synthetic popup/dialog/window actions too, not just the "normal"
+        # interactive ones further down.
+        ts = action.get("ts")
+        if prev_ts is None or ts is None:
+            wait_seconds = DEFAULT_WAIT_SECONDS
+        else:
+            wait_seconds = max(MIN_WAIT_SECONDS, math.ceil((ts - prev_ts) / 1000.0))
+        if ts is not None:
+            prev_ts = ts
+
+        # --- popup / new tab / new window --------------------------------
+        # Doesn't get its own replay step: Playwright can only reliably
+        # catch a new page by wrapping the ACTION THAT CAUSED IT in
+        # context.expect_page() (see steps.tmpl's new_page_wrapper macro),
+        # so this folds forward onto the step that was just appended
+        # (almost always the click that opened it) instead. If this is
+        # somehow the very first action in the whole recording (no
+        # preceding step to fold onto - e.g. the app pops a window
+        # immediately on load), falls back to a standalone step that just
+        # waits for one to appear.
+        if kind == "new_window":
+            if steps:
+                steps[-1]["opens_new_page"] = True
+                steps[-1]["new_page_index"] = page_index
+            else:
+                steps.append({
+                    "action": "new_window_wait",
+                    "element_name": None,
+                    "step_phrase": "waits for a new browser tab or window to open",
+                    "wait_seconds": wait_seconds,
+                    "new_page_index": page_index,
+                })
+            current_page_index = page_index
+            excel_labels.append(f"(new browser tab/window #{page_index} opens)")
+            continue
+
+        # --- tab/window closed --------------------------------------------
+        if kind == "window_closed":
+            opener_index = action.get("opener_page_index", 0) or 0
+            steps.append({
+                "action": "window_closed",
+                "element_name": None,
+                "step_phrase": "closes the browser tab or window",
+                "wait_seconds": wait_seconds,
+                "closed_page_index": page_index,
+                "switch_back_to_index": opener_index,
+            })
+            current_page_index = opener_index
+            excel_labels.append(f"(browser tab/window #{page_index} closed)")
+            continue
+
+        # --- native alert/confirm/prompt/beforeunload dialog --------------
+        if kind == "dialog":
+            steps.append({
+                "action": "dialog",
+                "element_name": None,
+                "step_phrase": "handles a browser dialog",
+                "wait_seconds": wait_seconds,
+                "dialog_type": action.get("dialog_type") or "alert",
+                "dialog_message": action.get("value") or "",
+            })
+            excel_labels.append(f"(dialog: {action.get('dialog_type') or 'alert'})")
+            continue
+
+        # --- OCR capture (right-click on the page -> "Capture text with
+        # OCR" - see recorder_injector.js's showOcrMenu and
+        # recorder.py's _process_ocr_request). Needs its own branch (not
+        # the generic name_step() path below) because its replay behavior
+        # is fundamentally different from a normal "copy" capture -
+        # screenshot + OCR, not a DOM/clipboard read - and it deserves its
+        # own clearly distinct step wording rather than reusing "captures
+        # the value of..." in a way that would misleadingly suggest a
+        # plain DOM read. Still needs a real locator (to know what to
+        # screenshot at replay time), so it's NOT folded away like
+        # new_window/dialog are.
+        if kind == "ocr_capture":
+            var_name = action.get("captured_as") or "ocr_value"
+            element_name = f"{var_name}_ocr_target"
+            n = 2
+            while element_name in locators_map or element_name in used_names:
+                element_name = f"{var_name}_ocr_target_{n}"
+                n += 1
+            used_names.add(element_name)
+            ordered = order_locators(action.get("locators") or [])
+            locators_map[element_name] = [
+                {"strategy": l["strategy"], "value": l["value"], "frame_path": frame_path} for l in ordered
+            ]
+            switch_to_page = page_index != current_page_index
+            current_page_index = page_index
+            steps.append({
+                "action": "ocr_capture",
+                "element_name": element_name,
+                "step_phrase": None,
+                "wait_seconds": wait_seconds,
+                "var_name": var_name,
+                "var_placeholder": "{{" + var_name + "}}",
+                "var_placeholder_escaped": "{{{{" + var_name + "}}}}",
+                "page_index": page_index,
+                "switch_to_page": switch_to_page,
+                "opens_new_page": False,
+                "new_page_index": None,
+            })
+            excel_labels.append(element_name)
+            continue
+
+        # --- normal interactive action -------------------------------------
+        naming = name_step(llm, action, used_names)
+        element_name = naming["element_name"]
+        ordered = order_locators(action["locators"])
+        locators_map[element_name] = [
+            {"strategy": l["strategy"], "value": l["value"], "frame_path": frame_path} for l in ordered
+        ]
+        is_keypress = action["action"] == "keypress"
+        key_name = action.get("value") if is_keypress else None
+
+        # If this action happened on a different tab/window than the one
+        # replay currently has "active", the generated step needs to switch
+        # to it FIRST (see steps.tmpl's maybe_switch macro) - covers both
+        # continuing in a just-opened popup and coming back to the original
+        # window after closing one.
+        switch_to_page = page_index != current_page_index
+        current_page_index = page_index
+
+        # Capture -> Store -> Reuse: "copy" actions get the derived variable
+        # name they were captured as; "paste"/"type" actions get the variable
+        # name they were correlated to (if their recorded value matched an
+        # earlier copy). Both drive a {{name}} placeholder used in the
+        # generated feature/steps text and resolved live at playback time
+        # (see runner/variables.py) instead of a hard-coded literal.
+        var_name = None
+        if action["action"] == "copy":
+            var_name = action.get("captured_as")
+        elif action["action"] in ("paste", "type"):
+            var_name = action.get("resolved_var")
+        var_placeholder = "{{" + var_name + "}}" if var_name else None
+        # behave matches step text with the `parse` library, which treats "{{" / "}}"
+        # in a @when(...) pattern as escaped literal single braces (str.format()-style) -
+        # so the DECORATOR needs 4 braces to literally match the feature file's 2-brace
+        # "{{name}}" text. Only the decorator pattern needs this; the runtime code that
+        # builds/resolves the value uses var_placeholder as-is.
+        var_placeholder_escaped = "{{{{" + var_name + "}}}}" if var_name else None
+
+        # Radio/checkbox clicks are recorded with the RESULTING checked state
+        # as their value (see recorder_injector.js's click listener) - route
+        # these to an explicit "toggle" step (Playwright's idempotent
+        # check()/uncheck() via BasePage.set_checked) instead of a plain
+        # click, so replay sets the exact recorded state instead of blindly
+        # toggling - a blind click is what risked a double-toggle if an
+        # earlier click fallback tier actually succeeded before a later
+        # tier ran anyway, and it can't tell "already correct" from "needs
+        # a click" the way an explicit target state can.
+        element_type = (action.get("element") or {}).get("type", "")
+        is_toggle = action["action"] == "click" and element_type in ("radio", "checkbox")
+        checked_value = bool(action.get("value")) if is_toggle else None
+
+        steps.append({
+            "action": "toggle" if is_toggle else action["action"],
+            "element_name": element_name,
+            "value": action.get("value") or "",
+            "checked_value": checked_value,
+            "step_phrase": naming["step_phrase"],
+            # Only set for "keypress" actions - the recorded key (e.g. "ENTER", "ARROW_DOWN",
+            # "CTRL+A") and its human-readable label, used by feature.tmpl/steps.tmpl to
+            # generate a step per key rather than assuming Enter.
+            "key_name": key_name,
+            "key_label": key_label(key_name) if key_name else None,
+            # Only set when this action is part of a Capture -> Store -> Reuse chain.
+            "var_name": var_name,
+            "var_placeholder": var_placeholder,
+            "var_placeholder_escaped": var_placeholder_escaped,
+            # Explicit wait timeout (seconds) measured from the recording -
+            # see BasePage.wait_ready in page.tmpl / steps.tmpl.
+            "wait_seconds": wait_seconds,
+            # Popup/new-tab/new-window support (see comments above) - which
+            # tab/window this action runs on, whether the step needs to
+            # switch to it first, and whether IT is the action that causes a
+            # new tab/window to open (set retroactively above when a later
+            # "new_window" action is folded onto this one).
+            "page_index": page_index,
+            "switch_to_page": switch_to_page,
+            "opens_new_page": False,
+            "new_page_index": None,
+        })
+        excel_labels.append(element_name)
+
+    env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)), trim_blocks=True, lstrip_blocks=True)
+
+    feature_text = env.get_template("feature.tmpl").render(
+        scenario_name="Recorded transaction",
+        recorded_at=recording.get("recorded_at", datetime.now().isoformat()),
+        target_url=target_url,
+        steps=steps,
+    )
+    steps_text = env.get_template("steps.tmpl").render(steps=steps)
+    page_text = env.get_template("page.tmpl").render(element_names=list(locators_map.keys()))
+
+    (out / "features" / "recorded.feature").write_text(feature_text)
+    (out / "features" / "steps" / "recorded_steps.py").write_text(steps_text)
+    (out / "pages" / "recorded_page.py").write_text(page_text)
+    (out / "pages" / "locators.json").write_text(json.dumps(locators_map, indent=2))
+
+    # environment.py is static (Playwright browser setup/teardown) - copy it in
+    env_src = ROOT / "runner" / "environment.py"
+    if env_src.exists():
+        shutil.copy(env_src, out / "features" / "environment.py")
+
+    (out / "pages" / "__init__.py").touch()
+
+    excel_path = None
+    try:
+        # imported lazily (not at module load time) so a missing/broken
+        # pandas or openpyxl install - or a stale extraction missing this
+        # file - degrades to "no Excel report" instead of crashing the
+        # whole backend at startup.
+        from generator.excel_export import build_excel_report
+        excel_path = build_excel_report(
+            recording,
+            element_names=excel_labels,
+            output_path=str(out / "recorded_steps.xlsx"),
+            mask_passwords=mask_passwords,
+            actions=actions,
+        )
+    except Exception as e:
+        print(f"[warning] Skipped Excel report ({type(e).__name__}: {e}). "
+              f"Feature/steps/page files were still generated normally.")
+
+    return {
+        "feature_file": str(out / "features" / "recorded.feature"),
+        "steps_file": str(out / "features" / "steps" / "recorded_steps.py"),
+        "page_file": str(out / "pages" / "recorded_page.py"),
+        "locators_file": str(out / "pages" / "locators.json"),
+        "excel_report": excel_path,
+        "element_count": len(locators_map),
+        "step_count": len(steps),
+    }
