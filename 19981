@@ -1,351 +1,135 @@
-import { useEffect, useState } from "react";
-import { api } from "@/lib/api";
-import { recordingsApi } from "@/lib/api";
-import { useAuth } from "@/context/AuthContext";
-import { buildReportText, buildReportHtml, downloadBlob, openReportInBrowser } from "@/lib/report";
-import { ReportDonut, StepSequenceBar } from "@/components/ReportCharts";
-import {
-  Button,
-  Callout,
-  Checkbox,
-  DataTable,
-  Disclosure,
-  Field,
-  Metric,
-  Panel,
-  PanelHeader,
-  Select,
-  Spinner,
-  StatusBadge,
-  TextInput,
-} from "@/components/ui";
+"""
+Shared OCR helper, used at BOTH:
+  - RECORD time (recorder/recorder.py, when the user right-clicks an
+    element on the page and chooses "Capture text with OCR" from the
+    custom menu injected by recorder_injector.js)
+  - REPLAY time (generator/templates/page.tmpl's
+    BasePage.capture_value_ocr, called from the generated step - see
+    generator/templates/steps.tmpl's "ocr_capture" branch)
 
-export default function RunSavedTab() {
-  const { user } = useAuth();
+One implementation, so both always extract text the exact same way - and
+critically, REPLAY re-runs the OCR live every single time the test
+executes (a fresh screenshot, fresh OCR pass) rather than reusing
+whatever text was read during recording, the same way a plain
+copy-captured value is re-read live rather than hard-coded (see
+recorder/variable_capture.py's module docstring) - these are usually
+values the application generates fresh each run (a new application
+number, a new reference ID rendered into an image/canvas rather than
+real DOM text), so baking in the recording-time value would make the
+generated test increasingly wrong over time.
 
-  const [recordings, setRecordings] = useState([]);
-  const [recordingsError, setRecordingsError] = useState(null);
-  const [selectedRecFile, setSelectedRecFile] = useState("");
-  const [runHeadless, setRunHeadless] = useState(false);
+Uses EasyOCR - a pure-Python OCR engine (pip install easyocr, nothing
+else to install separately, unlike Tesseract) built on PyTorch. This is a
+genuine trade-off, not a strictly-better choice, worth understanding:
+  - Nothing to install on the target machine beyond `pip install easyocr`
+    (or whatever's bundled into local_agent's frozen build) - no separate
+    binary, no PATH configuration, no corporate-security exclusion needed
+    for a second executable.
+  - But: it's a MUCH heavier dependency (EasyOCR pulls in PyTorch - use
+    the CPU-only build, `pip install torch --index-url
+    https://download.pytorch.org/whl/cpu`, NOT the default GPU build,
+    which is several GB larger for zero benefit on a laptop with no GPU).
+  - And: EasyOCR downloads its detection/recognition model weights
+    (~100MB) from the internet the FIRST time a Reader() is ever created
+    on a given machine, caching them (default: ~/.EasyOCR/model/, or
+    wherever EASYOCR_MODULE_PATH points - see _get_reader below) for
+    every run after that. On a machine with restricted/no internet
+    access, this first-run download needs to be pre-staged (copy an
+    already-populated ~/.EasyOCR/model/ folder over, or point
+    EASYOCR_MODULE_PATH at a pre-staged location bundled with the
+    installer) BEFORE the first OCR capture is ever attempted there.
+  - Reader() initialization itself (loading those model weights into
+    memory) takes a few seconds - too slow to redo on every single
+    capture, so _get_reader() below creates it ONCE per process and
+    reuses it for every subsequent OCR call in that process's lifetime.
+"""
+from __future__ import annotations
+import io
+import os
+import threading
 
-  // ---- test data (editable, shown before running - see generator/test_data.py) ----
-  const [testData, setTestData] = useState([]);
-  const [testDataLoading, setTestDataLoading] = useState(false);
-  const [testDataError, setTestDataError] = useState(null);
-  const [editValues, setEditValues] = useState({}); // { [action index]: current input value }
-  const [savingData, setSavingData] = useState(false);
-  const [saveDataNotice, setSaveDataNotice] = useState(null);
-  const [saveDataError, setSaveDataError] = useState(null);
+_reader = None
+_reader_lock = threading.Lock()
 
-  const [runBusy, setRunBusy] = useState(false);
-  const [runError, setRunError] = useState(null);
-  const [report, setReport] = useState(null);
 
-  const [regenBusy, setRegenBusy] = useState(false);
-  const [regenNotice, setRegenNotice] = useState(null);
+def _get_reader():
+    """Lazily creates ONE EasyOCR Reader for this process's whole
+    lifetime (thread-safe) - Reader() itself is slow (loads model
+    weights), so this must never be called fresh per-capture. English
+    only by default; add languages via OCR_LANGUAGES (comma-separated
+    EasyOCR language codes, e.g. "en,hi") if this ever needs to read
+    non-English text."""
+    global _reader
+    if _reader is None:
+        with _reader_lock:
+            if _reader is None:
+                import easyocr
+                languages = os.environ.get("OCR_LANGUAGES", "en").split(",")
+                model_dir = os.environ.get("EASYOCR_MODULE_PATH")  # pre-staged model weights, for a machine with no internet access
+                _reader = easyocr.Reader(
+                    [lang.strip() for lang in languages if lang.strip()],
+                    gpu=False,  # laptops running this agent have no GPU worth using - forcing this off also skips a slow, pointless CUDA availability probe
+                    model_storage_directory=model_dir,
+                    download_enabled=model_dir is None or not os.path.isdir(model_dir),
+                )
+    return _reader
 
-  async function loadRecordings() {
-    try {
-      const r = await api.getRecordings();
-      setRecordings(r);
-      setRecordingsError(null);
-      if (r.length && !selectedRecFile) setSelectedRecFile(r[0].file);
-    } catch (e) {
-      setRecordingsError(e.detail || e.message);
-    }
-  }
 
-  useEffect(() => {
-    loadRecordings();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+def ocr_available() -> bool:
+    """Best-effort check - used by recorder.py to fail an OCR capture
+    request clearly and immediately (rather than partway through) if
+    EasyOCR genuinely can't run here (not installed, or model weights
+    can't be obtained/found and there's no internet access to fetch
+    them)."""
+    try:
+        _get_reader()
+        return True
+    except Exception:
+        return False
 
-  async function loadTestData(file) {
-    setTestDataLoading(true);
-    setTestDataError(null);
-    setSaveDataNotice(null);
-    setSaveDataError(null);
-    try {
-      const data = await api.getRecordingTestData(file);
-      setTestData(data.fields);
-      setEditValues(Object.fromEntries(data.fields.map((f) => [f.index, f.value])));
-    } catch (e) {
-      setTestData([]);
-      setEditValues({});
-      setTestDataError(e.detail || e.message);
-    } finally {
-      setTestDataLoading(false);
-    }
-  }
 
-  useEffect(() => {
-    setReport(null); // a different recording's exit report shouldn't linger once you switch
-    setRegenNotice(null);
-    if (selectedRecFile) loadTestData(selectedRecFile);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedRecFile]);
+def extract_text_from_png_bytes(png_bytes: bytes) -> str:
+    """Runs OCR on a screenshot (PNG bytes, exactly what Playwright's
+    `element.screenshot()` returns) and returns the extracted text.
+    Multiple detected text regions (EasyOCR reports each line/word
+    separately, with its own bounding box) are joined with a single space
+    in top-to-bottom, left-to-right reading order - e.g. a reference
+    number rendered as two visually-separate pieces ("REF" and "998877")
+    comes back as one "REF 998877" string, not a list. Raises a clear,
+    actionable RuntimeError - not a raw EasyOCR/PyTorch traceback - if OCR
+    genuinely can't run here, since that's a different, more urgent
+    problem than "OCR ran but the image had no readable text"."""
+    try:
+        from PIL import Image
+        import numpy as np
+    except ImportError as e:
+        raise RuntimeError(
+            "OCR support isn't fully installed on this machine - "
+            "pip install easyocr Pillow numpy "
+            "(see local_agent/requirements-agent.txt)."
+        ) from e
 
-  function updateValue(index, value) {
-    setEditValues((prev) => ({ ...prev, [index]: value }));
-    setSaveDataNotice(null);
-  }
+    try:
+        reader = _get_reader()
+    except Exception as e:
+        raise RuntimeError(
+            f"EasyOCR could not initialize ({type(e).__name__}: {e}). If this machine has no "
+            "internet access, EasyOCR's model weights need to be pre-staged - copy an already-"
+            "populated ~/.EasyOCR/model/ folder from a machine that has run OCR successfully "
+            "once, or set EASYOCR_MODULE_PATH to a pre-staged model directory bundled with the "
+            "installer."
+        ) from e
 
-  async function saveTestDataOnly() {
-    setSavingData(true);
-    setSaveDataError(null);
-    setSaveDataNotice(null);
-    try {
-      const data = await api.updateRecordingTestData(selectedRecFile, editValues);
-      setTestData(data.fields);
-      setSaveDataNotice("Test data saved - future runs of this recording will use these values too.");
-    } catch (e) {
-      setSaveDataError(e.detail || e.message);
-    } finally {
-      setSavingData(false);
-    }
-  }
+    image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    image_array = np.array(image)
 
-  async function handleRun() {
-    if (!selectedRecFile) return;
-    setRunError(null);
-    setRunBusy(true);
-    try {
-      // Whatever is currently in the grid is what gets run - saved to the
-      // recording first (so it's also the new baseline for next time),
-      // then executed. No separate "save" step required.
-      if (testData.length > 0) {
-        await api.updateRecordingTestData(selectedRecFile, editValues);
-      }
-      const r = await api.runRecording(selectedRecFile, runHeadless);
-      setReport(r);
-    } catch (e) {
-      setRunError(e.detail || e.message);
-    } finally {
-      setRunBusy(false);
-    }
-  }
+    try:
+        # detail=0 returns just the recognized strings, already in EasyOCR's
+        # own natural (top-to-bottom, left-to-right) reading order - no
+        # manual bounding-box sorting needed.
+        results = reader.readtext(image_array, detail=0)
+    except Exception as e:
+        raise RuntimeError(f"OCR failed while reading the captured image: {type(e).__name__}: {e}") from e
 
-  async function handleRegenerate() {
-    if (!selectedRecFile) return;
-    setRegenNotice(null);
-    setRegenBusy(true);
-    try {
-      const r = await recordingsApi.regenerate(selectedRecFile);
-      setRegenNotice({
-        tone: "success",
-        text: `Regenerated (${r.build_result.step_count} steps) - the next run of this recording already uses the current generator code either way, but the files on disk are refreshed now too.`,
-      });
-    } catch (e) {
-      setRegenNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setRegenBusy(false);
-    }
-  }
+    return " ".join(results).strip()
 
-  return (
-    <div className="grid min-w-0 gap-6 lg:grid-cols-[360px_1fr]">
-      <Panel>
-        <PanelHeader title="Run a saved recording" caption="Pick a recording, review/edit its test data, then run it." />
-        <div className="space-y-4 px-5 py-5">
-          <Callout>
-            Running as <strong>{user?.first_name} {user?.last_name}</strong> ({user?.username}). Every run is logged
-            against your account.
-          </Callout>
-
-          {recordingsError && <Callout tone="error">Could not load recordings: {recordingsError}</Callout>}
-
-          {recordings.length === 0 ? (
-            <Callout>No saved recordings found yet. Record one in the &ldquo;Record &amp; Generate&rdquo; tab first.</Callout>
-          ) : (
-            <>
-              <Field label="Saved recording">
-                <Select value={selectedRecFile} onChange={(e) => setSelectedRecFile(e.target.value)}>
-                  {recordings.map((r) => (
-                    <option key={r.file} value={r.file}>
-                      {r.name} — {r.target_url} ({r.action_count} actions)
-                    </option>
-                  ))}
-                </Select>
-              </Field>
-
-              <Checkbox label="headless" checked={runHeadless} onChange={setRunHeadless} />
-
-              <Button onClick={handleRun} disabled={runBusy} className="w-full">
-                {runBusy ? "Running..." : "Run recording"}
-              </Button>
-
-              {runBusy && <Spinner label="Running the saved recording..." />}
-              {runError && <Callout tone="error">Run failed: {runError}</Callout>}
-
-              <div className="border-t border-line pt-4">
-                <Button variant="secondary" onClick={handleRegenerate} disabled={regenBusy} className="w-full">
-                  {regenBusy ? "Regenerating..." : "Regenerate (no run)"}
-                </Button>
-                <p className="mt-1.5 text-xs text-muted">
-                  Refreshes this recording's generated feature/steps/page files from the latest generator code -
-                  without re-recording or running anything. Useful right after a code/template fix, to confirm it
-                  applies here.
-                </p>
-                {regenNotice && (
-                  <div className="mt-2">
-                    <Callout tone={regenNotice.tone}>{regenNotice.text}</Callout>
-                  </div>
-                )}
-              </div>
-            </>
-          )}
-        </div>
-      </Panel>
-
-      <div className="min-w-0 space-y-4">
-        {selectedRecFile && (
-          <Panel>
-            <div className="flex items-center justify-between border-b border-line px-5 py-4">
-              <div>
-                <h2 className="text-sm font-semibold text-ink">Test data</h2>
-                <p className="mt-0.5 text-xs text-muted">
-                  The values this recording types/selects when it runs. Edit anything below, then hit{" "}
-                  <strong>Run recording</strong> - no need to download or re-upload the Excel report; changes save
-                  straight into this recording.
-                </p>
-              </div>
-              {testData.length > 0 && (
-                <Button variant="secondary" onClick={saveTestDataOnly} disabled={savingData}>
-                  {savingData ? "Saving..." : "Save without running"}
-                </Button>
-              )}
-            </div>
-            <div className="px-5 py-4">
-              {testDataLoading && <Spinner label="Loading test data..." />}
-              {testDataError && <Callout tone="error">{testDataError}</Callout>}
-              {saveDataError && <Callout tone="error">{saveDataError}</Callout>}
-              {saveDataNotice && <Callout tone="success">{saveDataNotice}</Callout>}
-
-              {!testDataLoading && !testDataError && testData.length === 0 && (
-                <p className="text-sm text-muted">
-                  This recording has no typed or selected values to edit (e.g. it's clicks/navigation only).
-                </p>
-              )}
-
-              {testData.length > 0 && (
-                <DataTable
-                  columns={[
-                    { key: "label", label: "Field" },
-                    { key: "action", label: "Type", mono: true },
-                    { key: "value", label: "Value" },
-                  ]}
-                  rows={testData.map((f) => ({
-                    label: f.label,
-                    action: f.action,
-                    value: (
-                      <TextInput
-                        value={editValues[f.index] ?? ""}
-                        onChange={(e) => updateValue(f.index, e.target.value)}
-                      />
-                    ),
-                  }))}
-                />
-              )}
-            </div>
-          </Panel>
-        )}
-
-        {report && (
-          <Panel>
-            <PanelHeader title="Exit report" caption={`Transaction #${report.transaction_id} · ${report.date_time} UTC`} />
-            <div className="min-w-0 space-y-6 px-5 py-5">
-              {/* ---- Graphical summary: donut + step-sequence strip + metrics ---- */}
-              <div className="flex flex-wrap items-center gap-6 rounded-sm border border-line bg-rail/60 p-4">
-                <ReportDonut passed={report.passed_count} failed={report.failed_count} />
-                <div className="min-w-0 flex-1 space-y-3">
-                  <div className="flex flex-wrap items-center gap-3">
-                    <StatusBadge status={report.status} />
-                    <span className="text-sm text-muted">
-                      Run by <strong className="font-medium text-ink">{report.user}</strong>
-                    </span>
-                  </div>
-                  <StepSequenceBar steps={report.steps} />
-                  <div className="grid grid-cols-3 gap-2 sm:max-w-sm">
-                    <Metric label="Steps" value={report.step_count} />
-                    <Metric label="Passed" value={report.passed_count} />
-                    <Metric label="Failed" value={report.failed_count} />
-                  </div>
-                </div>
-              </div>
-
-              <div className="min-w-0">
-                <h3 className="mb-2 text-sm font-semibold text-ink">Automation log</h3>
-                <DataTable
-                  columns={[
-                    { key: "n", label: "#" },
-                    { key: "step", label: "Playwright step" },
-                    { key: "status", label: "Status" },
-                    { key: "error", label: "Error", mono: true },
-                  ]}
-                  rows={report.steps.map((s, i) => ({
-                    n: i + 1,
-                    step: s.step_name,
-                    status: <StatusBadge status={s.status} />,
-                    error: s.error_message || "",
-                  }))}
-                />
-              </div>
-
-              <Disclosure title={`Files produced (${report.files.length})`}>
-                <DataTable
-                  columns={[
-                    { key: "file_name", label: "File" },
-                    { key: "folder_path", label: "Folder", mono: true },
-                  ]}
-                  rows={report.files.map((f) => ({ file_name: f.file_name, folder_path: f.folder_path }))}
-                />
-              </Disclosure>
-
-              <Disclosure title="Raw Behave output">
-                <pre className="max-h-96 w-full min-w-0 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-[#0B1A33] p-4 font-mono text-xs text-[#D7E1EF] scroll-thin">
-                  {report.raw_output}
-                </pre>
-              </Disclosure>
-
-              <div className="flex flex-wrap gap-2">
-                <Button onClick={() => openReportInBrowser(report)}>Open report in browser</Button>
-                <Button
-                  variant="secondary"
-                  onClick={() =>
-                    downloadBlob(
-                      `transaction_${report.transaction_id}_exit_report.html`,
-                      buildReportHtml(report),
-                      "text/html"
-                    )
-                  }
-                >
-                  Download (.html)
-                </Button>
-                <Button
-                  variant="secondary"
-                  onClick={() =>
-                    downloadBlob(
-                      `transaction_${report.transaction_id}_exit_report.txt`,
-                      buildReportText(report),
-                      "text/plain"
-                    )
-                  }
-                >
-                  Download (.txt)
-                </Button>
-              </div>
-            </div>
-          </Panel>
-        )}
-
-        {!selectedRecFile && (
-          <Panel>
-            <div className="px-5 py-10 text-center text-sm text-muted">
-              Pick a saved recording to review its test data and run it.
-            </div>
-          </Panel>
-        )}
-      </div>
-    </div>
-  );
-}
