@@ -1,135 +1,136 @@
 """
-Shared OCR helper, used at BOTH:
-  - RECORD time (recorder/recorder.py, when the user right-clicks an
-    element on the page and chooses "Capture text with OCR" from the
-    custom menu injected by recorder_injector.js)
-  - REPLAY time (generator/templates/page.tmpl's
-    BasePage.capture_value_ocr, called from the generated step - see
-    generator/templates/steps.tmpl's "ocr_capture" branch)
+Turns raw "copy"/"paste" actions captured by the injected JS (see
+recorder/recorder_injector.js's copy/cut/paste listeners) into the
+Capture -> Store -> Reuse variable pipeline:
 
-One implementation, so both always extract text the exact same way - and
-critically, REPLAY re-runs the OCR live every single time the test
-executes (a fresh screenshot, fresh OCR pass) rather than reusing
-whatever text was read during recording, the same way a plain
-copy-captured value is re-read live rather than hard-coded (see
-recorder/variable_capture.py's module docstring) - these are usually
-values the application generates fresh each run (a new application
-number, a new reference ID rendered into an image/canvas rather than
-real DOM text), so baking in the recording-time value would make the
-generated test increasingly wrong over time.
+  1. A "copy" action's source field gets a stable {{name}} placeholder
+     derived from its label, e.g. a field labeled "Generated Username"
+     becomes {{username}}, "Generated Application ID" becomes
+     {{application_id}}.
+  2. Any LATER "paste" (or manually retyped "type") action whose recorded
+     value exactly matches a previously copied value is tagged with that
+     same placeholder, so the generator (generator/build.py) can emit a
+     step that resolves it from the LIVE value captured earlier in that
+     same run (see runner/variables.py) instead of a hard-coded literal.
 
-Uses EasyOCR - a pure-Python OCR engine (pip install easyocr, nothing
-else to install separately, unlike Tesseract) built on PyTorch. This is a
-genuine trade-off, not a strictly-better choice, worth understanding:
-  - Nothing to install on the target machine beyond `pip install easyocr`
-    (or whatever's bundled into local_agent's frozen build) - no separate
-    binary, no PATH configuration, no corporate-security exclusion needed
-    for a second executable.
-  - But: it's a MUCH heavier dependency (EasyOCR pulls in PyTorch - use
-    the CPU-only build, `pip install torch --index-url
-    https://download.pytorch.org/whl/cpu`, NOT the default GPU build,
-    which is several GB larger for zero benefit on a laptop with no GPU).
-  - And: EasyOCR downloads its detection/recognition model weights
-    (~100MB) from the internet the FIRST time a Reader() is ever created
-    on a given machine, caching them (default: ~/.EasyOCR/model/, or
-    wherever EASYOCR_MODULE_PATH points - see _get_reader below) for
-    every run after that. On a machine with restricted/no internet
-    access, this first-run download needs to be pre-staged (copy an
-    already-populated ~/.EasyOCR/model/ folder over, or point
-    EASYOCR_MODULE_PATH at a pre-staged location bundled with the
-    installer) BEFORE the first OCR capture is ever attempted there.
-  - Reader() initialization itself (loading those model weights into
-    memory) takes a few seconds - too slow to redo on every single
-    capture, so _get_reader() below creates it ONCE per process and
-    reuses it for every subsequent OCR call in that process's lifetime.
+This module only ADDS optional keys to the action dicts it's given
+("captured_as" on copy actions, "resolved_var" on paste/type actions) - it
+never removes or rewrites an existing key, so recordings without any
+copy/paste in them (or JSON built before this feature existed) round-trip
+completely unchanged. It's also idempotent: running it twice on the same
+actions list keeps the same names, so generator/build.py can safely call it
+again as a safety net for recordings that were produced without going
+through Recorder.stop()'s hook.
 """
 from __future__ import annotations
-import io
-import os
-import threading
+from typing import Dict, List
 
-_reader = None
-_reader_lock = threading.Lock()
-
-
-def _get_reader():
-    """Lazily creates ONE EasyOCR Reader for this process's whole
-    lifetime (thread-safe) - Reader() itself is slow (loads model
-    weights), so this must never be called fresh per-capture. English
-    only by default; add languages via OCR_LANGUAGES (comma-separated
-    EasyOCR language codes, e.g. "en,hi") if this ever needs to read
-    non-English text."""
-    global _reader
-    if _reader is None:
-        with _reader_lock:
-            if _reader is None:
-                import easyocr
-                languages = os.environ.get("OCR_LANGUAGES", "en").split(",")
-                model_dir = os.environ.get("EASYOCR_MODULE_PATH")  # pre-staged model weights, for a machine with no internet access
-                _reader = easyocr.Reader(
-                    [lang.strip() for lang in languages if lang.strip()],
-                    gpu=False,  # laptops running this agent have no GPU worth using - forcing this off also skips a slow, pointless CUDA availability probe
-                    model_storage_directory=model_dir,
-                    download_enabled=model_dir is None or not os.path.isdir(model_dir),
-                )
-    return _reader
+# Words stripped from a source field's label before it becomes a variable
+# name, e.g. "Generated Username" -> "username", "Generated Application ID"
+# -> "application_id".
+_STOPWORDS = {
+    "generated", "generate", "new", "auto", "your", "the", "a", "an",
+    "current", "this", "field", "value", "display", "label", "output",
+}
 
 
-def ocr_available() -> bool:
-    """Best-effort check - used by recorder.py to fail an OCR capture
-    request clearly and immediately (rather than partway through) if
-    EasyOCR genuinely can't run here (not installed, or model weights
-    can't be obtained/found and there's no internet access to fetch
-    them)."""
-    try:
-        _get_reader()
-        return True
-    except Exception:
-        return False
+def _locator_identity(action: Dict):
+    """A stable-ish key for 'is this the same physical element' - prefers the
+    first (highest-priority) captured locator, since two different actions
+    on the SAME element should always agree on it; falls back to the
+    element description for the rare case no locator was captured at all."""
+    locs = action.get("locators") or []
+    if locs:
+        top = locs[0]
+        return (top.get("strategy"), top.get("value"))
+    el = action.get("element") or {}
+    return (el.get("tag"), el.get("name"), el.get("placeholder"), el.get("ariaLabel"))
 
 
-def extract_text_from_png_bytes(png_bytes: bytes) -> str:
-    """Runs OCR on a screenshot (PNG bytes, exactly what Playwright's
-    `element.screenshot()` returns) and returns the extracted text.
-    Multiple detected text regions (EasyOCR reports each line/word
-    separately, with its own bounding box) are joined with a single space
-    in top-to-bottom, left-to-right reading order - e.g. a reference
-    number rendered as two visually-separate pieces ("REF" and "998877")
-    comes back as one "REF 998877" string, not a list. Raises a clear,
-    actionable RuntimeError - not a raw EasyOCR/PyTorch traceback - if OCR
-    genuinely can't run here, since that's a different, more urgent
-    problem than "OCR ran but the image had no readable text"."""
-    try:
-        from PIL import Image
-        import numpy as np
-    except ImportError as e:
-        raise RuntimeError(
-            "OCR support isn't fully installed on this machine - "
-            "pip install easyocr Pillow numpy "
-            "(see local_agent/requirements-agent.txt)."
-        ) from e
+def coalesce_consecutive_types(actions: List[Dict], window_ms: int = 3000) -> List[Dict]:
+    """
+    Merges a 'type' action into the immediately preceding one if both target
+    the SAME element and happened within `window_ms` of each other, keeping
+    the LATER value. Native/masked inputs (date pickers especially) commonly
+    fire more than one 'change' event for what the user experienced as ONE
+    edit - e.g. the browser reformatting "01092026" into "01/09/2026" right
+    after typing, or a native date picker's day/month/year segments each
+    firing their own change - which otherwise shows up as two separate,
+    confusingly-duplicated "enters X into Y" steps for the same field.
+    Only ADJACENT same-element 'type' actions are merged - an intervening
+    click/keypress/other action on something else breaks the chain, since
+    that's very likely a deliberate second visit to the field rather than
+    the same edit settling.
+    """
+    merged: List[Dict] = []
+    for action in actions:
+        if (
+            action.get("action") == "type"
+            and merged
+            and merged[-1].get("action") == "type"
+            and _locator_identity(action) == _locator_identity(merged[-1])
+            and (action.get("ts", 0) - merged[-1].get("ts", 0)) <= window_ms
+        ):
+            merged[-1] = {
+                **merged[-1],
+                "value": action.get("value"),
+                "ts": action.get("ts"),
+                "locators": action.get("locators") or merged[-1].get("locators"),
+            }
+            continue
+        merged.append(action)
+    return merged
 
-    try:
-        reader = _get_reader()
-    except Exception as e:
-        raise RuntimeError(
-            f"EasyOCR could not initialize ({type(e).__name__}: {e}). If this machine has no "
-            "internet access, EasyOCR's model weights need to be pre-staged - copy an already-"
-            "populated ~/.EasyOCR/model/ folder from a machine that has run OCR successfully "
-            "once, or set EASYOCR_MODULE_PATH to a pre-staged model directory bundled with the "
-            "installer."
-        ) from e
 
-    image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-    image_array = np.array(image)
+def derive_variable_name(element: Dict, used_names: set) -> str:
+    """Heuristic, LLM-free variable-name generator for a copy source element."""
+    base = (
+        element.get("ariaLabel")
+        or element.get("placeholder")
+        or element.get("name")
+        or element.get("text")
+        or element.get("tag")
+        or "value"
+    )
+    tokens = "".join(c if c.isalnum() else " " for c in base.lower()).split()
+    filtered = [t for t in tokens if t not in _STOPWORDS]
+    tokens = filtered or tokens or ["value"]
+    name = "_".join(tokens)[:40].strip("_") or "value"
 
-    try:
-        # detail=0 returns just the recognized strings, already in EasyOCR's
-        # own natural (top-to-bottom, left-to-right) reading order - no
-        # manual bounding-box sorting needed.
-        results = reader.readtext(image_array, detail=0)
-    except Exception as e:
-        raise RuntimeError(f"OCR failed while reading the captured image: {type(e).__name__}: {e}") from e
+    candidate = name
+    n = 2
+    while candidate in used_names:
+        candidate = f"{name}_{n}"
+        n += 1
+    used_names.add(candidate)
+    return candidate
 
-    return " ".join(results).strip()
 
+def annotate_variables(actions: List[Dict]) -> List[Dict]:
+    """
+    Walks the recording in order and stamps "captured_as" / "resolved_var"
+    onto the relevant action dicts in place (and also returns the list, for
+    convenience). See module docstring for the full behavior.
+    """
+    used_names: set = set()
+    captured_values: Dict[str, str] = {}  # copied text -> variable name
+
+    for action in actions:
+        kind = action.get("action")
+        value = action.get("value")
+
+        if kind in ("copy", "ocr_capture") and value:
+            var_name = action.get("captured_as") or captured_values.get(value)
+            if var_name:
+                used_names.add(var_name)
+            else:
+                var_name = derive_variable_name(action.get("element", {}), used_names)
+            captured_values[value] = var_name
+            action["captured_as"] = var_name
+
+        elif kind in ("paste", "type") and value:
+            var_name = action.get("resolved_var") or captured_values.get(value)
+            if var_name:
+                action["resolved_var"] = var_name
+
+    return actions
