@@ -1,128 +1,300 @@
-"""
-Launches a Playwright browser. Two modes, controlled by BROWSER= in .env:
+# -*- mode: python ; coding: utf-8 -*-
+#
+# PyInstaller spec for freezing local_agent into a standalone
+# local_agent.exe, so an end user's PC needs no Python installation at all
+# (see docs/electron-local-agent-architecture.md's "Packaging" section).
+#
+# IMPORTANT: this spec has NOT been built or tested here - doing so
+# requires an actual Windows machine (PyInstaller's Windows target must
+# run on Windows, or under Wine with real limitations). Treat this as a
+# verified-on-your-machine starting point once you build it, not an
+# artifact that's already been confirmed working.
+#
+# Usage (on a Windows machine, from the project root, inside a venv with
+# local_agent/requirements-agent.txt + pyinstaller installed):
+#
+#   pip install -r local_agent\requirements-agent.txt
+#   pip install pyinstaller
+#   pyinstaller local_agent\local_agent.spec
+#
+# Produces dist\local_agent\local_agent.exe (one-folder build, not
+# one-file - Playwright's own browser binaries are large enough that a
+# one-folder build is the more practical choice; electron-builder's
+# extraResources then bundles that whole dist\local_agent\ folder instead
+# of raw .py files + a system Python - see electron/package.json).
 
-  BROWSER=edge / chrome (default: edge)
-    Drives the REAL, already-installed system browser via Playwright's
-    "channel" option instead of downloading its own bundled Chromium build
-    - same idea as the old webdriver-manager auto-download, except
-    Playwright doesn't need a separate driver executable at all:
-    `pip install playwright` + `playwright install msedge` (or `chrome`)
-    is enough. Good for local/dev use where you want the exact browser
-    people actually use.
+from pathlib import Path
+from PyInstaller.utils.hooks import collect_submodules
 
-  BROWSER=chromium
-    Uses Playwright's OWN bundled Chromium (`playwright install chromium`)
-    instead of a system browser channel. No dependency on system Edge/
-    Chrome being installed, licensed, or launchable under whatever account
-    runs the backend - which matters once this runs as a Windows Service
-    (no interactive desktop, a service account that may not have Edge set
-    up the same way a normal user profile does) or just as a more
-    reproducible, version-pinned-to-Playwright headless target for
-    server-hosted concurrent recording. Recommended for hosted deployments
-    (see DEPLOYMENT_WINDOWS.md); BROWSER=edge remains the default for
-    local single-user dev, where using the browser you actually see and
-    click around in day to day is more convenient.
-"""
-from __future__ import annotations
-import os
-from dataclasses import dataclass
-from typing import Optional
+# ---------------------------------------------------------
+# Project paths
+# ---------------------------------------------------------
+#
+# PyInstaller provides SPECPATH while executing the .spec file.
+#
+# SPECPATH:
+#   C:\...\ai-test-recorder-pw\local_agent
+#
+# Therefore:
+#   PROJECT_ROOT = C:\...\ai-test-recorder-pw
+#   AGENT_ROOT   = C:\...\ai-test-recorder-pw\local_agent
+#
+SPEC_DIR = Path(SPECPATH).resolve()
+PROJECT_ROOT = SPEC_DIR.parent
+AGENT_ROOT = SPEC_DIR
 
-from playwright.sync_api import sync_playwright, Playwright, Browser, BrowserContext
+# ---------------------------------------------------------
+# Validate important files before building - fail fast with a clear
+# message instead of a confusing mid-build PyInstaller error if this spec
+# is ever run from the wrong location or against a stale checkout.
+# ---------------------------------------------------------
+MAIN_PY = AGENT_ROOT / "_pyinstaller_entry.py"
+INJECTOR_JS = PROJECT_ROOT / "recorder" / "recorder_injector.js"
+AGENT_ENVIRONMENT = AGENT_ROOT / "agent_environment.py"
 
+if not MAIN_PY.exists():
+    raise FileNotFoundError(f"local_agent PyInstaller entry point not found: {MAIN_PY}")
+if not INJECTOR_JS.exists():
+    raise FileNotFoundError(f"recorder_injector.js not found: {INJECTOR_JS}")
+if not AGENT_ENVIRONMENT.exists():
+    raise FileNotFoundError(f"agent_environment.py not found: {AGENT_ENVIRONMENT}")
 
-def get_channel() -> Optional[str]:
-    """Returns the Playwright `channel=` value to pass to launch(), or
-    None to use Playwright's own bundled Chromium instead (BROWSER=chromium)."""
-    browser = os.getenv("BROWSER", "edge").lower().strip()
-    if browser == "edge":
-        return "msedge"
-    if browser == "chrome":
-        return "chrome"
-    if browser == "chromium":
-        return None
-    raise ValueError(f"Unsupported BROWSER='{browser}'. Use 'edge', 'chrome', or 'chromium'.")
+# ---------------------------------------------------------
+# Hidden imports
+# ---------------------------------------------------------
+# Playwright does some dynamic importing (its driver-process bridge, the
+# generated sync API wrappers) that PyInstaller's static analysis can
+# miss - collect_submodules pulls in everything under the package rather
+# than hoping the single explicit entry below is sufficient.
+hiddenimports = (
+    collect_submodules("playwright")
+    + ["playwright.sync_api"]
+    # Behave is now invoked via its own programmatic entry point
+    # (behave.__main__.main) rather than as an external `python -m behave`
+    # subprocess when running from this frozen exe - see
+    # runner/run_tests.py's run_behave_cli for why (sys.executable inside a
+    # frozen build points at this exe, not a real Python interpreter, so
+    # shelling out to "behave" never worked from a packaged build). That
+    # means behave's own submodules need to be statically bundled here too,
+    # not just importable at dev-time.
+    + collect_submodules("behave")
+    + [
+        # Uses EasyOCR (pure-Python OCR, no separate engine binary to
+        # install - see recorder/ocr_engine.py's docstring for the
+        # trade-off vs. Tesseract) - which pulls in PyTorch as a real
+        # dependency. collect_submodules("torch") is NOT used here
+        # deliberately: PyTorch's full module tree includes CUDA/GPU-
+        # specific code paths that pull in nvidia-* packages if present in
+        # the build environment - this build must use the CPU-only torch
+        # wheel (pip install torch --index-url
+        # https://download.pytorch.org/whl/cpu) BEFORE running this spec,
+        # so there's nothing CUDA-related for a blanket collect to find in
+        # the first place. If a "hidden import not found" warning appears
+        # for a specific torch/easyocr submodule when actually building
+        # this, add that ONE module here explicitly rather than switching
+        # to a blanket collect_submodules("torch") - the CPU-only-wheel
+        # discipline is easy to silently lose that way.
+        "easyocr",
+        "torch",
+        "torchvision",
+        "PIL",
+        "PIL.Image",
+        "numpy",
+        "cv2",
+    ]
+)
 
+# ---------------------------------------------------------
+# recorder/ and runner/ are bundled as RAW DATA FILES, not analyzed as
+# modules - deliberately.
+# ---------------------------------------------------------
+# History: recorder.browser_factory (and, transitively, the rest of
+# recorder/ and runner/) went through several rounds of being added to
+# hiddenimports (see git history / prior versions of this file) after
+# repeatedly hitting "ModuleNotFoundError: No module named 'agent'", then
+# "...'runner.variables'" on earlier builds. Those fixes worked. But on at
+# least one real build (same project, same spec, a clean rebuild with
+# cleared __pycache__, no shadowing "recorder" package on the venv's
+# PYTHONPATH, no duplicate/stray browser_factory.py anywhere in the
+# project tree, and file content verified byte-for-byte identical) -
+# PyInstaller's own analysis log showed:
+#
+#   invalid module named recorder.browser_factory - imported by
+#   local_agent.browser_manager (top-level), recorder.recorder
+#   (optional), local_agent\_pyinstaller_entry.py (top-level)
+#
+# "invalid module" (not "missing module") means PyInstaller's modulegraph
+# genuinely found and traced the real, correct import statement in
+# local_agent/browser_manager.py, but its own dependency analysis
+# misclassified the result - on that machine, for reasons that were not
+# fully root-caused (namespace-package edge cases and cross-version
+# PyInstaller/Python 3.13 interactions are the leading suspects, but this
+# was not conclusively proven). Rather than keep chasing PyInstaller's
+# internal module-graph classification, this sidesteps it entirely for
+# recorder/ and runner/: their .py files are copied in as plain DATA
+# (see `datas` below, using PROJECT_ROOT / "recorder" and
+# PROJECT_ROOT / "runner" as whole-directory copies), and
+# PYTHONPATH_ADDITIONS below adds their PARENT directory
+# (sys._MEIPASS, where PyInstaller's bootloader already extracts/points
+# datas to) onto sys.path via a small runtime hook. At that point these
+# are just ordinary files on disk, imported by the STANDARD CPython
+# import system exactly as if this were an unfrozen script - nothing
+# about PyInstaller's own module bundling/analysis touches them at all,
+# so whatever caused the "invalid module" misclassification cannot recur.
+#
+# generator/, database/, backend/, and agent/ (the central-server-only
+# packages - see excludes below) are NOT part of this datas copy, even
+# though they physically live under runner/run_recording.py's import
+# statements - only the specific files actually needed client-side are
+# copied (see the explicit file list below), not the whole directories
+# wholesale, to avoid shipping server code to the end user's PC.
+RECORDER_ROOT = PROJECT_ROOT / "recorder"
+RUNNER_ROOT = PROJECT_ROOT / "runner"
 
-@dataclass
-class BrowserSession:
-    """Bundles the three Playwright handles that need to be torn down together."""
-    playwright: Playwright
-    browser: Browser
-    context: BrowserContext
+RECORDER_FILES_NEEDED = [
+    "__init__.py",
+    "browser_factory.py",
+    "recorder.py",
+    "locator_strategy.py",
+    "variable_capture.py",
+    "ocr_engine.py",
+]
+RUNNER_FILES_NEEDED = [
+    "__init__.py",
+    "variables.py",
+    "run_tests.py",
+]
 
-    def new_page(self):
-        return self.context.new_page()
+datas_for_recorder_and_runner = [
+    (str(RECORDER_ROOT / fname), "recorder") for fname in RECORDER_FILES_NEEDED
+] + [
+    (str(RUNNER_ROOT / fname), "runner") for fname in RUNNER_FILES_NEEDED
+]
 
-    def close(self):
-        try:
-            self.context.close()
-        except Exception:
-            pass
-        try:
-            self.browser.close()
-        except Exception:
-            pass
-        try:
-            self.playwright.stop()
-        except Exception:
-            pass
+for fname in RECORDER_FILES_NEEDED:
+    if not (RECORDER_ROOT / fname).exists():
+        raise FileNotFoundError(f"Expected recorder file not found: {RECORDER_ROOT / fname}")
+for fname in RUNNER_FILES_NEEDED:
+    if not (RUNNER_ROOT / fname).exists():
+        raise FileNotFoundError(f"Expected runner file not found: {RUNNER_ROOT / fname}")
 
+# ---------------------------------------------------------
+# Analysis
+# ---------------------------------------------------------
+a = Analysis(
+    [str(MAIN_PY)],
+    pathex=[
+        str(PROJECT_ROOT),
+        str(AGENT_ROOT),
+    ],
+    binaries=[],
+    datas=[
+        # Recorder injector used by the local agent (read as a text file
+        # at runtime - see recorder/recorder.py's INJECTOR_PATH; not a
+        # .py module PyInstaller would bundle automatically).
+        (
+            str(INJECTOR_JS),
+            "recorder",
+        ),
+        # Agent environment module/data
+        (
+            str(AGENT_ENVIRONMENT),
+            "local_agent",
+        ),
+    ] + datas_for_recorder_and_runner,
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        # Central-server-only packages that must NOT be shipped to an end
+        # user's PC (see local_agent/agent_environment.py's docstring for
+        # why "agent" - the AI/self-healing package - specifically is
+        # excluded: local execution deliberately runs without self-healing
+        # so no LLM key/dependency needs to exist client-side). If any of
+        # these accidentally get pulled in by a stray import, this list is
+        # what catches it at build time as a missing-module error instead
+        # of silently shipping backend code to end users.
+        "fastapi",
+        "sqlalchemy",
+        "jwt",
+        "bcrypt",
+        "jinja2",
+        "pandas",
+        "openpyxl",
+        "backend",
+        "database",
+        "agent",
+        "generator",
+        # "recorder" and "runner" are excluded from PyInstaller's own
+        # module-graph analysis DELIBERATELY - see the long comment above
+        # datas_for_recorder_and_runner for why. This does not remove
+        # them from the running program: their actual source files are
+        # copied in via `datas` above instead, landing under
+        # sys._MEIPASS (which PyInstaller's bootloader already puts on
+        # sys.path automatically), where Python's normal, un-frozen
+        # import system finds and imports them exactly as it would for
+        # any ordinary script - completely bypassing whatever caused
+        # PyInstaller's analysis to misclassify them as "invalid module"
+        # on at least one real build.
+        "recorder",
+        "runner",
+    ],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=None,
+    noarchive=False,
+)
 
-def launch_browser(headless: bool = False, ignore_https_errors: bool = None) -> BrowserSession:
-    """
-    Starts Playwright and launches the configured browser channel.
-    `no_viewport=True` + `--start-maximized` mirrors the old Selenium
-    `--start-maximized` behavior (the window fills the screen instead of
-    being locked to a fixed viewport size) - used for headed sessions
-    (local dev, or an interactive desktop session).
+# ---------------------------------------------------------
+# PYZ
+# ---------------------------------------------------------
+pyz = PYZ(
+    a.pure,
+    a.zipped_data,
+    cipher=None,
+)
 
-    Headless sessions (required on a hosted server with no desktop -
-    see recorder/recorder.py's live-view/CDP-screencast support) get a
-    fixed, generous viewport instead, since there's no physical window to
-    maximize - this is exactly what gets streamed to a remote user's
-    browser as the live recording view.
+# ---------------------------------------------------------
+# EXE
+# ---------------------------------------------------------
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name="local_agent",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=True,  # keep a console window for now so connection/errors are visible - revisit once the Electron UI surfaces agent logs well enough to hide it
+    disable_windowed_traceback=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
 
-    `ignore_https_errors`: internal/UAT environments very often have a
-    certificate that doesn't validate cleanly (self-signed, internally-
-    issued CA not trusted by the OS, hostname mismatch like
-    ERR_CERT_COMMON_NAME_INVALID) - unlike a real browser, which lets you
-    click through an "unsafe" warning, Playwright just fails the navigation
-    outright unless this is enabled. Defaults to the IGNORE_HTTPS_ERRORS env
-    var (see .env.example), itself defaulting to true, since this tool is
-    for testing internal apps where that's the common case; set it to
-    false in .env for a public-internet target where an invalid cert
-    should actually fail the test.
-    """
-    channel = get_channel()
-    if ignore_https_errors is None:
-        ignore_https_errors = os.getenv("IGNORE_HTTPS_ERRORS", "true").lower().strip() != "false"
-    pw = sync_playwright().start()
-    launch_args = ["--start-maximized"] if not headless else []
-    launch_kwargs = {"headless": headless, "args": launch_args}
-    if channel is not None:
-        launch_kwargs["channel"] = channel  # omitted entirely for BROWSER=chromium - uses Playwright's bundled build
-    browser = pw.chromium.launch(**launch_kwargs)
-    if headless:
-        width = int(os.getenv("HEADLESS_VIEWPORT_WIDTH", "1440"))
-        height = int(os.getenv("HEADLESS_VIEWPORT_HEIGHT", "900"))
-        context = browser.new_context(viewport={"width": width, "height": height}, ignore_https_errors=ignore_https_errors)
-    else:
-        context = browser.new_context(no_viewport=True, ignore_https_errors=ignore_https_errors)
+# ---------------------------------------------------------
+# COLLECT
+# ---------------------------------------------------------
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name="local_agent",
+)
 
-    # Without this, navigator.clipboard.writeText() (used by
-    # recorder/recorder.py's _process_ocr_request, to let the person
-    # recording paste an OCR-captured value into the next field with
-    # Ctrl+V instead of retyping it) silently fails - Chromium requires
-    # the "clipboard-write" permission to be explicitly granted to the
-    # context, it's not implicitly available to page scripts even on a
-    # trusted/first-party origin. Best-effort: some origins (e.g. a plain
-    # http:// UAT environment without a secure context) may still reject
-    # this - that's fine, the captured value is stored as a recording
-    # variable regardless of whether the clipboard convenience worked.
-    try:
-        context.grant_permissions(["clipboard-write", "clipboard-read"])
-    except Exception:
-        pass
-
-    return BrowserSession(playwright=pw, browser=browser, context=context)
+# ---------------------------------------------------------
+# NOT HANDLED BY THIS SPEC (see docs/electron-local-agent-architecture.md)
+# ---------------------------------------------------------
+#   - Playwright's own browser binaries (`playwright install msedge`) are
+#     NOT bundled by PyInstaller - they need a separate install step,
+#     either bundled as additional `datas`/`binaries` entries (large - a
+#     full Chromium-based browser download) or run once at application
+#     first-launch with a visible progress indicator. Decide which before
+#     relying on this spec for a real installer.
