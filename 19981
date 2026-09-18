@@ -1,408 +1,552 @@
-import { useEffect, useState } from "react";
-import { api } from "@/lib/api";
-import { recordingsApi } from "@/lib/api";
-import { useAuth } from "@/context/AuthContext";
-import { buildReportText, buildReportHtml, downloadBlob, openReportInBrowser } from "@/lib/report";
-import { ReportDonut, StepSequenceBar } from "@/components/ReportCharts";
-import {
-  Button,
-  Callout,
-  Checkbox,
-  DataTable,
-  Disclosure,
-  Field,
-  Metric,
-  Panel,
-  PanelHeader,
-  Select,
-  Spinner,
-  StatusBadge,
-  TextInput,
-} from "@/components/ui";
+/*
+Injected via Playwright's page.add_init_script() so it re-attaches on every
+navigation (including SPA route changes that reload the document, and full
+page loads). Captures click + input/change events and builds MULTIPLE
+independent locator strategies per element so the generated tests don't
+depend on a single brittle selector. Actions are queued here and drained
+by the Python side polling window.__flushActions() (see
+recorder/recorder.py) from the single worker thread that owns the page.
+*/
+(function () {
+  if (window.__recorderInstalled) return;
+  window.__recorderInstalled = true;
 
-export default function RunSavedTab() {
-  const { user } = useAuth();
+  // Actions are also mirrored to sessionStorage (same-origin, survives a
+  // navigation) so a queued action isn't lost if the page navigates/reloads
+  // (e.g. pressing Enter submits the form) before the Python side's next
+  // poll had a chance to flush window.__recordedQueue - that race is why
+  // Enter/submit-triggered actions could intermittently go unrecorded.
+  var STORAGE_KEY = '__recorderQueue';
 
-  const [recordings, setRecordings] = useState([]);
-  const [recordingsError, setRecordingsError] = useState(null);
-  const [selectedRecFile, setSelectedRecFile] = useState("");
-  const [runHeadless, setRunHeadless] = useState(false);
-
-  // ---- test data (editable, shown before running - see generator/test_data.py) ----
-  const [testData, setTestData] = useState([]);
-  const [testDataLoading, setTestDataLoading] = useState(false);
-  const [testDataError, setTestDataError] = useState(null);
-  const [editValues, setEditValues] = useState({}); // { [action index]: current input value }
-  const [savingData, setSavingData] = useState(false);
-  const [saveDataNotice, setSaveDataNotice] = useState(null);
-  const [saveDataError, setSaveDataError] = useState(null);
-
-  const [runBusy, setRunBusy] = useState(false);
-  const [runError, setRunError] = useState(null);
-  const [report, setReport] = useState(null);
-
-  const [regenBusy, setRegenBusy] = useState(false);
-  const [regenNotice, setRegenNotice] = useState(null);
-
-  const [importBusy, setImportBusy] = useState(false);
-  const [importNotice, setImportNotice] = useState(null);
-  const [importFile, setImportFile] = useState(null);
-  const [importName, setImportName] = useState("");
-
-  async function loadRecordings() {
+  function loadPersistedQueue() {
     try {
-      const r = await api.getRecordings();
-      setRecordings(r);
-      setRecordingsError(null);
-      if (r.length && !selectedRecFile) setSelectedRecFile(r[0].file);
+      var raw = sessionStorage.getItem(STORAGE_KEY);
+      return raw ? JSON.parse(raw) : [];
     } catch (e) {
-      setRecordingsError(e.detail || e.message);
+      return [];
     }
   }
 
-  useEffect(() => {
-    loadRecordings();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  async function loadTestData(file) {
-    setTestDataLoading(true);
-    setTestDataError(null);
-    setSaveDataNotice(null);
-    setSaveDataError(null);
+  function persistQueue() {
     try {
-      const data = await api.getRecordingTestData(file);
-      setTestData(data.fields);
-      setEditValues(Object.fromEntries(data.fields.map((f) => [f.index, f.value])));
+      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(window.__recordedQueue));
+    } catch (e) { /* storage unavailable/full - keep going in-memory only */ }
+  }
+
+  window.__recordedQueue = loadPersistedQueue();
+
+  function cssEscape(s) {
+    return (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/([^a-zA-Z0-9_-])/g, '\\$1');
+  }
+
+  function isUnique(selector) {
+    try {
+      return document.querySelectorAll(selector).length === 1;
     } catch (e) {
-      setTestData([]);
-      setEditValues({});
-      setTestDataError(e.detail || e.message);
-    } finally {
-      setTestDataLoading(false);
+      return false;
     }
   }
 
-  useEffect(() => {
-    setReport(null); // a different recording's exit report shouldn't linger once you switch
-    setRegenNotice(null);
-    if (selectedRecFile) loadTestData(selectedRecFile);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedRecFile]);
-
-  function updateValue(index, value) {
-    setEditValues((prev) => ({ ...prev, [index]: value }));
-    setSaveDataNotice(null);
-  }
-
-  async function saveTestDataOnly() {
-    setSavingData(true);
-    setSaveDataError(null);
-    setSaveDataNotice(null);
-    try {
-      const data = await api.updateRecordingTestData(selectedRecFile, editValues);
-      setTestData(data.fields);
-      setSaveDataNotice("Test data saved - future runs of this recording will use these values too.");
-    } catch (e) {
-      setSaveDataError(e.detail || e.message);
-    } finally {
-      setSavingData(false);
-    }
-  }
-
-  async function handleRun() {
-    if (!selectedRecFile) return;
-    setRunError(null);
-    setRunBusy(true);
-    try {
-      // Whatever is currently in the grid is what gets run - saved to the
-      // recording first (so it's also the new baseline for next time),
-      // then executed. No separate "save" step required.
-      if (testData.length > 0) {
-        await api.updateRecordingTestData(selectedRecFile, editValues);
+  function cssPath(el) {
+    if (!(el instanceof Element)) return null;
+    var path = [];
+    while (el && el.nodeType === Node.ELEMENT_NODE && el.tagName.toLowerCase() !== 'html') {
+      var selector = el.tagName.toLowerCase();
+      if (el.id) {
+        selector = '#' + cssEscape(el.id);
+        path.unshift(selector);
+        break;
+      } else {
+        var sib = el, nth = 1;
+        while ((sib = sib.previousElementSibling)) {
+          if (sib.tagName === el.tagName) nth++;
+        }
+        selector += ':nth-of-type(' + nth + ')';
       }
-      const r = await api.runRecording(selectedRecFile, runHeadless);
-      setReport(r);
-    } catch (e) {
-      setRunError(e.detail || e.message);
-    } finally {
-      setRunBusy(false);
+      path.unshift(selector);
+      el = el.parentElement;
     }
+    return path.join(' > ');
   }
 
-  async function handleRegenerate() {
-    if (!selectedRecFile) return;
-    setRegenNotice(null);
-    setRegenBusy(true);
+  function xpathOf(el) {
+    if (el.id) return '//*[@id="' + el.id + '"]';
+    var parts = [];
+    while (el && el.nodeType === Node.ELEMENT_NODE) {
+      var idx = 1;
+      var sib = el.previousElementSibling;
+      while (sib) {
+        if (sib.tagName === el.tagName) idx++;
+        sib = sib.previousElementSibling;
+      }
+      parts.unshift(el.tagName.toLowerCase() + '[' + idx + ']');
+      el = el.parentElement;
+    }
+    return '/' + parts.join('/');
+  }
+
+  function textXPath(el) {
+    var text = (el.innerText || el.textContent || '').trim();
+    if (!text || text.length > 60) return null;
+    var tag = el.tagName.toLowerCase();
+    return "//" + tag + "[normalize-space(.)=\"" + text.replace(/"/g, '') + "\"]";
+  }
+
+  function isUniqueXPath(xpath) {
     try {
-      const r = await recordingsApi.regenerate(selectedRecFile);
-      setRegenNotice({
-        tone: "success",
-        text: `Regenerated (${r.build_result.step_count} steps) - the next run of this recording already uses the current generator code either way, but the files on disk are refreshed now too.`,
-      });
+      var result = document.evaluate('count(' + xpath + ')', document, null, XPathResult.NUMBER_TYPE, null);
+      return result.numberValue === 1;
     } catch (e) {
-      setRegenNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setRegenBusy(false);
+      return false;
     }
   }
 
-  async function handleImportUipath() {
-    if (!importFile) return;
-    setImportNotice(null);
-    setImportBusy(true);
+  function ancestorTextXPath(el) {
+    // Radio/checkbox inputs usually have NO text content of their own - the
+    // visible option label lives on a wrapping component instead (e.g.
+    // Angular Material's <mat-radio-button>/<mat-checkbox>, or a plain
+    // wrapping <label>), so textXPath(el) above returns null for them. That
+    // leaves the input's auto-generated id (e.g. Angular's "mat-radio-9-input")
+    // as the only usable locator - and that id is NOT stable across page
+    // loads, since frameworks like Angular/React generate it from a global
+    // counter that depends on everything else rendered earlier on the page.
+    // Climbing to the nearest wrapper with short, meaningful text and
+    // anchoring an XPath on THAT text (then navigating back down to the
+    // input) gives a locator based on what a real user actually sees - e.g.
+    // //mat-radio-button[normalize-space(.)="Yes"]//input - which stays
+    // correct regardless of what id Angular happens to generate this time.
+    if (!(el.tagName === 'INPUT' && (el.type === 'radio' || el.type === 'checkbox'))) return null;
+    var wrapper = el.closest('mat-radio-button, mat-checkbox, [role="radio"], [role="checkbox"], label') || el.parentElement;
+    var depth = 0;
+    while (wrapper && depth < 4) {
+      var text = (wrapper.innerText || wrapper.textContent || '').trim();
+      if (text && text.length <= 60) {
+        var tag = wrapper.tagName.toLowerCase();
+        var xp = "//" + tag + "[normalize-space(.)=\"" + text.replace(/"/g, '') + "\"]//input[@type=\"" + el.type + "\"]";
+        if (isUniqueXPath(xp)) return xp;
+      }
+      wrapper = wrapper.parentElement;
+      depth++;
+    }
+    return null;
+  }
+
+  function buildLocators(el) {
+    var locs = [];
+
+    if (el.getAttribute('data-testid')) {
+      var v = el.getAttribute('data-testid');
+      var sel = '[data-testid="' + cssEscape(v) + '"]';
+      if (isUnique(sel)) locs.push({ strategy: 'CSS', value: sel, note: 'data-testid' });
+    }
+    if (el.id) {
+      var idSel = '#' + cssEscape(el.id);
+      if (isUnique(idSel)) locs.push({ strategy: 'ID', value: el.id });
+    }
+    if (el.name) {
+      var nameSel = '[name="' + cssEscape(el.name) + '"]';
+      if (isUnique(nameSel)) locs.push({ strategy: 'NAME', value: el.name });
+    }
+    if (el.getAttribute('aria-label')) {
+      var al = el.getAttribute('aria-label');
+      var alSel = '[aria-label="' + cssEscape(al) + '"]';
+      if (isUnique(alSel)) locs.push({ strategy: 'CSS', value: alSel, note: 'aria-label' });
+    }
+    if (el.getAttribute('placeholder')) {
+      var ph = el.getAttribute('placeholder');
+      var phSel = '[placeholder="' + cssEscape(ph) + '"]';
+      if (isUnique(phSel)) locs.push({ strategy: 'CSS', value: phSel, note: 'placeholder' });
+    }
+    var txp = textXPath(el);
+    if (txp) locs.push({ strategy: 'XPATH', value: txp, note: 'text' });
+
+    var atxp = ancestorTextXPath(el);
+    if (atxp) locs.push({ strategy: 'XPATH', value: atxp, note: 'text' });
+
+    var cp = cssPath(el);
+    if (cp) locs.push({ strategy: 'CSS', value: cp, note: 'generated-path' });
+
+    var xp = xpathOf(el);
+    if (xp) locs.push({ strategy: 'XPATH', value: xp, note: 'generated-path' });
+
+    return locs;
+  }
+
+  function describe(el) {
+    return {
+      tag: el.tagName.toLowerCase(),
+      type: el.getAttribute('type') || '',
+      text: (el.innerText || el.textContent || '').trim().slice(0, 60),
+      placeholder: el.getAttribute('placeholder') || '',
+      name: el.name || '',
+      ariaLabel: el.getAttribute('aria-label') || ''
+    };
+  }
+
+  function record(action, el, value) {
+    window.__recordedQueue.push({
+      ts: Date.now(),
+      action: action,
+      value: value === undefined ? null : value,
+      element: describe(el),
+      locators: buildLocators(el),
+      url: window.location.href
+    });
+    persistQueue();
+  }
+
+  document.addEventListener('click', function (e) {
+    var el = e.target;
+    if (!el || el === document || el === document.body) return;
+    // walk up to nearest clickable-ish element if the click landed on an inline text node wrapper.
+    // Includes radio/checkbox inputs and <label> so clicks on custom-styled radio/checkbox UIs
+    // (where the visible click target is a label or wrapping span, not the native input) still
+    // resolve to the actual underlying <input>.
+    var clickable = el.closest(
+      'button, a, [role="button"], input[type="submit"], input[type="button"], ' +
+      'input[type="radio"], input[type="checkbox"], label, [onclick]'
+    ) || el;
+
+    if (clickable.tagName && clickable.tagName.toLowerCase() === 'label') {
+      var forId = clickable.getAttribute('for');
+      var resolved = forId ? document.getElementById(forId) : clickable.querySelector('input, select');
+      if (resolved) clickable = resolved;
+    }
+
+    if (clickable.tagName === 'INPUT' && (clickable.type === 'radio' || clickable.type === 'checkbox')) {
+      // The browser applies the click's default action (actually flipping
+      // .checked) AFTER all capture/bubble listeners have run, so reading
+      // clickable.checked synchronously here would still see the OLD value.
+      // Deferring to the next tick lets us record the RESULTING checked
+      // state as this action's value - the generated replay step then uses
+      // that as an explicit target state (Playwright's check()/uncheck())
+      // instead of a blind click, so replay can never double-toggle it.
+      var target = clickable;
+      setTimeout(function () {
+        record('click', target, target.checked);
+      }, 0);
+      return;
+    }
+
+    record('click', clickable);
+  }, true);
+
+  document.addEventListener('change', function (e) {
+    var el = e.target;
+    if (!el) return;
+    var tag = el.tagName.toLowerCase();
+
+    if (tag === 'select') {
+      var opt = el.options[el.selectedIndex];
+      record('select', el, opt ? opt.text.trim() : el.value);
+      return;
+    }
+    if (tag === 'input' && el.type === 'file') {
+      // el.value is ALWAYS a browser-fabricated "C:\fakepath\<name>" string
+      // for security - never the real absolute disk path, and there's no
+      // way to type/set a file input back to it on replay. BUT the File
+      // API DOES let JS read the chosen file's actual CONTENT (just not
+      // its path) - so instead of requiring a human to manually go find
+      // and copy the same file into a fixtures folder before every
+      // replay, capture the real bytes here, right now, while the file is
+      // actually available, and ship them along with this action.
+      // generator/build.py writes them straight into output/fixtures/<name>
+      // automatically - by the time replay runs, the exact file used at
+      // recording time is already sitting there, whatever its name was.
+      var file = el.files && el.files.length ? el.files[0] : null;
+      var chosenName = file ? file.name : '';
+      var MAX_INLINE_BYTES = 4 * 1024 * 1024; // ~4MB - stays well under the
+      // ~5-10MB per-origin sessionStorage quota this queue is mirrored
+      // into (see persistQueue), leaving room for other queued actions.
+      if (!file || file.size > MAX_INLINE_BYTES) {
+        // Too large to safely inline (or no file object available for some
+        // reason) - fall back to name-only capture; upload_file() at
+        // replay time will still work fine if a file with this name is
+        // placed in fixtures/ manually.
+        record('file_upload', el, chosenName);
+        return;
+      }
+      var reader = new FileReader();
+      reader.onload = function () {
+        // reader.result is a "data:<mime>;base64,<data>" URL - strip the
+        // prefix down to just the base64 payload.
+        var dataUrl = reader.result || '';
+        var comma = dataUrl.indexOf(',');
+        var base64 = comma >= 0 ? dataUrl.slice(comma + 1) : '';
+        window.__recordedQueue.push({
+          ts: Date.now(),
+          action: 'file_upload',
+          value: chosenName,
+          fileDataBase64: base64,
+          element: describe(el),
+          locators: buildLocators(el),
+          url: window.location.href
+        });
+        persistQueue();
+      };
+      reader.onerror = function () {
+        // Reading failed for some reason - still record the name so
+        // upload_file()'s manual-fallback path remains available.
+        record('file_upload', el, chosenName);
+      };
+      reader.readAsDataURL(file);
+      return;
+    }
+    if (tag === 'input' && (el.type === 'radio' || el.type === 'checkbox')) {
+      // handled by the click listener above (clicking IS the interaction for these;
+      // recording it again here would create a duplicate/redundant step)
+      return;
+    }
+    if (tag === 'input' || tag === 'textarea') {
+      record('type', el, el.value);
+    }
+  }, true);
+
+  // Capture keyboard-driven actions (Enter to submit, Backspace to clear/edit,
+  // Arrow Up/Down to move through suggestion lists, Ctrl combos, function keys,
+  // etc.) separately from typed text, since these are user-initiated key presses
+  // rather than a change to the field's value.
+  //
+  // CTRL+C / CTRL+V / CTRL+X are deliberately NOT recorded here - they're
+  // captured with richer data (the actual copied/pasted text and the source/
+  // target element) by the dedicated copy/cut/paste listeners below instead,
+  // so recording them again here would just be a redundant, value-less entry.
+  var SIMPLE_KEY_MAP = {
+    'Enter': 'ENTER',
+    'Backspace': 'BACKSPACE',
+    'Escape': 'ESCAPE',
+    'Delete': 'DELETE',
+    ' ': 'SPACE',
+    'Spacebar': 'SPACE',
+    'ArrowUp': 'ARROW_UP',
+    'ArrowDown': 'ARROW_DOWN',
+    'ArrowLeft': 'ARROW_LEFT',
+    'ArrowRight': 'ARROW_RIGHT',
+    'Home': 'HOME',
+    'End': 'END'
+  };
+  for (var _f = 1; _f <= 12; _f++) SIMPLE_KEY_MAP['F' + _f] = 'F' + _f;
+
+  // Ctrl/Cmd combos recorded generically as a single keypress action (so
+  // playback can literally re-press them via Playwright). 'c'/'v'/'x' are
+  // excluded here on purpose - see note above.
+  var CTRL_COMBO_MAP = {
+    'a': 'CTRL+A',
+    'p': 'CTRL+P',
+    's': 'CTRL+S'
+  };
+
+  function keyComboLabel(e) {
+    var key = e.key;
+    var ctrlLike = e.ctrlKey || e.metaKey;
+
+    if (ctrlLike && !e.altKey) {
+      var combo = CTRL_COMBO_MAP[(key || '').toLowerCase()];
+      if (combo) return combo;
+      if (['c', 'v', 'x'].indexOf((key || '').toLowerCase()) !== -1) return null;
+    }
+    if (e.shiftKey && key === 'Tab') return 'SHIFT+TAB';
+    if (!ctrlLike && !e.altKey) {
+      if (key === 'Tab') return 'TAB';
+      return SIMPLE_KEY_MAP[key] || null;
+    }
+    return null;
+  }
+
+  document.addEventListener('keydown', function (e) {
+    var el = e.target;
+    if (!el) return;
+    var label = keyComboLabel(e);
+    if (label) {
+      record('keypress', el, label);
+    }
+  }, true);
+
+  // Real-time copy/cut/paste capture: records not just THAT a copy/paste
+  // happened, but the actual text value and the source (copy/cut) or target
+  // (paste) element, so the variable Capture -> Store -> Reuse pipeline (see
+  // recorder/variable_capture.py) can later recognize "this pasted value is
+  // the same one copied earlier from that generated-username field" and turn
+  // it into a {{username}}-style placeholder instead of baking in the
+  // literal string.
+  function selectedTextFrom(el) {
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') &&
+        typeof el.selectionStart === 'number' && el.selectionStart !== el.selectionEnd) {
+      return el.value.substring(el.selectionStart, el.selectionEnd);
+    }
+    var sel = window.getSelection();
+    return sel ? sel.toString() : '';
+  }
+
+  function recordCopyLike() {
+    var el = document.activeElement;
+    var text = selectedTextFrom(el);
+    if (!text) return;
+    record('copy', (el instanceof Element) ? el : document.body, text);
+  }
+
+  document.addEventListener('copy', recordCopyLike, true);
+  document.addEventListener('cut', recordCopyLike, true);
+
+  document.addEventListener('paste', function (e) {
+    var el = e.target;
+    var text = '';
     try {
-      const r = await recordingsApi.importUipathExcel(importFile, importName);
-      const warningText = r.warnings.length
-        ? ` (${r.warnings.length} warning${r.warnings.length > 1 ? "s" : ""}: ${r.warnings.join(" · ")})`
-        : "";
-      setImportNotice({
-        tone: r.warnings.length ? "warning" : "success",
-        text: `Imported ${r.action_count} steps from ${importFile.name}.${warningText} It's now in the list below.`,
-      });
-      setImportFile(null);
-      setImportName("");
-      await loadRecordings();
-      setSelectedRecFile(r.recording_file);
-    } catch (e) {
-      setImportNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setImportBusy(false);
+      text = (e.clipboardData || window.clipboardData).getData('text');
+    } catch (err) { /* clipboard not readable here - resolved at build/runtime instead */ }
+    record('paste', el, text);
+  }, true);
+
+  // --- Right-click capture: two related but distinct mechanisms behind
+  // one gesture -
+  //
+  //   "text" - reads the element's DISPLAYED TEXT DIRECTLY (input value,
+  //   or innerText/textContent for read-only labels/divs/spans) - no
+  //   image processing at all, resolved instantly, entirely in this
+  //   script. This is what most values actually need: a plain-text field
+  //   or label that the person just never happened to Ctrl+C during
+  //   recording (the existing copy/paste listeners above only fire on a
+  //   REAL clipboard event - looking at a value and typing the same thing
+  //   into another field, with no copy gesture at all, leaves nothing for
+  //   them to correlate). Reuses the EXISTING "copy" action type end to
+  //   end (see recorder.py's handling below, which just relabels the
+  //   request rather than reprocessing it) - a value captured this way is
+  //   stored, correlated, and re-read live at replay through the exact
+  //   same {{var}} pipeline a real Ctrl+C copy already uses; nothing
+  //   downstream needs to know or care which gesture produced it.
+  //
+  //   "ocr" - for values rendered as an IMAGE or CANVAS (a scanned
+  //   reference number, a canvas-drawn amount) that have no real
+  //   selectable/readable DOM text at all - see recorder.py's
+  //   "ocr_capture_request" handling, which screenshots the element and
+  //   runs OCR on it instead.
+  //
+  // Uses window.prompt()/window.confirm() - native, BLOCKING browser
+  // dialogs - rather than a custom floating menu. A custom on-page menu
+  // was tried first and turned out fragile in practice: it closed itself
+  // via an "any click outside the menu dismisses it" listener, and that
+  // listener could end up catching a trailing part of the very same
+  // right-click gesture that opened it, making the menu flash and vanish
+  // before it could be clicked. A native dialog can't have this problem -
+  // it blocks all further page script (including any click-based
+  // dismissal logic) until the person actually answers it.
+  //
+  // Deliberately intercepts EVERY right-click on the page while recording
+  // (not just on <img>/<canvas>/inputs) and replaces the native context
+  // menu with this - many apps render meaningful text via SVG,
+  // background-image, or other non-<img> elements too, and there's no
+  // reliable way to detect "this element visually contains text" from the
+  // DOM alone. The trade-off: the browser's own right-click menu
+  // (Inspect, "Save image as", etc.) isn't available during recording,
+  // and every right-click now shows a prompt (leave it blank/Cancel for a
+  // normal right-click you don't want captured).
+  function recordTextCaptureRequest(el, varName) {
+    var text = '';
+    if ('value' in el && el.value) {
+      text = el.value;
+    } else {
+      text = (el.innerText || el.textContent || '');
     }
+    text = text.trim();
+    // Reuses the SAME "copy" action shape a real Ctrl+C produces
+    // (recordCopyLike above) - captured_as is the one addition, carrying
+    // the user's explicitly CHOSEN name through instead of leaving it to
+    // be auto-derived from the element the way an incidental real copy
+    // event's name is (see recorder/variable_capture.py's
+    // derive_variable_name) - the person picked this name on purpose here,
+    // so it should win.
+    window.__recordedQueue.push({
+      ts: Date.now(),
+      action: 'copy',
+      value: text,
+      captured_as: varName,
+      element: describe(el),
+      locators: buildLocators(el),
+      url: window.location.href
+    });
+    persistQueue();
+    // Best-effort convenience so the person recording can genuinely Ctrl+V
+    // this into the next field instead of retyping it by hand - done
+    // directly here in JS (unlike the OCR path below, which has to do this
+    // from Python after its screenshot/OCR round trip) since the value is
+    // already known immediately, with no round trip needed at all.
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text);
+      }
+    } catch (err) { /* non-fatal - the captured value is already stored regardless */ }
   }
 
-  return (
-    <div className="grid min-w-0 gap-6 lg:grid-cols-[360px_1fr]">
-      <Panel>
-        <PanelHeader title="Run a saved recording" caption="Pick a recording, review/edit its test data, then run it." />
-        <div className="space-y-4 px-5 py-5">
-          <Callout>
-            Running as <strong>{user?.first_name} {user?.last_name}</strong> ({user?.username}). Every run is logged
-            against your account.
-          </Callout>
+  function recordOcrCaptureRequest(el, varName) {
+    window.__recordedQueue.push({
+      ts: Date.now(),
+      action: 'ocr_capture_request',
+      value: null,
+      requested_var_name: varName,
+      element: describe(el),
+      locators: buildLocators(el),
+      url: window.location.href
+    });
+    persistQueue();
+  }
 
-          <Disclosure title="Import from a UiPath Excel sheet">
-            <div className="space-y-3">
-              <p className="text-xs text-muted">
-                Upload a spreadsheet with Steps / NAME / Action-Method / present element / input columns - it's
-                converted into a saved recording here, ready to run or regenerate like any other.
-              </p>
-              <Field label="Excel file (.xlsx)">
-                <input
-                  type="file"
-                  accept=".xlsx,.xlsm"
-                  onChange={(e) => setImportFile(e.target.files?.[0] || null)}
-                  className="block w-full text-sm text-ink file:mr-3 file:rounded-sm file:border-0 file:bg-rail file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-ink hover:file:bg-line"
-                />
-              </Field>
-              <Field label="Name this recording (optional)">
-                <TextInput
-                  value={importName}
-                  onChange={(e) => setImportName(e.target.value)}
-                  placeholder="e.g. LLMS Lite MCC Flow"
-                />
-              </Field>
-              <Button variant="secondary" onClick={handleImportUipath} disabled={!importFile || importBusy} className="w-full">
-                {importBusy ? "Importing..." : "Import"}
-              </Button>
-              {importNotice && <Callout tone={importNotice.tone}>{importNotice.text}</Callout>}
-            </div>
-          </Disclosure>
+  document.addEventListener('contextmenu', function (e) {
+    var el = e.target;
+    if (!el || el === document || el === document.body) return;
+    e.preventDefault();
 
-          {recordingsError && <Callout tone="error">Could not load recordings: {recordingsError}</Callout>}
+    var choice = window.prompt(
+      'Capture a value from this element, to reuse later in this recording?\n\n' +
+      'Type "text" to capture its displayed text directly (fast, reliable - ' +
+      'use this for any real label, input value, or read-only text)\n' +
+      'Type "ocr" instead if the value is rendered inside an IMAGE or CANVAS ' +
+      '(slower - reads the pixels)\n\n' +
+      'Leave blank or Cancel for a normal right-click.',
+      'text'
+    );
+    if (!choice) return;
+    choice = choice.trim().toLowerCase();
+    if (choice !== 'text' && choice !== 'ocr') return;
 
-          {recordings.length === 0 ? (
-            <Callout>No saved recordings found yet. Record one in the &ldquo;Record &amp; Generate&rdquo; tab first.</Callout>
-          ) : (
-            <>
-              <Field label="Saved recording">
-                <Select value={selectedRecFile} onChange={(e) => setSelectedRecFile(e.target.value)}>
-                  {recordings.map((r) => (
-                    <option key={r.file} value={r.file}>
-                      {r.name} — {r.target_url} ({r.action_count} actions)
-                    </option>
-                  ))}
-                </Select>
-              </Field>
+    var varName = window.prompt(
+      'Variable name for this captured value (letters/numbers/underscore only):',
+      'captured_value'
+    );
+    if (!varName || !varName.trim()) return;
+    varName = varName.trim().replace(/[^a-zA-Z0-9_]/g, '_');
 
-              <Checkbox label="headless" checked={runHeadless} onChange={setRunHeadless} />
+    if (choice === 'ocr') {
+      recordOcrCaptureRequest(el, varName);
+      window.alert(
+        'Marked for OCR capture as {{' + varName + '}}.\n\n' +
+        'It will be extracted now (check the recorded actions), and re-read ' +
+        'live from this same spot every time this test runs later.'
+      );
+      return;
+    }
 
-              <Button onClick={handleRun} disabled={runBusy} className="w-full">
-                {runBusy ? "Running..." : "Run recording"}
-              </Button>
+    recordTextCaptureRequest(el, varName);
+    window.alert(
+      'Marked "{{' + varName + '}}" to be captured as live text.\n\n' +
+      'It will be re-read from this exact spot every time this test runs later.'
+    );
+  }, true);
 
-              {runBusy && <Spinner label="Running the saved recording..." />}
-              {runError && <Callout tone="error">Run failed: {runError}</Callout>}
+  window.__flushActions = function () {
+    var q = window.__recordedQueue;
+    window.__recordedQueue = [];
+    persistQueue();
+    return q;
+  };
 
-              <div className="border-t border-line pt-4">
-                <Button variant="secondary" onClick={handleRegenerate} disabled={regenBusy} className="w-full">
-                  {regenBusy ? "Regenerating..." : "Regenerate (no run)"}
-                </Button>
-                <p className="mt-1.5 text-xs text-muted">
-                  Refreshes this recording's generated feature/steps/page files from the latest generator code -
-                  without re-recording or running anything. Useful right after a code/template fix, to confirm it
-                  applies here.
-                </p>
-                {regenNotice && (
-                  <div className="mt-2">
-                    <Callout tone={regenNotice.tone}>{regenNotice.text}</Callout>
-                  </div>
-                )}
-              </div>
-            </>
-          )}
-        </div>
-      </Panel>
-
-      <div className="min-w-0 space-y-4">
-        {selectedRecFile && (
-          <Panel>
-            <div className="flex items-center justify-between border-b border-line px-5 py-4">
-              <div>
-                <h2 className="text-sm font-semibold text-ink">Test data</h2>
-                <p className="mt-0.5 text-xs text-muted">
-                  The values this recording types/selects when it runs. Edit anything below, then hit{" "}
-                  <strong>Run recording</strong> - no need to download or re-upload the Excel report; changes save
-                  straight into this recording.
-                </p>
-              </div>
-              {testData.length > 0 && (
-                <Button variant="secondary" onClick={saveTestDataOnly} disabled={savingData}>
-                  {savingData ? "Saving..." : "Save without running"}
-                </Button>
-              )}
-            </div>
-            <div className="px-5 py-4">
-              {testDataLoading && <Spinner label="Loading test data..." />}
-              {testDataError && <Callout tone="error">{testDataError}</Callout>}
-              {saveDataError && <Callout tone="error">{saveDataError}</Callout>}
-              {saveDataNotice && <Callout tone="success">{saveDataNotice}</Callout>}
-
-              {!testDataLoading && !testDataError && testData.length === 0 && (
-                <p className="text-sm text-muted">
-                  This recording has no typed or selected values to edit (e.g. it's clicks/navigation only).
-                </p>
-              )}
-
-              {testData.length > 0 && (
-                <DataTable
-                  columns={[
-                    { key: "label", label: "Field" },
-                    { key: "action", label: "Type", mono: true },
-                    { key: "value", label: "Value" },
-                  ]}
-                  rows={testData.map((f) => ({
-                    label: f.label,
-                    action: f.action,
-                    value: (
-                      <TextInput
-                        value={editValues[f.index] ?? ""}
-                        onChange={(e) => updateValue(f.index, e.target.value)}
-                      />
-                    ),
-                  }))}
-                />
-              )}
-            </div>
-          </Panel>
-        )}
-
-        {report && (
-          <Panel>
-            <PanelHeader title="Exit report" caption={`Transaction #${report.transaction_id} · ${report.date_time} UTC`} />
-            <div className="min-w-0 space-y-6 px-5 py-5">
-              {/* ---- Graphical summary: donut + step-sequence strip + metrics ---- */}
-              <div className="flex flex-wrap items-center gap-6 rounded-sm border border-line bg-rail/60 p-4">
-                <ReportDonut passed={report.passed_count} failed={report.failed_count} />
-                <div className="min-w-0 flex-1 space-y-3">
-                  <div className="flex flex-wrap items-center gap-3">
-                    <StatusBadge status={report.status} />
-                    <span className="text-sm text-muted">
-                      Run by <strong className="font-medium text-ink">{report.user}</strong>
-                    </span>
-                  </div>
-                  <StepSequenceBar steps={report.steps} />
-                  <div className="grid grid-cols-3 gap-2 sm:max-w-sm">
-                    <Metric label="Steps" value={report.step_count} />
-                    <Metric label="Passed" value={report.passed_count} />
-                    <Metric label="Failed" value={report.failed_count} />
-                  </div>
-                </div>
-              </div>
-
-              <div className="min-w-0">
-                <h3 className="mb-2 text-sm font-semibold text-ink">Automation log</h3>
-                <DataTable
-                  columns={[
-                    { key: "n", label: "#" },
-                    { key: "step", label: "Playwright step" },
-                    { key: "status", label: "Status" },
-                    { key: "error", label: "Error", mono: true },
-                  ]}
-                  rows={report.steps.map((s, i) => ({
-                    n: i + 1,
-                    step: s.step_name,
-                    status: <StatusBadge status={s.status} />,
-                    error: s.error_message || "",
-                  }))}
-                />
-              </div>
-
-              <Disclosure title={`Files produced (${report.files.length})`}>
-                <DataTable
-                  columns={[
-                    { key: "file_name", label: "File" },
-                    { key: "folder_path", label: "Folder", mono: true },
-                  ]}
-                  rows={report.files.map((f) => ({ file_name: f.file_name, folder_path: f.folder_path }))}
-                />
-              </Disclosure>
-
-              <Disclosure title="Raw Behave output">
-                <pre className="max-h-96 w-full min-w-0 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-[#0B1A33] p-4 font-mono text-xs text-[#D7E1EF] scroll-thin">
-                  {report.raw_output}
-                </pre>
-              </Disclosure>
-
-              <div className="flex flex-wrap gap-2">
-                <Button onClick={() => openReportInBrowser(report)}>Open report in browser</Button>
-                <Button
-                  variant="secondary"
-                  onClick={() =>
-                    downloadBlob(
-                      `transaction_${report.transaction_id}_exit_report.html`,
-                      buildReportHtml(report),
-                      "text/html"
-                    )
-                  }
-                >
-                  Download (.html)
-                </Button>
-                <Button
-                  variant="secondary"
-                  onClick={() =>
-                    downloadBlob(
-                      `transaction_${report.transaction_id}_exit_report.txt`,
-                      buildReportText(report),
-                      "text/plain"
-                    )
-                  }
-                >
-                  Download (.txt)
-                </Button>
-              </div>
-            </div>
-          </Panel>
-        )}
-
-        {!selectedRecFile && (
-          <Panel>
-            <div className="px-5 py-10 text-center text-sm text-muted">
-              Pick a saved recording to review its test data and run it.
-            </div>
-          </Panel>
-        )}
-      </div>
-    </div>
-  );
-}
+  // Exposed so the Python side (recorder/recorder.py) can compute a stable
+  // CSS path for an <iframe>/<frame> DOM ELEMENT from *inside the PARENT
+  // frame's context* (Playwright's Frame.frame_element() returns that
+  // element handle, but it has to be evaluated against the parent frame,
+  // not the iframe's own document) - this is how mainframe/iframe support
+  // builds a "frame_path" (a chain of selectors from the top page down to
+  // the frame an action happened in) without needing any new JS of its
+  // own; it just reuses the same cssPath() this file already uses for
+  // in-page elements. See Recorder._frame_path_for.
+  window.__recorderCssPathFor = cssPath;
+})();
