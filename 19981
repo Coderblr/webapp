@@ -1,552 +1,415 @@
-/*
-Injected via Playwright's page.add_init_script() so it re-attaches on every
-navigation (including SPA route changes that reload the document, and full
-page loads). Captures click + input/change events and builds MULTIPLE
-independent locator strategies per element so the generated tests don't
-depend on a single brittle selector. Actions are queued here and drained
-by the Python side polling window.__flushActions() (see
-recorder/recorder.py) from the single worker thread that owns the page.
-*/
-(function () {
-  if (window.__recorderInstalled) return;
-  window.__recorderInstalled = true;
+"""
+Takes a raw recording (list of actions from recorder.Recorder) and produces:
+  - output/features/recorded.feature
+  - output/features/steps/recorded_steps.py
+  - output/features/environment.py   (copied static file, see runner/environment.py)
+  - output/pages/recorded_page.py
+  - output/pages/locators.json
 
-  // Actions are also mirrored to sessionStorage (same-origin, survives a
-  // navigation) so a queued action isn't lost if the page navigates/reloads
-  // (e.g. pressing Enter submits the form) before the Python side's next
-  // poll had a chance to flush window.__recordedQueue - that race is why
-  // Enter/submit-triggered actions could intermittently go unrecorded.
-  var STORAGE_KEY = '__recorderQueue';
+This is deterministic scaffolding; the only place an LLM is optionally
+consulted is agent/step_namer.py (naming elements + phrasing steps).
+"""
+from __future__ import annotations
+import base64
+import json
+import math
+import re
+import shutil
+from pathlib import Path
+from datetime import datetime
 
-  function loadPersistedQueue() {
-    try {
-      var raw = sessionStorage.getItem(STORAGE_KEY);
-      return raw ? JSON.parse(raw) : [];
-    } catch (e) {
-      return [];
-    }
-  }
+from jinja2 import Environment, FileSystemLoader
 
-  function persistQueue() {
-    try {
-      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(window.__recordedQueue));
-    } catch (e) { /* storage unavailable/full - keep going in-memory only */ }
-  }
+from recorder.locator_strategy import order_locators
+from agent.step_namer import name_step, key_label
 
-  window.__recordedQueue = loadPersistedQueue();
+TEMPLATES_DIR = Path(__file__).parent / "templates"
+ROOT = Path(__file__).parent.parent
 
-  function cssEscape(s) {
-    return (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/([^a-zA-Z0-9_-])/g, '\\$1');
-  }
+# Floor for the measured recording-to-recording wait, so two actions that
+# happened to be recorded a fraction of a second apart don't generate an
+# unrealistically tight timeout.
+MIN_WAIT_SECONDS = 5
+# Used when no timing data is available at all (e.g. a hand-built recording).
+DEFAULT_WAIT_SECONDS = 10
 
-  function isUnique(selector) {
-    try {
-      return document.querySelectorAll(selector).length === 1;
-    } catch (e) {
-      return false;
-    }
-  }
 
-  function cssPath(el) {
-    if (!(el instanceof Element)) return null;
-    var path = [];
-    while (el && el.nodeType === Node.ELEMENT_NODE && el.tagName.toLowerCase() !== 'html') {
-      var selector = el.tagName.toLowerCase();
-      if (el.id) {
-        selector = '#' + cssEscape(el.id);
-        path.unshift(selector);
-        break;
-      } else {
-        var sib = el, nth = 1;
-        while ((sib = sib.previousElementSibling)) {
-          if (sib.tagName === el.tagName) nth++;
-        }
-        selector += ':nth-of-type(' + nth + ')';
-      }
-      path.unshift(selector);
-      el = el.parentElement;
-    }
-    return path.join(' > ');
-  }
+def build_artifacts(recording: dict, llm=None, output_dir: str = "output", mask_passwords: bool = True) -> dict:
+    out = Path(output_dir)
+    (out / "features" / "steps").mkdir(parents=True, exist_ok=True)
+    (out / "pages").mkdir(parents=True, exist_ok=True)
+    (out / "fixtures").mkdir(parents=True, exist_ok=True)
 
-  function xpathOf(el) {
-    if (el.id) return '//*[@id="' + el.id + '"]';
-    var parts = [];
-    while (el && el.nodeType === Node.ELEMENT_NODE) {
-      var idx = 1;
-      var sib = el.previousElementSibling;
-      while (sib) {
-        if (sib.tagName === el.tagName) idx++;
-        sib = sib.previousElementSibling;
-      }
-      parts.unshift(el.tagName.toLowerCase() + '[' + idx + ']');
-      el = el.parentElement;
-    }
-    return '/' + parts.join('/');
-  }
+    target_url = recording["target_url"]
+    actions = recording["actions"]
 
-  function textXPath(el) {
-    var text = (el.innerText || el.textContent || '').trim();
-    if (!text || text.length > 60) return null;
-    var tag = el.tagName.toLowerCase();
-    return "//" + tag + "[normalize-space(.)=\"" + text.replace(/"/g, '') + "\"]";
-  }
+    # Best-effort: merge same-element 'type' actions that fired within a
+    # short window of each other (see coalesce_consecutive_types's docstring)
+    # in case this recording predates that fix, or was regenerated from a
+    # previously-saved recording. Runs BEFORE variable annotation below so
+    # {{var}} correlation sees the final, de-duplicated values.
+    try:
+        from recorder.variable_capture import coalesce_consecutive_types
+        actions = coalesce_consecutive_types(actions)
+    except Exception:
+        pass
 
-  function isUniqueXPath(xpath) {
-    try {
-      var result = document.evaluate('count(' + xpath + ')', document, null, XPathResult.NUMBER_TYPE, null);
-      return result.numberValue === 1;
-    } catch (e) {
-      return false;
-    }
-  }
+    # Best-effort: derive/refresh the Capture -> Store -> Reuse {{var}} metadata
+    # (see recorder/variable_capture.py) in case this recording was produced
+    # before that hook existed in Recorder.stop(), or was built by hand. Safe
+    # to call even if it already ran - it's idempotent.
+    try:
+        from recorder.variable_capture import annotate_variables
+        actions = annotate_variables(actions)
+    except Exception:
+        pass
 
-  function ancestorTextXPath(el) {
-    // Radio/checkbox inputs usually have NO text content of their own - the
-    // visible option label lives on a wrapping component instead (e.g.
-    // Angular Material's <mat-radio-button>/<mat-checkbox>, or a plain
-    // wrapping <label>), so textXPath(el) above returns null for them. That
-    // leaves the input's auto-generated id (e.g. Angular's "mat-radio-9-input")
-    // as the only usable locator - and that id is NOT stable across page
-    // loads, since frameworks like Angular/React generate it from a global
-    // counter that depends on everything else rendered earlier on the page.
-    // Climbing to the nearest wrapper with short, meaningful text and
-    // anchoring an XPath on THAT text (then navigating back down to the
-    // input) gives a locator based on what a real user actually sees - e.g.
-    // //mat-radio-button[normalize-space(.)="Yes"]//input - which stays
-    // correct regardless of what id Angular happens to generate this time.
-    if (!(el.tagName === 'INPUT' && (el.type === 'radio' || el.type === 'checkbox'))) return null;
-    var wrapper = el.closest('mat-radio-button, mat-checkbox, [role="radio"], [role="checkbox"], label') || el.parentElement;
-    var depth = 0;
-    while (wrapper && depth < 4) {
-      var text = (wrapper.innerText || wrapper.textContent || '').trim();
-      if (text && text.length <= 60) {
-        var tag = wrapper.tagName.toLowerCase();
-        var xp = "//" + tag + "[normalize-space(.)=\"" + text.replace(/"/g, '') + "\"]//input[@type=\"" + el.type + "\"]";
-        if (isUniqueXPath(xp)) return xp;
-      }
-      wrapper = wrapper.parentElement;
-      depth++;
-    }
-    return null;
-  }
+    # Materialize any file(s) actually uploaded during recording into
+    # output/fixtures/ under their original name (see recorder_injector.js's
+    # file_upload handling) - this is what lets a tester upload literally
+    # any file, with any name, and have replay just work with no manual
+    # "go copy the file into fixtures/" step. Only skipped when a file was
+    # too large to have been captured inline (see MAX_INLINE_BYTES in the
+    # injector) or predates this feature - BasePage.upload_file()'s
+    # FileNotFoundError message tells the user exactly what to do in that
+    # fallback case.
+    for action in actions:
+        if action.get("action") != "file_upload":
+            continue
+        b64 = action.get("fileDataBase64")
+        file_name = action.get("value")
+        if not b64 or not file_name:
+            continue
+        try:
+            file_bytes = base64.b64decode(b64)
+            # Strip any path-like characters from the recorded name before
+            # using it as a filename - defense in depth, since this is
+            # ultimately attacker-controllable browser-reported input.
+            # Deliberately NOT just Path(file_name).name: that only splits
+            # on the CURRENT platform's separator - on Linux, a Windows-
+            # style "C:\fakepath\name.pdf" string (exactly what a real
+            # recorded file_upload value looks like, per
+            # recorder_injector.js) has no "/" in it at all, so .name
+            # would return the WHOLE fake path unchanged, not just the
+            # filename. Splitting on both slash characters explicitly
+            # works the same regardless of which OS actually runs this.
+            safe_name = re.split(r"[\\/]", file_name)[-1] or "uploaded_file"
+            (out / "fixtures" / safe_name).write_bytes(file_bytes)
+        except Exception:
+            # Corrupt/partial base64, disk issue, etc. - don't fail the
+            # whole build over one file; upload_file()'s own error message
+            # at replay time will make the problem obvious if it matters.
+            pass
 
-  function buildLocators(el) {
-    var locs = [];
+    used_names = set()
+    steps = []
+    locators_map = {}
+    prev_ts = None
 
-    if (el.getAttribute('data-testid')) {
-      var v = el.getAttribute('data-testid');
-      var sel = '[data-testid="' + cssEscape(v) + '"]';
-      if (isUnique(sel)) locs.push({ strategy: 'CSS', value: sel, note: 'data-testid' });
-    }
-    if (el.id) {
-      var idSel = '#' + cssEscape(el.id);
-      if (isUnique(idSel)) locs.push({ strategy: 'ID', value: el.id });
-    }
-    if (el.name) {
-      var nameSel = '[name="' + cssEscape(el.name) + '"]';
-      if (isUnique(nameSel)) locs.push({ strategy: 'NAME', value: el.name });
-    }
-    if (el.getAttribute('aria-label')) {
-      var al = el.getAttribute('aria-label');
-      var alSel = '[aria-label="' + cssEscape(al) + '"]';
-      if (isUnique(alSel)) locs.push({ strategy: 'CSS', value: alSel, note: 'aria-label' });
-    }
-    if (el.getAttribute('placeholder')) {
-      var ph = el.getAttribute('placeholder');
-      var phSel = '[placeholder="' + cssEscape(ph) + '"]';
-      if (isUnique(phSel)) locs.push({ strategy: 'CSS', value: phSel, note: 'placeholder' });
-    }
-    var txp = textXPath(el);
-    if (txp) locs.push({ strategy: 'XPATH', value: txp, note: 'text' });
+    # Tracks which browser tab/window index (0 = the one the recording
+    # started on) replay currently considers "active", as we walk the
+    # recording in order - lets each real interactive step know whether it
+    # needs to switch tabs/windows first (see step["switch_to_page"] below),
+    # and lets a "new_window"/"window_closed" synthetic action fold its
+    # effect into the step it belongs with instead of needing its own.
+    current_page_index = 0
 
-    var atxp = ancestorTextXPath(el);
-    if (atxp) locs.push({ strategy: 'XPATH', value: atxp, note: 'text' });
+    # Parallel to `actions` (NOT to `steps` - a "new_window" action folds
+    # into the PRECEDING step and produces no step of its own, so the two
+    # lists can differ in length) - used for the Excel report below, which
+    # needs one label per ACTION, including the synthetic ones.
+    excel_labels = []
 
-    var cp = cssPath(el);
-    if (cp) locs.push({ strategy: 'CSS', value: cp, note: 'generated-path' });
+    for action in actions:
+        kind = action["action"]
+        page_index = action.get("page_index", 0)
+        frame_path = action.get("frame_path") or []
 
-    var xp = xpathOf(el);
-    if (xp) locs.push({ strategy: 'XPATH', value: xp, note: 'generated-path' });
+        # Explicit wait: how long the app actually took, during recording, to
+        # reach the state this action needed (i.e. the gap between the
+        # previous recorded action and this one) - so a step that recorded
+        # slow (e.g. a 50s dashboard load) gets a matching wait_ready()
+        # timeout, while a fast one doesn't sit around waiting needlessly.
+        # Computed here (before the branches below) so it's available for
+        # synthetic popup/dialog/window actions too, not just the "normal"
+        # interactive ones further down.
+        ts = action.get("ts")
+        if prev_ts is None or ts is None:
+            wait_seconds = DEFAULT_WAIT_SECONDS
+        else:
+            wait_seconds = max(MIN_WAIT_SECONDS, math.ceil((ts - prev_ts) / 1000.0))
+        if ts is not None:
+            prev_ts = ts
 
-    return locs;
-  }
+        # --- popup / new tab / new window --------------------------------
+        # Doesn't get its own replay step: Playwright can only reliably
+        # catch a new page by wrapping the ACTION THAT CAUSED IT in
+        # context.expect_page() (see steps.tmpl's new_page_wrapper macro),
+        # so this folds forward onto the step that was just appended
+        # (almost always the click that opened it) instead. If this is
+        # somehow the very first action in the whole recording (no
+        # preceding step to fold onto - e.g. the app pops a window
+        # immediately on load), falls back to a standalone step that just
+        # waits for one to appear.
+        if kind == "new_window":
+            if steps:
+                steps[-1]["opens_new_page"] = True
+                steps[-1]["new_page_index"] = page_index
+            else:
+                steps.append({
+                    "action": "new_window_wait",
+                    "element_name": None,
+                    "step_phrase": "waits for a new browser tab or window to open",
+                    "wait_seconds": wait_seconds,
+                    "new_page_index": page_index,
+                })
+            current_page_index = page_index
+            excel_labels.append(f"(new browser tab/window #{page_index} opens)")
+            continue
 
-  function describe(el) {
+        # --- tab/window closed --------------------------------------------
+        if kind == "window_closed":
+            opener_index = action.get("opener_page_index", 0) or 0
+            steps.append({
+                "action": "window_closed",
+                "element_name": None,
+                "step_phrase": "closes the browser tab or window",
+                "wait_seconds": wait_seconds,
+                "closed_page_index": page_index,
+                "switch_back_to_index": opener_index,
+            })
+            current_page_index = opener_index
+            excel_labels.append(f"(browser tab/window #{page_index} closed)")
+            continue
+
+        # --- native alert/confirm/prompt/beforeunload dialog --------------
+        if kind == "dialog":
+            steps.append({
+                "action": "dialog",
+                "element_name": None,
+                "step_phrase": "handles a browser dialog",
+                "wait_seconds": wait_seconds,
+                "dialog_type": action.get("dialog_type") or "alert",
+                "dialog_message": action.get("value") or "",
+            })
+            excel_labels.append(f"(dialog: {action.get('dialog_type') or 'alert'})")
+            continue
+
+        # --- explicit delay/pause (e.g. imported from a UiPath-style Excel
+        # flow's DELAY step - see generator/uipath_importer.py) - a plain
+        # wait with no element/locator involved at all.
+        if kind == "delay":
+            delay_seconds = float(action.get("value") or 1)
+            steps.append({
+                "action": "delay",
+                "element_name": None,
+                "step_phrase": f"waits {delay_seconds:g} seconds",
+                "wait_seconds": 0,  # the delay IS the wait - don't also apply the normal inter-step timing heuristic
+                "delay_seconds": delay_seconds,
+            })
+            excel_labels.append(f"(delay {delay_seconds:g}s)")
+            continue
+
+        # --- page scroll (e.g. imported from a UiPath-style Excel flow's
+        # SCROLL step - "DOWN-4"/"UP-2" etc., direction + a rough
+        # magnitude - see generator/uipath_importer.py) - no element
+        # involved, scrolls the whole page/viewport.
+        if kind == "scroll":
+            steps.append({
+                "action": "scroll",
+                "element_name": None,
+                "step_phrase": f"scrolls {action.get('scroll_direction', 'down')}",
+                "wait_seconds": wait_seconds,
+                "scroll_direction": action.get("scroll_direction", "down"),
+                "scroll_amount": int(action.get("scroll_amount", 1)),
+            })
+            excel_labels.append(f"(scroll {action.get('scroll_direction', 'down')})")
+            continue
+
+        # --- OCR capture (right-click on the page -> "Capture text with
+        # OCR" - see recorder_injector.js's showOcrMenu and
+        # recorder.py's _process_ocr_request). Needs its own branch (not
+        # the generic name_step() path below) because its replay behavior
+        # is fundamentally different from a normal "copy" capture -
+        # screenshot + OCR, not a DOM/clipboard read - and it deserves its
+        # own clearly distinct step wording rather than reusing "captures
+        # the value of..." in a way that would misleadingly suggest a
+        # plain DOM read. Still needs a real locator (to know what to
+        # screenshot at replay time), so it's NOT folded away like
+        # new_window/dialog are.
+        if kind == "ocr_capture":
+            var_name = action.get("captured_as") or "ocr_value"
+            element_name = f"{var_name}_ocr_target"
+            n = 2
+            while element_name in locators_map or element_name in used_names:
+                element_name = f"{var_name}_ocr_target_{n}"
+                n += 1
+            used_names.add(element_name)
+            ordered = order_locators(action.get("locators") or [])
+            locators_map[element_name] = [
+                {"strategy": l["strategy"], "value": l["value"], "frame_path": frame_path} for l in ordered
+            ]
+            switch_to_page = page_index != current_page_index
+            current_page_index = page_index
+            steps.append({
+                "action": "ocr_capture",
+                "element_name": element_name,
+                "step_phrase": None,
+                "wait_seconds": wait_seconds,
+                "var_name": var_name,
+                "var_placeholder": "{{" + var_name + "}}",
+                "var_placeholder_escaped": "{{{{" + var_name + "}}}}",
+                "page_index": page_index,
+                "switch_to_page": switch_to_page,
+                "opens_new_page": False,
+                "new_page_index": None,
+            })
+            excel_labels.append(element_name)
+            continue
+
+        # --- normal interactive action -------------------------------------
+        naming = name_step(llm, action, used_names)
+        element_name = naming["element_name"]
+        ordered = order_locators(action["locators"])
+        locators_map[element_name] = [
+            {"strategy": l["strategy"], "value": l["value"], "frame_path": frame_path} for l in ordered
+        ]
+        is_keypress = action["action"] == "keypress"
+        key_name = action.get("value") if is_keypress else None
+
+        # If this action happened on a different tab/window than the one
+        # replay currently has "active", the generated step needs to switch
+        # to it FIRST (see steps.tmpl's maybe_switch macro) - covers both
+        # continuing in a just-opened popup and coming back to the original
+        # window after closing one.
+        switch_to_page = page_index != current_page_index
+        current_page_index = page_index
+
+        # Capture -> Store -> Reuse: "copy" actions get the derived variable
+        # name they were captured as; "paste"/"type" actions get the variable
+        # name they were correlated to (if their recorded value matched an
+        # earlier copy). Both drive a {{name}} placeholder used in the
+        # generated feature/steps text and resolved live at playback time
+        # (see runner/variables.py) instead of a hard-coded literal.
+        var_name = None
+        if action["action"] == "copy":
+            var_name = action.get("captured_as")
+        elif action["action"] in ("paste", "type"):
+            var_name = action.get("resolved_var")
+        var_placeholder = "{{" + var_name + "}}" if var_name else None
+        # behave matches step text with the `parse` library, which treats "{{" / "}}"
+        # in a @when(...) pattern as escaped literal single braces (str.format()-style) -
+        # so the DECORATOR needs 4 braces to literally match the feature file's 2-brace
+        # "{{name}}" text. Only the decorator pattern needs this; the runtime code that
+        # builds/resolves the value uses var_placeholder as-is.
+        var_placeholder_escaped = "{{{{" + var_name + "}}}}" if var_name else None
+
+        # Radio/checkbox clicks are recorded with the RESULTING checked state
+        # as their value (see recorder_injector.js's click listener) - route
+        # these to an explicit "toggle" step (Playwright's idempotent
+        # check()/uncheck() via BasePage.set_checked) instead of a plain
+        # click, so replay sets the exact recorded state instead of blindly
+        # toggling - a blind click is what risked a double-toggle if an
+        # earlier click fallback tier actually succeeded before a later
+        # tier ran anyway, and it can't tell "already correct" from "needs
+        # a click" the way an explicit target state can.
+        element_type = (action.get("element") or {}).get("type", "")
+        is_toggle = action["action"] == "click" and element_type in ("radio", "checkbox")
+        checked_value = bool(action.get("value")) if is_toggle else None
+
+        steps.append({
+            "action": "toggle" if is_toggle else action["action"],
+            "element_name": element_name,
+            "value": action.get("value") or "",
+            "checked_value": checked_value,
+            "step_phrase": naming["step_phrase"],
+            # Only set for "keypress" actions - the recorded key (e.g. "ENTER", "ARROW_DOWN",
+            # "CTRL+A") and its human-readable label, used by feature.tmpl/steps.tmpl to
+            # generate a step per key rather than assuming Enter.
+            "key_name": key_name,
+            "key_label": key_label(key_name) if key_name else None,
+            # Only set when this action is part of a Capture -> Store -> Reuse chain.
+            "var_name": var_name,
+            "var_placeholder": var_placeholder,
+            "var_placeholder_escaped": var_placeholder_escaped,
+            # Explicit wait timeout (seconds) measured from the recording -
+            # see BasePage.wait_ready in page.tmpl / steps.tmpl.
+            "wait_seconds": wait_seconds,
+            # Popup/new-tab/new-window support (see comments above) - which
+            # tab/window this action runs on, whether the step needs to
+            # switch to it first, and whether IT is the action that causes a
+            # new tab/window to open (set retroactively above when a later
+            # "new_window" action is folded onto this one).
+            "page_index": page_index,
+            "switch_to_page": switch_to_page,
+            "opens_new_page": False,
+            "new_page_index": None,
+        })
+        excel_labels.append(element_name)
+
+    env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)), trim_blocks=True, lstrip_blocks=True)
+
+    def pyesc(value):
+        """Escapes a value for safe embedding inside a double-quoted Python
+        string literal in generated code (steps.tmpl). Plain interpolation
+        of a raw value is unsafe: a backslash (e.g. a Windows file-upload
+        path like C:\\fakepath\\image (55).png - see the new "file_upload"
+        action) gets reinterpreted as a Python escape sequence when the
+        generated .py file is parsed - \\f silently becomes an actual
+        form-feed character, which then no longer matches the plain-text
+        version of the same value in the .feature file, and behave reports
+        the step as undefined. Escaping backslashes and double quotes up
+        front keeps the parsed Python string identical to the original
+        recorded value."""
+        return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+    env.filters["pyesc"] = pyesc
+
+    feature_text = env.get_template("feature.tmpl").render(
+        scenario_name="Recorded transaction",
+        recorded_at=recording.get("recorded_at", datetime.now().isoformat()),
+        target_url=target_url,
+        steps=steps,
+    )
+    steps_text = env.get_template("steps.tmpl").render(steps=steps)
+    page_text = env.get_template("page.tmpl").render(element_names=list(locators_map.keys()))
+
+    (out / "features" / "recorded.feature").write_text(feature_text)
+    (out / "features" / "steps" / "recorded_steps.py").write_text(steps_text)
+    (out / "pages" / "recorded_page.py").write_text(page_text)
+    (out / "pages" / "locators.json").write_text(json.dumps(locators_map, indent=2))
+
+    # environment.py is static (Playwright browser setup/teardown) - copy it in
+    env_src = ROOT / "runner" / "environment.py"
+    if env_src.exists():
+        shutil.copy(env_src, out / "features" / "environment.py")
+
+    (out / "pages" / "__init__.py").touch()
+
+    excel_path = None
+    try:
+        # imported lazily (not at module load time) so a missing/broken
+        # pandas or openpyxl install - or a stale extraction missing this
+        # file - degrades to "no Excel report" instead of crashing the
+        # whole backend at startup.
+        from generator.excel_export import build_excel_report
+        excel_path = build_excel_report(
+            recording,
+            element_names=excel_labels,
+            output_path=str(out / "recorded_steps.xlsx"),
+            mask_passwords=mask_passwords,
+            actions=actions,
+        )
+    except Exception as e:
+        print(f"[warning] Skipped Excel report ({type(e).__name__}: {e}). "
+              f"Feature/steps/page files were still generated normally.")
+
     return {
-      tag: el.tagName.toLowerCase(),
-      type: el.getAttribute('type') || '',
-      text: (el.innerText || el.textContent || '').trim().slice(0, 60),
-      placeholder: el.getAttribute('placeholder') || '',
-      name: el.name || '',
-      ariaLabel: el.getAttribute('aria-label') || ''
-    };
-  }
-
-  function record(action, el, value) {
-    window.__recordedQueue.push({
-      ts: Date.now(),
-      action: action,
-      value: value === undefined ? null : value,
-      element: describe(el),
-      locators: buildLocators(el),
-      url: window.location.href
-    });
-    persistQueue();
-  }
-
-  document.addEventListener('click', function (e) {
-    var el = e.target;
-    if (!el || el === document || el === document.body) return;
-    // walk up to nearest clickable-ish element if the click landed on an inline text node wrapper.
-    // Includes radio/checkbox inputs and <label> so clicks on custom-styled radio/checkbox UIs
-    // (where the visible click target is a label or wrapping span, not the native input) still
-    // resolve to the actual underlying <input>.
-    var clickable = el.closest(
-      'button, a, [role="button"], input[type="submit"], input[type="button"], ' +
-      'input[type="radio"], input[type="checkbox"], label, [onclick]'
-    ) || el;
-
-    if (clickable.tagName && clickable.tagName.toLowerCase() === 'label') {
-      var forId = clickable.getAttribute('for');
-      var resolved = forId ? document.getElementById(forId) : clickable.querySelector('input, select');
-      if (resolved) clickable = resolved;
+        "feature_file": str(out / "features" / "recorded.feature"),
+        "steps_file": str(out / "features" / "steps" / "recorded_steps.py"),
+        "page_file": str(out / "pages" / "recorded_page.py"),
+        "locators_file": str(out / "pages" / "locators.json"),
+        "excel_report": excel_path,
+        "element_count": len(locators_map),
+        "step_count": len(steps),
     }
-
-    if (clickable.tagName === 'INPUT' && (clickable.type === 'radio' || clickable.type === 'checkbox')) {
-      // The browser applies the click's default action (actually flipping
-      // .checked) AFTER all capture/bubble listeners have run, so reading
-      // clickable.checked synchronously here would still see the OLD value.
-      // Deferring to the next tick lets us record the RESULTING checked
-      // state as this action's value - the generated replay step then uses
-      // that as an explicit target state (Playwright's check()/uncheck())
-      // instead of a blind click, so replay can never double-toggle it.
-      var target = clickable;
-      setTimeout(function () {
-        record('click', target, target.checked);
-      }, 0);
-      return;
-    }
-
-    record('click', clickable);
-  }, true);
-
-  document.addEventListener('change', function (e) {
-    var el = e.target;
-    if (!el) return;
-    var tag = el.tagName.toLowerCase();
-
-    if (tag === 'select') {
-      var opt = el.options[el.selectedIndex];
-      record('select', el, opt ? opt.text.trim() : el.value);
-      return;
-    }
-    if (tag === 'input' && el.type === 'file') {
-      // el.value is ALWAYS a browser-fabricated "C:\fakepath\<name>" string
-      // for security - never the real absolute disk path, and there's no
-      // way to type/set a file input back to it on replay. BUT the File
-      // API DOES let JS read the chosen file's actual CONTENT (just not
-      // its path) - so instead of requiring a human to manually go find
-      // and copy the same file into a fixtures folder before every
-      // replay, capture the real bytes here, right now, while the file is
-      // actually available, and ship them along with this action.
-      // generator/build.py writes them straight into output/fixtures/<name>
-      // automatically - by the time replay runs, the exact file used at
-      // recording time is already sitting there, whatever its name was.
-      var file = el.files && el.files.length ? el.files[0] : null;
-      var chosenName = file ? file.name : '';
-      var MAX_INLINE_BYTES = 4 * 1024 * 1024; // ~4MB - stays well under the
-      // ~5-10MB per-origin sessionStorage quota this queue is mirrored
-      // into (see persistQueue), leaving room for other queued actions.
-      if (!file || file.size > MAX_INLINE_BYTES) {
-        // Too large to safely inline (or no file object available for some
-        // reason) - fall back to name-only capture; upload_file() at
-        // replay time will still work fine if a file with this name is
-        // placed in fixtures/ manually.
-        record('file_upload', el, chosenName);
-        return;
-      }
-      var reader = new FileReader();
-      reader.onload = function () {
-        // reader.result is a "data:<mime>;base64,<data>" URL - strip the
-        // prefix down to just the base64 payload.
-        var dataUrl = reader.result || '';
-        var comma = dataUrl.indexOf(',');
-        var base64 = comma >= 0 ? dataUrl.slice(comma + 1) : '';
-        window.__recordedQueue.push({
-          ts: Date.now(),
-          action: 'file_upload',
-          value: chosenName,
-          fileDataBase64: base64,
-          element: describe(el),
-          locators: buildLocators(el),
-          url: window.location.href
-        });
-        persistQueue();
-      };
-      reader.onerror = function () {
-        // Reading failed for some reason - still record the name so
-        // upload_file()'s manual-fallback path remains available.
-        record('file_upload', el, chosenName);
-      };
-      reader.readAsDataURL(file);
-      return;
-    }
-    if (tag === 'input' && (el.type === 'radio' || el.type === 'checkbox')) {
-      // handled by the click listener above (clicking IS the interaction for these;
-      // recording it again here would create a duplicate/redundant step)
-      return;
-    }
-    if (tag === 'input' || tag === 'textarea') {
-      record('type', el, el.value);
-    }
-  }, true);
-
-  // Capture keyboard-driven actions (Enter to submit, Backspace to clear/edit,
-  // Arrow Up/Down to move through suggestion lists, Ctrl combos, function keys,
-  // etc.) separately from typed text, since these are user-initiated key presses
-  // rather than a change to the field's value.
-  //
-  // CTRL+C / CTRL+V / CTRL+X are deliberately NOT recorded here - they're
-  // captured with richer data (the actual copied/pasted text and the source/
-  // target element) by the dedicated copy/cut/paste listeners below instead,
-  // so recording them again here would just be a redundant, value-less entry.
-  var SIMPLE_KEY_MAP = {
-    'Enter': 'ENTER',
-    'Backspace': 'BACKSPACE',
-    'Escape': 'ESCAPE',
-    'Delete': 'DELETE',
-    ' ': 'SPACE',
-    'Spacebar': 'SPACE',
-    'ArrowUp': 'ARROW_UP',
-    'ArrowDown': 'ARROW_DOWN',
-    'ArrowLeft': 'ARROW_LEFT',
-    'ArrowRight': 'ARROW_RIGHT',
-    'Home': 'HOME',
-    'End': 'END'
-  };
-  for (var _f = 1; _f <= 12; _f++) SIMPLE_KEY_MAP['F' + _f] = 'F' + _f;
-
-  // Ctrl/Cmd combos recorded generically as a single keypress action (so
-  // playback can literally re-press them via Playwright). 'c'/'v'/'x' are
-  // excluded here on purpose - see note above.
-  var CTRL_COMBO_MAP = {
-    'a': 'CTRL+A',
-    'p': 'CTRL+P',
-    's': 'CTRL+S'
-  };
-
-  function keyComboLabel(e) {
-    var key = e.key;
-    var ctrlLike = e.ctrlKey || e.metaKey;
-
-    if (ctrlLike && !e.altKey) {
-      var combo = CTRL_COMBO_MAP[(key || '').toLowerCase()];
-      if (combo) return combo;
-      if (['c', 'v', 'x'].indexOf((key || '').toLowerCase()) !== -1) return null;
-    }
-    if (e.shiftKey && key === 'Tab') return 'SHIFT+TAB';
-    if (!ctrlLike && !e.altKey) {
-      if (key === 'Tab') return 'TAB';
-      return SIMPLE_KEY_MAP[key] || null;
-    }
-    return null;
-  }
-
-  document.addEventListener('keydown', function (e) {
-    var el = e.target;
-    if (!el) return;
-    var label = keyComboLabel(e);
-    if (label) {
-      record('keypress', el, label);
-    }
-  }, true);
-
-  // Real-time copy/cut/paste capture: records not just THAT a copy/paste
-  // happened, but the actual text value and the source (copy/cut) or target
-  // (paste) element, so the variable Capture -> Store -> Reuse pipeline (see
-  // recorder/variable_capture.py) can later recognize "this pasted value is
-  // the same one copied earlier from that generated-username field" and turn
-  // it into a {{username}}-style placeholder instead of baking in the
-  // literal string.
-  function selectedTextFrom(el) {
-    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') &&
-        typeof el.selectionStart === 'number' && el.selectionStart !== el.selectionEnd) {
-      return el.value.substring(el.selectionStart, el.selectionEnd);
-    }
-    var sel = window.getSelection();
-    return sel ? sel.toString() : '';
-  }
-
-  function recordCopyLike() {
-    var el = document.activeElement;
-    var text = selectedTextFrom(el);
-    if (!text) return;
-    record('copy', (el instanceof Element) ? el : document.body, text);
-  }
-
-  document.addEventListener('copy', recordCopyLike, true);
-  document.addEventListener('cut', recordCopyLike, true);
-
-  document.addEventListener('paste', function (e) {
-    var el = e.target;
-    var text = '';
-    try {
-      text = (e.clipboardData || window.clipboardData).getData('text');
-    } catch (err) { /* clipboard not readable here - resolved at build/runtime instead */ }
-    record('paste', el, text);
-  }, true);
-
-  // --- Right-click capture: two related but distinct mechanisms behind
-  // one gesture -
-  //
-  //   "text" - reads the element's DISPLAYED TEXT DIRECTLY (input value,
-  //   or innerText/textContent for read-only labels/divs/spans) - no
-  //   image processing at all, resolved instantly, entirely in this
-  //   script. This is what most values actually need: a plain-text field
-  //   or label that the person just never happened to Ctrl+C during
-  //   recording (the existing copy/paste listeners above only fire on a
-  //   REAL clipboard event - looking at a value and typing the same thing
-  //   into another field, with no copy gesture at all, leaves nothing for
-  //   them to correlate). Reuses the EXISTING "copy" action type end to
-  //   end (see recorder.py's handling below, which just relabels the
-  //   request rather than reprocessing it) - a value captured this way is
-  //   stored, correlated, and re-read live at replay through the exact
-  //   same {{var}} pipeline a real Ctrl+C copy already uses; nothing
-  //   downstream needs to know or care which gesture produced it.
-  //
-  //   "ocr" - for values rendered as an IMAGE or CANVAS (a scanned
-  //   reference number, a canvas-drawn amount) that have no real
-  //   selectable/readable DOM text at all - see recorder.py's
-  //   "ocr_capture_request" handling, which screenshots the element and
-  //   runs OCR on it instead.
-  //
-  // Uses window.prompt()/window.confirm() - native, BLOCKING browser
-  // dialogs - rather than a custom floating menu. A custom on-page menu
-  // was tried first and turned out fragile in practice: it closed itself
-  // via an "any click outside the menu dismisses it" listener, and that
-  // listener could end up catching a trailing part of the very same
-  // right-click gesture that opened it, making the menu flash and vanish
-  // before it could be clicked. A native dialog can't have this problem -
-  // it blocks all further page script (including any click-based
-  // dismissal logic) until the person actually answers it.
-  //
-  // Deliberately intercepts EVERY right-click on the page while recording
-  // (not just on <img>/<canvas>/inputs) and replaces the native context
-  // menu with this - many apps render meaningful text via SVG,
-  // background-image, or other non-<img> elements too, and there's no
-  // reliable way to detect "this element visually contains text" from the
-  // DOM alone. The trade-off: the browser's own right-click menu
-  // (Inspect, "Save image as", etc.) isn't available during recording,
-  // and every right-click now shows a prompt (leave it blank/Cancel for a
-  // normal right-click you don't want captured).
-  function recordTextCaptureRequest(el, varName) {
-    var text = '';
-    if ('value' in el && el.value) {
-      text = el.value;
-    } else {
-      text = (el.innerText || el.textContent || '');
-    }
-    text = text.trim();
-    // Reuses the SAME "copy" action shape a real Ctrl+C produces
-    // (recordCopyLike above) - captured_as is the one addition, carrying
-    // the user's explicitly CHOSEN name through instead of leaving it to
-    // be auto-derived from the element the way an incidental real copy
-    // event's name is (see recorder/variable_capture.py's
-    // derive_variable_name) - the person picked this name on purpose here,
-    // so it should win.
-    window.__recordedQueue.push({
-      ts: Date.now(),
-      action: 'copy',
-      value: text,
-      captured_as: varName,
-      element: describe(el),
-      locators: buildLocators(el),
-      url: window.location.href
-    });
-    persistQueue();
-    // Best-effort convenience so the person recording can genuinely Ctrl+V
-    // this into the next field instead of retyping it by hand - done
-    // directly here in JS (unlike the OCR path below, which has to do this
-    // from Python after its screenshot/OCR round trip) since the value is
-    // already known immediately, with no round trip needed at all.
-    try {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text);
-      }
-    } catch (err) { /* non-fatal - the captured value is already stored regardless */ }
-  }
-
-  function recordOcrCaptureRequest(el, varName) {
-    window.__recordedQueue.push({
-      ts: Date.now(),
-      action: 'ocr_capture_request',
-      value: null,
-      requested_var_name: varName,
-      element: describe(el),
-      locators: buildLocators(el),
-      url: window.location.href
-    });
-    persistQueue();
-  }
-
-  document.addEventListener('contextmenu', function (e) {
-    var el = e.target;
-    if (!el || el === document || el === document.body) return;
-    e.preventDefault();
-
-    var choice = window.prompt(
-      'Capture a value from this element, to reuse later in this recording?\n\n' +
-      'Type "text" to capture its displayed text directly (fast, reliable - ' +
-      'use this for any real label, input value, or read-only text)\n' +
-      'Type "ocr" instead if the value is rendered inside an IMAGE or CANVAS ' +
-      '(slower - reads the pixels)\n\n' +
-      'Leave blank or Cancel for a normal right-click.',
-      'text'
-    );
-    if (!choice) return;
-    choice = choice.trim().toLowerCase();
-    if (choice !== 'text' && choice !== 'ocr') return;
-
-    var varName = window.prompt(
-      'Variable name for this captured value (letters/numbers/underscore only):',
-      'captured_value'
-    );
-    if (!varName || !varName.trim()) return;
-    varName = varName.trim().replace(/[^a-zA-Z0-9_]/g, '_');
-
-    if (choice === 'ocr') {
-      recordOcrCaptureRequest(el, varName);
-      window.alert(
-        'Marked for OCR capture as {{' + varName + '}}.\n\n' +
-        'It will be extracted now (check the recorded actions), and re-read ' +
-        'live from this same spot every time this test runs later.'
-      );
-      return;
-    }
-
-    recordTextCaptureRequest(el, varName);
-    window.alert(
-      'Marked "{{' + varName + '}}" to be captured as live text.\n\n' +
-      'It will be re-read from this exact spot every time this test runs later.'
-    );
-  }, true);
-
-  window.__flushActions = function () {
-    var q = window.__recordedQueue;
-    window.__recordedQueue = [];
-    persistQueue();
-    return q;
-  };
-
-  // Exposed so the Python side (recorder/recorder.py) can compute a stable
-  // CSS path for an <iframe>/<frame> DOM ELEMENT from *inside the PARENT
-  // frame's context* (Playwright's Frame.frame_element() returns that
-  // element handle, but it has to be evaluated against the parent frame,
-  // not the iframe's own document) - this is how mainframe/iframe support
-  // builds a "frame_path" (a chain of selectors from the top page down to
-  // the frame an action happened in) without needing any new JS of its
-  // own; it just reuses the same cssPath() this file already uses for
-  // in-page elements. See Recorder._frame_path_for.
-  window.__recorderCssPathFor = cssPath;
-})();
