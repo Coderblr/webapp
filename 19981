@@ -1,359 +1,233 @@
 """
-Takes a raw recording (list of actions from recorder.Recorder) and produces:
-  - output/features/recorded.feature
-  - output/features/steps/recorded_steps.py
-  - output/features/environment.py   (copied static file, see runner/environment.py)
-  - output/pages/recorded_page.py
-  - output/pages/locators.json
-
-This is deterministic scaffolding; the only place an LLM is optionally
-consulted is agent/step_namer.py (naming elements + phrasing steps).
+Auto-generated behave step definitions.
+Regenerating from a new recording will overwrite this file - customize
+downstream (e.g. add real assertions to the Then step) in a copy if needed.
 """
-from __future__ import annotations
-import json
-import math
-import shutil
-from pathlib import Path
-from datetime import datetime
-
-from jinja2 import Environment, FileSystemLoader
-
-from recorder.locator_strategy import order_locators
-from agent.step_namer import name_step, key_label
-
-TEMPLATES_DIR = Path(__file__).parent / "templates"
-ROOT = Path(__file__).parent.parent
-
-# Floor for the measured recording-to-recording wait, so two actions that
-# happened to be recorded a fraction of a second apart don't generate an
-# unrealistically tight timeout.
-MIN_WAIT_SECONDS = 5
-# Used when no timing data is available at all (e.g. a hand-built recording).
-DEFAULT_WAIT_SECONDS = 10
+from behave import given, when, then
 
 
-def build_artifacts(recording: dict, llm=None, output_dir: str = "output", mask_passwords: bool = True) -> dict:
-    out = Path(output_dir)
-    (out / "features" / "steps").mkdir(parents=True, exist_ok=True)
-    (out / "pages").mkdir(parents=True, exist_ok=True)
+@given('the user opens "{url}"')
+def step_open(context, url):
+    context.raw_page.goto(url)
 
-    target_url = recording["target_url"]
-    actions = recording["actions"]
 
-    # Best-effort: merge same-element 'type' actions that fired within a
-    # short window of each other (see coalesce_consecutive_types's docstring)
-    # in case this recording predates that fix, or was regenerated from a
-    # previously-saved recording. Runs BEFORE variable annotation below so
-    # {{var}} correlation sees the final, de-duplicated values.
-    try:
-        from recorder.variable_capture import coalesce_consecutive_types
-        actions = coalesce_consecutive_types(actions)
-    except Exception:
-        pass
+{% macro explicit_wait(step) %}
+    # Recording showed this step's target took ~{{ step.wait_seconds }}s to become ready.
+    # No sleep() - wait_ready() polls every known locator strategy and continues
+    # the moment one resolves, up to this measured timeout, so a fast response
+    # doesn't sit around waiting.
+    context.page.wait_ready("{{ step.element_name }}", timeout={{ step.wait_seconds }})
+{%- endmacro %}
+{% macro maybe_switch(step) %}
+{% if step.switch_to_page %}
+    # Recorded on browser tab/window #{{ step.page_index }} - switch to it
+    # first (see generator/build.py's page_index/switch_to_page and
+    # RecordedPage.switch_page). Covers both continuing in a popup/new tab
+    # that just opened and coming back to an earlier tab/window.
+    context.page.switch_page(context.recorder_pages[{{ step.page_index }}])
+{% endif %}
+{%- endmacro %}
+{% macro new_page_wrapper(step) %}
+{% if step.opens_new_page %}
+    # This action opens a new browser tab/window (a target="_blank" link,
+    # "open in new window", window.open(), etc.) - expect_page() is the only
+    # reliable way to catch it: it must wrap the exact call that triggers it.
+    with context.browser_session.context.expect_page() as _new_page_info:
+{{ caller() | indent(4, true) }}
+    _new_pg = _new_page_info.value
+    _new_pg.wait_for_load_state()
+    context.recorder_pages.append(_new_pg)
+    context.page.switch_page(_new_pg)
+{% else %}
+{{ caller() }}
+{% endif %}
+{%- endmacro %}
+{% for step in steps -%}
+{%- if step.action == "click" %}
+@when('the user clicks "{{ step.element_name }}"')
+def step_click_{{ step.element_name }}(context):
+{{ maybe_switch(step) }}
+{{ explicit_wait(step) }}
+{% call new_page_wrapper(step) %}
+    context.page.click("{{ step.element_name }}")
+{% endcall %}
 
-    # Best-effort: derive/refresh the Capture -> Store -> Reuse {{var}} metadata
-    # (see recorder/variable_capture.py) in case this recording was produced
-    # before that hook existed in Recorder.stop(), or was built by hand. Safe
-    # to call even if it already ran - it's idempotent.
-    try:
-        from recorder.variable_capture import annotate_variables
-        actions = annotate_variables(actions)
-    except Exception:
-        pass
+{% elif step.action == "toggle" %}
+{% if step.checked_value %}
+@when('the user checks "{{ step.element_name }}"')
+def step_check_{{ step.element_name }}(context):
+{{ maybe_switch(step) }}
+{{ explicit_wait(step) }}
+    # Idempotent by design (BasePage.set_checked reads the current state
+    # first) - this is what avoids the double-toggle risk a blind click()
+    # has for checkbox/radio inputs.
+{% call new_page_wrapper(step) %}
+    context.page.set_checked("{{ step.element_name }}", True)
+{% endcall %}
 
-    used_names = set()
-    steps = []
-    locators_map = {}
-    prev_ts = None
+{% else %}
+@when('the user unchecks "{{ step.element_name }}"')
+def step_uncheck_{{ step.element_name }}(context):
+{{ maybe_switch(step) }}
+{{ explicit_wait(step) }}
+{% call new_page_wrapper(step) %}
+    context.page.set_checked("{{ step.element_name }}", False)
+{% endcall %}
 
-    # Tracks which browser tab/window index (0 = the one the recording
-    # started on) replay currently considers "active", as we walk the
-    # recording in order - lets each real interactive step know whether it
-    # needs to switch tabs/windows first (see step["switch_to_page"] below),
-    # and lets a "new_window"/"window_closed" synthetic action fold its
-    # effect into the step it belongs with instead of needing its own.
-    current_page_index = 0
+{% endif %}
+{% elif step.action in ("type", "paste") %}
+{% if step.var_placeholder %}
+@when('the user enters "{{ step.var_placeholder_escaped }}" into "{{ step.element_name }}"')
+def step_type_{{ step.element_name }}(context):
+{{ maybe_switch(step) }}
+{{ explicit_wait(step) }}
+    # Reuse: resolved from the LIVE value captured earlier in THIS run (see
+    # context.variables, seeded by a "captures the value of ..." step below)
+    # instead of the literal value that happened to be recorded originally.
+    value = context.variables.resolve("{{ step.var_placeholder }}")
+{% call new_page_wrapper(step) %}
+{% if step.action == "paste" %}
+    context.page.paste_text("{{ step.element_name }}", value)
+{% else %}
+    context.page.type_text("{{ step.element_name }}", value)
+{% endif %}
+{% endcall %}
 
-    # Parallel to `actions` (NOT to `steps` - a "new_window" action folds
-    # into the PRECEDING step and produces no step of its own, so the two
-    # lists can differ in length) - used for the Excel report below, which
-    # needs one label per ACTION, including the synthetic ones.
-    excel_labels = []
+{% else %}
+@when('the user enters "{{ step.value }}" into "{{ step.element_name }}"')
+def step_type_{{ step.element_name }}(context):
+{{ maybe_switch(step) }}
+{{ explicit_wait(step) }}
+{% call new_page_wrapper(step) %}
+{% if step.action == "paste" %}
+    context.page.paste_text("{{ step.element_name }}", "{{ step.value }}")
+{% else %}
+    context.page.type_text("{{ step.element_name }}", "{{ step.value }}")
+{% endif %}
+{% endcall %}
 
-    for action in actions:
-        kind = action["action"]
-        page_index = action.get("page_index", 0)
-        frame_path = action.get("frame_path") or []
+{% endif %}
+{% elif step.action == "select" %}
+@when('the user selects "{{ step.value }}" from "{{ step.element_name }}"')
+def step_select_{{ step.element_name }}(context):
+{{ maybe_switch(step) }}
+{{ explicit_wait(step) }}
+{% call new_page_wrapper(step) %}
+    context.page.select_option("{{ step.element_name }}", "{{ step.value }}")
+{% endcall %}
 
-        # Explicit wait: how long the app actually took, during recording, to
-        # reach the state this action needed (i.e. the gap between the
-        # previous recorded action and this one) - so a step that recorded
-        # slow (e.g. a 50s dashboard load) gets a matching wait_ready()
-        # timeout, while a fast one doesn't sit around waiting needlessly.
-        # Computed here (before the branches below) so it's available for
-        # synthetic popup/dialog/window actions too, not just the "normal"
-        # interactive ones further down.
-        ts = action.get("ts")
-        if prev_ts is None or ts is None:
-            wait_seconds = DEFAULT_WAIT_SECONDS
-        else:
-            wait_seconds = max(MIN_WAIT_SECONDS, math.ceil((ts - prev_ts) / 1000.0))
-        if ts is not None:
-            prev_ts = ts
+{% elif step.action == "keypress" %}
+@when('the user presses {{ step.key_label }} on "{{ step.element_name }}"')
+def step_keypress_{{ step.element_name }}_{{ step.key_name|lower|replace("+", "_") }}(context):
+{{ maybe_switch(step) }}
+{{ explicit_wait(step) }}
+{% call new_page_wrapper(step) %}
+    context.page.press_key("{{ step.element_name }}", "{{ step.key_name }}")
+{% endcall %}
 
-        # --- popup / new tab / new window --------------------------------
-        # Doesn't get its own replay step: Playwright can only reliably
-        # catch a new page by wrapping the ACTION THAT CAUSED IT in
-        # context.expect_page() (see steps.tmpl's new_page_wrapper macro),
-        # so this folds forward onto the step that was just appended
-        # (almost always the click that opened it) instead. If this is
-        # somehow the very first action in the whole recording (no
-        # preceding step to fold onto - e.g. the app pops a window
-        # immediately on load), falls back to a standalone step that just
-        # waits for one to appear.
-        if kind == "new_window":
-            if steps:
-                steps[-1]["opens_new_page"] = True
-                steps[-1]["new_page_index"] = page_index
-            else:
-                steps.append({
-                    "action": "new_window_wait",
-                    "element_name": None,
-                    "step_phrase": "waits for a new browser tab or window to open",
-                    "wait_seconds": wait_seconds,
-                    "new_page_index": page_index,
-                })
-            current_page_index = page_index
-            excel_labels.append(f"(new browser tab/window #{page_index} opens)")
-            continue
+{% elif step.action == "copy" %}
+@when('the user captures the value of "{{ step.element_name }}" as "{{ step.var_placeholder_escaped }}"')
+def step_capture_{{ step.element_name }}(context):
+{{ maybe_switch(step) }}
+{{ explicit_wait(step) }}
+    # Capture: prefers reading the live DOM value/text via Playwright
+    # (input_value() / text_content()) and only falls back to the browser's
+    # own clipboard (still entirely through Playwright) if the element itself
+    # doesn't expose the value - see BasePage.capture_value in the page object.
+    value = context.page.capture_value("{{ step.element_name }}")
+    context.variables.store("{{ step.var_name }}", value)
 
-        # --- tab/window closed --------------------------------------------
-        if kind == "window_closed":
-            opener_index = action.get("opener_page_index", 0) or 0
-            steps.append({
-                "action": "window_closed",
-                "element_name": None,
-                "step_phrase": "closes the browser tab or window",
-                "wait_seconds": wait_seconds,
-                "closed_page_index": page_index,
-                "switch_back_to_index": opener_index,
-            })
-            current_page_index = opener_index
-            excel_labels.append(f"(browser tab/window #{page_index} closed)")
-            continue
+{% elif step.action == "ocr_capture" %}
+@when('the user captures the value of "{{ step.element_name }}" via OCR as "{{ step.var_placeholder_escaped }}"')
+def step_ocr_capture_{{ step.element_name }}(context):
+{{ maybe_switch(step) }}
+{{ explicit_wait(step) }}
+    # OCR capture: screenshots this element fresh and re-reads its text via
+    # OCR on EVERY run (never baked in from recording time) - for a value
+    # with no real selectable DOM text at all (an image or canvas-rendered
+    # reference number, a scanned document field, etc.) that a plain
+    # capture_value() can't see. See recorder/ocr_engine.py (the same
+    # module used when this was first captured during recording) - it
+    # requires Tesseract OCR installed separately on this machine.
+    value = context.page.capture_value_ocr("{{ step.element_name }}")
+    context.variables.store("{{ step.var_name }}", value)
 
-        # --- native alert/confirm/prompt/beforeunload dialog --------------
-        if kind == "dialog":
-            steps.append({
-                "action": "dialog",
-                "element_name": None,
-                "step_phrase": "handles a browser dialog",
-                "wait_seconds": wait_seconds,
-                "dialog_type": action.get("dialog_type") or "alert",
-                "dialog_message": action.get("value") or "",
-            })
-            excel_labels.append(f"(dialog: {action.get('dialog_type') or 'alert'})")
-            continue
+{% elif step.action == "window_closed" %}
+@when('the user closes the current browser tab or window (step {{ loop.index }})')
+def step_close_window_{{ loop.index }}(context):
+    # Recorded browser tab/window #{{ step.closed_page_index }} being closed -
+    # switch replay back to whichever tab/window opened it (#{{ step.switch_back_to_index }}).
+    context.page.page.close()
+    context.page.switch_page(context.recorder_pages[{{ step.switch_back_to_index }}])
 
-        # --- explicit delay/pause (e.g. imported from a UiPath-style Excel
-        # flow's DELAY step - see generator/uipath_importer.py) - a plain
-        # wait with no element/locator involved at all.
-        if kind == "delay":
-            delay_seconds = float(action.get("value") or 1)
-            steps.append({
-                "action": "delay",
-                "element_name": None,
-                "step_phrase": f"waits {delay_seconds:g} seconds",
-                "wait_seconds": 0,  # the delay IS the wait - don't also apply the normal inter-step timing heuristic
-                "delay_seconds": delay_seconds,
-            })
-            excel_labels.append(f"(delay {delay_seconds:g}s)")
-            continue
+{% elif step.action == "dialog" %}
+@when('a "{{ step.dialog_type }}" dialog appears and is accepted (step {{ loop.index }})')
+def step_dialog_{{ loop.index }}(context):
+    # Native alert/confirm/prompt/beforeunload dialogs are auto-accepted
+    # globally for every page/tab/window (see environment.py's page.on(
+    # "dialog", ...) handlers) - this step performs no action of its own and
+    # exists purely so the generated feature/report show that the recording
+    # encountered one. Recorded message: {{ step.dialog_message }}
+    pass
 
-        # --- page scroll (e.g. imported from a UiPath-style Excel flow's
-        # SCROLL step - "DOWN-4"/"UP-2" etc., direction + a rough
-        # magnitude - see generator/uipath_importer.py) - no element
-        # involved, scrolls the whole page/viewport.
-        if kind == "scroll":
-            steps.append({
-                "action": "scroll",
-                "element_name": None,
-                "step_phrase": f"scrolls {action.get('scroll_direction', 'down')}",
-                "wait_seconds": wait_seconds,
-                "scroll_direction": action.get("scroll_direction", "down"),
-                "scroll_amount": int(action.get("scroll_amount", 1)),
-            })
-            excel_labels.append(f"(scroll {action.get('scroll_direction', 'down')})")
-            continue
+{% elif step.action == "delay" %}
+@when('the flow waits {{ step.delay_seconds }} seconds (step {{ loop.index }})')
+def step_delay_{{ loop.index }}(context):
+    context.page.page.wait_for_timeout({{ (step.delay_seconds * 1000) | int }})
 
-        # --- OCR capture (right-click on the page -> "Capture text with
-        # OCR" - see recorder_injector.js's showOcrMenu and
-        # recorder.py's _process_ocr_request). Needs its own branch (not
-        # the generic name_step() path below) because its replay behavior
-        # is fundamentally different from a normal "copy" capture -
-        # screenshot + OCR, not a DOM/clipboard read - and it deserves its
-        # own clearly distinct step wording rather than reusing "captures
-        # the value of..." in a way that would misleadingly suggest a
-        # plain DOM read. Still needs a real locator (to know what to
-        # screenshot at replay time), so it's NOT folded away like
-        # new_window/dialog are.
-        if kind == "ocr_capture":
-            var_name = action.get("captured_as") or "ocr_value"
-            element_name = f"{var_name}_ocr_target"
-            n = 2
-            while element_name in locators_map or element_name in used_names:
-                element_name = f"{var_name}_ocr_target_{n}"
-                n += 1
-            used_names.add(element_name)
-            ordered = order_locators(action.get("locators") or [])
-            locators_map[element_name] = [
-                {"strategy": l["strategy"], "value": l["value"], "frame_path": frame_path} for l in ordered
-            ]
-            switch_to_page = page_index != current_page_index
-            current_page_index = page_index
-            steps.append({
-                "action": "ocr_capture",
-                "element_name": element_name,
-                "step_phrase": None,
-                "wait_seconds": wait_seconds,
-                "var_name": var_name,
-                "var_placeholder": "{{" + var_name + "}}",
-                "var_placeholder_escaped": "{{{{" + var_name + "}}}}",
-                "page_index": page_index,
-                "switch_to_page": switch_to_page,
-                "opens_new_page": False,
-                "new_page_index": None,
-            })
-            excel_labels.append(element_name)
-            continue
+{% elif step.action == "scroll" %}
+@when('the page scrolls {{ step.scroll_direction }} (step {{ loop.index }})')
+def step_scroll_{{ loop.index }}(context):
+    _dy = {{ step.scroll_amount }} * 400 * (1 if "{{ step.scroll_direction }}" == "down" else -1)
+    context.page.page.mouse.wheel(0, _dy)
+    context.page.page.wait_for_timeout(300)
 
-        # --- normal interactive action -------------------------------------
-        naming = name_step(llm, action, used_names)
-        element_name = naming["element_name"]
-        ordered = order_locators(action["locators"])
-        locators_map[element_name] = [
-            {"strategy": l["strategy"], "value": l["value"], "frame_path": frame_path} for l in ordered
-        ]
-        is_keypress = action["action"] == "keypress"
-        key_name = action.get("value") if is_keypress else None
+{% elif step.action == "new_window_wait" %}
+@when('a new browser tab or window opens (step {{ loop.index }})')
+def step_new_window_wait_{{ loop.index }}(context):
+    # Fallback path: this recording's very first captured event was a new
+    # tab/window opening (no earlier click/type step to fold expect_page()
+    # onto - e.g. the app pops one immediately on load), so there's nothing
+    # to wrap; just wait for the context to report one directly.
+    _new_pg = context.browser_session.context.wait_for_event("page", timeout={{ step.wait_seconds * 1000 }})
+    _new_pg.wait_for_load_state()
+    context.recorder_pages.append(_new_pg)
+    context.page.switch_page(_new_pg)
 
-        # If this action happened on a different tab/window than the one
-        # replay currently has "active", the generated step needs to switch
-        # to it FIRST (see steps.tmpl's maybe_switch macro) - covers both
-        # continuing in a just-opened popup and coming back to the original
-        # window after closing one.
-        switch_to_page = page_index != current_page_index
-        current_page_index = page_index
+{% endif -%}
+{% if step.opens_new_page %}
+@when('the new browser tab or window is now active (step {{ loop.index }})')
+def step_new_page_now_active_{{ loop.index }}(context):
+    # Purely informational/traceability line for the feature file and exit
+    # report - the actual expect_page()/switch_page() handoff already
+    # happened inside the PREVIOUS step (the click/type/etc. that caused
+    # this tab/window to open - see steps.tmpl's new_page_wrapper macro),
+    # so there's nothing left to do here.
+    pass
 
-        # Capture -> Store -> Reuse: "copy" actions get the derived variable
-        # name they were captured as; "paste"/"type" actions get the variable
-        # name they were correlated to (if their recorded value matched an
-        # earlier copy). Both drive a {{name}} placeholder used in the
-        # generated feature/steps text and resolved live at playback time
-        # (see runner/variables.py) instead of a hard-coded literal.
-        var_name = None
-        if action["action"] == "copy":
-            var_name = action.get("captured_as")
-        elif action["action"] in ("paste", "type"):
-            var_name = action.get("resolved_var")
-        var_placeholder = "{{" + var_name + "}}" if var_name else None
-        # behave matches step text with the `parse` library, which treats "{{" / "}}"
-        # in a @when(...) pattern as escaped literal single braces (str.format()-style) -
-        # so the DECORATOR needs 4 braces to literally match the feature file's 2-brace
-        # "{{name}}" text. Only the decorator pattern needs this; the runtime code that
-        # builds/resolves the value uses var_placeholder as-is.
-        var_placeholder_escaped = "{{{{" + var_name + "}}}}" if var_name else None
+{% endif %}
+{% endfor %}
 
-        # Radio/checkbox clicks are recorded with the RESULTING checked state
-        # as their value (see recorder_injector.js's click listener) - route
-        # these to an explicit "toggle" step (Playwright's idempotent
-        # check()/uncheck() via BasePage.set_checked) instead of a plain
-        # click, so replay sets the exact recorded state instead of blindly
-        # toggling - a blind click is what risked a double-toggle if an
-        # earlier click fallback tier actually succeeded before a later
-        # tier ran anyway, and it can't tell "already correct" from "needs
-        # a click" the way an explicit target state can.
-        element_type = (action.get("element") or {}).get("type", "")
-        is_toggle = action["action"] == "click" and element_type in ("radio", "checkbox")
-        checked_value = bool(action.get("value")) if is_toggle else None
-
-        steps.append({
-            "action": "toggle" if is_toggle else action["action"],
-            "element_name": element_name,
-            "value": action.get("value") or "",
-            "checked_value": checked_value,
-            "step_phrase": naming["step_phrase"],
-            # Only set for "keypress" actions - the recorded key (e.g. "ENTER", "ARROW_DOWN",
-            # "CTRL+A") and its human-readable label, used by feature.tmpl/steps.tmpl to
-            # generate a step per key rather than assuming Enter.
-            "key_name": key_name,
-            "key_label": key_label(key_name) if key_name else None,
-            # Only set when this action is part of a Capture -> Store -> Reuse chain.
-            "var_name": var_name,
-            "var_placeholder": var_placeholder,
-            "var_placeholder_escaped": var_placeholder_escaped,
-            # Explicit wait timeout (seconds) measured from the recording -
-            # see BasePage.wait_ready in page.tmpl / steps.tmpl.
-            "wait_seconds": wait_seconds,
-            # Popup/new-tab/new-window support (see comments above) - which
-            # tab/window this action runs on, whether the step needs to
-            # switch to it first, and whether IT is the action that causes a
-            # new tab/window to open (set retroactively above when a later
-            # "new_window" action is folded onto this one).
-            "page_index": page_index,
-            "switch_to_page": switch_to_page,
-            "opens_new_page": False,
-            "new_page_index": None,
-        })
-        excel_labels.append(element_name)
-
-    env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)), trim_blocks=True, lstrip_blocks=True)
-
-    feature_text = env.get_template("feature.tmpl").render(
-        scenario_name="Recorded transaction",
-        recorded_at=recording.get("recorded_at", datetime.now().isoformat()),
-        target_url=target_url,
-        steps=steps,
-    )
-    steps_text = env.get_template("steps.tmpl").render(steps=steps)
-    page_text = env.get_template("page.tmpl").render(element_names=list(locators_map.keys()))
-
-    (out / "features" / "recorded.feature").write_text(feature_text)
-    (out / "features" / "steps" / "recorded_steps.py").write_text(steps_text)
-    (out / "pages" / "recorded_page.py").write_text(page_text)
-    (out / "pages" / "locators.json").write_text(json.dumps(locators_map, indent=2))
-
-    # environment.py is static (Playwright browser setup/teardown) - copy it in
-    env_src = ROOT / "runner" / "environment.py"
-    if env_src.exists():
-        shutil.copy(env_src, out / "features" / "environment.py")
-
-    (out / "pages" / "__init__.py").touch()
-
-    excel_path = None
-    try:
-        # imported lazily (not at module load time) so a missing/broken
-        # pandas or openpyxl install - or a stale extraction missing this
-        # file - degrades to "no Excel report" instead of crashing the
-        # whole backend at startup.
-        from generator.excel_export import build_excel_report
-        excel_path = build_excel_report(
-            recording,
-            element_names=excel_labels,
-            output_path=str(out / "recorded_steps.xlsx"),
-            mask_passwords=mask_passwords,
-            actions=actions,
-        )
-    except Exception as e:
-        print(f"[warning] Skipped Excel report ({type(e).__name__}: {e}). "
-              f"Feature/steps/page files were still generated normally.")
-
-    return {
-        "feature_file": str(out / "features" / "recorded.feature"),
-        "steps_file": str(out / "features" / "steps" / "recorded_steps.py"),
-        "page_file": str(out / "pages" / "recorded_page.py"),
-        "locators_file": str(out / "pages" / "locators.json"),
-        "excel_report": excel_path,
-        "element_count": len(locators_map),
-        "step_count": len(steps),
-    }
+@then('the flow should complete without errors')
+def step_verify_no_errors(context):
+    # Generic post-condition: no unhandled browser alert/JS error banner.
+    # Checks the CURRENTLY ACTIVE tab/window (context.page.page - see
+    # RecordedPage.switch_page), not always the original one, so this still
+    # works for a flow that ends on a popup/new tab/new window.
+    #
+    # A recorded flow can legitimately end by closing its own tab/window
+    # (see the "the user closes the current browser tab or window" step,
+    # generated for a recorded window/tab-close action) - at that point
+    # there is nothing left to check a title on, and that's a successful
+    # end state, not a failure. Checking is_closed() first (a local state
+    # check, safe to call on an already-closed page) avoids ever calling
+    # .title() on a closed page in the first place - .title() talks to the
+    # browser process and raises TargetClosedError there instead of
+    # returning some default value, which would otherwise fail this
+    # deliberately generic, no-op-by-default final check for a flow that
+    # did nothing wrong.
+    if context.page.page.is_closed():
+        return
+    assert context.page.page.title() is not None
+    # Replace with an assertion specific to the target application
+    # (e.g. checking a confirmation message or success banner).
