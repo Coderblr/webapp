@@ -1,300 +1,325 @@
-# -*- mode: python ; coding: utf-8 -*-
-#
-# PyInstaller spec for freezing local_agent into a standalone
-# local_agent.exe, so an end user's PC needs no Python installation at all
-# (see docs/electron-local-agent-architecture.md's "Packaging" section).
-#
-# IMPORTANT: this spec has NOT been built or tested here - doing so
-# requires an actual Windows machine (PyInstaller's Windows target must
-# run on Windows, or under Wine with real limitations). Treat this as a
-# verified-on-your-machine starting point once you build it, not an
-# artifact that's already been confirmed working.
-#
-# Usage (on a Windows machine, from the project root, inside a venv with
-# local_agent/requirements-agent.txt + pyinstaller installed):
-#
-#   pip install -r local_agent\requirements-agent.txt
-#   pip install pyinstaller
-#   pyinstaller local_agent\local_agent.spec
-#
-# Produces dist\local_agent\local_agent.exe (one-folder build, not
-# one-file - Playwright's own browser binaries are large enough that a
-# one-folder build is the more practical choice; electron-builder's
-# extraResources then bundles that whole dist\local_agent\ folder instead
-# of raw .py files + a system Python - see electron/package.json).
+"""
+Converts a UiPath-style Excel test-steps sheet into the SAME recording
+JSON schema recorder/recorder.py already produces - so a UiPath-authored
+flow flows through the EXACT same downstream pipeline as a recorded one:
+generator/build.py, the Behave/Playwright templates, "Run Saved
+Recording", the exit report, Regenerate, everything. Nothing downstream
+needs to know or care whether a recording came from a live browser
+session or an imported spreadsheet.
 
-from pathlib import Path
-from PyInstaller.utils.hooks import collect_submodules
+Expected columns (case-insensitive, matched by header text - order
+doesn't matter): Steps, NAME, Action/Method, present element, input.
+"present element" holds UiPath's own selector dump, e.g.:
 
-# ---------------------------------------------------------
-# Project paths
-# ---------------------------------------------------------
-#
-# PyInstaller provides SPECPATH while executing the .spec file.
-#
-# SPECPATH:
-#   C:\...\ai-test-recorder-pw\local_agent
-#
-# Therefore:
-#   PROJECT_ROOT = C:\...\ai-test-recorder-pw
-#   AGENT_ROOT   = C:\...\ai-test-recorder-pw\local_agent
-#
-SPEC_DIR = Path(SPECPATH).resolve()
-PROJECT_ROOT = SPEC_DIR.parent
-AGENT_ROOT = SPEC_DIR
+    <html app='msedge.exe' title='LLMS Lite' />
+    <webctrl id='username' tag='INPUT' />
 
-# ---------------------------------------------------------
-# Validate important files before building - fail fast with a clear
-# message instead of a confusing mid-build PyInstaller error if this spec
-# is ever run from the wrong location or against a stale checkout.
-# ---------------------------------------------------------
-MAIN_PY = AGENT_ROOT / "_pyinstaller_entry.py"
-INJECTOR_JS = PROJECT_ROOT / "recorder" / "recorder_injector.js"
-AGENT_ENVIRONMENT = AGENT_ROOT / "agent_environment.py"
+Only the <webctrl .../> line's attributes matter here - the <html .../>
+line just identifies the target application/window, which this project
+already gets from the recording's own target_url instead.
 
-if not MAIN_PY.exists():
-    raise FileNotFoundError(f"local_agent PyInstaller entry point not found: {MAIN_PY}")
-if not INJECTOR_JS.exists():
-    raise FileNotFoundError(f"recorder_injector.js not found: {INJECTOR_JS}")
-if not AGENT_ENVIRONMENT.exists():
-    raise FileNotFoundError(f"agent_environment.py not found: {AGENT_ENVIRONMENT}")
+Action/Method -> internal action mapping:
+    OPENBROWSER  -> sets the recording's target_url (not a step of its own)
+    DELAY        -> "delay" action, "input" column is the number of seconds
+    INPUT-C      -> "type" action, "input" column is the value to type
+    CLICK-C      -> "click" action
+    DROPDOWN-S   -> "select" action, "input" column is the option to select
+    SCROLL       -> "scroll" action, "input" column is "DOWN-4"/"UP-2" style (direction-amount)
+    CLOSETAB     -> "window_closed" action (same one recorder.py itself
+                    produces for a real closed tab/window - see
+                    generator/build.py)
 
-# ---------------------------------------------------------
-# Hidden imports
-# ---------------------------------------------------------
-# Playwright does some dynamic importing (its driver-process bridge, the
-# generated sync API wrappers) that PyInstaller's static analysis can
-# miss - collect_submodules pulls in everything under the package rather
-# than hoping the single explicit entry below is sufficient.
-hiddenimports = (
-    collect_submodules("playwright")
-    + ["playwright.sync_api"]
-    # Behave is now invoked via its own programmatic entry point
-    # (behave.__main__.main) rather than as an external `python -m behave`
-    # subprocess when running from this frozen exe - see
-    # runner/run_tests.py's run_behave_cli for why (sys.executable inside a
-    # frozen build points at this exe, not a real Python interpreter, so
-    # shelling out to "behave" never worked from a packaged build). That
-    # means behave's own submodules need to be statically bundled here too,
-    # not just importable at dev-time.
-    + collect_submodules("behave")
-    + [
-        # Uses EasyOCR (pure-Python OCR, no separate engine binary to
-        # install - see recorder/ocr_engine.py's docstring for the
-        # trade-off vs. Tesseract) - which pulls in PyTorch as a real
-        # dependency. collect_submodules("torch") is NOT used here
-        # deliberately: PyTorch's full module tree includes CUDA/GPU-
-        # specific code paths that pull in nvidia-* packages if present in
-        # the build environment - this build must use the CPU-only torch
-        # wheel (pip install torch --index-url
-        # https://download.pytorch.org/whl/cpu) BEFORE running this spec,
-        # so there's nothing CUDA-related for a blanket collect to find in
-        # the first place. If a "hidden import not found" warning appears
-        # for a specific torch/easyocr submodule when actually building
-        # this, add that ONE module here explicitly rather than switching
-        # to a blanket collect_submodules("torch") - the CPU-only-wheel
-        # discipline is easy to silently lose that way.
-        "easyocr",
-        "torch",
-        "torchvision",
-        "PIL",
-        "PIL.Image",
-        "numpy",
-        "cv2",
-    ]
-)
+Anything else in the Action/Method column is imported as a "click" by
+default (logged as a warning in the returned `warnings` list) rather than
+silently dropped or failing the whole import - a single unrecognized
+row shouldn't block importing the other 50 rows in a real spreadsheet.
+"""
+from __future__ import annotations
+import re
+from datetime import datetime
+from typing import Optional
 
-# ---------------------------------------------------------
-# recorder/ and runner/ are bundled as RAW DATA FILES, not analyzed as
-# modules - deliberately.
-# ---------------------------------------------------------
-# History: recorder.browser_factory (and, transitively, the rest of
-# recorder/ and runner/) went through several rounds of being added to
-# hiddenimports (see git history / prior versions of this file) after
-# repeatedly hitting "ModuleNotFoundError: No module named 'agent'", then
-# "...'runner.variables'" on earlier builds. Those fixes worked. But on at
-# least one real build (same project, same spec, a clean rebuild with
-# cleared __pycache__, no shadowing "recorder" package on the venv's
-# PYTHONPATH, no duplicate/stray browser_factory.py anywhere in the
-# project tree, and file content verified byte-for-byte identical) -
-# PyInstaller's own analysis log showed:
-#
-#   invalid module named recorder.browser_factory - imported by
-#   local_agent.browser_manager (top-level), recorder.recorder
-#   (optional), local_agent\_pyinstaller_entry.py (top-level)
-#
-# "invalid module" (not "missing module") means PyInstaller's modulegraph
-# genuinely found and traced the real, correct import statement in
-# local_agent/browser_manager.py, but its own dependency analysis
-# misclassified the result - on that machine, for reasons that were not
-# fully root-caused (namespace-package edge cases and cross-version
-# PyInstaller/Python 3.13 interactions are the leading suspects, but this
-# was not conclusively proven). Rather than keep chasing PyInstaller's
-# internal module-graph classification, this sidesteps it entirely for
-# recorder/ and runner/: their .py files are copied in as plain DATA
-# (see `datas` below, using PROJECT_ROOT / "recorder" and
-# PROJECT_ROOT / "runner" as whole-directory copies), and
-# PYTHONPATH_ADDITIONS below adds their PARENT directory
-# (sys._MEIPASS, where PyInstaller's bootloader already extracts/points
-# datas to) onto sys.path via a small runtime hook. At that point these
-# are just ordinary files on disk, imported by the STANDARD CPython
-# import system exactly as if this were an unfrozen script - nothing
-# about PyInstaller's own module bundling/analysis touches them at all,
-# so whatever caused the "invalid module" misclassification cannot recur.
-#
-# generator/, database/, backend/, and agent/ (the central-server-only
-# packages - see excludes below) are NOT part of this datas copy, even
-# though they physically live under runner/run_recording.py's import
-# statements - only the specific files actually needed client-side are
-# copied (see the explicit file list below), not the whole directories
-# wholesale, to avoid shipping server code to the end user's PC.
-RECORDER_ROOT = PROJECT_ROOT / "recorder"
-RUNNER_ROOT = PROJECT_ROOT / "runner"
+import openpyxl
 
-RECORDER_FILES_NEEDED = [
-    "__init__.py",
-    "browser_factory.py",
-    "recorder.py",
-    "locator_strategy.py",
-    "variable_capture.py",
-    "ocr_engine.py",
-]
-RUNNER_FILES_NEEDED = [
-    "__init__.py",
-    "variables.py",
-    "run_tests.py",
-]
+ACTION_MAP = {
+    "CLICK-C": "click",
+    "INPUT-C": "type",
+    "DROPDOWN-S": "select",
+}
 
-datas_for_recorder_and_runner = [
-    (str(RECORDER_ROOT / fname), "recorder") for fname in RECORDER_FILES_NEEDED
-] + [
-    (str(RUNNER_ROOT / fname), "runner") for fname in RUNNER_FILES_NEEDED
-]
+# Columns this importer looks for, matched case-insensitively against the
+# header row - the exact wording/casing in real spreadsheets varies
+# ("Action/Method" vs "Action / Method" vs "Method"), so this matches on
+# whichever of these substrings appears first in each header cell.
+COLUMN_ALIASES = {
+    "step": ["steps", "step"],
+    "name": ["name"],
+    "action": ["action/method", "action / method", "method", "action"],
+    "selector": ["present element", "selector", "element"],
+    "input": ["input", "value", "data"],
+}
 
-for fname in RECORDER_FILES_NEEDED:
-    if not (RECORDER_ROOT / fname).exists():
-        raise FileNotFoundError(f"Expected recorder file not found: {RECORDER_ROOT / fname}")
-for fname in RUNNER_FILES_NEEDED:
-    if not (RUNNER_ROOT / fname).exists():
-        raise FileNotFoundError(f"Expected runner file not found: {RUNNER_ROOT / fname}")
+_WEBCTRL_RE = re.compile(r"<webctrl\b([^/>]*)/?>", re.IGNORECASE)
+_ATTR_RE = re.compile(r"([a-zA-Z_:][\w:.-]*)\s*=\s*'([^']*)'|([a-zA-Z_:][\w:.-]*)\s*=\s*\"([^\"]*)\"")
 
-# ---------------------------------------------------------
-# Analysis
-# ---------------------------------------------------------
-a = Analysis(
-    [str(MAIN_PY)],
-    pathex=[
-        str(PROJECT_ROOT),
-        str(AGENT_ROOT),
-    ],
-    binaries=[],
-    datas=[
-        # Recorder injector used by the local agent (read as a text file
-        # at runtime - see recorder/recorder.py's INJECTOR_PATH; not a
-        # .py module PyInstaller would bundle automatically).
-        (
-            str(INJECTOR_JS),
-            "recorder",
-        ),
-        # Agent environment module/data
-        (
-            str(AGENT_ENVIRONMENT),
-            "local_agent",
-        ),
-    ] + datas_for_recorder_and_runner,
-    hiddenimports=hiddenimports,
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[],
-    excludes=[
-        # Central-server-only packages that must NOT be shipped to an end
-        # user's PC (see local_agent/agent_environment.py's docstring for
-        # why "agent" - the AI/self-healing package - specifically is
-        # excluded: local execution deliberately runs without self-healing
-        # so no LLM key/dependency needs to exist client-side). If any of
-        # these accidentally get pulled in by a stray import, this list is
-        # what catches it at build time as a missing-module error instead
-        # of silently shipping backend code to end users.
-        "fastapi",
-        "sqlalchemy",
-        "jwt",
-        "bcrypt",
-        "jinja2",
-        "pandas",
-        "openpyxl",
-        "backend",
-        "database",
-        "agent",
-        "generator",
-        # "recorder" and "runner" are excluded from PyInstaller's own
-        # module-graph analysis DELIBERATELY - see the long comment above
-        # datas_for_recorder_and_runner for why. This does not remove
-        # them from the running program: their actual source files are
-        # copied in via `datas` above instead, landing under
-        # sys._MEIPASS (which PyInstaller's bootloader already puts on
-        # sys.path automatically), where Python's normal, un-frozen
-        # import system finds and imports them exactly as it would for
-        # any ordinary script - completely bypassing whatever caused
-        # PyInstaller's analysis to misclassify them as "invalid module"
-        # on at least one real build.
-        "recorder",
-        "runner",
-    ],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=None,
-    noarchive=False,
-)
 
-# ---------------------------------------------------------
-# PYZ
-# ---------------------------------------------------------
-pyz = PYZ(
-    a.pure,
-    a.zipped_data,
-    cipher=None,
-)
+def _find_column_indices(header_row: list) -> dict:
+    """Maps each logical column name (see COLUMN_ALIASES) to the header
+    row's cell index it was found at. Missing optional columns (name,
+    input) are fine - only "action" and "selector" are ever required, and
+    only for rows whose action actually needs them."""
+    normalized = [str(c or "").strip().lower() for c in header_row]
+    indices = {}
+    for logical_name, aliases in COLUMN_ALIASES.items():
+        for i, cell in enumerate(normalized):
+            if any(alias in cell for alias in aliases):
+                indices[logical_name] = i
+                break
+    return indices
 
-# ---------------------------------------------------------
-# EXE
-# ---------------------------------------------------------
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
-    exclude_binaries=True,
-    name="local_agent",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
-    console=True,  # keep a console window for now so connection/errors are visible - revisit once the Electron UI surfaces agent logs well enough to hide it
-    disable_windowed_traceback=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-)
 
-# ---------------------------------------------------------
-# COLLECT
-# ---------------------------------------------------------
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name="local_agent",
-)
+def _parse_webctrl_attrs(selector_text: str) -> dict:
+    """Extracts every attribute='value' pair from the <webctrl .../> line
+    of a UiPath selector dump - ignores the <html .../> line entirely
+    (see this module's docstring for why)."""
+    if not selector_text:
+        return {}
+    match = _WEBCTRL_RE.search(selector_text)
+    if not match:
+        return {}
+    attrs_text = match.group(1)
+    attrs = {}
+    for m in _ATTR_RE.finditer(attrs_text):
+        if m.group(1):
+            attrs[m.group(1).lower()] = m.group(2)
+        else:
+            attrs[m.group(3).lower()] = m.group(4)
+    return attrs
 
-# ---------------------------------------------------------
-# NOT HANDLED BY THIS SPEC (see docs/electron-local-agent-architecture.md)
-# ---------------------------------------------------------
-#   - Playwright's own browser binaries (`playwright install msedge`) are
-#     NOT bundled by PyInstaller - they need a separate install step,
-#     either bundled as additional `datas`/`binaries` entries (large - a
-#     full Chromium-based browser download) or run once at application
-#     first-launch with a visible progress indicator. Decide which before
-#     relying on this spec for a real installer.
+
+def _css_attr(name: str, value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'[{name}="{escaped}"]'
+
+
+def _xpath_literal(value: str) -> str:
+    if '"' not in value:
+        return f'"{value}"'
+    if "'" not in value:
+        return f"'{value}'"
+    parts = value.split('"')
+    return "concat(" + ', \'"\', '.join(f'"{p}"' for p in parts) + ")"
+
+
+def build_locators_from_uipath_selector(selector_text: str) -> list[dict]:
+    """Translates one UiPath <webctrl .../> selector into a PRIORITY-ORDERED
+    list of {"strategy", "value"} candidates - deliberately produces
+    several fallback tiers (not just one "best" guess), the same way a
+    real browser recording captures multiple locator strategies per
+    element: replay already knows how to try each one in turn until one
+    resolves (see generator/templates/page.tmpl's wait_ready()), so an
+    imperfect translation for one attribute combination doesn't need to
+    be perfect - it just needs to include a reasonable set of candidates."""
+    attrs = _parse_webctrl_attrs(selector_text)
+    tag = (attrs.get("tag") or "").lower()
+    locators: list[dict] = []
+
+    if attrs.get("id"):
+        locators.append({"strategy": "ID", "value": attrs["id"]})
+
+    if attrs.get("name") and not (attrs.get("type") == "radio" and attrs.get("idx")):
+        locators.append({"strategy": "NAME", "value": attrs["name"]})
+
+    if attrs.get("aria-label"):
+        locators.append({"strategy": "CSS", "value": _css_attr("aria-label", attrs["aria-label"])})
+
+    # "aaname" (UiPath's "accessible automation name") is usually the
+    # element's visible/accessible text - treat it like visibleinnertext
+    # for XPath purposes when there's no better attribute to key off of.
+    text_value = (attrs.get("visibleinnertext") or attrs.get("aaname") or "").strip()
+    if text_value and tag:
+        locators.append({
+            "strategy": "XPATH",
+            "value": f"//{tag}[normalize-space(text())={_xpath_literal(text_value)}]",
+        })
+    elif text_value:
+        locators.append({
+            "strategy": "XPATH",
+            "value": f"//*[normalize-space(text())={_xpath_literal(text_value)}]",
+        })
+
+    if attrs.get("parentid") and tag:
+        locators.append({"strategy": "CSS", "value": f'[id="{attrs["parentid"]}"] {tag}'})
+
+    # A same-name group of radio/checkbox inputs, disambiguated by
+    # position (UiPath's "idx") - matches recorder.py's own convention of
+    # tagging same-name radio options distinctly.
+    if attrs.get("name") and attrs.get("type") and attrs.get("idx"):
+        try:
+            position = int(attrs["idx"])
+            locators.append({
+                "strategy": "XPATH",
+                "value": f'(//{tag or "input"}[@name={_xpath_literal(attrs["name"])} and @type={_xpath_literal(attrs["type"])}])[{position}]',
+            })
+        except ValueError:
+            pass
+
+    # Table-cell targeting: UiPath's tableCol/tableRow are coordinates
+    # into a specific rendered table whose structure this importer has no
+    # other knowledge of - a text-based match (already added above if
+    # visibleinnertext was present) is far more robust than trying to
+    # compute an nth-child position, so this only adds a plain tag+text
+    # fallback when NOTHING else was found at all.
+    if not locators and tag:
+        locators.append({"strategy": "XPATH", "value": f"//{tag}"})
+
+    return locators
+
+
+def _parse_scroll_input(value: str) -> tuple[str, int]:
+    """"DOWN-4" -> ("down", 4); tolerates "DOWN", "down-4", stray
+    whitespace, or a bare number (defaults direction to "down")."""
+    value = (value or "down-1").strip()
+    match = re.match(r"([a-zA-Z]+)\s*-?\s*(\d+)?", value)
+    if not match:
+        return "down", 1
+    direction = match.group(1).lower()
+    amount = int(match.group(2)) if match.group(2) else 1
+    if direction not in ("up", "down"):
+        direction = "down"
+    return direction, amount
+
+
+def import_uipath_excel(file_path: str, recording_name: Optional[str] = None) -> dict:
+    """Reads a UiPath-style Excel file and returns
+    {"recording": {...}, "warnings": [...]} - `recording` is ready to pass
+    straight to recorder/recorder.py's save_recording_json() or
+    generator/build.py's build_artifacts(), exactly like a live-recorded
+    session would be. `warnings` lists any rows that couldn't be fully
+    understood (an unrecognized Action/Method, a selector with no usable
+    attributes, etc.) - these don't stop the import, but are worth
+    surfacing to whoever's reviewing the result."""
+    wb = openpyxl.load_workbook(file_path, data_only=True)
+    ws = wb.active
+
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        raise ValueError("The spreadsheet is empty.")
+
+    header_row_idx = 0
+    columns = _find_column_indices(rows[header_row_idx])
+    if "action" not in columns:
+        raise ValueError(
+            "Could not find an 'Action/Method' column in the spreadsheet - "
+            "expected a header row with a column containing that text."
+        )
+
+    def cell(row, key):
+        idx = columns.get(key)
+        if idx is None or idx >= len(row):
+            return None
+        value = row[idx]
+        return str(value).strip() if value is not None else None
+
+    target_url = None
+    actions: list[dict] = []
+    warnings: list[str] = []
+
+    for row_num, row in enumerate(rows[header_row_idx + 1:], start=header_row_idx + 2):
+        if row is None or all(v is None for v in row):
+            continue
+
+        action_method = (cell(row, "action") or "").strip().upper()
+        if not action_method:
+            continue
+
+        name_hint = cell(row, "name") or ""
+        selector_text = cell(row, "selector") or ""
+        input_value = cell(row, "input")
+        step_label = cell(row, "step") or f"row {row_num}"
+
+        if action_method == "OPENBROWSER":
+            target_url = input_value or target_url
+            continue
+
+        if action_method == "DELAY":
+            try:
+                delay_seconds = float(input_value or 1)
+            except ValueError:
+                delay_seconds = 1.0
+                warnings.append(f"{step_label}: DELAY value {input_value!r} isn't a number - defaulted to 1 second.")
+            actions.append({
+                "action": "delay", "value": delay_seconds, "element": {}, "locators": [],
+                "page_index": 0, "frame_path": [],
+            })
+            continue
+
+        if action_method == "SCROLL":
+            direction, amount = _parse_scroll_input(input_value)
+            actions.append({
+                "action": "scroll", "value": None, "element": {}, "locators": [],
+                "page_index": 0, "frame_path": [], "scroll_direction": direction, "scroll_amount": amount,
+            })
+            continue
+
+        if action_method in ("CLOSETAB", "CLOSE_TAB", "CLOSE TAB"):
+            actions.append({
+                "action": "window_closed", "value": None, "element": {}, "locators": [],
+                "page_index": 0, "frame_path": [], "opener_page_index": 0,
+            })
+            continue
+
+        # Everything else needs a selector to act on.
+        locators = build_locators_from_uipath_selector(selector_text)
+        if not locators:
+            warnings.append(f"{step_label} ({name_hint or 'unnamed'}): no usable selector found in {selector_text!r} - row skipped.")
+            continue
+
+        attrs = _parse_webctrl_attrs(selector_text)
+        element = {
+            "tag": (attrs.get("tag") or "").lower(),
+            "type": attrs.get("type", ""),
+            "text": (attrs.get("visibleinnertext") or attrs.get("aaname") or name_hint or "").strip()[:60],
+            "placeholder": "",
+            "name": attrs.get("name", ""),
+            "ariaLabel": attrs.get("aria-label", "") or attrs.get("aaname", ""),
+        }
+
+        internal_action = ACTION_MAP.get(action_method)
+        if internal_action is None:
+            warnings.append(f"{step_label} ({name_hint or 'unnamed'}): unrecognized Action/Method {action_method!r} - imported as a click.")
+            internal_action = "click"
+
+        action_dict = {
+            "action": internal_action,
+            "value": input_value if internal_action in ("type", "select") else None,
+            "element": element,
+            "locators": locators,
+            "page_index": 0,
+            "frame_path": [],
+        }
+        # Radio/checkbox clicks need the resulting checked state as their
+        # "value" (see recorder_injector.js's own click listener +
+        # generator/build.py's is_toggle handling) - a UiPath CLICK-C on a
+        # radio/checkbox is assumed to be selecting/checking it (UiPath
+        # itself doesn't record an "uncheck" gesture the way this project
+        # does), which covers the overwhelming majority of real flows.
+        if internal_action == "click" and element["type"] in ("radio", "checkbox"):
+            action_dict["value"] = True
+
+        actions.append(action_dict)
+
+    if not actions:
+        warnings.append("No actionable steps were found in this spreadsheet.")
+
+    recording = {
+        "target_url": target_url or "",
+        "recorded_at": datetime.now().strftime("%Y%m%d_%H%M%S"),
+        "recording_name": recording_name,
+        "actions": actions,
+        "imported_from": "uipath_excel",
+    }
+    if not target_url:
+        warnings.append("No OPENBROWSER row was found - this recording has no target_url set. Add one before running it.")
+
+    return {"recording": recording, "warnings": warnings}
