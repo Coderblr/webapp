@@ -1,206 +1,73 @@
 """
-Runs the generated behave suite and returns structured pass/fail output.
+Entrypoint: `python -m local_agent.main`
 
-Uses a real subprocess so every run gets a genuinely fresh, isolated
-Python process - important because behave keeps process-wide global state
-(step registrations, and evidently more than just that - see the history
-below) that leaks across runs sharing one process.
+This is what Electron's main process spawns as a child process (see
+electron/main.js) - a plain Python script with no GUI of its own; all
+interaction happens via the connection to the central backend (recording/
+test commands) and via stdout/log files (see local_agent/logger.py) for
+diagnostics Electron surfaces through its own status indicator.
 
-IMPORTANT for the local desktop agent (local_agent/): `sys.executable`
-inside a PyInstaller-frozen executable (see local_agent/local_agent.spec)
-is the path to the FROZEN .EXE ITSELF, not a real Python interpreter -
-there is no separate "python.exe" to shell out to. `[sys.executable, "-m",
-"behave", ...]` would try to re-launch the agent app with nonsense
-arguments instead of actually running behave, which is exactly why "Start
-Recording" (in-process, via recorder/recorder.py - no subprocess involved)
-worked from a packaged local_agent.exe while "Run" (this file, subprocess-
-based) did not.
+Configuration is entirely via environment variables (spec section 22 -
+"no localhost URLs in production"), set by Electron before spawning this
+process:
 
-Several things were tried and abandoned before landing on the current
-design - documented here so nobody re-attempts them:
+    SERVER_URL   - e.g. https://recorder.yourbank.internal (required in production)
+    WS_URL       - optional override; derived from SERVER_URL otherwise
+    AGENT_VERSION - the installed desktop app's version, for the backend's agent listing
+    LOG_LEVEL    - DEBUG/INFO/WARNING/ERROR (default INFO)
 
-  1. In-process invocation (`behave.__main__.main()` called directly, no
-     subprocess at all) when frozen. This worked for a SINGLE run, but a
-     second test run in the same long-running agent process failed with
-     "AmbiguousStep: ... has already been defined" - even after explicitly
-     resetting `behave.step_registry.registry` before each call. Something
-     else internal to behave (never fully identified - possibly a
-     `Runner`/`ModelRunner`-level cache, possibly matcher-level state) was
-     still holding onto the first run's step definitions. Chasing down and
-     resetting every piece of undocumented internal state behave might
-     accumulate is fragile and not a fight worth continuing.
+--behave-worker: a second, hidden mode this same entrypoint supports -
+see runner/run_tests.py's run_behave_cli for the full explanation of why.
+Short version: a PyInstaller-frozen local_agent.exe has no separate
+"python.exe" to shell out to for running Behave in its own clean process
+the way the non-frozen path does (sys.executable inside a frozen build
+just points back at this exe) - and running Behave repeatedly IN-PROCESS
+inside one long-lived agent turned out to leak internal behave state
+across runs in ways that go beyond the documented step-registry (a second
+test run in the same process failed with "AmbiguousStep... already
+defined" even after resetting behave.step_registry.registry - something
+else inside behave was still holding onto the first run's state). This
+originally worked by having run_behave_cli spawn THIS SAME EXE again as a
+subprocess with "--behave-worker <behave CLI args>", short-circuiting
+straight to behave's own entry point.
 
-  2. Have the frozen exe RE-INVOKE ITSELF as a subprocess with a hidden
-     `--behave-worker <behave CLI args>` flag it recognizes (see
-     local_agent/main.py) - `sys.executable` inside a frozen build
-     correctly points at the exe's own path, so `[sys.executable,
-     "--behave-worker", ...]` genuinely launches a fresh copy of the same
-     .exe, which short-circuits straight to `behave.__main__.main()` and
-     exits. This gave every test run its own real, fully independent OS
-     process. It worked - but on at least one real corporate deployment,
-     it triggered a PERSISTENT "[WinError 5] Access is denied": a process
-     launching a byte-for-byte copy of itself is a well-known pattern
-     antivirus/EDR software watches for (it's how many self-replicating
-     threats behave), and this specific security product denied it every
-     single time, not just as an occasional timing race the retry logic
-     below could paper over.
-
-  3. CURRENT: a genuinely SEPARATE executable, behave_worker.exe (built
-     from local_agent/behave_worker.spec), whose only job is running
-     Behave - see behave_worker_main.py's docstring. A parent app
-     launching a distinct helper program is a completely standard,
-     unflagged pattern (most desktop apps with a multi-process
-     architecture already work this way), unlike launching a copy of
-     itself. run_behave_cli() below looks for this exe sitting right next
-     to the running local_agent.exe FIRST, and only falls back to
-     approach 2's self-respawn if it isn't found there - so an existing
-     install that hasn't been rebuilt with the new worker yet keeps
-     working exactly as it did before, just without this fix, rather than
-     breaking outright.
-
-KNOWN ISSUE on locked-down corporate Windows machines: "[WinError 5]
-Access is denied" when a subprocess launch happens (either the worker exe
-or, on an install predating it, the self-respawn fallback). Root cause is
-almost certainly antivirus/EDR software - approach 3 above eliminates the
-"launches a copy of itself" trigger entirely for the worker-exe path, but
-a fresh executable launch can still be transiently blocked by an
-on-access scanner mid-file-write/mid-scan, or persistently blocked by a
-security policy that's stricter still. Two mitigations, both present
-here:
-
-  - AUTOMATIC (this file): the launch is retried a few times with a short
-    backoff before giving up - this alone resolves the transient
-    "AV briefly locked the file mid-scan" case, which is the more common
-    one in practice.
-  - MANUAL, for a PERSISTENT block (the security product denies it every
-    single time, not just a timing race): the machine's antivirus/EDR
-    needs an exclusion added for the local agent's install folder and its
-    %APPDATA%\\ai-test-recorder-agent workspace folder. This is standard
-    practice for any legitimate line-of-business tool and does not weaken
-    the machine's overall security posture - it scopes the exclusion to
-    this one application. See docs/electron-local-agent-architecture.md's
-    "Known issue" section for exact steps to hand to IT/security.
+That approach is now the FALLBACK, not the primary path: run_behave_cli
+prefers a genuinely separate executable, behave_worker.exe (built from
+local_agent/behave_worker.spec, see that file and
+behave_worker_main.py), whenever it's found sitting alongside this one -
+a distinct helper program launched by its parent is a completely
+standard pattern, unlike a process launching a byte-for-byte copy of
+itself, which is exactly the kind of thing antivirus/EDR software
+watches for and which caused a real, persistent "[WinError 5] Access is
+denied" on at least one deployment (see
+docs/electron-local-agent-architecture.md's "Known issue" section). This
+flag is kept here so an install that hasn't been rebuilt with the new
+worker exe yet still works exactly as before, rather than breaking
+outright.
 """
-from __future__ import annotations
-import os
-import subprocess
 import sys
-import time
-from pathlib import Path
-
-ROOT = Path(__file__).parent.parent
-
-_LAUNCH_RETRY_ATTEMPTS = 3
-_LAUNCH_RETRY_BASE_DELAY_SECONDS = 0.5
 
 
-def _find_behave_worker_exe() -> Path | None:
-    """Looks for behave_worker.exe (see local_agent/behave_worker.spec)
-    sitting in the SAME directory as the currently-running frozen exe -
-    that's where it's expected to be copied to during packaging (see that
-    spec's own comments). Returns None if not found (an older install
-    predating this fix, or a non-frozen/dev run, where it's irrelevant
-    anyway) - run_behave_cli() falls back to the previous self-respawn
-    approach in that case, rather than failing outright."""
-    if not getattr(sys, "frozen", False):
-        return None
-    exe_name = "behave_worker.exe" if sys.platform == "win32" else "behave_worker"
-    candidate = Path(sys.executable).resolve().parent / exe_name
-    return candidate if candidate.exists() else None
+def _run_as_behave_worker(argv: list[str]) -> None:
+    from behave.__main__ import main as behave_main
+    try:
+        returncode = behave_main(argv)
+        sys.exit(returncode if isinstance(returncode, int) else 0)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"local_agent --behave-worker failed: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
-def run_behave_cli(behave_args: list[str], cwd: str, env_overrides: dict) -> dict:
-    """Runs behave with `behave_args` (e.g. [features_dir, "--no-capture"]),
-    returning {"returncode", "output"}. Always a real subprocess - see this
-    module's docstring for the full history of how that subprocess is
-    launched, and for the "[WinError 5] Access is denied" retry logic
-    below."""
-    full_env = {**os.environ, **env_overrides}
+def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "--behave-worker":
+        _run_as_behave_worker(sys.argv[2:])
+        return  # unreachable (the branch above always sys.exit()s) - kept for clarity
 
-    if getattr(sys, "frozen", False):
-        worker_exe = _find_behave_worker_exe()
-        if worker_exe is not None:
-            cmd = [str(worker_exe), *behave_args]
-        else:
-            # Fallback: this install predates behave_worker.exe (see this
-            # module's docstring, approach 2) - self-respawn with the
-            # hidden flag local_agent/main.py still recognizes for exactly
-            # this reason.
-            cmd = [sys.executable, "--behave-worker", *behave_args]
-    else:
-        cmd = [sys.executable, "-m", "behave", *behave_args]
-
-    last_error = None
-    for attempt in range(1, _LAUNCH_RETRY_ATTEMPTS + 1):
-        try:
-            proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=full_env)
-            return {"returncode": proc.returncode, "output": proc.stdout + "\n" + proc.stderr}
-        except (PermissionError, OSError) as e:
-            # [WinError 5] Access is denied surfaces here as a PermissionError
-            # (or a plain OSError with winerror=5) raised by subprocess.run
-            # itself - the process never even started, so there's no
-            # proc.stdout/stderr to report. See this module's docstring for
-            # why this happens and what the two mitigations are.
-            last_error = e
-            if attempt < _LAUNCH_RETRY_ATTEMPTS:
-                time.sleep(_LAUNCH_RETRY_BASE_DELAY_SECONDS * attempt)
-                continue
-
-    return {
-        "returncode": -1,
-        "output": (
-            f"Failed to launch the test-execution process after {_LAUNCH_RETRY_ATTEMPTS} attempts: "
-            f"{type(last_error).__name__}: {last_error}\n\n"
-            "This is commonly caused by antivirus/endpoint-security software blocking or briefly "
-            "locking a newly-launched process. If this keeps happening, ask your "
-            "IT/security team to add an exclusion for the local agent's install folder and its "
-            r"%APPDATA%\ai-test-recorder-agent\ workspace folder - see "
-            "docs/electron-local-agent-architecture.md's 'Known issue' section for exact wording to give them."
-        ),
-    }
-    for attempt in range(1, _LAUNCH_RETRY_ATTEMPTS + 1):
-        try:
-            proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=full_env)
-            return {"returncode": proc.returncode, "output": proc.stdout + "\n" + proc.stderr}
-        except (PermissionError, OSError) as e:
-            # [WinError 5] Access is denied surfaces here as a PermissionError
-            # (or a plain OSError with winerror=5) raised by subprocess.run
-            # itself - the process never even started, so there's no
-            # proc.stdout/stderr to report. See this module's docstring for
-            # why this happens and what the two mitigations are.
-            last_error = e
-            if attempt < _LAUNCH_RETRY_ATTEMPTS:
-                time.sleep(_LAUNCH_RETRY_BASE_DELAY_SECONDS * attempt)
-                continue
-
-    return {
-        "returncode": -1,
-        "output": (
-            f"Failed to launch the test-execution process after {_LAUNCH_RETRY_ATTEMPTS} attempts: "
-            f"{type(last_error).__name__}: {last_error}\n\n"
-            "This is commonly caused by antivirus/endpoint-security software blocking or briefly "
-            "locking a process that launches a copy of itself. If this keeps happening, ask your "
-            "IT/security team to add an exclusion for the local agent's install folder and its "
-            r"%APPDATA%\ai-test-recorder-agent\ workspace folder - see "
-            "docs/electron-local-agent-architecture.md's 'Known issue' section for exact wording to give them."
-        ),
-    }
-
-
-def run(output_dir: str = "output", headless: bool = False) -> dict:
-    features_dir = Path(output_dir) / "features"
-    if not features_dir.exists():
-        return {"ok": False, "returncode": -1, "output": f"No features found at {features_dir}. Generate first."}
-
-    result = run_behave_cli(
-        [str(features_dir), "--no-capture"],
-        cwd=str(ROOT),
-        env_overrides={"HEADLESS": "true" if headless else "false"},
-    )
-    return {"ok": result["returncode"] == 0, "returncode": result["returncode"], "output": result["output"]}
+    from local_agent.client import main as run_agent_main
+    run_agent_main()
 
 
 if __name__ == "__main__":
-    result = run()
-    print(result["output"])
-    sys.exit(result["returncode"])
+    main()
