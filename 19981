@@ -1,247 +1,608 @@
 """
-Auto-generated behave step definitions.
-Regenerating from a new recording will overwrite this file - customize
-downstream (e.g. add real assertions to the Then step) in a copy if needed.
+Converts a UiPath-style Excel test-steps sheet into the SAME recording
+JSON schema recorder/recorder.py already produces - so a UiPath-authored
+flow flows through the EXACT same downstream pipeline as a recorded one:
+generator/build.py, the Behave/Playwright templates, "Run Saved
+Recording", the exit report, Regenerate, everything. Nothing downstream
+needs to know or care whether a recording came from a live browser
+session or an imported spreadsheet.
+
+Expected columns (case-insensitive, matched by header text - order
+doesn't matter): Steps, NAME, Action/Method, present element, input.
+"present element" holds UiPath's own selector dump, e.g.:
+
+    <html app='msedge.exe' title='LLMS Lite' />
+    <webctrl id='username' tag='INPUT' />
+
+Only the <webctrl .../> line's attributes matter here - the <html .../>
+line just identifies the target application/window, which this project
+already gets from the recording's own target_url instead.
+
+Action/Method -> internal action mapping:
+    OPENBROWSER  -> sets the recording's target_url (not a step of its own)
+    DELAY        -> "delay" action, "input" column is the number of seconds
+    INPUT-C      -> "type" action, "input" column is the value to type
+    CLICK-C      -> "click" action
+    DROPDOWN-S   -> "select" action, "input" column is the option to select
+    SCROLL       -> "scroll" action, "input" column is "DOWN-4"/"UP-2" style (direction-amount)
+    CLOSETAB     -> "window_closed" action (same one recorder.py itself
+                    produces for a real closed tab/window - see
+                    generator/build.py)
+    ENTER        -> "keypress" action (presses Enter - a UiPath ENTER step
+                    never carries a selector of its own; it acts on
+                    whatever element currently has focus, exactly like a
+                    real Enter keypress does)
+    VERIFICATION -> "assert_text" action - asserts the selector's element
+                    contains the expected text (from "input"). Does NOT
+                    click/type anything - a pure check. See
+                    generator/build.py and the templates for the
+                    corresponding replay step.
+    STOPPER      -> imported as "click" (UiPath's STOPPER marks a step that
+                    needs special handling - most commonly a date-picker
+                    day cell, which behaves like a normal click once
+                    resolved) - logged as a warning since the selector for
+                    these is usually the least reliable in the whole sheet
+                    and worth a human double-checking.
+
+A selector dump with MORE THAN ONE <webctrl .../> line (UiPath emits this
+for a nested/scoped target, e.g. a specific cell inside a specific table)
+uses the LAST (innermost, most specific) <webctrl> line's attributes -
+that's always the one actually closest to the real interactive element;
+the earlier line(s) are just scoping/context UiPath included for its own
+matching, e.g. the containing <table> or <tr>.
+
+A selector dump using UiPath's DESKTOP/native-dialog syntax instead of
+<webctrl> (<wnd .../><ctrl role='dialog' .../>...) - e.g. a native
+"llmslite.uat.sbi says... OK" browser confirm popup - is skipped
+entirely, with an informational note rather than a warning: this
+project's generated tests already auto-accept every native browser
+dialog globally (see runner/environment.py and
+local_agent/agent_environment.py's page.on("dialog", ...) handlers), so
+no explicit step is needed for it at all.
+
+Anything else in the Action/Method column is imported as a "click" by
+default (logged as a warning in the returned `warnings` list) rather than
+silently dropped or failing the whole import - a single unrecognized
+row shouldn't block importing the other 50 rows in a real spreadsheet.
 """
-from behave import given, when, then
+from __future__ import annotations
+import re
+from datetime import datetime
+from typing import Optional
+
+import openpyxl
+
+ACTION_MAP = {
+    "CLICK-C": "click",
+    "INPUT-C": "type",
+    "DROPDOWN-S": "select",
+    "STOPPER": "click",
+}
+
+# Columns this importer looks for, matched case-insensitively against the
+# header row - the exact wording/casing in real spreadsheets varies
+# ("Action/Method" vs "Action / Method" vs "Method"), so this matches on
+# whichever of these substrings appears first in each header cell. Extra
+# columns some sheets include (a "Test Case No" ID column, a trailing
+# "Proposal" reference column, etc.) are simply ignored - nothing here
+# assumes a fixed column count or order, only that these specific headers
+# exist somewhere in the row.
+COLUMN_ALIASES = {
+    "step": ["steps", "step"],
+    "name": ["name"],
+    "action": ["action/method", "action / method", "method", "action"],
+    "selector": ["present element", "selector", "element"],
+    "input": ["input", "value", "data"],
+}
+
+# Matches every <webctrl .../> occurrence in a selector dump, not just the
+# first - a scoped/nested target (a specific cell inside a specific table,
+# a specific button inside a specific dialog) is expressed as MULTIPLE
+# webctrl lines, and the LAST one is always the actual target element
+# (see this module's docstring).
+# Matches UP TO THE LITERAL "/>" closing sequence (not just any "/") -
+# critical because a real attribute VALUE can itself contain a bare "/"
+# (e.g. aaname='Permanent / Correspondence Address ' - a genuine value
+# seen in real data), which the naive "everything except / or >" pattern
+# this used originally would stop at prematurely, failing to match the
+# tag at all. Non-greedy + DOTALL so it matches the FIRST "/>" it finds
+# (the tag's own close) rather than running past it into whatever follows.
+_WEBCTRL_RE = re.compile(r"<webctrl\b(.*?)/>", re.IGNORECASE | re.DOTALL)
+_ATTR_RE = re.compile(r"([a-zA-Z_:][\w:.-]*)\s*=\s*'([^']*)'|([a-zA-Z_:][\w:.-]*)\s*=\s*\"([^\"]*)\"")
+
+# UiPath's DESKTOP/native-dialog selector syntax (a <wnd>/<ctrl> pair,
+# instead of <webctrl>) - identifies a row targeting a native OS/browser
+# dialog (e.g. a plain JS confirm() popup), which this project's replay
+# already auto-accepts globally without needing an explicit step - see
+# this module's docstring.
+_NATIVE_DIALOG_RE = re.compile(r"<wnd\b|<ctrl\b", re.IGNORECASE)
 
 
-@given('the user opens "{url}"')
-def step_open(context, url):
-    context.raw_page.goto(url)
+def _find_column_indices(header_row: list) -> dict:
+    """Maps each logical column name (see COLUMN_ALIASES) to the header
+    row's cell index it was found at. Missing optional columns (name,
+    input) are fine - only "action" and "selector" are ever required, and
+    only for rows whose action actually needs them."""
+    normalized = [str(c or "").strip().lower() for c in header_row]
+    indices = {}
+    for logical_name, aliases in COLUMN_ALIASES.items():
+        for i, cell in enumerate(normalized):
+            if any(alias in cell for alias in aliases):
+                indices[logical_name] = i
+                break
+    return indices
 
 
-{% macro explicit_wait(step) %}
-    # Recording showed this step's target took ~{{ step.wait_seconds }}s to become ready.
-    # No sleep() - wait_ready() polls every known locator strategy and continues
-    # the moment one resolves, up to this measured timeout, so a fast response
-    # doesn't sit around waiting.
-    context.page.wait_ready("{{ step.element_name }}", timeout={{ step.wait_seconds }})
-{%- endmacro %}
-{% macro maybe_switch(step) %}
-{% if step.switch_to_page %}
-    # Recorded on browser tab/window #{{ step.page_index }} - switch to it
-    # first (see generator/build.py's page_index/switch_to_page and
-    # RecordedPage.switch_page). Covers both continuing in a popup/new tab
-    # that just opened and coming back to an earlier tab/window.
-    context.page.switch_page(context.recorder_pages[{{ step.page_index }}])
-{% endif %}
-{%- endmacro %}
-{% macro new_page_wrapper(step) %}
-{% if step.opens_new_page %}
-    # This action opens a new browser tab/window (a target="_blank" link,
-    # "open in new window", window.open(), etc.) - expect_page() is the only
-    # reliable way to catch it: it must wrap the exact call that triggers it.
-    with context.browser_session.context.expect_page() as _new_page_info:
-{{ caller() | indent(4, true) }}
-    _new_pg = _new_page_info.value
-    _new_pg.wait_for_load_state()
-    context.recorder_pages.append(_new_pg)
-    context.page.switch_page(_new_pg)
-{% else %}
-{{ caller() }}
-{% endif %}
-{%- endmacro %}
-{% for step in steps -%}
-{%- if step.action == "click" %}
-@when('the user clicks "{{ step.element_name }}"')
-def step_click_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{{ explicit_wait(step) }}
-{% call new_page_wrapper(step) %}
-    context.page.click("{{ step.element_name }}")
-{% endcall %}
+def _normalize_selector_text(selector_text: str) -> str:
+    """Undoes a mangled-selector pattern seen in real data - a literal
+    backslash before every "<" and "<br>" tags standing in for real
+    newlines (e.g. "\\<html .../><br>\\<webctrl .../>" instead of the
+    normal clean, newline-separated form). This happens when the
+    selector text was copy-pasted through something HTML-aware (browser
+    dev tools, a rich-text editor, an HTML export) before landing in the
+    spreadsheet cell - the underlying selector is the same, just escaped.
+    Used by both _parse_webctrl_attrs and is_native_dialog_selector, so
+    neither needs to special-case it separately. A plain, unmangled cell
+    passes through unchanged."""
+    if not selector_text:
+        return selector_text
+    selector_text = re.sub(r"<br\s*/?>", "\n", selector_text, flags=re.IGNORECASE)
+    return selector_text.replace("\\<", "<")
 
-{% elif step.action == "toggle" %}
-{% if step.checked_value %}
-@when('the user checks "{{ step.element_name }}"')
-def step_check_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{{ explicit_wait(step) }}
-    # Idempotent by design (BasePage.set_checked reads the current state
-    # first) - this is what avoids the double-toggle risk a blind click()
-    # has for checkbox/radio inputs.
-{% call new_page_wrapper(step) %}
-    context.page.set_checked("{{ step.element_name }}", True)
-{% endcall %}
 
-{% else %}
-@when('the user unchecks "{{ step.element_name }}"')
-def step_uncheck_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{{ explicit_wait(step) }}
-{% call new_page_wrapper(step) %}
-    context.page.set_checked("{{ step.element_name }}", False)
-{% endcall %}
+def is_native_dialog_selector(selector_text: str) -> bool:
+    """True for a UiPath DESKTOP-style selector (<wnd>/<ctrl>) rather than
+    a <webctrl> one - see this module's docstring for why these rows are
+    skipped entirely at import time."""
+    if not selector_text:
+        return False
+    selector_text = _normalize_selector_text(selector_text)
+    return bool(_NATIVE_DIALOG_RE.search(selector_text)) and "<webctrl" not in selector_text.lower()
 
-{% endif %}
-{% elif step.action in ("type", "paste") %}
-{% if step.var_placeholder %}
-@when('the user enters "{{ step.var_placeholder_escaped }}" into "{{ step.element_name }}"')
-def step_type_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{{ explicit_wait(step) }}
-    # Reuse: resolved from the LIVE value captured earlier in THIS run (see
-    # context.variables, seeded by a "captures the value of ..." step below)
-    # instead of the literal value that happened to be recorded originally.
-    value = context.variables.resolve("{{ step.var_placeholder }}")
-{% call new_page_wrapper(step) %}
-{% if step.action == "paste" %}
-    context.page.paste_text("{{ step.element_name }}", value)
-{% else %}
-    context.page.type_text("{{ step.element_name }}", value)
-{% endif %}
-{% endcall %}
 
-{% else %}
-@when('the user enters "{{ step.value }}" into "{{ step.element_name }}"')
-def step_type_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{{ explicit_wait(step) }}
-{% call new_page_wrapper(step) %}
-{% if step.action == "paste" %}
-    context.page.paste_text("{{ step.element_name }}", "{{ step.value }}")
-{% else %}
-    context.page.type_text("{{ step.element_name }}", "{{ step.value }}")
-{% endif %}
-{% endcall %}
+def _parse_webctrl_attrs(selector_text: str) -> dict:
+    """Extracts every attribute='value' pair from the LAST <webctrl .../>
+    line of a UiPath selector dump (see this module's docstring for why
+    the last one, when there's more than one) - ignores <html .../>/
+    <wnd .../> lines entirely, those just identify the target
+    application/window, which this project already gets from the
+    recording's own target_url instead."""
+    if not selector_text:
+        return {}
+    selector_text = _normalize_selector_text(selector_text)
+    matches = list(_WEBCTRL_RE.finditer(selector_text))
+    if not matches:
+        return {}
+    attrs_text = matches[-1].group(1)
+    attrs = {}
+    for m in _ATTR_RE.finditer(attrs_text):
+        if m.group(1):
+            attrs[m.group(1).lower()] = m.group(2)
+        else:
+            attrs[m.group(3).lower()] = m.group(4)
+    return attrs
 
-{% endif %}
-{% elif step.action == "file_upload" %}
-@when('the user uploads the file "{{ step.value | pyesc }}" into "{{ step.element_name }}"')
-def step_upload_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{{ explicit_wait(step) }}
-{% call new_page_wrapper(step) %}
-    # Only the file NAME was ever recordable - browsers never expose the
-    # real local path of a chosen file to JavaScript (el.value is a
-    # fabricated "C:\fakepath\<name>" string for security). BasePage.
-    # upload_file() resolves this name to a real file for replay - see
-    # its docstring in page.tmpl for where it looks.
-    context.page.upload_file("{{ step.element_name }}", "{{ step.value | pyesc }}")
-{% endcall %}
 
-{% elif step.action == "select" %}
-@when('the user selects "{{ step.value }}" from "{{ step.element_name }}"')
-def step_select_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{{ explicit_wait(step) }}
-{% call new_page_wrapper(step) %}
-    context.page.select_option("{{ step.element_name }}", "{{ step.value }}")
-{% endcall %}
+def _css_attr(name: str, value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'[{name}="{escaped}"]'
 
-{% elif step.action == "keypress" %}
-@when('the user presses {{ step.key_label }} on "{{ step.element_name }}"')
-def step_keypress_{{ step.element_name }}_{{ step.key_name|lower|replace("+", "_") }}(context):
-{{ maybe_switch(step) }}
-{{ explicit_wait(step) }}
-{% call new_page_wrapper(step) %}
-    context.page.press_key("{{ step.element_name }}", "{{ step.key_name }}")
-{% endcall %}
 
-{% elif step.action == "copy" %}
-@when('the user captures the value of "{{ step.element_name }}" as "{{ step.var_placeholder_escaped }}"')
-def step_capture_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{{ explicit_wait(step) }}
-    # Capture: prefers reading the live DOM value/text via Playwright
-    # (input_value() / text_content()) and only falls back to the browser's
-    # own clipboard (still entirely through Playwright) if the element itself
-    # doesn't expose the value - see BasePage.capture_value in the page object.
-    value = context.page.capture_value("{{ step.element_name }}")
-    context.variables.store("{{ step.var_name }}", value)
+def _xpath_literal(value: str) -> str:
+    if '"' not in value:
+        return f'"{value}"'
+    if "'" not in value:
+        return f"'{value}'"
+    parts = value.split('"')
+    return "concat(" + ', \'"\', '.join(f'"{p}"' for p in parts) + ")"
 
-{% elif step.action == "ocr_capture" %}
-@when('the user captures the value of "{{ step.element_name }}" via OCR as "{{ step.var_placeholder_escaped }}"')
-def step_ocr_capture_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{{ explicit_wait(step) }}
-    # OCR capture: screenshots this element fresh and re-reads its text via
-    # OCR on EVERY run (never baked in from recording time) - for a value
-    # with no real selectable DOM text at all (an image or canvas-rendered
-    # reference number, a scanned document field, etc.) that a plain
-    # capture_value() can't see. See recorder/ocr_engine.py (the same
-    # module used when this was first captured during recording) - it
-    # requires Tesseract OCR installed separately on this machine.
-    value = context.page.capture_value_ocr("{{ step.element_name }}")
-    context.variables.store("{{ step.var_name }}", value)
 
-{% elif step.action == "window_closed" %}
-@when('the user closes the current browser tab or window (step {{ loop.index }})')
-def step_close_window_{{ loop.index }}(context):
-    # Recorded browser tab/window #{{ step.closed_page_index }} being closed -
-    # switch replay back to whichever tab/window opened it (#{{ step.switch_back_to_index }}).
-    context.page.page.close()
-    context.page.switch_page(context.recorder_pages[{{ step.switch_back_to_index }}])
+def build_locators_from_uipath_selector(selector_text: str) -> list[dict]:
+    """Translates one UiPath <webctrl .../> selector into a PRIORITY-ORDERED
+    list of {"strategy", "value"} candidates - deliberately produces
+    several fallback tiers (not just one "best" guess), the same way a
+    real browser recording captures multiple locator strategies per
+    element: replay already knows how to try each one in turn until one
+    resolves (see generator/templates/page.tmpl's wait_ready()), so an
+    imperfect translation for one attribute combination doesn't need to
+    be perfect - it just needs to include a reasonable set of candidates."""
+    attrs = _parse_webctrl_attrs(selector_text)
+    tag = (attrs.get("tag") or "").lower()
+    locators: list[dict] = []
 
-{% elif step.action == "dialog" %}
-@when('a "{{ step.dialog_type }}" dialog appears and is accepted (step {{ loop.index }})')
-def step_dialog_{{ loop.index }}(context):
-    # Native alert/confirm/prompt/beforeunload dialogs are auto-accepted
-    # globally for every page/tab/window (see environment.py's page.on(
-    # "dialog", ...) handlers) - this step performs no action of its own and
-    # exists purely so the generated feature/report show that the recording
-    # encountered one. Recorded message: {{ step.dialog_message }}
-    pass
+    if attrs.get("id"):
+        locators.append({"strategy": "ID", "value": attrs["id"]})
 
-{% elif step.action == "delay" %}
-@when('the flow waits {{ step.delay_seconds }} seconds (step {{ loop.index }})')
-def step_delay_{{ loop.index }}(context):
-    context.page.page.wait_for_timeout({{ (step.delay_seconds * 1000) | int }})
+    if attrs.get("name") and not attrs.get("idx"):
+        # A plain NAME locator is only safe when there's exactly one match -
+        # if "idx" is also present, UiPath is telling us this name is
+        # shared by more than one element (a radio/checkbox group, a
+        # repeated field), so a bare NAME locator would non-deterministically
+        # resolve to whichever one Playwright happens to pick first. The
+        # idx-based XPath further below (which fires whenever idx is
+        # present, for ANY tag/type - not just radio/checkbox) is the
+        # correct, disambiguated locator for that case instead.
+        locators.append({"strategy": "NAME", "value": attrs["name"]})
 
-{% elif step.action == "scroll" %}
-@when('the page scrolls {{ step.scroll_direction }} (step {{ loop.index }})')
-def step_scroll_{{ loop.index }}(context):
-    _dy = {{ step.scroll_amount }} * 400 * (1 if "{{ step.scroll_direction }}" == "down" else -1)
-    context.page.page.mouse.wheel(0, _dy)
-    context.page.page.wait_for_timeout(300)
+    if attrs.get("aria-label"):
+        locators.append({"strategy": "CSS", "value": _css_attr("aria-label", attrs["aria-label"])})
 
-{% elif step.action == "new_window_wait" %}
-@when('a new browser tab or window opens (step {{ loop.index }})')
-def step_new_window_wait_{{ loop.index }}(context):
-    # Fallback path: this recording's very first captured event was a new
-    # tab/window opening (no earlier click/type step to fold expect_page()
-    # onto - e.g. the app pops one immediately on load), so there's nothing
-    # to wrap; just wait for the context to report one directly.
-    _new_pg = context.browser_session.context.wait_for_event("page", timeout={{ step.wait_seconds * 1000 }})
-    _new_pg.wait_for_load_state()
-    context.recorder_pages.append(_new_pg)
-    context.page.switch_page(_new_pg)
+    if attrs.get("placeholder"):
+        locators.append({"strategy": "CSS", "value": _css_attr("placeholder", attrs["placeholder"])})
 
-{% endif -%}
-{% if step.opens_new_page %}
-@when('the new browser tab or window is now active (step {{ loop.index }})')
-def step_new_page_now_active_{{ loop.index }}(context):
-    # Purely informational/traceability line for the feature file and exit
-    # report - the actual expect_page()/switch_page() handoff already
-    # happened inside the PREVIOUS step (the click/type/etc. that caused
-    # this tab/window to open - see steps.tmpl's new_page_wrapper macro),
-    # so there's nothing left to do here.
-    pass
+    # "aaname" (UiPath's "accessible automation name") and plain
+    # "innertext" (no "visible" prefix - some UiPath selector dumps use
+    # one, some the other, for what's functionally the same thing) are
+    # both treated like visibleinnertext for XPath purposes when there's
+    # no better attribute to key off of.
+    text_value = (attrs.get("visibleinnertext") or attrs.get("innertext") or attrs.get("aaname") or "").strip()
+    if text_value and tag:
+        locators.append({
+            "strategy": "XPATH",
+            "value": f"//{tag}[normalize-space(text())={_xpath_literal(text_value)}]",
+        })
+    elif text_value:
+        locators.append({
+            "strategy": "XPATH",
+            "value": f"//*[normalize-space(text())={_xpath_literal(text_value)}]",
+        })
 
-{% endif %}
-{% endfor %}
+    if attrs.get("parentid") and tag:
+        locators.append({"strategy": "CSS", "value": f'[id="{attrs["parentid"]}"] {tag}'})
 
-@then('the flow should complete without errors')
-def step_verify_no_errors(context):
-    # Generic post-condition: no unhandled browser alert/JS error banner.
-    # Checks the CURRENTLY ACTIVE tab/window (context.page.page - see
-    # RecordedPage.switch_page), not always the original one, so this still
-    # works for a flow that ends on a popup/new tab/new window.
+    # Position-based disambiguation (UiPath's "idx") - fires for ANY
+    # element with an idx, not just radio/checkbox inputs (a plain text
+    # input can just as easily be the 3rd of several otherwise-identical
+    # fields - e.g. a repeated "Address line" input with only a shared
+    # placeholder to go on). Builds the most specific XPath predicate it
+    # can from whatever OTHER attributes are actually present (name,
+    # type, placeholder), falling back to tag alone if that's all there
+    # is - still meaningfully narrower than the last-resort "//tag" below,
+    # since taking the Nth match at least respects document order.
     #
-    # A recorded flow can legitimately end by closing its own tab/window
-    # (see the "the user closes the current browser tab or window" step,
-    # generated for a recorded window/tab-close action) - at that point
-    # there is nothing left to check a title on, and that's a successful
-    # end state, not a failure. Checking is_closed() first (a local state
-    # check, safe to call on an already-closed page) avoids ever calling
-    # .title() on a closed page in the first place - .title() talks to the
-    # browser process and raises TargetClosedError there instead of
-    # returning some default value, which would otherwise fail this
-    # deliberately generic, no-op-by-default final check for a flow that
-    # did nothing wrong.
-    if context.page.page.is_closed():
-        return
-    assert context.page.page.title() is not None
-    # Replace with an assertion specific to the target application
-    # (e.g. checking a confirmation message or success banner).
+    # Skipped when rowName/colName is ALSO present (see below): in that
+    # combination, the idx is clearly meant to be interpreted WITHIN that
+    # row/column's scope, not against the whole page - the row/col-scoped
+    # locators below already incorporate it correctly, and a global,
+    # unscoped "(//select)[1]" candidate ahead of them would often
+    # resolve to the wrong element (whatever happens to be the first
+    # matching tag anywhere on the page) before replay ever tries the
+    # more specific ones.
+    if attrs.get("idx") and not (attrs.get("rowname") or attrs.get("colname")):
+        try:
+            position = int(attrs["idx"])
+            predicates = []
+            if attrs.get("name"):
+                predicates.append(f"@name={_xpath_literal(attrs['name'])}")
+            if attrs.get("type"):
+                predicates.append(f"@type={_xpath_literal(attrs['type'])}")
+            if attrs.get("placeholder") and not predicates:
+                predicates.append(f"@placeholder={_xpath_literal(attrs['placeholder'])}")
+            predicate = f"[{' and '.join(predicates)}]" if predicates else ""
+            locators.append({
+                "strategy": "XPATH",
+                "value": f'(//{tag or "*"}{predicate})[{position}]',
+            })
+        except ValueError:
+            pass
+
+    # rowName/colName - UiPath's way of targeting "the Nth <tag> in the
+    # table row/column labeled X" (e.g. Step 51-53's "Year-1"/"Year-2"/
+    # "Year-3" dropdowns, or Step 77-78's "First Name"/"Last Name" table
+    # columns). There's no way to know the real table's exact DOM shape
+    # from the spreadsheet alone, so this is a best-effort approximation:
+    # find the nearest ancestor row (a <tr>, or any element - some tables
+    # aren't real <table> markup) containing that label text, then take
+    # the idx'th (or 1st, if no idx given) matching tag within it. Worth a
+    # human double-check if the table turns out to have an unusual
+    # structure - this is exactly the kind of row worth spot-checking
+    # after import.
+    row_or_col_name = attrs.get("rowname") or attrs.get("colname")
+    if row_or_col_name and tag:
+        position = 1
+        if attrs.get("idx"):
+            try:
+                position = int(attrs["idx"])
+            except ValueError:
+                pass
+        label = row_or_col_name.strip()
+        locators.append({
+            "strategy": "XPATH",
+            "value": (
+                f'(//tr[.//*[contains(normalize-space(text()), {_xpath_literal(label)})]]'
+                f'//{tag})[{position}]'
+            ),
+        })
+        # Some "table" layouts aren't real <table>/<tr> markup at all (div-
+        # based grids are common) - a looser fallback that doesn't require
+        # an actual <tr> ancestor, just SOME ancestor containing the label.
+        locators.append({
+            "strategy": "XPATH",
+            "value": (
+                f'(//*[.//*[contains(normalize-space(text()), {_xpath_literal(label)})]]'
+                f'//{tag})[{position}]'
+            ),
+        })
+
+    # Table-cell targeting: UiPath's tableCol/tableRow are coordinates
+    # into a specific rendered table whose structure this importer has no
+    # other knowledge of - a text-based match (already added above if
+    # visibleinnertext was present) is far more robust than trying to
+    # compute an nth-child position, so this only adds a plain tag+text
+    # fallback when NOTHING else was found at all.
+    if not locators and tag:
+        locators.append({"strategy": "XPATH", "value": f"//{tag}"})
+
+    return locators
+
+
+def _parse_scroll_input(value: str) -> tuple[str, int]:
+    """"DOWN-4" -> ("down", 4); tolerates "DOWN", "down-4", stray
+    whitespace, or a bare number (defaults direction to "down")."""
+    value = (value or "down-1").strip()
+    match = re.match(r"([a-zA-Z]+)\s*-?\s*(\d+)?", value)
+    if not match:
+        return "down", 1
+    direction = match.group(1).lower()
+    amount = int(match.group(2)) if match.group(2) else 1
+    if direction not in ("up", "down"):
+        direction = "down"
+    return direction, amount
+
+
+def list_uipath_sheets(file_path: str) -> list[str]:
+    """Returns every sheet name in the workbook, in their on-disk order -
+    used by the "which sheet(s) do you want to import?" step on the
+    frontend BEFORE anything is actually imported (see
+    backend/api.py's /api/recordings/uipath_sheets), since a real UiPath
+    test suite is very often organized as one sheet per test case/
+    scenario rather than one sheet per file."""
+    wb = openpyxl.load_workbook(file_path, read_only=True)
+    try:
+        return list(wb.sheetnames)
+    finally:
+        wb.close()
+
+
+def import_uipath_excel(file_path: str, recording_name: Optional[str] = None, sheet_name: Optional[str] = None) -> dict:
+    """Reads ONE sheet of a UiPath-style Excel file and returns
+    {"recording": {...}, "warnings": [...]} - `recording` is ready to pass
+    straight to recorder/recorder.py's save_recording_json() or
+    generator/build.py's build_artifacts(), exactly like a live-recorded
+    session would be. `warnings` lists any rows that couldn't be fully
+    understood (an unrecognized Action/Method, a selector with no usable
+    attributes, etc.) - these don't stop the import, but are worth
+    surfacing to whoever's reviewing the result.
+
+    `sheet_name` selects which sheet to read - omit it (or pass None) to
+    use the workbook's active sheet, matching this function's original,
+    single-sheet-file behavior. For a workbook with multiple sheets (one
+    per test case, commonly), see import_uipath_excel_sheets below, which
+    calls this once per sheet and returns one recording per sheet."""
+    wb = openpyxl.load_workbook(file_path, data_only=True)
+    ws = wb[sheet_name] if sheet_name else wb.active
+
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        raise ValueError("The spreadsheet is empty.")
+
+    header_row_idx = 0
+    columns = _find_column_indices(rows[header_row_idx])
+    if "action" not in columns:
+        raise ValueError(
+            "Could not find an 'Action/Method' column in the spreadsheet - "
+            "expected a header row with a column containing that text."
+        )
+
+    def cell(row, key):
+        idx = columns.get(key)
+        if idx is None or idx >= len(row):
+            return None
+        value = row[idx]
+        return str(value).strip() if value is not None else None
+
+    target_url = None
+    actions: list[dict] = []
+    warnings: list[str] = []
+    # Tracks the most recent row that had a real, resolvable element/
+    # locators - used by ENTER above, which needs to target "whatever was
+    # last interacted with" rather than a specific selector of its own.
+    last_element: dict = {}
+    last_locators: list = []
+
+    for row_num, row in enumerate(rows[header_row_idx + 1:], start=header_row_idx + 2):
+        if row is None or all(v is None for v in row):
+            continue
+
+        action_method = (cell(row, "action") or "").strip().upper()
+        if not action_method:
+            continue
+
+        name_hint = cell(row, "name") or ""
+        selector_text = cell(row, "selector") or ""
+        input_value = cell(row, "input")
+        step_label = cell(row, "step") or f"row {row_num}"
+
+        if action_method == "OPENBROWSER":
+            target_url = input_value or target_url
+            continue
+
+        if action_method == "DELAY":
+            try:
+                delay_seconds = float(input_value or 1)
+            except ValueError:
+                delay_seconds = 1.0
+                warnings.append(f"{step_label}: DELAY value {input_value!r} isn't a number - defaulted to 1 second.")
+            actions.append({
+                "action": "delay", "value": delay_seconds, "element": {}, "locators": [],
+                "page_index": 0, "frame_path": [],
+            })
+            continue
+
+        if action_method == "SCROLL":
+            direction, amount = _parse_scroll_input(input_value)
+            actions.append({
+                "action": "scroll", "value": None, "element": {}, "locators": [],
+                "page_index": 0, "frame_path": [], "scroll_direction": direction, "scroll_amount": amount,
+            })
+            continue
+
+        if action_method in ("CLOSETAB", "CLOSE_TAB", "CLOSE TAB"):
+            actions.append({
+                "action": "window_closed", "value": None, "element": {}, "locators": [],
+                "page_index": 0, "frame_path": [], "opener_page_index": 0,
+            })
+            continue
+
+        if action_method == "ENTER":
+            # UiPath's ENTER step never carries a selector of its own - in
+            # UiPath itself it presses Enter on whatever element currently
+            # has focus, which in a real flow is essentially always the
+            # field the immediately preceding step just interacted with
+            # (e.g. typing a pincode, then ENTER to trigger a city/state
+            # autofill - a very common pattern in these forms). Unlike a
+            # real browser recording's own "keypress" actions (which always
+            # have a genuine target element, since they're captured AT that
+            # element), this project's press_key() needs an actual element
+            # to resolve - so this reuses the last real element/locators
+            # seen so far in THIS import, rather than generating a step
+            # with an empty, unresolvable locator that would fail
+            # immediately at replay. If no prior element exists at all
+            # (ENTER as the very first meaningful step - unusual), the row
+            # is skipped with a warning rather than generating a step
+            # that's guaranteed to fail.
+            if last_locators:
+                actions.append({
+                    "action": "keypress", "value": "ENTER", "element": last_element, "locators": last_locators,
+                    "page_index": 0, "frame_path": [],
+                })
+            else:
+                warnings.append(f"{step_label}: ENTER has no preceding element to target - row skipped.")
+            continue
+
+        if is_native_dialog_selector(selector_text):
+            # A native OS/browser dialog (e.g. a plain confirm() popup) -
+            # this project's generated tests already auto-accept every
+            # such dialog globally (see runner/environment.py's page.on(
+            # "dialog", ...) handler), so no explicit step is needed for
+            # it at all - see this module's docstring.
+            continue
+
+        if action_method == "VERIFICATION":
+            locators = build_locators_from_uipath_selector(selector_text)
+            if not locators:
+                warnings.append(f"{step_label} ({name_hint or 'unnamed'}): VERIFICATION has no usable selector in {selector_text!r} - row skipped.")
+                continue
+            attrs = _parse_webctrl_attrs(selector_text)
+            expected_text = input_value or (attrs.get("visibleinnertext") or attrs.get("innertext") or "").strip()
+            actions.append({
+                "action": "assert_text",
+                "value": expected_text,
+                "element": {
+                    "tag": (attrs.get("tag") or "").lower(), "type": attrs.get("type", ""),
+                    "text": expected_text[:60], "placeholder": "", "name": attrs.get("name", ""),
+                    "ariaLabel": attrs.get("aria-label", "") or attrs.get("aaname", ""),
+                },
+                "locators": locators, "page_index": 0, "frame_path": [],
+            })
+            continue
+
+        # Everything else needs a selector to act on.
+        locators = build_locators_from_uipath_selector(selector_text)
+        if not locators:
+            warnings.append(f"{step_label} ({name_hint or 'unnamed'}): no usable selector found in {selector_text!r} - row skipped.")
+            continue
+
+        attrs = _parse_webctrl_attrs(selector_text)
+        element = {
+            "tag": (attrs.get("tag") or "").lower(),
+            "type": attrs.get("type", ""),
+            "text": (attrs.get("visibleinnertext") or attrs.get("aaname") or name_hint or "").strip()[:60],
+            "placeholder": "",
+            "name": attrs.get("name", ""),
+            "ariaLabel": attrs.get("aria-label", "") or attrs.get("aaname", ""),
+        }
+
+        internal_action = ACTION_MAP.get(action_method)
+        if internal_action is None:
+            warnings.append(f"{step_label} ({name_hint or 'unnamed'}): unrecognized Action/Method {action_method!r} - imported as a click.")
+            internal_action = "click"
+        elif action_method == "STOPPER":
+            warnings.append(
+                f"{step_label} ({name_hint or 'unnamed'}): STOPPER imported as a click - these are usually the "
+                f"least reliable selector in the sheet (often a date-picker day cell) and worth double-checking."
+            )
+
+        action_dict = {
+            "action": internal_action,
+            "value": input_value if internal_action in ("type", "select") else None,
+            "element": element,
+            "locators": locators,
+            "page_index": 0,
+            "frame_path": [],
+        }
+        # Radio/checkbox clicks need the resulting checked state as their
+        # "value" (see recorder_injector.js's own click listener +
+        # generator/build.py's is_toggle handling) - a UiPath CLICK-C on a
+        # radio/checkbox is assumed to be selecting/checking it (UiPath
+        # itself doesn't record an "uncheck" gesture the way this project
+        # does), which covers the overwhelming majority of real flows.
+        if internal_action == "click" and element["type"] in ("radio", "checkbox"):
+            action_dict["value"] = True
+
+        actions.append(action_dict)
+        last_element, last_locators = element, locators
+
+    if not actions:
+        warnings.append("No actionable steps were found in this spreadsheet.")
+
+    recording = {
+        "target_url": target_url or "",
+        "recorded_at": datetime.now().strftime("%Y%m%d_%H%M%S"),
+        "recording_name": recording_name,
+        "actions": actions,
+        "imported_from": "uipath_excel",
+    }
+    if not target_url:
+        warnings.append("No OPENBROWSER row was found - this recording has no target_url set. Add one before running it.")
+
+    return {"recording": recording, "warnings": warnings}
+
+
+def import_uipath_excel_sheets(file_path: str, sheet_names: list[str], recording_name_prefix: Optional[str] = None) -> list[dict]:
+    """Imports several sheets of ONE workbook, one recording per sheet -
+    see backend/api.py's /api/recordings/import_uipath, which lets the
+    person choose a specific sheet, several, or every sheet (via
+    list_uipath_sheets above) rather than always reading just the active
+    one. A real UiPath test suite is very often organized as one sheet
+    per test case/scenario, all bundled into a single .xlsx file - this
+    is what makes importing "all of them at once" meaningful rather than
+    just a convenience for a single-sheet file.
+
+    Returns one entry per sheet, in the SAME order as `sheet_names`:
+      {"sheet_name": str, "recording": {...} | None, "warnings": [...],
+       "error": str | None}
+    A sheet that isn't actually a test-steps sheet at all (e.g. a
+    reference/notes tab with no recognizable "Action/Method" column)
+    gets "error" set and "recording": None rather than aborting the
+    whole batch - the other sheets in the same file still import
+    normally. Each successfully-imported sheet's recording_name is
+    `f"{recording_name_prefix} - {sheet_name}"` (or just the sheet name
+    if no prefix was given), so a batch import of "MCC Flows.xlsx" with
+    sheets "Proposal" and "Sanction" produces two distinctly-named,
+    independently runnable recordings rather than one being silently
+    overwritten by the other."""
+    results = []
+    for sheet_name in sheet_names:
+        recording_name = f"{recording_name_prefix} - {sheet_name}" if recording_name_prefix else sheet_name
+        try:
+            single = import_uipath_excel(file_path, recording_name=recording_name, sheet_name=sheet_name)
+            results.append({
+                "sheet_name": sheet_name, "recording": single["recording"],
+                "warnings": single["warnings"], "error": None,
+            })
+        except Exception as e:
+            results.append({
+                "sheet_name": sheet_name, "recording": None, "warnings": [], "error": str(e),
+            })
+    return results
