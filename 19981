@@ -1,254 +1,494 @@
-import { getToken } from "@/lib/auth-storage";
+import { useEffect, useState } from "react";
+import { api } from "@/lib/api";
+import { recordingsApi } from "@/lib/api";
+import { useAuth } from "@/context/AuthContext";
+import { buildReportText, buildReportHtml, downloadBlob, openReportInBrowser } from "@/lib/report";
+import { ReportDonut, StepSequenceBar } from "@/components/ReportCharts";
+import {
+  Button,
+  Callout,
+  Checkbox,
+  DataTable,
+  Disclosure,
+  Field,
+  Metric,
+  Panel,
+  PanelHeader,
+  Select,
+  Spinner,
+  StatusBadge,
+  TextInput,
+} from "@/components/ui";
 
-export const API_BASE =
-  (process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000").replace(/\/$/, "");
+export default function RunSavedTab() {
+  const { user } = useAuth();
 
-// ws:// (http) or wss:// (https) - mirrors API_BASE's scheme so the live
-// recording view works the same in local dev and behind a TLS-terminating
-// reverse proxy in production, without a separate env var to keep in sync.
-export const WS_BASE = API_BASE.replace(/^http/, "ws");
+  const [recordings, setRecordings] = useState([]);
+  const [recordingsError, setRecordingsError] = useState(null);
+  const [selectedRecFile, setSelectedRecFile] = useState("");
+  const [runHeadless, setRunHeadless] = useState(false);
 
-export class ApiError extends Error {
-  constructor(detail, status) {
-    super(detail);
-    this.detail = detail;
-    this.status = status;
-  }
-}
+  // ---- test data (editable, shown before running - see generator/test_data.py) ----
+  const [testData, setTestData] = useState([]);
+  const [testDataLoading, setTestDataLoading] = useState(false);
+  const [testDataError, setTestDataError] = useState(null);
+  const [editValues, setEditValues] = useState({}); // { [action index]: current input value }
+  const [savingData, setSavingData] = useState(false);
+  const [saveDataNotice, setSaveDataNotice] = useState(null);
+  const [saveDataError, setSaveDataError] = useState(null);
 
-// Registered by AuthContext so any 401 anywhere (idle timeout, revoked
-// session, expired token, ...) immediately drops the user back to /login
-// instead of leaving them staring at a broken page.
-let unauthorizedHandler = null;
-export function setUnauthorizedHandler(fn) {
-  unauthorizedHandler = fn;
-}
+  const [runBusy, setRunBusy] = useState(false);
+  const [runError, setRunError] = useState(null);
+  const [report, setReport] = useState(null);
 
-async function request(path, init, { auth = true } = {}) {
-  const headers = { "Content-Type": "application/json", ...(init && init.headers) };
-  if (auth) {
-    const token = getToken();
-    if (token) headers.Authorization = `Bearer ${token}`;
-  }
+  const [regenBusy, setRegenBusy] = useState(false);
+  const [regenNotice, setRegenNotice] = useState(null);
 
-  let res;
-  try {
-    res = await fetch(`${API_BASE}${path}`, { ...init, headers, cache: "no-store" });
-  } catch (e) {
-    throw new ApiError(`Could not reach the backend at ${API_BASE}. Is it running? (${e.message})`, 0);
-  }
+  const [importBusy, setImportBusy] = useState(false);
+  const [importNotice, setImportNotice] = useState(null);
+  const [importFile, setImportFile] = useState(null);
+  const [importName, setImportName] = useState("");
+  const [importSheets, setImportSheets] = useState(null); // null = not checked yet; [] = single-sheet file, no picker needed
+  const [importSheetsLoading, setImportSheetsLoading] = useState(false);
+  const [selectedSheets, setSelectedSheets] = useState([]);
 
-  if (res.status === 401 && auth) {
-    let detail = "Session expired - please log in again.";
+  async function loadRecordings() {
     try {
-      const body = await res.json();
-      detail = body.detail || detail;
-    } catch {
-      /* no body */
-    }
-    if (unauthorizedHandler) unauthorizedHandler(detail);
-    throw new ApiError(detail, 401);
-  }
-
-  if (!res.ok) {
-    let detail = `${res.status} ${res.statusText}`;
-    try {
-      const body = await res.json();
-      detail = body.detail || detail;
-    } catch {
-      /* no body */
-    }
-    throw new ApiError(detail, res.status);
-  }
-
-  const contentType = res.headers.get("content-type") || "";
-  if (res.status === 204) return undefined;
-  if (contentType.includes("text/csv")) return res.text();
-  return res.json();
-}
-
-// ---------------------------------------------------------------------------
-// Auth (no token required for /login)
-// ---------------------------------------------------------------------------
-
-export const authApi = {
-  login: (username, password) =>
-    request("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }, { auth: false }),
-
-  changePassword: (current_password, new_password, confirm_password) =>
-    request("/api/auth/change-password", {
-      method: "POST",
-      body: JSON.stringify({ current_password, new_password, confirm_password }),
-    }),
-
-  logout: () => request("/api/auth/logout", { method: "POST" }),
-
-  me: () => request("/api/auth/me"),
-
-  // SSO - not implemented on the backend yet (see auth/providers.py), but
-  // the plumbing is real: sso_status() tells the login page whether to
-  // treat the "Sign in with SSO" button as live or "coming soon", and
-  // ssoLoginUrl() is where it navigates to once it is.
-  ssoStatus: () => request("/api/auth/sso/status", undefined, { auth: false }),
-  ssoLoginUrl: () => `${API_BASE}/api/auth/sso/login`,
-};
-
-// ---------------------------------------------------------------------------
-// Profile
-// ---------------------------------------------------------------------------
-
-export const profileApi = {
-  get: () => request("/api/profile/me"),
-  update: (body) => request("/api/profile/me", { method: "PUT", body: JSON.stringify(body) }),
-  activity: (limit = 100) => request(`/api/profile/activity?limit=${limit}`),
-  exportActivityUrl: () => `${API_BASE}/api/profile/activity/export`,
-};
-
-// ---------------------------------------------------------------------------
-// Admin
-// ---------------------------------------------------------------------------
-
-function toQuery(params) {
-  const qs = new URLSearchParams(
-    Object.fromEntries(Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== ""))
-  ).toString();
-  return qs ? `?${qs}` : "";
-}
-
-export const adminApi = {
-  createUser: (body) => request("/api/admin/users", { method: "POST", body: JSON.stringify(body) }),
-  listUsers: (params = {}) => request(`/api/admin/users${toQuery(params)}`),
-  getUser: (id) => request(`/api/admin/users/${id}`),
-  updateUser: (id, body) => request(`/api/admin/users/${id}`, { method: "PUT", body: JSON.stringify(body) }),
-  deleteUser: (id) => request(`/api/admin/users/${id}`, { method: "DELETE" }),
-  resetPassword: (id, temp_password = "") =>
-    request(`/api/admin/users/${id}/reset-password`, { method: "POST", body: JSON.stringify({ temp_password }) }),
-
-  listSessions: () => request("/api/admin/sessions"),
-  revokeSession: (sessionId) => request(`/api/admin/sessions/${sessionId}/revoke`, { method: "POST" }),
-
-  listAgents: () => request("/api/admin/agents"),
-  disconnectAgent: (agentId) => request(`/api/admin/agents/${agentId}/disconnect`, { method: "POST" }),
-  resetAgent: (agentId) => request(`/api/admin/agents/${agentId}/reset`, { method: "POST" }),
-
-  listActivity: (params = {}) => request(`/api/admin/activity${toQuery(params)}`),
-  exportActivityUrl: (params = {}) => `${API_BASE}/api/admin/activity/export${toQuery(params)}`,
-
-  dashboardStats: () => request("/api/admin/dashboard/stats"),
-};
-
-// ---------------------------------------------------------------------------
-// Recording regeneration - refresh a saved recording's generated
-// feature/steps/page files from its current JSON, without executing
-// anything (see backend/api.py's regenerate_recording).
-// ---------------------------------------------------------------------------
-
-export const recordingsApi = {
-  regenerate: (recording_file) =>
-    request("/api/recordings/regenerate", { method: "POST", body: JSON.stringify({ recording_file }) }),
-
-  // Deliberately NOT using request() above - it always forces
-  // Content-Type: application/json, which would break a multipart file
-  // upload (the browser needs to set that header itself, including the
-  // random boundary string, when the body is a FormData object).
-  async _postMultipart(path, formData) {
-    const token = getToken();
-    const headers = token ? { Authorization: `Bearer ${token}` } : {};
-
-    let res;
-    try {
-      res = await fetch(`${API_BASE}${path}`, { method: "POST", body: formData, headers });
+      const r = await api.getRecordings();
+      setRecordings(r);
+      setRecordingsError(null);
+      if (r.length && !selectedRecFile) setSelectedRecFile(r[0].file);
     } catch (e) {
-      throw new ApiError(`Could not reach the backend at ${API_BASE}. Is it running? (${e.message})`, 0);
+      setRecordingsError(e.detail || e.message);
     }
+  }
 
-    if (res.status === 401) {
-      let detail = "Session expired - please log in again.";
-      try {
-        detail = (await res.json()).detail || detail;
-      } catch {
-        /* no body */
+  useEffect(() => {
+    loadRecordings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function loadTestData(file) {
+    setTestDataLoading(true);
+    setTestDataError(null);
+    setSaveDataNotice(null);
+    setSaveDataError(null);
+    try {
+      const data = await api.getRecordingTestData(file);
+      setTestData(data.fields);
+      setEditValues(Object.fromEntries(data.fields.map((f) => [f.index, f.value])));
+    } catch (e) {
+      setTestData([]);
+      setEditValues({});
+      setTestDataError(e.detail || e.message);
+    } finally {
+      setTestDataLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    setReport(null); // a different recording's exit report shouldn't linger once you switch
+    setRegenNotice(null);
+    if (selectedRecFile) loadTestData(selectedRecFile);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedRecFile]);
+
+  function updateValue(index, value) {
+    setEditValues((prev) => ({ ...prev, [index]: value }));
+    setSaveDataNotice(null);
+  }
+
+  async function saveTestDataOnly() {
+    setSavingData(true);
+    setSaveDataError(null);
+    setSaveDataNotice(null);
+    try {
+      const data = await api.updateRecordingTestData(selectedRecFile, editValues);
+      setTestData(data.fields);
+      setSaveDataNotice("Test data saved - future runs of this recording will use these values too.");
+    } catch (e) {
+      setSaveDataError(e.detail || e.message);
+    } finally {
+      setSavingData(false);
+    }
+  }
+
+  async function handleRun() {
+    if (!selectedRecFile) return;
+    setRunError(null);
+    setRunBusy(true);
+    try {
+      // Whatever is currently in the grid is what gets run - saved to the
+      // recording first (so it's also the new baseline for next time),
+      // then executed. No separate "save" step required.
+      if (testData.length > 0) {
+        await api.updateRecordingTestData(selectedRecFile, editValues);
       }
-      if (unauthorizedHandler) unauthorizedHandler(detail);
-      throw new ApiError(detail, 401);
+      const r = await api.runRecording(selectedRecFile, runHeadless);
+      setReport(r);
+    } catch (e) {
+      setRunError(e.detail || e.message);
+    } finally {
+      setRunBusy(false);
     }
-    if (!res.ok) {
-      let detail = `${res.status} ${res.statusText}`;
-      try {
-        detail = (await res.json()).detail || detail;
-      } catch {
-        /* no body */
+  }
+
+  async function handleRegenerate() {
+    if (!selectedRecFile) return;
+    setRegenNotice(null);
+    setRegenBusy(true);
+    try {
+      const r = await recordingsApi.regenerate(selectedRecFile);
+      setRegenNotice({
+        tone: "success",
+        text: `Regenerated (${r.build_result.step_count} steps) - the next run of this recording already uses the current generator code either way, but the files on disk are refreshed now too.`,
+      });
+    } catch (e) {
+      setRegenNotice({ tone: "error", text: e.detail || e.message });
+    } finally {
+      setRegenBusy(false);
+    }
+  }
+
+  async function handleImportFileChosen(file) {
+    setImportFile(file);
+    setImportNotice(null);
+    setImportSheets(null);
+    setSelectedSheets([]);
+    if (!file) return;
+    setImportSheetsLoading(true);
+    try {
+      const r = await recordingsApi.listUipathSheets(file);
+      // A single-sheet workbook needs no picker at all - just import its
+      // one (active) sheet directly, exactly like before this feature
+      // existed. Only a genuinely multi-sheet file shows the checklist.
+      if (r.sheets.length > 1) {
+        setImportSheets(r.sheets);
+        setSelectedSheets(r.sheets); // default to "all sheets" selected - the common case
+      } else {
+        setImportSheets([]);
       }
-      throw new ApiError(detail, res.status);
+    } catch (e) {
+      setImportNotice({ tone: "error", text: e.detail || e.message });
+      setImportFile(null);
+    } finally {
+      setImportSheetsLoading(false);
     }
-    return res.json();
-  },
+  }
 
-  // Lists every sheet name in an uploaded workbook, without importing
-  // anything yet - call this first so the person can choose a specific
-  // sheet, several, or "all of them" (see importUipathExcel below).
-  listUipathSheets(file) {
-    const formData = new FormData();
-    formData.append("file", file);
-    return this._postMultipart("/api/recordings/uipath_sheets", formData);
-  },
+  function toggleSheetSelection(sheetName) {
+    setSelectedSheets((prev) =>
+      prev.includes(sheetName) ? prev.filter((s) => s !== sheetName) : [...prev, sheetName]
+    );
+  }
 
-  // sheetNames: optional array of sheet names to import, each becoming
-  // its own saved recording (from listUipathSheets above - pass every
-  // name to import "all sheets"). Omit entirely to import just the
-  // workbook's active sheet (a single-sheet file needs no picker step at
-  // all). Always returns {ok, results: [...]}, one entry per sheet
-  // imported (or one entry with sheet_name: null for the omitted case).
-  importUipathExcel(file, recordingName, sheetNames) {
-    const formData = new FormData();
-    formData.append("file", file);
-    if (recordingName) formData.append("recording_name", recordingName);
-    if (sheetNames && sheetNames.length) formData.append("sheet_names", sheetNames.join(","));
-    return this._postMultipart("/api/recordings/import_uipath", formData);
-  },
-};
+  async function handleImportUipath() {
+    if (!importFile) return;
+    if (importSheets && importSheets.length > 0 && selectedSheets.length === 0) {
+      setImportNotice({ tone: "error", text: "Select at least one sheet to import, or use \"Select all\"." });
+      return;
+    }
+    setImportNotice(null);
+    setImportBusy(true);
+    try {
+      const r = await recordingsApi.importUipathExcel(importFile, importName, selectedSheets.length ? selectedSheets : undefined);
+      const succeeded = r.results.filter((res) => !res.error);
+      const failed = r.results.filter((res) => res.error);
+      const totalWarnings = succeeded.reduce((n, res) => n + res.warnings.length, 0);
 
-// ---------------------------------------------------------------------------
-// Recorder tool endpoints (unchanged shapes, now all auth-required)
-// ---------------------------------------------------------------------------
+      const parts = [];
+      if (succeeded.length) {
+        const label = succeeded.length === 1 ? "1 recording" : `${succeeded.length} recordings`;
+        parts.push(`Imported ${label} from ${importFile.name}${totalWarnings ? ` (${totalWarnings} warning${totalWarnings > 1 ? "s" : ""} - check each recording's steps)` : ""}.`);
+      }
+      if (failed.length) {
+        parts.push(`${failed.length} sheet${failed.length > 1 ? "s" : ""} could not be imported: ${failed.map((f) => `${f.sheet_name || "sheet"} (${f.error})`).join("; ")}.`);
+      }
+      setImportNotice({
+        tone: failed.length && !succeeded.length ? "error" : failed.length || totalWarnings ? "warning" : "success",
+        text: parts.join(" "),
+      });
+      setImportFile(null);
+      setImportName("");
+      setImportSheets(null);
+      setSelectedSheets([]);
+      await loadRecordings();
+      if (succeeded.length) setSelectedRecFile(succeeded[0].recording_file);
+    } catch (e) {
+      setImportNotice({ tone: "error", text: e.detail || e.message });
+    } finally {
+      setImportBusy(false);
+    }
+  }
 
-// ---------------------------------------------------------------------------
-// Local agent (desktop app) - see backend/agent_registry.py
-// ---------------------------------------------------------------------------
+  return (
+    <div className="grid min-w-0 gap-6 lg:grid-cols-[360px_1fr]">
+      <Panel>
+        <PanelHeader title="Run a saved recording" caption="Pick a recording, review/edit its test data, then run it." />
+        <div className="space-y-4 px-5 py-5">
+          <Callout>
+            Running as <strong>{user?.first_name} {user?.last_name}</strong> ({user?.username}). Every run is logged
+            against your account.
+          </Callout>
 
-export const agentApi = {
-  status: () => request("/api/agent/status"),
-};
+          <Disclosure title="Import from a UiPath Excel sheet">
+            <div className="space-y-3">
+              <p className="text-xs text-muted">
+                Upload a spreadsheet with Steps / NAME / Action-Method / present element / input columns - it's
+                converted into a saved recording here, ready to run or regenerate like any other. A workbook with
+                several sheets (e.g. one per test case) lets you pick which to import below.
+              </p>
+              <Field label="Excel file (.xlsx)">
+                <input
+                  type="file"
+                  accept=".xlsx,.xlsm"
+                  onChange={(e) => handleImportFileChosen(e.target.files?.[0] || null)}
+                  className="block w-full text-sm text-ink file:mr-3 file:rounded-sm file:border-0 file:bg-rail file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-ink hover:file:bg-line"
+                />
+              </Field>
 
-export const api = {
-  getApplications: () => request("/api/applications"),
+              {importSheetsLoading && <Spinner label="Checking sheets in this file..." />}
 
-  startRecording: (body) => request("/api/start", { method: "POST", body: JSON.stringify(body) }),
+              {importSheets && importSheets.length > 0 && (
+                <div className="border border-line bg-rail px-3 py-2.5">
+                  <div className="mb-1.5 flex items-center justify-between">
+                    <span className="text-xs font-medium text-ink">
+                      This file has {importSheets.length} sheets - pick which to import as separate recordings:
+                    </span>
+                    <div className="flex gap-2 text-xs">
+                      <button type="button" className="text-brand-blue hover:underline" onClick={() => setSelectedSheets(importSheets)}>
+                        Select all
+                      </button>
+                      <button type="button" className="text-brand-blue hover:underline" onClick={() => setSelectedSheets([])}>
+                        Select none
+                      </button>
+                    </div>
+                  </div>
+                  <div className="max-h-40 space-y-1 overflow-y-auto">
+                    {importSheets.map((sheet) => (
+                      <Checkbox
+                        key={sheet}
+                        label={sheet}
+                        checked={selectedSheets.includes(sheet)}
+                        onChange={() => toggleSheetSelection(sheet)}
+                      />
+                    ))}
+                  </div>
+                </div>
+              )}
 
-  getStatus: () => request("/api/status"),
+              <Field label={importSheets && importSheets.length > 0 ? "Name prefix for these recordings (optional)" : "Name this recording (optional)"}>
+                <TextInput
+                  value={importName}
+                  onChange={(e) => setImportName(e.target.value)}
+                  placeholder="e.g. LLMS Lite MCC Flow"
+                />
+              </Field>
+              <Button variant="secondary" onClick={handleImportUipath} disabled={!importFile || importBusy || importSheetsLoading} className="w-full">
+                {importBusy
+                  ? "Importing..."
+                  : importSheets && importSheets.length > 0
+                  ? `Import ${selectedSheets.length} sheet${selectedSheets.length === 1 ? "" : "s"}`
+                  : "Import"}
+              </Button>
+              {importNotice && <Callout tone={importNotice.tone}>{importNotice.text}</Callout>}
+            </div>
+          </Disclosure>
 
-  stopAndSave: () => request("/api/stop_and_save", { method: "POST" }),
+          {recordingsError && <Callout tone="error">Could not load recordings: {recordingsError}</Callout>}
 
-  // Discards the current recording without saving/generating anything -
-  // for abandoning one mid-flow.
-  stopRecording: () => request("/api/stop", { method: "POST" }),
+          {recordings.length === 0 ? (
+            <Callout>No saved recordings found yet. Record one in the &ldquo;Record &amp; Generate&rdquo; tab first.</Callout>
+          ) : (
+            <>
+              <Field label="Saved recording">
+                <Select value={selectedRecFile} onChange={(e) => setSelectedRecFile(e.target.value)}>
+                  {recordings.map((r) => (
+                    <option key={r.file} value={r.file}>
+                      {r.name} — {r.target_url} ({r.action_count} actions)
+                    </option>
+                  ))}
+                </Select>
+              </Field>
 
-  runCheck: (headless) => request("/api/run", { method: "POST", body: JSON.stringify({ headless }) }),
+              <Checkbox label="headless" checked={runHeadless} onChange={setRunHeadless} />
 
-  getRecordings: () => request("/api/recordings"),
+              <Button onClick={handleRun} disabled={runBusy} className="w-full">
+                {runBusy ? "Running..." : "Run recording"}
+              </Button>
 
-  // Editable test-data grid shown before running a saved recording (see
-  // generator/test_data.py) - lets a user change typed/selected values
-  // right in the browser instead of downloading the Excel report, editing
-  // it, and re-uploading. Edits persist into the recording file itself.
-  getRecordingTestData: (file) => request(`/api/recordings/data?${new URLSearchParams({ file })}`),
-  updateRecordingTestData: (file, values) =>
-    request(`/api/recordings/data?${new URLSearchParams({ file })}`, {
-      method: "PUT",
-      body: JSON.stringify({ values }),
-    }),
+              {runBusy && <Spinner label="Running the saved recording..." />}
+              {runError && <Callout tone="error">Run failed: {runError}</Callout>}
 
-  // No more user_id - a saved recording always runs as whoever is logged in.
-  runRecording: (recording_file, headless) =>
-    request("/api/run_recording", { method: "POST", body: JSON.stringify({ recording_file, headless }) }),
-};
+              <div className="border-t border-line pt-4">
+                <Button variant="secondary" onClick={handleRegenerate} disabled={regenBusy} className="w-full">
+                  {regenBusy ? "Regenerating..." : "Regenerate (no run)"}
+                </Button>
+                <p className="mt-1.5 text-xs text-muted">
+                  Refreshes this recording's generated feature/steps/page files from the latest generator code -
+                  without re-recording or running anything. Useful right after a code/template fix, to confirm it
+                  applies here.
+                </p>
+                {regenNotice && (
+                  <div className="mt-2">
+                    <Callout tone={regenNotice.tone}>{regenNotice.text}</Callout>
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      </Panel>
+
+      <div className="min-w-0 space-y-4">
+        {selectedRecFile && (
+          <Panel>
+            <div className="flex items-center justify-between border-b border-line px-5 py-4">
+              <div>
+                <h2 className="text-sm font-semibold text-ink">Test data</h2>
+                <p className="mt-0.5 text-xs text-muted">
+                  The values this recording types/selects when it runs. Edit anything below, then hit{" "}
+                  <strong>Run recording</strong> - no need to download or re-upload the Excel report; changes save
+                  straight into this recording.
+                </p>
+              </div>
+              {testData.length > 0 && (
+                <Button variant="secondary" onClick={saveTestDataOnly} disabled={savingData}>
+                  {savingData ? "Saving..." : "Save without running"}
+                </Button>
+              )}
+            </div>
+            <div className="px-5 py-4">
+              {testDataLoading && <Spinner label="Loading test data..." />}
+              {testDataError && <Callout tone="error">{testDataError}</Callout>}
+              {saveDataError && <Callout tone="error">{saveDataError}</Callout>}
+              {saveDataNotice && <Callout tone="success">{saveDataNotice}</Callout>}
+
+              {!testDataLoading && !testDataError && testData.length === 0 && (
+                <p className="text-sm text-muted">
+                  This recording has no typed or selected values to edit (e.g. it's clicks/navigation only).
+                </p>
+              )}
+
+              {testData.length > 0 && (
+                <DataTable
+                  columns={[
+                    { key: "label", label: "Field" },
+                    { key: "action", label: "Type", mono: true },
+                    { key: "value", label: "Value" },
+                  ]}
+                  rows={testData.map((f) => ({
+                    label: f.label,
+                    action: f.action,
+                    value: (
+                      <TextInput
+                        value={editValues[f.index] ?? ""}
+                        onChange={(e) => updateValue(f.index, e.target.value)}
+                      />
+                    ),
+                  }))}
+                />
+              )}
+            </div>
+          </Panel>
+        )}
+
+        {report && (
+          <Panel>
+            <PanelHeader title="Exit report" caption={`Transaction #${report.transaction_id} · ${report.date_time} UTC`} />
+            <div className="min-w-0 space-y-6 px-5 py-5">
+              {/* ---- Graphical summary: donut + step-sequence strip + metrics ---- */}
+              <div className="flex flex-wrap items-center gap-6 rounded-sm border border-line bg-rail/60 p-4">
+                <ReportDonut passed={report.passed_count} failed={report.failed_count} />
+                <div className="min-w-0 flex-1 space-y-3">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <StatusBadge status={report.status} />
+                    <span className="text-sm text-muted">
+                      Run by <strong className="font-medium text-ink">{report.user}</strong>
+                    </span>
+                  </div>
+                  <StepSequenceBar steps={report.steps} />
+                  <div className="grid grid-cols-3 gap-2 sm:max-w-sm">
+                    <Metric label="Steps" value={report.step_count} />
+                    <Metric label="Passed" value={report.passed_count} />
+                    <Metric label="Failed" value={report.failed_count} />
+                  </div>
+                </div>
+              </div>
+
+              <div className="min-w-0">
+                <h3 className="mb-2 text-sm font-semibold text-ink">Automation log</h3>
+                <DataTable
+                  columns={[
+                    { key: "n", label: "#" },
+                    { key: "step", label: "Playwright step" },
+                    { key: "status", label: "Status" },
+                    { key: "error", label: "Error", mono: true },
+                  ]}
+                  rows={report.steps.map((s, i) => ({
+                    n: i + 1,
+                    step: s.step_name,
+                    status: <StatusBadge status={s.status} />,
+                    error: s.error_message || "",
+                  }))}
+                />
+              </div>
+
+              <Disclosure title={`Files produced (${report.files.length})`}>
+                <DataTable
+                  columns={[
+                    { key: "file_name", label: "File" },
+                    { key: "folder_path", label: "Folder", mono: true },
+                  ]}
+                  rows={report.files.map((f) => ({ file_name: f.file_name, folder_path: f.folder_path }))}
+                />
+              </Disclosure>
+
+              <Disclosure title="Raw Behave output">
+                <pre className="max-h-96 w-full min-w-0 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-[#0B1A33] p-4 font-mono text-xs text-[#D7E1EF] scroll-thin">
+                  {report.raw_output}
+                </pre>
+              </Disclosure>
+
+              <div className="flex flex-wrap gap-2">
+                <Button onClick={() => openReportInBrowser(report)}>Open report in browser</Button>
+                <Button
+                  variant="secondary"
+                  onClick={() =>
+                    downloadBlob(
+                      `transaction_${report.transaction_id}_exit_report.html`,
+                      buildReportHtml(report),
+                      "text/html"
+                    )
+                  }
+                >
+                  Download (.html)
+                </Button>
+                <Button
+                  variant="secondary"
+                  onClick={() =>
+                    downloadBlob(
+                      `transaction_${report.transaction_id}_exit_report.txt`,
+                      buildReportText(report),
+                      "text/plain"
+                    )
+                  }
+                >
+                  Download (.txt)
+                </Button>
+              </div>
+            </div>
+          </Panel>
+        )}
+
+        {!selectedRecFile && (
+          <Panel>
+            <div className="px-5 py-10 text-center text-sm text-muted">
+              Pick a saved recording to review its test data and run it.
+            </div>
+          </Panel>
+        )}
+      </div>
+    </div>
+  );
+}
