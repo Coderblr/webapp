@@ -1,408 +1,126 @@
 import { useEffect, useState } from "react";
-import { api } from "@/lib/api";
-import { recordingsApi } from "@/lib/api";
-import ReportView from "@/components/ReportView";
+import { transactionsApi } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
-import { buildReportText, buildReportHtml, downloadBlob, openReportInBrowser } from "@/lib/report";
-import { ReportDonut, StepSequenceBar } from "@/components/ReportCharts";
-import {
-  Button,
-  Callout,
-  Checkbox,
-  DataTable,
-  Disclosure,
-  Field,
-  Metric,
-  Panel,
-  PanelHeader,
-  Select,
-  Spinner,
-  StatusBadge,
-  TextInput,
-} from "@/components/ui";
+import ReportView from "@/components/ReportView";
+import { Panel, PanelHeader, Callout, Spinner, StatusBadge, Button } from "@/components/ui";
 
-export default function RunSavedTab() {
+/**
+ * "My Executions" - every run the current user has performed (an admin
+ * sees their own here too; broader admin-wide visibility already exists
+ * separately in the admin panel). Backed by GET /api/transactions, which
+ * is scoped server-side to the current user unless they're an admin
+ * explicitly asking for someone else - so this component never needs to
+ * pass user_id itself.
+ */
+export default function MyExecutionsTab() {
   const { user } = useAuth();
+  const [transactions, setTransactions] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
-  const [recordings, setRecordings] = useState([]);
-  const [recordingsError, setRecordingsError] = useState(null);
-  const [selectedRecFile, setSelectedRecFile] = useState("");
-  const [runHeadless, setRunHeadless] = useState(false);
-
-  // ---- test data (editable, shown before running - see generator/test_data.py) ----
-  const [testData, setTestData] = useState([]);
-  const [testDataLoading, setTestDataLoading] = useState(false);
-  const [testDataError, setTestDataError] = useState(null);
-  const [editValues, setEditValues] = useState({}); // { [action index]: current input value }
-  const [savingData, setSavingData] = useState(false);
-  const [saveDataNotice, setSaveDataNotice] = useState(null);
-  const [saveDataError, setSaveDataError] = useState(null);
-
-  const [runBusy, setRunBusy] = useState(false);
-  const [runError, setRunError] = useState(null);
-  const [report, setReport] = useState(null);
-
-  const [regenBusy, setRegenBusy] = useState(false);
-  const [regenNotice, setRegenNotice] = useState(null);
-
-  const [importBusy, setImportBusy] = useState(false);
-  const [importNotice, setImportNotice] = useState(null);
-  const [importFile, setImportFile] = useState(null);
-  const [importName, setImportName] = useState("");
-  const [importSheets, setImportSheets] = useState(null); // null = not checked yet; [] = single-sheet file, no picker needed
-  const [importSheetsLoading, setImportSheetsLoading] = useState(false);
-  const [selectedSheets, setSelectedSheets] = useState([]);
-
-  // (screenshot modal / download state now lives inside ReportView.js itself)
-
-  async function loadRecordings() {
-    try {
-      const r = await api.getRecordings();
-      setRecordings(r);
-      setRecordingsError(null);
-      if (r.length && !selectedRecFile) setSelectedRecFile(r[0].file);
-    } catch (e) {
-      setRecordingsError(e.detail || e.message);
-    }
-  }
+  const [selectedId, setSelectedId] = useState(null);
+  const [selectedReport, setSelectedReport] = useState(null);
+  const [reportLoading, setReportLoading] = useState(false);
+  const [reportError, setReportError] = useState(null);
 
   useEffect(() => {
-    loadRecordings();
+    load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function loadTestData(file) {
-    setTestDataLoading(true);
-    setTestDataError(null);
-    setSaveDataNotice(null);
-    setSaveDataError(null);
+  async function load() {
+    setLoading(true);
+    setError(null);
     try {
-      const data = await api.getRecordingTestData(file);
-      setTestData(data.fields);
-      setEditValues(Object.fromEntries(data.fields.map((f) => [f.index, f.value])));
+      const r = await transactionsApi.list({ limit: 100 });
+      setTransactions(r);
     } catch (e) {
-      setTestData([]);
-      setEditValues({});
-      setTestDataError(e.detail || e.message);
+      setError(e.detail || e.message);
     } finally {
-      setTestDataLoading(false);
+      setLoading(false);
     }
   }
 
-  useEffect(() => {
-    setReport(null); // a different recording's exit report shouldn't linger once you switch
-    setRegenNotice(null);
-    if (selectedRecFile) loadTestData(selectedRecFile);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedRecFile]);
-
-  function updateValue(index, value) {
-    setEditValues((prev) => ({ ...prev, [index]: value }));
-    setSaveDataNotice(null);
-  }
-
-  async function saveTestDataOnly() {
-    setSavingData(true);
-    setSaveDataError(null);
-    setSaveDataNotice(null);
+  async function handleView(transactionId) {
+    setSelectedId(transactionId);
+    setSelectedReport(null);
+    setReportError(null);
+    setReportLoading(true);
     try {
-      const data = await api.updateRecordingTestData(selectedRecFile, editValues);
-      setTestData(data.fields);
-      setSaveDataNotice("Test data saved - future runs of this recording will use these values too.");
+      const r = await transactionsApi.get(transactionId);
+      setSelectedReport(r);
     } catch (e) {
-      setSaveDataError(e.detail || e.message);
+      setReportError(e.detail || e.message);
     } finally {
-      setSavingData(false);
-    }
-  }
-
-  async function handleRun() {
-    if (!selectedRecFile) return;
-    setRunError(null);
-    setRunBusy(true);
-    try {
-      // Whatever is currently in the grid is what gets run - saved to the
-      // recording first (so it's also the new baseline for next time),
-      // then executed. No separate "save" step required.
-      if (testData.length > 0) {
-        await api.updateRecordingTestData(selectedRecFile, editValues);
-      }
-      const r = await api.runRecording(selectedRecFile, runHeadless);
-      setReport(r);
-    } catch (e) {
-      setRunError(e.detail || e.message);
-    } finally {
-      setRunBusy(false);
-    }
-  }
-
-  async function handleRegenerate() {
-    if (!selectedRecFile) return;
-    setRegenNotice(null);
-    setRegenBusy(true);
-    try {
-      const r = await recordingsApi.regenerate(selectedRecFile);
-      setRegenNotice({
-        tone: "success",
-        text: `Regenerated (${r.build_result.step_count} steps) - the next run of this recording already uses the current generator code either way, but the files on disk are refreshed now too.`,
-      });
-    } catch (e) {
-      setRegenNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setRegenBusy(false);
-    }
-  }
-
-  async function handleImportFileChosen(file) {
-    setImportFile(file);
-    setImportNotice(null);
-    setImportSheets(null);
-    setSelectedSheets([]);
-    if (!file) return;
-    setImportSheetsLoading(true);
-    try {
-      const r = await recordingsApi.listUipathSheets(file);
-      // A single-sheet workbook needs no picker at all - just import its
-      // one (active) sheet directly, exactly like before this feature
-      // existed. Only a genuinely multi-sheet file shows the checklist.
-      if (r.sheets.length > 1) {
-        setImportSheets(r.sheets);
-        setSelectedSheets(r.sheets); // default to "all sheets" selected - the common case
-      } else {
-        setImportSheets([]);
-      }
-    } catch (e) {
-      setImportNotice({ tone: "error", text: e.detail || e.message });
-      setImportFile(null);
-    } finally {
-      setImportSheetsLoading(false);
-    }
-  }
-
-  function toggleSheetSelection(sheetName) {
-    setSelectedSheets((prev) =>
-      prev.includes(sheetName) ? prev.filter((s) => s !== sheetName) : [...prev, sheetName]
-    );
-  }
-
-  async function handleImportUipath() {
-    if (!importFile) return;
-    if (importSheets && importSheets.length > 0 && selectedSheets.length === 0) {
-      setImportNotice({ tone: "error", text: "Select at least one sheet to import, or use \"Select all\"." });
-      return;
-    }
-    setImportNotice(null);
-    setImportBusy(true);
-    try {
-      const r = await recordingsApi.importUipathExcel(importFile, importName, selectedSheets.length ? selectedSheets : undefined);
-      const succeeded = r.results.filter((res) => !res.error);
-      const failed = r.results.filter((res) => res.error);
-      const totalWarnings = succeeded.reduce((n, res) => n + res.warnings.length, 0);
-
-      const parts = [];
-      if (succeeded.length) {
-        const label = succeeded.length === 1 ? "1 recording" : `${succeeded.length} recordings`;
-        parts.push(`Imported ${label} from ${importFile.name}${totalWarnings ? ` (${totalWarnings} warning${totalWarnings > 1 ? "s" : ""} - check each recording's steps)` : ""}.`);
-      }
-      if (failed.length) {
-        parts.push(`${failed.length} sheet${failed.length > 1 ? "s" : ""} could not be imported: ${failed.map((f) => `${f.sheet_name || "sheet"} (${f.error})`).join("; ")}.`);
-      }
-      setImportNotice({
-        tone: failed.length && !succeeded.length ? "error" : failed.length || totalWarnings ? "warning" : "success",
-        text: parts.join(" "),
-      });
-      setImportFile(null);
-      setImportName("");
-      setImportSheets(null);
-      setSelectedSheets([]);
-      await loadRecordings();
-      if (succeeded.length) setSelectedRecFile(succeeded[0].recording_file);
-    } catch (e) {
-      setImportNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setImportBusy(false);
+      setReportLoading(false);
     }
   }
 
   return (
-    <div className="grid min-w-0 gap-6 lg:grid-cols-[360px_1fr]">
-      <Panel>
-        <PanelHeader title="Run a saved recording" caption="Pick a recording, review/edit its test data, then run it." />
-        <div className="space-y-4 px-5 py-5">
-          <Callout>
-            Running as <strong>{user?.first_name} {user?.last_name}</strong> ({user?.username}). Every run is logged
-            against your account.
-          </Callout>
-
-          <Disclosure title="Import from a UiPath Excel sheet">
-            <div className="space-y-3">
-              <p className="text-xs text-muted">
-                Upload a spreadsheet with Steps / NAME / Action-Method / present element / input columns - it's
-                converted into a saved recording here, ready to run or regenerate like any other. A workbook with
-                several sheets (e.g. one per test case) lets you pick which to import below.
-              </p>
-              <Field label="Excel file (.xlsx)">
-                <input
-                  type="file"
-                  accept=".xlsx,.xlsm"
-                  onChange={(e) => handleImportFileChosen(e.target.files?.[0] || null)}
-                  className="block w-full text-sm text-ink file:mr-3 file:rounded-sm file:border-0 file:bg-rail file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-ink hover:file:bg-line"
-                />
-              </Field>
-
-              {importSheetsLoading && <Spinner label="Checking sheets in this file..." />}
-
-              {importSheets && importSheets.length > 0 && (
-                <div className="border border-line bg-rail px-3 py-2.5">
-                  <div className="mb-1.5 flex items-center justify-between">
-                    <span className="text-xs font-medium text-ink">
-                      This file has {importSheets.length} sheets - pick which to import as separate recordings:
-                    </span>
-                    <div className="flex gap-2 text-xs">
-                      <button type="button" className="text-brand-blue hover:underline" onClick={() => setSelectedSheets(importSheets)}>
-                        Select all
-                      </button>
-                      <button type="button" className="text-brand-blue hover:underline" onClick={() => setSelectedSheets([])}>
-                        Select none
-                      </button>
+    <div className="grid min-w-0 grid-cols-1 gap-6 lg:grid-cols-[22rem_1fr]">
+      <div className="min-w-0 space-y-4">
+        <Panel>
+          <PanelHeader
+            title="My executions"
+            caption={`Every recording ${user?.first_name ? `${user.first_name} has` : "you've"} run, most recent first.`}
+          />
+          <div className="min-w-0 px-5 py-5">
+            {loading && <Spinner label="Loading your execution history..." />}
+            {error && <Callout tone="error">Could not load execution history: {error}</Callout>}
+            {!loading && !error && transactions.length === 0 && (
+              <p className="text-sm text-muted">No executions yet - run a recording from the other tab and it'll show up here.</p>
+            )}
+            {!loading && !error && transactions.length > 0 && (
+              <div className="max-h-[32rem] space-y-1 overflow-y-auto scroll-thin">
+                {transactions.map((t) => (
+                  <button
+                    key={t.transaction_id}
+                    type="button"
+                    onClick={() => handleView(t.transaction_id)}
+                    className={`block w-full rounded-sm border px-3 py-2.5 text-left transition-colors ${
+                      selectedId === t.transaction_id ? "border-brand-blue bg-brand-blueLight" : "border-line bg-panel hover:border-brand-blue/40"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="min-w-0 truncate text-sm font-medium text-ink">{t.transaction_name}</span>
+                      <StatusBadge status={t.status} />
                     </div>
-                  </div>
-                  <div className="max-h-40 space-y-1 overflow-y-auto">
-                    {importSheets.map((sheet) => (
-                      <Checkbox
-                        key={sheet}
-                        label={sheet}
-                        checked={selectedSheets.includes(sheet)}
-                        onChange={() => toggleSheetSelection(sheet)}
-                      />
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              <Field label={importSheets && importSheets.length > 0 ? "Name prefix for these recordings (optional)" : "Name this recording (optional)"}>
-                <TextInput
-                  value={importName}
-                  onChange={(e) => setImportName(e.target.value)}
-                  placeholder="e.g. LLMS Lite MCC Flow"
-                />
-              </Field>
-              <Button variant="secondary" onClick={handleImportUipath} disabled={!importFile || importBusy || importSheetsLoading} className="w-full">
-                {importBusy
-                  ? "Importing..."
-                  : importSheets && importSheets.length > 0
-                  ? `Import ${selectedSheets.length} sheet${selectedSheets.length === 1 ? "" : "s"}`
-                  : "Import"}
-              </Button>
-              {importNotice && <Callout tone={importNotice.tone}>{importNotice.text}</Callout>}
-            </div>
-          </Disclosure>
-
-          {recordingsError && <Callout tone="error">Could not load recordings: {recordingsError}</Callout>}
-
-          {recordings.length === 0 ? (
-            <Callout>No saved recordings found yet. Record one in the &ldquo;Record &amp; Generate&rdquo; tab first.</Callout>
-          ) : (
-            <>
-              <Field label="Saved recording">
-                <Select value={selectedRecFile} onChange={(e) => setSelectedRecFile(e.target.value)}>
-                  {recordings.map((r) => (
-                    <option key={r.file} value={r.file}>
-                      {r.name} — {r.target_url} ({r.action_count} actions)
-                    </option>
-                  ))}
-                </Select>
-              </Field>
-
-              <Checkbox label="headless" checked={runHeadless} onChange={setRunHeadless} />
-
-              <Button onClick={handleRun} disabled={runBusy} className="w-full">
-                {runBusy ? "Running..." : "Run recording"}
-              </Button>
-
-              {runBusy && <Spinner label="Running the saved recording..." />}
-              {runError && <Callout tone="error">Run failed: {runError}</Callout>}
-
-              <div className="border-t border-line pt-4">
-                <Button variant="secondary" onClick={handleRegenerate} disabled={regenBusy} className="w-full">
-                  {regenBusy ? "Regenerating..." : "Regenerate (no run)"}
-                </Button>
-                <p className="mt-1.5 text-xs text-muted">
-                  Refreshes this recording's generated feature/steps/page files from the latest generator code -
-                  without re-recording or running anything. Useful right after a code/template fix, to confirm it
-                  applies here.
-                </p>
-                {regenNotice && (
-                  <div className="mt-2">
-                    <Callout tone={regenNotice.tone}>{regenNotice.text}</Callout>
-                  </div>
-                )}
+                    <div className="mt-1 flex items-center justify-between gap-2 text-xs text-muted">
+                      <span>{t.date_time}</span>
+                      <span>
+                        {t.passed_count ?? "—"}/{t.step_count ?? "—"} passed
+                      </span>
+                    </div>
+                  </button>
+                ))}
               </div>
-            </>
-          )}
-        </div>
-      </Panel>
+            )}
+            <Button variant="secondary" onClick={load} className="mt-3 w-full" disabled={loading}>
+              Refresh
+            </Button>
+          </div>
+        </Panel>
+      </div>
 
       <div className="min-w-0 space-y-4">
-        {selectedRecFile && (
+        {reportLoading && (
           <Panel>
-            <div className="flex items-center justify-between border-b border-line px-5 py-4">
-              <div>
-                <h2 className="text-sm font-semibold text-ink">Test data</h2>
-                <p className="mt-0.5 text-xs text-muted">
-                  The values this recording types/selects when it runs. Edit anything below, then hit{" "}
-                  <strong>Run recording</strong> - no need to download or re-upload the Excel report; changes save
-                  straight into this recording.
-                </p>
-              </div>
-              {testData.length > 0 && (
-                <Button variant="secondary" onClick={saveTestDataOnly} disabled={savingData}>
-                  {savingData ? "Saving..." : "Save without running"}
-                </Button>
-              )}
-            </div>
-            <div className="px-5 py-4">
-              {testDataLoading && <Spinner label="Loading test data..." />}
-              {testDataError && <Callout tone="error">{testDataError}</Callout>}
-              {saveDataError && <Callout tone="error">{saveDataError}</Callout>}
-              {saveDataNotice && <Callout tone="success">{saveDataNotice}</Callout>}
-
-              {!testDataLoading && !testDataError && testData.length === 0 && (
-                <p className="text-sm text-muted">
-                  This recording has no typed or selected values to edit (e.g. it's clicks/navigation only).
-                </p>
-              )}
-
-              {testData.length > 0 && (
-                <DataTable
-                  columns={[
-                    { key: "label", label: "Field" },
-                    { key: "action", label: "Type", mono: true },
-                    { key: "value", label: "Value" },
-                  ]}
-                  rows={testData.map((f) => ({
-                    label: f.label,
-                    action: f.action,
-                    value: (
-                      <TextInput
-                        value={editValues[f.index] ?? ""}
-                        onChange={(e) => updateValue(f.index, e.target.value)}
-                      />
-                    ),
-                  }))}
-                />
-              )}
+            <div className="px-5 py-10">
+              <Spinner label="Loading execution report..." />
             </div>
           </Panel>
         )}
-
-        {report && <ReportView key={report.transaction_id} report={report} />}
-
-        {!selectedRecFile && (
+        {reportError && (
           <Panel>
-            <div className="px-5 py-10 text-center text-sm text-muted">
-              Pick a saved recording to review its test data and run it.
+            <div className="px-5 py-5">
+              <Callout tone="error">Could not load this execution's report: {reportError}</Callout>
             </div>
+          </Panel>
+        )}
+        {!reportLoading && !reportError && selectedReport && <ReportView key={selectedReport.transaction_id} report={selectedReport} />}
+        {!reportLoading && !reportError && !selectedReport && (
+          <Panel>
+            <div className="px-5 py-10 text-center text-sm text-muted">Pick an execution on the left to see its full report.</div>
           </Panel>
         )}
       </div>
