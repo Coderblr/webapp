@@ -1,89 +1,195 @@
 """
-Behave environment hooks for LOCAL AGENT execution. Copied into an
-execution workspace's features/environment.py by
-local_agent/execution_manager.py INSTEAD OF runner/environment.py -
-identical Playwright browser setup/teardown, but deliberately WITHOUT
-self-healing, so the local agent (and therefore the end user's desktop
-installation) never needs the `agent/` AI package or an LLM API key at
-all - both stay strictly server-side, matching the requirement that users
-receive only local_agent/ + recorder/ + runner/, never backend/,
-database/, generator/, or agent/.
+Runs a Behave test suite ON THIS MACHINE, reusing the EXISTING
+runner/run_tests.py unmodified (per the task's constraints - no second
+independent test-execution implementation) for the plain pass/fail path,
+plus a JSON-formatter variant (mirroring runner/run_recording.py's
+_run_behave_json exactly) so a "Run Saved Recording" executed via the
+agent gets the same per-step granularity as one executed server-side -
+see run_test_with_json_report below.
 
-Trade-off, stated plainly: a locator that's gone stale will simply fail
-the step here, instead of being auto-repaired mid-run the way a
-server-executed test can be (see runner/environment.py, used server-side
-and by ALLOW_SERVER_FALLBACK's dev-only path). See
-docs/electron-local-agent-architecture.md's "Remaining work" for the
-proper fix (an agent -> server "propose a locator fix" callback endpoint)
-if closing that gap becomes a priority - it's a real, deliberate
-architecture decision, not an oversight.
+Why this works with zero changes to runner/run_tests.py: it invokes
+`python -m behave <features_dir>` with `cwd=<project root>` - and it's
+specifically that `cwd` (not any sys.path manipulation inside
+runner/environment.py) that makes `recorder`/`agent`/`runner` importable,
+because Python's `-m` flag inserts the CURRENT WORKING DIRECTORY onto
+sys.path. Confirmed by direct experiment: the exact same
+runner/environment.py fails with `ModuleNotFoundError: No module named
+'recorder'` when behave is invoked from any other cwd. Since this
+project's own layout puts local_agent/ right next to recorder/, agent/,
+and runner/ (same as the central server today), calling
+runner.run_tests.run() from here "just works" for a workspace at ANY
+nesting depth under agent_workspace/ - identical to how the server's own
+per-session output/sessions/<id>/ dirs already rely on this same mechanism.
 """
+from __future__ import annotations
+import base64
+import json
 import os
+import shutil
+import subprocess
 import sys
+import uuid
 from pathlib import Path
+from typing import Optional
 
-# make both the "project root" (for `recorder`) and the output dir (for
-# `pages`) importable - same mechanism runner/environment.py uses (see
-# local_agent/execution_manager.py's module docstring for why `cwd` at
-# invocation time, not this path arithmetic, is what actually makes
-# `recorder` importable - this insert is still needed for `pages`).
-_features_dir = Path(__file__).resolve().parent
-_output_dir = _features_dir.parent
-_project_root = _output_dir.parent
-sys.path.insert(0, str(_project_root))
-sys.path.insert(0, str(_output_dir))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from recorder.browser_factory import launch_browser
+from runner.run_tests import run as run_behave, run_behave_cli
+from local_agent.config import WORKSPACE_DIR
+from local_agent.logger import get_logger
 
-from pages.recorded_page import RecordedPage
-from runner.variables import VariableStore
+logger = get_logger("execution")
+
+_ENV_SOURCE = Path(__file__).resolve().parent / "agent_environment.py"
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def before_all(context):
-    headless = os.getenv("HEADLESS", "false").lower() == "true"
-    context.browser_session = launch_browser(headless=headless)
-    context.raw_page = context.browser_session.new_page()
-    # heal_callback=None (vs runner/environment.py's LLM-backed one) - see
-    # this file's module docstring for why.
-    context.page = RecordedPage(context.raw_page, heal_callback=None)
-    context.variables = VariableStore()
-
-    # Auto-accept native alert/confirm/prompt/beforeunload dialogs - both on
-    # the original page and on any popup/new tab/new window opened during
-    # this run - mirrors recorder/recorder.py's own _on_dialog (an
-    # unhandled dialog suspends the page indefinitely, hanging the run).
-    # Kept identical to runner/environment.py's version even though this
-    # file otherwise deliberately omits self-healing - dialog handling
-    # doesn't need an LLM, so there's no reason for local execution to
-    # behave differently here.
-    context.raw_page.on("dialog", lambda dialog: dialog.accept())
-    context.browser_session.context.on("page", lambda p: p.on("dialog", lambda dialog: dialog.accept()))
-    # Ordered list of every browser tab/window page.tmpl's BasePage.switch_page()
-    # has been pointed at during this run - see steps.tmpl's maybe_switch/
-    # new_page_wrapper macros, which append to and index into this.
-    context.recorder_pages = [context.raw_page]
+def _new_execution_dir() -> Path:
+    """Per spec section 17: an isolated workspace per execution so
+    concurrent runs (however unlikely on a single agent that handles one
+    thing at a time today - see connection_manager.py's BUSY state) can
+    never overwrite each other's files."""
+    execution_id = uuid.uuid4().hex[:12]
+    workspace = WORKSPACE_DIR / f"execution-{execution_id}"
+    workspace.mkdir(parents=True, exist_ok=True)
+    return workspace
 
 
-def after_all(context):
+def _write_workspace(files: dict, workspace: Path) -> None:
+    """Writes every received file into the workspace, EXCEPT
+    "features/environment.py" - that one always comes from this agent's
+    OWN local, self-healing-free copy (_ENV_SOURCE = agent_environment.py),
+    never from whatever the server sent, even if a caller's `files` dict
+    happens to include one. This is deliberate, not an oversight: the
+    server's own environment.py imports agent.llm_factory/agent.self_healer
+    for LLM-backed self-healing, which a packaged local_agent.exe does NOT
+    bundle (see local_agent/local_agent.spec's excludes) - using the
+    server's copy here crashes Behave with "ModuleNotFoundError: No module
+    named 'agent'" before before_all() ever calls launch_browser(), which
+    is exactly why Run/Run Saved Recording previously never opened a
+    browser at all even though Start Recording (no environment.py
+    involved) worked fine. See backend/api.py's _collect_generated_files,
+    which as of this fix no longer even sends one - this check is the
+    second, redundant layer of protection against the same mistake."""
+    for rel_path, content in files.items():
+        if rel_path == "features/environment.py":
+            continue
+        dest = workspace / rel_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content)
+    env_dest = workspace / "features" / "environment.py"
+    env_dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(_ENV_SOURCE, env_dest)
+
+
+def run_test(files: dict, headless: bool = True) -> dict:
+    """Plain pass/fail execution via the existing runner/run_tests.py -
+    used by the live "Record & Generate" tab's Run/Check button (no
+    per-step JSON needed there)."""
+    workspace = _new_execution_dir()
+    logger.info(f"Starting local test execution in {workspace}")
     try:
-        context.browser_session.close()
-    except Exception:
-        pass
+        _write_workspace(files, workspace)
+        result = run_behave(output_dir=str(workspace), headless=headless)
+        logger.info(f"Execution finished: ok={result.get('ok')}")
+        return result
+    except Exception as e:
+        logger.exception("Local test execution failed unexpectedly")
+        return {"ok": False, "returncode": -1, "output": f"Agent-side execution error: {e}"}
 
 
-def after_step(context, step):
-    """See runner/environment.py's after_step - identical logic, kept in
-    sync deliberately (screenshot capture doesn't need an LLM, so there's
-    no reason for local execution to behave differently here, the same
-    principle already applied to dialog handling above)."""
-    context.step_counter = getattr(context, "step_counter", 0) + 1
-    status_name = getattr(step.status, "name", str(step.status))
-    if status_name not in ("passed", "failed", "error"):
+def run_test_with_json_report(files: dict, headless: bool = True) -> dict:
+    """Same as run_test, but also captures Behave's `--format json` output
+    (mirroring runner/run_recording.py's _run_behave_json exactly) so a
+    "Run Saved Recording" executed via this agent gets the same per-step
+    pass/fail/error detail as one executed server-side - see
+    backend/api.py's run_saved_recording, which needs this shape to keep
+    generating the same exit report regardless of where the test actually ran.
+
+    Uses runner.run_tests.run_behave_cli, which correctly handles a
+    PyInstaller-frozen agent (see that module's docstring - this is the
+    fix for "Start Recording opens a browser but Run/Run Saved Recording
+    doesn't" when running from a packaged local_agent.exe: sys.executable
+    inside a frozen exe is the exe itself, not a real Python interpreter,
+    so the old subprocess-based invocation here never actually launched
+    behave at all).
+
+    Returns {"ok", "returncode", "output", "json": [...]} - "json" is the
+    raw parsed Behave JSON array (possibly empty if Behave crashed before
+    producing it), exactly what runner/run_recording.py's
+    _extract_steps() already knows how to flatten.
+    """
+    workspace = _new_execution_dir()
+    logger.info(f"Starting local test execution (with JSON report) in {workspace}")
+    try:
+        _write_workspace(files, workspace)
+        features_dir = workspace / "features"
+        results_path = workspace / "behave_results.json"
+
+        result = run_behave_cli(
+            [str(features_dir), "--no-capture", "--format", "json", "--outfile", str(results_path)],
+            cwd=str(_PROJECT_ROOT),
+            env_overrides={"HEADLESS": "true" if headless else "false"},
+        )
+        try:
+            parsed = json.loads(results_path.read_text())
+        except Exception:
+            parsed = []
+
+        # Collect + base64-encode any screenshots environment.py's
+        # after_step hook captured during this run (workspace/screenshots/
+        # step_NNN.png - see runner/environment.py's after_step for the
+        # naming scheme) and send them back over the SAME WebSocket
+        # round-trip already carrying `parsed` above, rather than standing
+        # up a separate upload endpoint for this - the backend already
+        # knows how to receive an arbitrary JSON response to a command
+        # (see agent_registry.send_command), so this reuses that instead
+        # of new infrastructure. Capped at MAX_SCREENSHOT_PAYLOAD_BYTES
+        # total (base64-inflated) so a very large test suite can't produce
+        # an unreasonably huge single WebSocket message - screenshots
+        # beyond the cap are simply left out; the ones already included
+        # (in step order) are unaffected.
+        screenshots_dir = workspace / "screenshots"
+        screenshots_b64: dict[str, str] = {}
+        MAX_SCREENSHOT_PAYLOAD_BYTES = 20 * 1024 * 1024  # ~20MB of base64 text
+        running_total = 0
+        if screenshots_dir.is_dir():
+            for shot_path in sorted(screenshots_dir.glob("step_*.png")):
+                try:
+                    raw = shot_path.read_bytes()
+                except Exception:
+                    continue
+                encoded = base64.b64encode(raw).decode("ascii")
+                if running_total + len(encoded) > MAX_SCREENSHOT_PAYLOAD_BYTES:
+                    logger.warning(
+                        f"Screenshot payload cap reached ({MAX_SCREENSHOT_PAYLOAD_BYTES} bytes) - "
+                        f"omitting {shot_path.name} and any remaining screenshots from this run's response."
+                    )
+                    break
+                screenshots_b64[shot_path.name] = encoded
+                running_total += len(encoded)
+
+        logger.info(f"Execution finished: returncode={result['returncode']}, screenshots captured={len(screenshots_b64)}")
+        return {
+            "ok": result["returncode"] == 0, "returncode": result["returncode"], "output": result["output"],
+            "json": parsed, "screenshots": screenshots_b64,
+        }
+    except Exception as e:
+        logger.exception("Local test execution (JSON report) failed unexpectedly")
+        return {"ok": False, "returncode": -1, "output": f"Agent-side execution error: {e}", "json": [], "screenshots": {}}
+
+
+def cleanup_old_executions(keep_last: int = 10) -> None:
+    """Retention per spec section 18 - avoid the workspace directory
+    growing unbounded across a long-running agent's lifetime. Called
+    periodically by client.py, not on every single run (recent executions
+    are kept around briefly in case their artifacts/logs are still useful
+    to look at locally)."""
+    if not WORKSPACE_DIR.exists():
         return
-    try:
-        screenshots_dir = _output_dir / "screenshots"
-        screenshots_dir.mkdir(parents=True, exist_ok=True)
-        active_page = context.page.page if hasattr(context, "page") and context.page else context.raw_page
-        active_page.screenshot(path=str(screenshots_dir / f"step_{context.step_counter:03d}.png"))
-    except Exception:
-        pass
+    executions = sorted(WORKSPACE_DIR.glob("execution-*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in executions[keep_last:]:
+        try:
+            shutil.rmtree(old, ignore_errors=True)
+        except Exception:
+            pass
