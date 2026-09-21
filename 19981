@@ -1,77 +1,66 @@
 """
-Behave environment hooks. Copied verbatim into output/features/environment.py
-by generator/build.py. Launches a Playwright browser (Edge by default, see
-recorder/browser_factory.py - set BROWSER=chrome in .env to switch) for the
-whole run and exposes context.page (RecordedPage) to every step definition,
-plus context.raw_page (the underlying Playwright Page) for the Given/Then
-steps in steps.tmpl that need it directly.
-Also wires the self-healing callback so a broken locator triggers the LLM
-repair agent (agent/self_healer.py) before the step fails.
+Behave environment hooks for LOCAL AGENT execution. Copied into an
+execution workspace's features/environment.py by
+local_agent/execution_manager.py INSTEAD OF runner/environment.py -
+identical Playwright browser setup/teardown, but deliberately WITHOUT
+self-healing, so the local agent (and therefore the end user's desktop
+installation) never needs the `agent/` AI package or an LLM API key at
+all - both stay strictly server-side, matching the requirement that users
+receive only local_agent/ + recorder/ + runner/, never backend/,
+database/, generator/, or agent/.
+
+Trade-off, stated plainly: a locator that's gone stale will simply fail
+the step here, instead of being auto-repaired mid-run the way a
+server-executed test can be (see runner/environment.py, used server-side
+and by ALLOW_SERVER_FALLBACK's dev-only path). See
+docs/electron-local-agent-architecture.md's "Remaining work" for the
+proper fix (an agent -> server "propose a locator fix" callback endpoint)
+if closing that gap becomes a priority - it's a real, deliberate
+architecture decision, not an oversight.
 """
 import os
 import sys
 from pathlib import Path
 
-# make both the project root (for `agent`/`recorder`) and the output dir (for `pages`) importable
+# make both the "project root" (for `recorder`) and the output dir (for
+# `pages`) importable - same mechanism runner/environment.py uses (see
+# local_agent/execution_manager.py's module docstring for why `cwd` at
+# invocation time, not this path arithmetic, is what actually makes
+# `recorder` importable - this insert is still needed for `pages`).
 _features_dir = Path(__file__).resolve().parent
-_output_dir = _features_dir.parent          # .../output
-_project_root = _output_dir.parent           # project root
+_output_dir = _features_dir.parent
+_project_root = _output_dir.parent
 sys.path.insert(0, str(_project_root))
 sys.path.insert(0, str(_output_dir))
 
 from recorder.browser_factory import launch_browser
 
 from pages.recorded_page import RecordedPage
-from agent.llm_factory import get_llm
-from agent.self_healer import propose_fix, validate_locator
 from runner.variables import VariableStore
-
-
-def _make_heal_callback():
-    llm = get_llm()
-
-    def heal(element_name, page):
-        if llm is None:
-            return None
-        page_html = page.content()
-        fix = propose_fix(llm, element_name, {"note": "see locators.json for original strategies"}, page_html)
-        if fix and validate_locator(page, fix["strategy"], fix["value"]):
-            print(f"[self-heal] repaired locator for '{element_name}' -> {fix}")
-            return fix
-        return None
-
-    return heal
 
 
 def before_all(context):
     headless = os.getenv("HEADLESS", "false").lower() == "true"
     context.browser_session = launch_browser(headless=headless)
     context.raw_page = context.browser_session.new_page()
-    context.page = RecordedPage(context.raw_page, heal_callback=_make_heal_callback())
-    # Capture -> Store -> Reuse: {{username}}/{{application_id}}-style variables
-    # captured during THIS run (see runner/variables.py) - resolved at playback
-    # time from live values, never from the static values baked in when the
-    # recording was made.
+    # heal_callback=None (vs runner/environment.py's LLM-backed one) - see
+    # this file's module docstring for why.
+    context.page = RecordedPage(context.raw_page, heal_callback=None)
     context.variables = VariableStore()
 
-    # Auto-accept native alert/confirm/prompt/beforeunload dialogs on the
-    # ORIGINAL page - mirrors recorder/recorder.py's own _on_dialog (a
-    # dialog left unhandled suspends the page indefinitely, hanging the run).
+    # Auto-accept native alert/confirm/prompt/beforeunload dialogs - both on
+    # the original page and on any popup/new tab/new window opened during
+    # this run - mirrors recorder/recorder.py's own _on_dialog (an
+    # unhandled dialog suspends the page indefinitely, hanging the run).
+    # Kept identical to runner/environment.py's version even though this
+    # file otherwise deliberately omits self-healing - dialog handling
+    # doesn't need an LLM, so there's no reason for local execution to
+    # behave differently here.
     context.raw_page.on("dialog", lambda dialog: dialog.accept())
-    # Safety net for popups/new tabs/new windows: auto-accepts native
-    # alert/confirm/prompt/beforeunload dialogs on ANY page opened under
-    # this browser context during replay, including ones the generated
-    # steps don't explicitly track via expect_page() (see steps.tmpl's
-    # new_page_wrapper macro) - without this, an unexpected dialog on a
-    # popup would hang the whole run instead of just getting accepted, the
-    # same way the recorder itself auto-accepts them (see
-    # recorder/recorder.py's _on_dialog).
     context.browser_session.context.on("page", lambda p: p.on("dialog", lambda dialog: dialog.accept()))
     # Ordered list of every browser tab/window page.tmpl's BasePage.switch_page()
-    # has been pointed at during this run - index 0 is always the original
-    # tab. Generated steps append to this as popups/new tabs/new windows open
-    # (see steps.tmpl's new_page_wrapper macro) and index back into it to
-    # switch tabs/windows (see steps.tmpl's maybe_switch macro).
+    # has been pointed at during this run - see steps.tmpl's maybe_switch/
+    # new_page_wrapper macros, which append to and index into this.
     context.recorder_pages = [context.raw_page]
 
 
@@ -83,30 +72,10 @@ def after_all(context):
 
 
 def after_step(context, step):
-    """
-    Screenshots the CURRENTLY ACTIVE page/tab after every step that
-    actually executed (passed, failed, or errored) - not undefined/
-    skipped ones, since nothing ran for those and a screenshot would just
-    show misleadingly stale state left over from whatever came before.
-
-    Saved under output/screenshots/step_<n>.png, where <n> is this
-    scenario's 1-based step position - the SAME position
-    runner/run_recording.py's _extract_steps() assigns each step when it
-    parses behave's own JSON output afterward (both walk the identical,
-    in-order step list Behave produces), so the two line up without
-    needing any extra bookkeeping passed between them. The counter
-    advances for every step Behave attempts, including undefined/skipped
-    ones - only the FILE is skipped for those, keeping the numbering
-    aligned even though there's a gap in which numbers actually exist on
-    disk.
-
-    Wrapped in a broad try/except deliberately: a screenshot failure
-    (the page just closed, crashed, or is mid-navigation) must never mask
-    or interfere with the step's own actual pass/fail result - at worst,
-    this one step's screenshot is silently missing, which the report
-    already handles as a normal case (no screenshot available yet, or
-    ever, for that step).
-    """
+    """See runner/environment.py's after_step - identical logic, kept in
+    sync deliberately (screenshot capture doesn't need an LLM, so there's
+    no reason for local execution to behave differently here, the same
+    principle already applied to dialog handling above)."""
     context.step_counter = getattr(context, "step_counter", 0) + 1
     status_name = getattr(step.status, "name", str(step.status))
     if status_name not in ("passed", "failed", "error"):
