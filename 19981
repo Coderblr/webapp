@@ -1,304 +1,120 @@
 """
-Runs an already-SAVED recording (a JSON file under recordings/) end-to-end
-and produces an "exit report":
-
-  1. Load the recording JSON.
-  2. Regenerate the feature/steps/page/locators files for it
-     (generator.build.build_artifacts) - guarantees the run reflects the
-     saved recording, not stale output/ from some earlier run.
-  3. Execute the generated Behave suite, capturing a PER-STEP result via
-     Behave's JSON formatter (pass/fail/error per Playwright step, not just
-     an overall pass/fail).
-  4. Persist the run to a plain JSON file under transactions/ (NOT the
-     database - the database is reserved for auth/session/activity data
-     only; see runner/transaction_store.py) - the run's status, every
-     file it produced, and every step's result.
-  5. Write a human-readable exit report (.txt) to output/reports/ and
-     return the same information as a JSON-serializable dict, so a caller
-     (backend/api.py, main.py, a script) can show/save it either way.
+Behave environment hooks. Copied verbatim into output/features/environment.py
+by generator/build.py. Launches a Playwright browser (Edge by default, see
+recorder/browser_factory.py - set BROWSER=chrome in .env to switch) for the
+whole run and exposes context.page (RecordedPage) to every step definition,
+plus context.raw_page (the underlying Playwright Page) for the Given/Then
+steps in steps.tmpl that need it directly.
+Also wires the self-healing callback so a broken locator triggers the LLM
+repair agent (agent/self_healer.py) before the step fails.
 """
-from __future__ import annotations
-import base64
-import json
-import logging
-import subprocess
+import os
 import sys
-from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
-logger = logging.getLogger(__name__)
+# make both the project root (for `agent`/`recorder`) and the output dir (for `pages`) importable
+_features_dir = Path(__file__).resolve().parent
+_output_dir = _features_dir.parent          # .../output
+_project_root = _output_dir.parent           # project root
+sys.path.insert(0, str(_project_root))
+sys.path.insert(0, str(_output_dir))
 
-from database.db import get_session, init_db
-from database import repository as repo
-from runner import transaction_store
-from generator.build import build_artifacts
+from recorder.browser_factory import launch_browser
+
+from pages.recorded_page import RecordedPage
 from agent.llm_factory import get_llm
-
-ROOT = Path(__file__).parent.parent
-RECORDINGS_DIR = ROOT / "recordings"
-REPORTS_DIR = ROOT / "output" / "reports"
+from agent.self_healer import propose_fix, validate_locator
+from runner.variables import VariableStore
 
 
-def list_saved_recordings() -> list[dict]:
-    """Metadata for every recording JSON file saved under recordings/, newest first."""
-    out = []
-    if not RECORDINGS_DIR.exists():
-        return out
-    for f in RECORDINGS_DIR.glob("*.json"):
-        try:
-            data = json.loads(f.read_text())
-            out.append({
-                "file": str(f),
-                "name": data.get("recording_name") or f.stem,
-                "target_url": data.get("target_url"),
-                "recorded_at": data.get("recorded_at"),
-                "action_count": len(data.get("actions", [])),
-            })
-        except Exception:
-            continue
-    out.sort(key=lambda r: r.get("recorded_at") or "", reverse=True)
-    return out
-
-
-def _run_behave_json(features_dir: Path, headless: bool) -> dict:
-    """Run behave once with the JSON formatter so each step's result (not
-    just the overall pass/fail) is available for the Automation Logs table."""
-    import os
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    results_path = REPORTS_DIR / "last_run_results.json"
-
-    env = {**os.environ, "HEADLESS": "true" if headless else "false"}
-    proc = subprocess.run(
-        [sys.executable, "-m", "behave", str(features_dir),
-         "--no-capture", "--format", "json", "--outfile", str(results_path)],
-        cwd=str(ROOT), capture_output=True, text=True, env=env,
-    )
-
-    parsed: list = []
-    try:
-        parsed = json.loads(results_path.read_text())
-    except Exception:
-        parsed = []
-
-    return {
-        "returncode": proc.returncode,
-        "stdout": proc.stdout,
-        "stderr": proc.stderr,
-        "json": parsed,
-    }
-
-
-def _extract_steps(behave_json: list, screenshots_dir: Optional[Path] = None) -> list[dict]:
-    """Flatten behave's nested JSON into one row per executed Playwright
-    step. `screenshots_dir`, if given, attaches a "screenshot" filename to
-    any step a screenshot actually exists for (see runner/environment.py's
-    after_step hook, which writes step_<n>.png there during the run) -
-    the Nth step in this flattened list lines up with step_<n>.png because
-    both walk the same steps in the same order; a step with no screenshot
-    (never executed - undefined/skipped - or the screenshot genuinely
-    failed to save) simply gets no "screenshot" key at all, rather than a
-    reference to a file that doesn't exist."""
-    rows = []
-    step_index = 0
-    for feature in behave_json:
-        for element in feature.get("elements", []):
-            if element.get("type") != "scenario":
-                continue
-            for step in element.get("steps", []):
-                step_index += 1
-                result = step.get("result", {}) or {}
-                status = (result.get("status") or "undefined").capitalize()
-                error = result.get("error_message")
-                if isinstance(error, list):
-                    error = "\n".join(error)
-                row = {
-                    "step_name": f'{step.get("keyword", "").strip()} {step.get("name", "")}'.strip(),
-                    "status": status,
-                    "error_message": error,
-                }
-                if screenshots_dir is not None:
-                    candidate = screenshots_dir / f"step_{step_index:03d}.png"
-                    if candidate.exists():
-                        row["screenshot"] = candidate.name
-                rows.append(row)
-    return rows
-
-
-def _write_exit_report(path: Path, transaction_id: int, recording_name: str,
-                        user_name: str, status: str, steps: list[dict]) -> None:
-    passed = sum(1 for s in steps if s["status"] == "Passed")
-    # Deliberately "everything that isn't Passed" rather than counting only
-    # a literal "Failed" status - Behave's real per-step statuses include
-    # "passed", "failed", "error" (an uncaught exception, as opposed to a
-    # plain assertion failure - e.g. a Playwright TimeoutError), "skipped",
-    # and "undefined" (a step Behave never even reached, because an
-    # earlier step in the same scenario already failed/errored). Counting
-    # only "Failed" left Error/Undefined/Skipped steps invisible to both
-    # this count and the web UI's pass-rate donut chart - a run where 1
-    # step genuinely errored and the other 94 were never reached (all
-    # "Undefined") was being reported as "6 passed, 0 failed" and a
-    # misleading 100% pass rate, instead of the true ~6%.
-    failed = len(steps) - passed
-    lines = [
-        "=" * 72,
-        "AI TEST RECORDER - EXIT REPORT",
-        "=" * 72,
-        f"Transaction ID : {transaction_id}",
-        f"Recording      : {recording_name}",
-        f"Run by         : {user_name}",
-        f"Run at (UTC)   : {datetime.utcnow().isoformat(timespec='seconds')}",
-        f"Overall Status : {status}",
-        "-" * 72,
-        f"{'#':<4}{'Playwright Step':<50}{'Status':<10}",
-        "-" * 72,
-    ]
-    for i, s in enumerate(steps, start=1):
-        lines.append(f"{i:<4}{s['step_name'][:48]:<50}{s['status']:<10}")
-        if s.get("error_message"):
-            lines.append(f"     -> ERROR: {s['error_message']}")
-    lines += [
-        "-" * 72,
-        f"Passed: {passed}   Failed: {failed}   Total: {len(steps)}",
-        "=" * 72,
-    ]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines))
-
-
-def run_recording(recording_file: str, user_id: int, headless: bool = False,
-                   output_dir: Optional[str] = None, mask_passwords: bool = True,
-                   execute_fn=None) -> dict:
-    """Run one saved recording and return its exit report as a dict.
-
-    Raises FileNotFoundError / ValueError for bad input (missing recording,
-    unknown or Inactive user) before anything is written to disk. `user_id`
-    is still validated against the Users table (auth data, stays in the
-    DB) - only the resulting transaction/files/step-log record is written
-    to transactions/ instead of the database.
-
-    `output_dir`: defaults to a fresh output/runs/<transaction_id>/
-    subfolder (computed below, once the transaction id is known) rather
-    than the shared "output/" - so two people running recordings at the
-    same time (or the live-recording flow's own per-session folder, see
-    backend/recording_sessions.py) never clobber each other's generated
-    feature/steps/page files. Pass an explicit output_dir to opt back into
-    the old shared-folder behavior (e.g. scripting/CLI use where nothing
-    else could possibly be running concurrently).
-
-    `execute_fn`: optional `(output_dir: str, headless: bool) -> dict`
-    returning `{"returncode", "stdout", "stderr", "json"}` - defaults to
-    the local `_run_behave_json` (server-side execution) if not given.
-    backend/api.py passes a function that delegates to a connected desktop
-    agent instead (see local_agent/execution_manager.py's
-    run_test_with_json_report, which returns the exact same shape) - this
-    function itself doesn't need to know or care which one actually ran;
-    everything downstream (step extraction, the exit report, the
-    transaction record) is identical either way.
-    """
-    init_db()
-
-    rec_path = Path(recording_file)
-    if not rec_path.exists():
-        raise FileNotFoundError(f"Recording not found: {recording_file}")
-    recording = json.loads(rec_path.read_text())
-    recording_name = recording.get("recording_name") or recording.get("recorded_at") or rec_path.stem
-
-    with get_session() as session:
-        user = repo.get_user(session, user_id)
-        if user is None:
-            raise ValueError(f"No such user_id={user_id}")
-        if user.status != "Active":
-            raise ValueError(f"User '{user.name}' is Inactive and cannot run recordings")
-        user_name = user.name
-
-    transaction_id = transaction_store.next_transaction_id()
-    if output_dir is None:
-        output_dir = str(ROOT / "output" / "runs" / str(transaction_id))
-    files: list[dict] = [{"file_name": rec_path.name, "folder_path": str(rec_path.parent.resolve())}]
-
-    # ---- regenerate feature/steps/page files from the saved recording ----
+def _make_heal_callback():
     llm = get_llm()
-    build_result = build_artifacts(recording, llm=llm, output_dir=output_dir, mask_passwords=mask_passwords)
 
-    for key in ("feature_file", "steps_file", "page_file", "locators_file", "excel_report"):
-        path = build_result.get(key)
-        if path:
-            p = Path(path)
-            files.append({"file_name": p.name, "folder_path": str(p.parent.resolve())})
+    def heal(element_name, page):
+        if llm is None:
+            return None
+        page_html = page.content()
+        fix = propose_fix(llm, element_name, {"note": "see locators.json for original strategies"}, page_html)
+        if fix and validate_locator(page, fix["strategy"], fix["value"]):
+            print(f"[self-heal] repaired locator for '{element_name}' -> {fix}")
+            return fix
+        return None
 
-    # ---- execute the generated Behave/Playwright suite ----------------------
-    if execute_fn is None:
-        features_dir = Path(output_dir) / "features"
-        run_result = _run_behave_json(features_dir, headless=headless)
-    else:
-        run_result = execute_fn(output_dir, headless)
+    return heal
 
-    screenshots_dir = Path(output_dir) / "screenshots"
-    # Server-direct execution (execute_fn is None) already writes screenshots
-    # straight to screenshots_dir itself - environment.py's after_step hook
-    # runs in THIS process against THIS output_dir, no transfer needed. Agent
-    # -mode execution runs on a completely different machine, so its
-    # screenshots (base64-encoded - see local_agent/execution_manager.py's
-    # run_test_with_json_report) arrive in run_result and need writing out
-    # here before _extract_steps() below can find them.
-    agent_screenshots = run_result.get("screenshots") or {}
-    if agent_screenshots:
+
+def before_all(context):
+    headless = os.getenv("HEADLESS", "false").lower() == "true"
+    context.browser_session = launch_browser(headless=headless)
+    context.raw_page = context.browser_session.new_page()
+    context.page = RecordedPage(context.raw_page, heal_callback=_make_heal_callback())
+    # Capture -> Store -> Reuse: {{username}}/{{application_id}}-style variables
+    # captured during THIS run (see runner/variables.py) - resolved at playback
+    # time from live values, never from the static values baked in when the
+    # recording was made.
+    context.variables = VariableStore()
+
+    # Auto-accept native alert/confirm/prompt/beforeunload dialogs on the
+    # ORIGINAL page - mirrors recorder/recorder.py's own _on_dialog (a
+    # dialog left unhandled suspends the page indefinitely, hanging the run).
+    context.raw_page.on("dialog", lambda dialog: dialog.accept())
+    # Safety net for popups/new tabs/new windows: auto-accepts native
+    # alert/confirm/prompt/beforeunload dialogs on ANY page opened under
+    # this browser context during replay, including ones the generated
+    # steps don't explicitly track via expect_page() (see steps.tmpl's
+    # new_page_wrapper macro) - without this, an unexpected dialog on a
+    # popup would hang the whole run instead of just getting accepted, the
+    # same way the recorder itself auto-accepts them (see
+    # recorder/recorder.py's _on_dialog).
+    context.browser_session.context.on("page", lambda p: p.on("dialog", lambda dialog: dialog.accept()))
+    # Ordered list of every browser tab/window page.tmpl's BasePage.switch_page()
+    # has been pointed at during this run - index 0 is always the original
+    # tab. Generated steps append to this as popups/new tabs/new windows open
+    # (see steps.tmpl's new_page_wrapper macro) and index back into it to
+    # switch tabs/windows (see steps.tmpl's maybe_switch macro).
+    context.recorder_pages = [context.raw_page]
+
+
+def after_all(context):
+    try:
+        context.browser_session.close()
+    except Exception:
+        pass
+
+
+def after_step(context, step):
+    """
+    Screenshots the CURRENTLY ACTIVE page/tab after every step that
+    actually executed (passed, failed, or errored) - not undefined/
+    skipped ones, since nothing ran for those and a screenshot would just
+    show misleadingly stale state left over from whatever came before.
+
+    Saved under output/screenshots/step_<n>.png, where <n> is this
+    scenario's 1-based step position - the SAME position
+    runner/run_recording.py's _extract_steps() assigns each step when it
+    parses behave's own JSON output afterward (both walk the identical,
+    in-order step list Behave produces), so the two line up without
+    needing any extra bookkeeping passed between them. The counter
+    advances for every step Behave attempts, including undefined/skipped
+    ones - only the FILE is skipped for those, keeping the numbering
+    aligned even though there's a gap in which numbers actually exist on
+    disk.
+
+    Wrapped in a broad try/except deliberately: a screenshot failure
+    (the page just closed, crashed, or is mid-navigation) must never mask
+    or interfere with the step's own actual pass/fail result - at worst,
+    this one step's screenshot is silently missing, which the report
+    already handles as a normal case (no screenshot available yet, or
+    ever, for that step).
+    """
+    context.step_counter = getattr(context, "step_counter", 0) + 1
+    status_name = getattr(step.status, "name", str(step.status))
+    if status_name not in ("passed", "failed", "error"):
+        return
+    try:
+        screenshots_dir = _output_dir / "screenshots"
         screenshots_dir.mkdir(parents=True, exist_ok=True)
-        for file_name, b64_data in agent_screenshots.items():
-            try:
-                safe_name = Path(file_name).name  # defense in depth - see uipath_importer's same pattern
-                (screenshots_dir / safe_name).write_bytes(base64.b64decode(b64_data))
-            except Exception:
-                logger.warning(f"Could not decode/save screenshot '{file_name}' from agent response")
-
-    steps = _extract_steps(run_result["json"], screenshots_dir=screenshots_dir if screenshots_dir.is_dir() else None)
-    if screenshots_dir.is_dir():
-        files.append({"file_name": "screenshots", "folder_path": str(screenshots_dir.resolve())})
-
-    if not steps:
-        # Behave never got as far as running a step (e.g. import error,
-        # bad feature file) - log that as a single failed automation entry
-        # instead of silently reporting an empty run.
-        steps = [{
-            "step_name": "Behave execution",
-            "status": "Failed",
-            "error_message": (run_result["stderr"] or run_result["stdout"] or "Behave produced no step results").strip()[:4000],
-        }]
-
-    overall_status = "Success" if run_result["returncode"] == 0 else "Failed"
-
-    # ---- write + log the exit report file ---------------------------------
-    report_path = REPORTS_DIR / f"transaction_{transaction_id}_exit_report.txt"
-    _write_exit_report(report_path, transaction_id, recording_name, user_name, overall_status, steps)
-    files.append({"file_name": report_path.name, "folder_path": str(report_path.parent.resolve())})
-
-    date_time = datetime.utcnow().isoformat()
-    transaction = {
-        "transaction_id": transaction_id,
-        "user_id": user_id,
-        "user": user_name,
-        "transaction_name": recording_name,
-        "status": overall_status,
-        "date_time": date_time,
-        "steps": steps,
-        "step_count": len(steps),
-        "passed_count": sum(1 for s in steps if s["status"] == "Passed"),
-        # See _write_exit_report's comment above - "everything that isn't
-        # Passed", not just a literal "Failed" status, so Error/Undefined/
-        # Skipped steps are correctly reflected in both this count and the
-        # web UI's pass-rate donut chart instead of silently vanishing
-        # from the denominator.
-        "failed_count": len(steps) - sum(1 for s in steps if s["status"] == "Passed"),
-        # Lets the frontend build a download/view request for any given
-        # step's "screenshot" filename (see _extract_steps above) without
-        # having to know or guess this path structure itself - None when
-        # no screenshots exist at all for this run (e.g. a crash before
-        # before_all ever launched a browser).
-        "screenshots_folder": str(screenshots_dir.resolve()) if screenshots_dir.is_dir() else None,
-        "files": files,
-        "raw_output": run_result["stdout"] + "\n" + run_result["stderr"],
-        "report_file": str(report_path),
-    }
-    transaction_store.save_transaction(transaction)
-    return transaction
+        active_page = context.page.page if hasattr(context, "page") and context.page else context.raw_page
+        active_page.screenshot(path=str(screenshots_dir / f"step_{context.step_counter:03d}.png"))
+    except Exception:
+        pass
