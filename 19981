@@ -1,362 +1,325 @@
-import { getToken } from "@/lib/auth-storage";
+import { useEffect, useState } from "react";
+import { recordingsApi } from "@/lib/api";
+import { Panel, Disclosure, Callout, Spinner, Button, Field, TextInput, Select } from "@/components/ui";
 
-export const API_BASE =
-  (process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000").replace(/\/$/, "");
-
-// ws:// (http) or wss:// (https) - mirrors API_BASE's scheme so the live
-// recording view works the same in local dev and behind a TLS-terminating
-// reverse proxy in production, without a separate env var to keep in sync.
-export const WS_BASE = API_BASE.replace(/^http/, "ws");
-
-export class ApiError extends Error {
-  constructor(detail, status) {
-    super(detail);
-    this.detail = detail;
-    this.status = status;
-  }
-}
-
-// Registered by AuthContext so any 401 anywhere (idle timeout, revoked
-// session, expired token, ...) immediately drops the user back to /login
-// instead of leaving them staring at a broken page.
-let unauthorizedHandler = null;
-export function setUnauthorizedHandler(fn) {
-  unauthorizedHandler = fn;
-}
-
-async function request(path, init, { auth = true } = {}) {
-  const headers = { "Content-Type": "application/json", ...(init && init.headers) };
-  if (auth) {
-    const token = getToken();
-    if (token) headers.Authorization = `Bearer ${token}`;
-  }
-
-  let res;
-  try {
-    res = await fetch(`${API_BASE}${path}`, { ...init, headers, cache: "no-store" });
-  } catch (e) {
-    throw new ApiError(`Could not reach the backend at ${API_BASE}. Is it running? (${e.message})`, 0);
-  }
-
-  if (res.status === 401 && auth) {
-    let detail = "Session expired - please log in again.";
-    try {
-      const body = await res.json();
-      detail = body.detail || detail;
-    } catch {
-      /* no body */
-    }
-    if (unauthorizedHandler) unauthorizedHandler(detail);
-    throw new ApiError(detail, 401);
-  }
-
-  if (!res.ok) {
-    let detail = `${res.status} ${res.statusText}`;
-    try {
-      const body = await res.json();
-      detail = body.detail || detail;
-    } catch {
-      /* no body */
-    }
-    throw new ApiError(detail, res.status);
-  }
-
-  const contentType = res.headers.get("content-type") || "";
-  if (res.status === 204) return undefined;
-  if (contentType.includes("text/csv")) return res.text();
-  return res.json();
-}
-
-// ---------------------------------------------------------------------------
-// Auth (no token required for /login)
-// ---------------------------------------------------------------------------
-
-export const authApi = {
-  login: (username, password) =>
-    request("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }, { auth: false }),
-
-  changePassword: (current_password, new_password, confirm_password) =>
-    request("/api/auth/change-password", {
-      method: "POST",
-      body: JSON.stringify({ current_password, new_password, confirm_password }),
-    }),
-
-  logout: () => request("/api/auth/logout", { method: "POST" }),
-
-  me: () => request("/api/auth/me"),
-
-  // SSO - not implemented on the backend yet (see auth/providers.py), but
-  // the plumbing is real: sso_status() tells the login page whether to
-  // treat the "Sign in with SSO" button as live or "coming soon", and
-  // ssoLoginUrl() is where it navigates to once it is.
-  ssoStatus: () => request("/api/auth/sso/status", undefined, { auth: false }),
-  ssoLoginUrl: () => `${API_BASE}/api/auth/sso/login`,
+const ACTION_LABELS = {
+  click: "Click",
+  type: "Type text",
+  select: "Select dropdown option",
+  keypress: "Press a key",
+  delay: "Wait / delay",
+  scroll: "Scroll page",
+  window_closed: "Close current tab/window",
+  assert_text: "Verify text is shown",
+  file_upload: "Upload a file",
+  copy: "Capture a value",
+  ocr_capture: "Capture a value (OCR)",
 };
 
-// ---------------------------------------------------------------------------
-// Profile
-// ---------------------------------------------------------------------------
+// Which fields the Add/Edit form actually needs, per action type - keeps
+// the form from showing a "Value" box for a scroll step or a "Direction"
+// dropdown for a click, which would just be confusing clutter.
+const NEEDS_SELECTOR = new Set(["click", "type", "select", "assert_text", "file_upload", "copy", "ocr_capture"]);
+const NEEDS_VALUE = new Set(["type", "select", "assert_text", "file_upload"]);
 
-export const profileApi = {
-  get: () => request("/api/profile/me"),
-  update: (body) => request("/api/profile/me", { method: "PUT", body: JSON.stringify(body) }),
-  activity: (limit = 100) => request(`/api/profile/activity?limit=${limit}`),
-  exportActivityUrl: () => `${API_BASE}/api/profile/activity/export`,
-};
-
-// ---------------------------------------------------------------------------
-// Admin
-// ---------------------------------------------------------------------------
-
-function toQuery(params) {
-  const qs = new URLSearchParams(
-    Object.fromEntries(Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== ""))
-  ).toString();
-  return qs ? `?${qs}` : "";
+function blankForm() {
+  return {
+    action: "click", label: "", value: "", locators: [], scroll_direction: "down", scroll_amount: 1,
+    delay_seconds: 1, captured_as: "", selectorText: "",
+  };
 }
 
-export const adminApi = {
-  createUser: (body) => request("/api/admin/users", { method: "POST", body: JSON.stringify(body) }),
-  listUsers: (params = {}) => request(`/api/admin/users${toQuery(params)}`),
-  getUser: (id) => request(`/api/admin/users/${id}`),
-  updateUser: (id, body) => request(`/api/admin/users/${id}`, { method: "PUT", body: JSON.stringify(body) }),
-  deleteUser: (id) => request(`/api/admin/users/${id}`, { method: "DELETE" }),
-  resetPassword: (id, temp_password = "") =>
-    request(`/api/admin/users/${id}/reset-password`, { method: "POST", body: JSON.stringify({ temp_password }) }),
+function summarizeLocators(locators) {
+  if (!locators || locators.length === 0) return "(no selector)";
+  const first = locators[0];
+  const extra = locators.length > 1 ? ` (+${locators.length - 1} more)` : "";
+  return `${first.strategy}: ${first.value}${extra}`;
+}
 
-  listSessions: () => request("/api/admin/sessions"),
-  revokeSession: (sessionId) => request(`/api/admin/sessions/${sessionId}/revoke`, { method: "POST" }),
+/**
+ * Lets someone add, delete, reorder, and edit any step in a saved
+ * recording directly - so a small change (a value, a step order, a new
+ * field on the form) doesn't require re-exporting/re-importing the whole
+ * UiPath spreadsheet every time. Selectors are entered the SAME way the
+ * Excel importer reads them - paste a <webctrl .../> snippet and it's
+ * parsed into real locators (see /api/recordings/parse_selector) - so
+ * this doesn't ask anyone to hand-write CSS/XPath.
+ */
+export default function StepEditor({ recordingFile, onSaved }) {
+  const [steps, setSteps] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [loadError, setLoadError] = useState(null);
+  const [notice, setNotice] = useState(null);
 
-  listAgents: () => request("/api/admin/agents"),
-  disconnectAgent: (agentId) => request(`/api/admin/agents/${agentId}/disconnect`, { method: "POST" }),
-  resetAgent: (agentId) => request(`/api/admin/agents/${agentId}/reset`, { method: "POST" }),
+  const [editingIndex, setEditingIndex] = useState(null); // null = closed, -1 = adding, N = editing step N
+  const [form, setForm] = useState(blankForm());
+  const [parsing, setParsing] = useState(false);
+  const [parseNotice, setParseNotice] = useState(null);
 
-  listActivity: (params = {}) => request(`/api/admin/activity${toQuery(params)}`),
-  exportActivityUrl: (params = {}) => `${API_BASE}/api/admin/activity/export${toQuery(params)}`,
+  useEffect(() => {
+    if (recordingFile) load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recordingFile]);
 
-  dashboardStats: () => request("/api/admin/dashboard/stats"),
-};
-
-// ---------------------------------------------------------------------------
-// Recording regeneration - refresh a saved recording's generated
-// feature/steps/page files from its current JSON, without executing
-// anything (see backend/api.py's regenerate_recording).
-// ---------------------------------------------------------------------------
-
-export const recordingsApi = {
-  regenerate: (recording_file) =>
-    request("/api/recordings/regenerate", { method: "POST", body: JSON.stringify({ recording_file }) }),
-
-  // Deliberately NOT using request() above - it always forces
-  // Content-Type: application/json, which would break a multipart file
-  // upload (the browser needs to set that header itself, including the
-  // random boundary string, when the body is a FormData object).
-  async _postMultipart(path, formData) {    const token = getToken();
-    const headers = token ? { Authorization: `Bearer ${token}` } : {};
-
-    let res;
+  async function load() {
+    setLoading(true);
+    setLoadError(null);
+    setEditingIndex(null);
     try {
-      res = await fetch(`${API_BASE}${path}`, { method: "POST", body: formData, headers });
+      const r = await recordingsApi.getSteps(recordingFile);
+      setSteps(r.steps);
     } catch (e) {
-      throw new ApiError(`Could not reach the backend at ${API_BASE}. Is it running? (${e.message})`, 0);
+      setLoadError(e.detail || e.message);
+    } finally {
+      setLoading(false);
     }
+  }
 
-    if (res.status === 401) {
-      let detail = "Session expired - please log in again.";
-      try {
-        detail = (await res.json()).detail || detail;
-      } catch {
-        /* no body */
-      }
-      if (unauthorizedHandler) unauthorizedHandler(detail);
-      throw new ApiError(detail, 401);
-    }
-    if (!res.ok) {
-      let detail = `${res.status} ${res.statusText}`;
-      try {
-        detail = (await res.json()).detail || detail;
-      } catch {
-        /* no body */
-      }
-      throw new ApiError(detail, res.status);
-    }
-    return res.json();
-  },
+  function startAdd() {
+    setForm(blankForm());
+    setParseNotice(null);
+    setEditingIndex(-1);
+  }
 
-  // Lists every sheet name in an uploaded workbook, without importing
-  // anything yet - call this first so the person can choose a specific
-  // sheet, several, or "all of them" (see importUipathExcel below).
-  listUipathSheets(file) {
-    const formData = new FormData();
-    formData.append("file", file);
-    return this._postMultipart("/api/recordings/uipath_sheets", formData);
-  },
+  function startEdit(i) {
+    setForm({ ...blankForm(), ...steps[i], selectorText: "" });
+    setParseNotice(null);
+    setEditingIndex(i);
+  }
 
-  // sheetNames: optional array of sheet names to import, each becoming
-  // its own saved recording (from listUipathSheets above - pass every
-  // name to import "all sheets"). Omit entirely to import just the
-  // workbook's active sheet (a single-sheet file needs no picker step at
-  // all). Always returns {ok, results: [...]}, one entry per sheet
-  // imported (or one entry with sheet_name: null for the omitted case).
-  importUipathExcel(file, recordingName, sheetNames) {
-    const formData = new FormData();
-    formData.append("file", file);
-    if (recordingName) formData.append("recording_name", recordingName);
-    if (sheetNames && sheetNames.length) formData.append("sheet_names", sheetNames.join(","));
-    return this._postMultipart("/api/recordings/import_uipath", formData);
-  },
+  function cancelForm() {
+    setEditingIndex(null);
+  }
 
-  // ---- Step editor (add/delete/reorder/edit any step without re-importing) ----
-  getSteps: (recording_file) => request(`/api/recordings/steps${toQuery({ file: recording_file })}`),
-  updateSteps: (recording_file, steps) =>
-    request(`/api/recordings/steps${toQuery({ file: recording_file })}`, { method: "PUT", body: JSON.stringify({ steps }) }),
-  // Parses a pasted UiPath <webctrl .../> selector snippet into real
-  // locators, reusing the same parser the Excel importer uses - lets the
-  // step editor's Add/Edit form accept the exact selector format already
-  // familiar from the spreadsheet instead of asking for hand-written CSS/XPath.
-  parseSelector: (selector_text) => request("/api/recordings/parse_selector", { method: "POST", body: JSON.stringify({ selector_text }) }),
+  function deleteStep(i) {
+    if (!window.confirm(`Delete step ${i + 1} (${ACTION_LABELS[steps[i].action] || steps[i].action})?`)) return;
+    setSteps(steps.filter((_, idx) => idx !== i));
+    setNotice({ tone: "info", text: 'Step deleted from the list below - click "Save changes" to make it permanent.' });
+  }
 
-  // Downloads one file produced by regenerate() below - reuses the same
-  // fetch-as-blob approach as transactionsApi.downloadFile (a plain <a
-  // href> can't carry the Authorization header this endpoint requires).
-  async downloadRegeneratedFile(path, saveAsName) {
-    const token = getToken();
-    const headers = token ? { Authorization: `Bearer ${token}` } : {};
-    const url = `${API_BASE}/api/recordings/regenerate/download${toQuery({ path })}`;
+  function moveStep(i, delta) {
+    const target = i + delta;
+    if (target < 0 || target >= steps.length) return;
+    const next = [...steps];
+    [next[i], next[target]] = [next[target], next[i]];
+    setSteps(next);
+  }
 
-    let res;
+  async function handleParseSelector() {
+    if (!form.selectorText.trim()) return;
+    setParsing(true);
+    setParseNotice(null);
     try {
-      res = await fetch(url, { headers });
-    } catch (e) {
-      throw new ApiError(`Could not reach the backend at ${API_BASE}. Is it running? (${e.message})`, 0);
-    }
-    if (!res.ok) {
-      let detail = `${res.status} ${res.statusText}`;
-      try {
-        detail = (await res.json()).detail || detail;
-      } catch {
-        /* no body */
+      const r = await recordingsApi.parseSelector(form.selectorText);
+      if (r.locators.length === 0) {
+        setParseNotice({ tone: "error", text: "Could not find a usable selector in that text - check it includes a <webctrl .../> tag." });
+        return;
       }
-      throw new ApiError(detail, res.status);
+      setForm((f) => ({ ...f, locators: r.locators, label: f.label || r.suggested_label }));
+      setParseNotice({ tone: "success", text: `Found ${r.locators.length} locator candidate${r.locators.length > 1 ? "s" : ""} - see below.` });
+    } catch (e) {
+      setParseNotice({ tone: "error", text: e.detail || e.message });
+    } finally {
+      setParsing(false);
     }
-    const blob = await res.blob();
-    const objectUrl = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = objectUrl;
-    a.download = saveAsName || path.split("/").pop();
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(objectUrl);
-  },
-};
+  }
 
-// ---------------------------------------------------------------------------
-// Recorder tool endpoints (unchanged shapes, now all auth-required)
-// ---------------------------------------------------------------------------
+  function saveFormIntoList() {
+    if (NEEDS_SELECTOR.has(form.action) && form.locators.length === 0) {
+      setParseNotice({ tone: "error", text: "This step type needs a selector - paste one above and click \"Parse selector\" first." });
+      return;
+    }
+    const { selectorText, ...stepData } = form;
+    const next = [...steps];
+    if (editingIndex === -1) next.push(stepData);
+    else next[editingIndex] = stepData;
+    setSteps(next);
+    setEditingIndex(null);
+    setNotice({ tone: "info", text: 'Step added to the list below - click "Save changes" to make it permanent.' });
+  }
 
-// ---------------------------------------------------------------------------
-// Local agent (desktop app) - see backend/agent_registry.py
-// ---------------------------------------------------------------------------
-
-export const agentApi = {
-  status: () => request("/api/agent/status"),
-};
-
-export const api = {
-  getApplications: () => request("/api/applications"),
-
-  startRecording: (body) => request("/api/start", { method: "POST", body: JSON.stringify(body) }),
-
-  getStatus: () => request("/api/status"),
-
-  stopAndSave: () => request("/api/stop_and_save", { method: "POST" }),
-
-  // Discards the current recording without saving/generating anything -
-  // for abandoning one mid-flow.
-  stopRecording: () => request("/api/stop", { method: "POST" }),
-
-  runCheck: (headless) => request("/api/run", { method: "POST", body: JSON.stringify({ headless }) }),
-
-  getRecordings: () => request("/api/recordings"),
-
-  // Editable test-data grid shown before running a saved recording (see
-  // generator/test_data.py) - lets a user change typed/selected values
-  // right in the browser instead of downloading the Excel report, editing
-  // it, and re-uploading. Edits persist into the recording file itself.
-  getRecordingTestData: (file) => request(`/api/recordings/data?${new URLSearchParams({ file })}`),
-  updateRecordingTestData: (file, values) =>
-    request(`/api/recordings/data?${new URLSearchParams({ file })}`, {
-      method: "PUT",
-      body: JSON.stringify({ values }),
-    }),
-
-  // No more user_id - a saved recording always runs as whoever is logged in.
-  runRecording: (recording_file, headless) =>
-    request("/api/run_recording", { method: "POST", body: JSON.stringify({ recording_file, headless }) }),
-};
-
-// ---------------------------------------------------------------------------
-// Transaction history ("My Executions") + file/screenshot downloads
-// ---------------------------------------------------------------------------
-
-export const transactionsApi = {
-  list: (params = {}) => request(`/api/transactions${toQuery(params)}`),
-  get: (transactionId) => request(`/api/transactions/${transactionId}`),
-
-  // Fetches a file (a generated artifact, the exit report, a step
-  // screenshot) as a blob and triggers a normal browser download - not a
-  // plain <a href> to the endpoint directly, since that can't carry the
-  // Authorization header this protected endpoint requires; this keeps
-  // auth consistent with every other request in the app (Bearer header,
-  // not a token embedded in the URL where it could end up in browser
-  // history/server logs).
-  async downloadFile(transactionId, fileName, folderPath, saveAsName) {
-    const token = getToken();
-    const headers = token ? { Authorization: `Bearer ${token}` } : {};
-    const url = `${API_BASE}/api/transactions/${transactionId}/download${toQuery({ file_name: fileName, folder_path: folderPath })}`;
-
-    let res;
+  async function saveAll() {
+    setSaving(true);
+    setNotice(null);
     try {
-      res = await fetch(url, { headers });
+      const r = await recordingsApi.updateSteps(recordingFile, steps);
+      setSteps(r.steps);
+      setNotice({ tone: "success", text: `Saved - this recording now has ${r.steps.length} steps.` });
+      if (onSaved) onSaved();
     } catch (e) {
-      throw new ApiError(`Could not reach the backend at ${API_BASE}. Is it running? (${e.message})`, 0);
+      setNotice({ tone: "error", text: e.detail || e.message });
+    } finally {
+      setSaving(false);
     }
-    if (!res.ok) {
-      let detail = `${res.status} ${res.statusText}`;
-      try {
-        detail = (await res.json()).detail || detail;
-      } catch {
-        /* no body */
-      }
-      throw new ApiError(detail, res.status);
-    }
-    const blob = await res.blob();
-    const objectUrl = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = objectUrl;
-    a.download = saveAsName || fileName;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(objectUrl);
-  },
+  }
 
-  // Same fetch-as-blob mechanism as downloadFile, but returns a data: URL
-  // instead of triggering a save - for showing a screenshot inline (an
-  // <img src=...>) rather than downloading it.
-  async fetchImageDataUrl(transactionId, fileName, folderPath) {
-    const token = getToken();
-    const headers = token ? { Authorization: `Bearer ${token}` } : {};
-    const url = `${API_BASE}/api/transactions/${transactionId}/download${toQuery({ file_name: fileName, folder_path: folderPath })}`;
-    const res = await fetch(url, { headers });
-    if (!res.ok) throw new ApiError(`${res.status} ${res.statusText}`, res.status);
-    const blob = await res.blob();
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = reject;
-      reader.readAsDataURL(blob);
-    });
-  },
-};
+  return (
+    <Panel>
+      <div className="px-5 py-4">
+        <Disclosure title="Edit steps" defaultOpen>
+      <div className="space-y-3">
+        <p className="text-xs text-muted">
+          Add, delete, reorder, or edit any step here - changes apply once you click &quot;Save changes&quot; below, no
+          need to re-import the spreadsheet for a small edit.
+        </p>
+
+        {loading && <Spinner label="Loading steps..." />}
+        {loadError && <Callout tone="error">Could not load steps: {loadError}</Callout>}
+
+        {!loading && !loadError && (
+          <>
+            <div className="max-h-96 space-y-1 overflow-y-auto scroll-thin">
+              {steps.map((s, i) => (
+                <div key={i} className="flex items-center gap-2 rounded-sm border border-line bg-panel px-3 py-2">
+                  <span className="w-6 shrink-0 text-xs text-muted">#{i + 1}</span>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm text-ink">
+                      <span className="font-medium">{ACTION_LABELS[s.action] || s.action}</span>
+                      {s.label ? ` — ${s.label}` : ""}
+                      {s.value ? ` = "${s.value}"` : ""}
+                    </div>
+                    {NEEDS_SELECTOR.has(s.action) && (
+                      <div className="truncate font-mono text-xs text-muted">{summarizeLocators(s.locators)}</div>
+                    )}
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <button type="button" className="px-1 text-muted hover:text-ink disabled:opacity-30" disabled={i === 0} onClick={() => moveStep(i, -1)} title="Move up">
+                      ↑
+                    </button>
+                    <button type="button" className="px-1 text-muted hover:text-ink disabled:opacity-30" disabled={i === steps.length - 1} onClick={() => moveStep(i, 1)} title="Move down">
+                      ↓
+                    </button>
+                    <button type="button" className="px-2 text-xs font-medium text-brand-blue hover:underline" onClick={() => startEdit(i)}>
+                      Edit
+                    </button>
+                    <button type="button" className="px-2 text-xs font-medium text-signal-rust hover:underline" onClick={() => deleteStep(i)}>
+                      Delete
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {steps.length === 0 && <p className="px-1 py-3 text-sm text-muted">No steps yet - add one below.</p>}
+            </div>
+
+            {editingIndex === null && (
+              <Button variant="secondary" onClick={startAdd} className="w-full">
+                + Add step
+              </Button>
+            )}
+
+            {editingIndex !== null && (
+              <div className="space-y-3 rounded-sm border border-brand-blue/30 bg-brand-blueLight/40 p-3">
+                <h4 className="text-sm font-semibold text-ink">{editingIndex === -1 ? "Add a step" : `Edit step ${editingIndex + 1}`}</h4>
+
+                <Field label="Action">
+                  <Select value={form.action} onChange={(e) => setForm((f) => ({ ...f, action: e.target.value }))}>
+                    {Object.entries(ACTION_LABELS).map(([value, label]) => (
+                      <option key={value} value={value}>
+                        {label}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+
+                <Field label="Label (for your own reference)">
+                  <TextInput value={form.label} onChange={(e) => setForm((f) => ({ ...f, label: e.target.value }))} placeholder="e.g. Submit button" />
+                </Field>
+
+                {NEEDS_VALUE.has(form.action) && (
+                  <Field label={form.action === "file_upload" ? "File name (must exist in output/fixtures/)" : form.action === "assert_text" ? "Text expected to appear" : "Value"}>
+                    <TextInput value={form.value || ""} onChange={(e) => setForm((f) => ({ ...f, value: e.target.value }))} />
+                  </Field>
+                )}
+
+                {(form.action === "copy" || form.action === "ocr_capture") && (
+                  <Field label="Variable name" hint="Reuse this later as {{name}} in another step's value.">
+                    <TextInput value={form.captured_as || ""} onChange={(e) => setForm((f) => ({ ...f, captured_as: e.target.value }))} />
+                  </Field>
+                )}
+
+                {form.action === "delay" && (
+                  <Field label="Seconds to wait">
+                    <TextInput
+                      type="number"
+                      min="0"
+                      step="0.5"
+                      value={form.delay_seconds}
+                      onChange={(e) => setForm((f) => ({ ...f, delay_seconds: parseFloat(e.target.value) || 0 }))}
+                    />
+                  </Field>
+                )}
+
+                {form.action === "scroll" && (
+                  <div className="grid grid-cols-2 gap-3">
+                    <Field label="Direction">
+                      <Select value={form.scroll_direction} onChange={(e) => setForm((f) => ({ ...f, scroll_direction: e.target.value }))}>
+                        <option value="down">Down</option>
+                        <option value="up">Up</option>
+                      </Select>
+                    </Field>
+                    <Field label="Amount">
+                      <TextInput
+                        type="number"
+                        min="1"
+                        value={form.scroll_amount}
+                        onChange={(e) => setForm((f) => ({ ...f, scroll_amount: parseInt(e.target.value, 10) || 1 }))}
+                      />
+                    </Field>
+                  </div>
+                )}
+
+                {NEEDS_SELECTOR.has(form.action) && (
+                  <Field
+                    label="Selector"
+                    hint='Paste the same <webctrl .../> snippet UiPath uses (from "present element" in your spreadsheet), then click Parse selector.'
+                  >
+                    <textarea
+                      className="w-full rounded-sm border border-line bg-panel px-3 py-2 font-mono text-xs text-ink placeholder:text-muted focus:border-brand-blue"
+                      rows={3}
+                      value={form.selectorText}
+                      onChange={(e) => setForm((f) => ({ ...f, selectorText: e.target.value }))}
+                      placeholder="<html app='msedge.exe' />&#10;<webctrl id='username' tag='INPUT' />"
+                    />
+                    <div className="mt-1.5 flex items-center gap-2">
+                      <Button variant="secondary" onClick={handleParseSelector} disabled={parsing || !form.selectorText.trim()}>
+                        {parsing ? "Parsing..." : "Parse selector"}
+                      </Button>
+                      {form.locators.length > 0 && (
+                        <span className="font-mono text-xs text-muted">Current: {summarizeLocators(form.locators)}</span>
+                      )}
+                    </div>
+                    {parseNotice && (
+                      <div className="mt-1.5">
+                        <Callout tone={parseNotice.tone}>{parseNotice.text}</Callout>
+                      </div>
+                    )}
+                  </Field>
+                )}
+
+                <div className="flex gap-2">
+                  <Button onClick={saveFormIntoList}>{editingIndex === -1 ? "Add to list" : "Update step"}</Button>
+                  <Button variant="secondary" onClick={cancelForm}>
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            <div className="flex items-center gap-2 border-t border-line pt-3">
+              <Button onClick={saveAll} disabled={saving}>
+                {saving ? "Saving..." : "Save changes"}
+              </Button>
+              <Button variant="secondary" onClick={load} disabled={saving}>
+                Discard &amp; reload
+              </Button>
+            </div>
+            {notice && <Callout tone={notice.tone}>{notice.text}</Callout>}
+          </>
+        )}
+      </div>
+        </Disclosure>
+      </div>
+    </Panel>
+  );
+}
