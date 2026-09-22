@@ -1,325 +1,458 @@
 import { useEffect, useState } from "react";
+import { api } from "@/lib/api";
 import { recordingsApi } from "@/lib/api";
-import { Panel, Disclosure, Callout, Spinner, Button, Field, TextInput, Select } from "@/components/ui";
+import ReportView from "@/components/ReportView";
+import StepEditor from "@/components/StepEditor";
+import { useAuth } from "@/context/AuthContext";
+import { buildReportText, buildReportHtml, downloadBlob, openReportInBrowser } from "@/lib/report";
+import { ReportDonut, StepSequenceBar } from "@/components/ReportCharts";
+import {
+  Button,
+  Callout,
+  Checkbox,
+  DataTable,
+  Disclosure,
+  Field,
+  Metric,
+  Panel,
+  PanelHeader,
+  Select,
+  Spinner,
+  StatusBadge,
+  TextInput,
+} from "@/components/ui";
 
-const ACTION_LABELS = {
-  click: "Click",
-  type: "Type text",
-  select: "Select dropdown option",
-  keypress: "Press a key",
-  delay: "Wait / delay",
-  scroll: "Scroll page",
-  window_closed: "Close current tab/window",
-  assert_text: "Verify text is shown",
-  file_upload: "Upload a file",
-  copy: "Capture a value",
-  ocr_capture: "Capture a value (OCR)",
-};
+export default function RunSavedTab() {
+  const { user } = useAuth();
 
-// Which fields the Add/Edit form actually needs, per action type - keeps
-// the form from showing a "Value" box for a scroll step or a "Direction"
-// dropdown for a click, which would just be confusing clutter.
-const NEEDS_SELECTOR = new Set(["click", "type", "select", "assert_text", "file_upload", "copy", "ocr_capture"]);
-const NEEDS_VALUE = new Set(["type", "select", "assert_text", "file_upload"]);
+  const [recordings, setRecordings] = useState([]);
+  const [recordingsError, setRecordingsError] = useState(null);
+  const [selectedRecFile, setSelectedRecFile] = useState("");
+  const [runHeadless, setRunHeadless] = useState(false);
 
-function blankForm() {
-  return {
-    action: "click", label: "", value: "", locators: [], scroll_direction: "down", scroll_amount: 1,
-    delay_seconds: 1, captured_as: "", selectorText: "",
-  };
-}
+  // ---- test data (editable, shown before running - see generator/test_data.py) ----
+  const [testData, setTestData] = useState([]);
+  const [testDataLoading, setTestDataLoading] = useState(false);
+  const [testDataError, setTestDataError] = useState(null);
+  const [editValues, setEditValues] = useState({}); // { [action index]: current input value }
+  const [savingData, setSavingData] = useState(false);
+  const [saveDataNotice, setSaveDataNotice] = useState(null);
+  const [saveDataError, setSaveDataError] = useState(null);
 
-function summarizeLocators(locators) {
-  if (!locators || locators.length === 0) return "(no selector)";
-  const first = locators[0];
-  const extra = locators.length > 1 ? ` (+${locators.length - 1} more)` : "";
-  return `${first.strategy}: ${first.value}${extra}`;
-}
+  const [runBusy, setRunBusy] = useState(false);
+  const [runError, setRunError] = useState(null);
+  const [report, setReport] = useState(null);
 
-/**
- * Lets someone add, delete, reorder, and edit any step in a saved
- * recording directly - so a small change (a value, a step order, a new
- * field on the form) doesn't require re-exporting/re-importing the whole
- * UiPath spreadsheet every time. Selectors are entered the SAME way the
- * Excel importer reads them - paste a <webctrl .../> snippet and it's
- * parsed into real locators (see /api/recordings/parse_selector) - so
- * this doesn't ask anyone to hand-write CSS/XPath.
- */
-export default function StepEditor({ recordingFile, onSaved }) {
-  const [steps, setSteps] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [loadError, setLoadError] = useState(null);
-  const [notice, setNotice] = useState(null);
+  const [regenBusy, setRegenBusy] = useState(false);
+  const [regenNotice, setRegenNotice] = useState(null);
+  const [regenFiles, setRegenFiles] = useState(null); // {feature_file, steps_file, page_file, locators_file} | null
+  const [downloadingRegen, setDownloadingRegen] = useState(null);
 
-  const [editingIndex, setEditingIndex] = useState(null); // null = closed, -1 = adding, N = editing step N
-  const [form, setForm] = useState(blankForm());
-  const [parsing, setParsing] = useState(false);
-  const [parseNotice, setParseNotice] = useState(null);
+  const [importBusy, setImportBusy] = useState(false);
+  const [importNotice, setImportNotice] = useState(null);
+  const [importFile, setImportFile] = useState(null);
+  const [importName, setImportName] = useState("");
+  const [importSheets, setImportSheets] = useState(null); // null = not checked yet; [] = single-sheet file, no picker needed
+  const [importSheetsLoading, setImportSheetsLoading] = useState(false);
+  const [selectedSheets, setSelectedSheets] = useState([]);
+
+  // (screenshot modal / download state now lives inside ReportView.js itself)
+
+  async function loadRecordings() {
+    try {
+      const r = await api.getRecordings();
+      setRecordings(r);
+      setRecordingsError(null);
+      if (r.length && !selectedRecFile) setSelectedRecFile(r[0].file);
+    } catch (e) {
+      setRecordingsError(e.detail || e.message);
+    }
+  }
 
   useEffect(() => {
-    if (recordingFile) load();
+    loadRecordings();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [recordingFile]);
+  }, []);
 
-  async function load() {
-    setLoading(true);
-    setLoadError(null);
-    setEditingIndex(null);
+  async function loadTestData(file) {
+    setTestDataLoading(true);
+    setTestDataError(null);
+    setSaveDataNotice(null);
+    setSaveDataError(null);
     try {
-      const r = await recordingsApi.getSteps(recordingFile);
-      setSteps(r.steps);
+      const data = await api.getRecordingTestData(file);
+      setTestData(data.fields);
+      setEditValues(Object.fromEntries(data.fields.map((f) => [f.index, f.value])));
     } catch (e) {
-      setLoadError(e.detail || e.message);
+      setTestData([]);
+      setEditValues({});
+      setTestDataError(e.detail || e.message);
     } finally {
-      setLoading(false);
+      setTestDataLoading(false);
     }
   }
 
-  function startAdd() {
-    setForm(blankForm());
-    setParseNotice(null);
-    setEditingIndex(-1);
+  useEffect(() => {
+    setReport(null); // a different recording's exit report shouldn't linger once you switch
+    setRegenNotice(null);
+    setRegenFiles(null);
+    if (selectedRecFile) loadTestData(selectedRecFile);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedRecFile]);
+
+  function updateValue(index, value) {
+    setEditValues((prev) => ({ ...prev, [index]: value }));
+    setSaveDataNotice(null);
   }
 
-  function startEdit(i) {
-    setForm({ ...blankForm(), ...steps[i], selectorText: "" });
-    setParseNotice(null);
-    setEditingIndex(i);
-  }
-
-  function cancelForm() {
-    setEditingIndex(null);
-  }
-
-  function deleteStep(i) {
-    if (!window.confirm(`Delete step ${i + 1} (${ACTION_LABELS[steps[i].action] || steps[i].action})?`)) return;
-    setSteps(steps.filter((_, idx) => idx !== i));
-    setNotice({ tone: "info", text: 'Step deleted from the list below - click "Save changes" to make it permanent.' });
-  }
-
-  function moveStep(i, delta) {
-    const target = i + delta;
-    if (target < 0 || target >= steps.length) return;
-    const next = [...steps];
-    [next[i], next[target]] = [next[target], next[i]];
-    setSteps(next);
-  }
-
-  async function handleParseSelector() {
-    if (!form.selectorText.trim()) return;
-    setParsing(true);
-    setParseNotice(null);
+  async function saveTestDataOnly() {
+    setSavingData(true);
+    setSaveDataError(null);
+    setSaveDataNotice(null);
     try {
-      const r = await recordingsApi.parseSelector(form.selectorText);
-      if (r.locators.length === 0) {
-        setParseNotice({ tone: "error", text: "Could not find a usable selector in that text - check it includes a <webctrl .../> tag." });
-        return;
+      const data = await api.updateRecordingTestData(selectedRecFile, editValues);
+      setTestData(data.fields);
+      setSaveDataNotice("Test data saved - future runs of this recording will use these values too.");
+    } catch (e) {
+      setSaveDataError(e.detail || e.message);
+    } finally {
+      setSavingData(false);
+    }
+  }
+
+  async function handleRun() {
+    if (!selectedRecFile) return;
+    setRunError(null);
+    setRunBusy(true);
+    try {
+      // Whatever is currently in the grid is what gets run - saved to the
+      // recording first (so it's also the new baseline for next time),
+      // then executed. No separate "save" step required.
+      if (testData.length > 0) {
+        await api.updateRecordingTestData(selectedRecFile, editValues);
       }
-      setForm((f) => ({ ...f, locators: r.locators, label: f.label || r.suggested_label }));
-      setParseNotice({ tone: "success", text: `Found ${r.locators.length} locator candidate${r.locators.length > 1 ? "s" : ""} - see below.` });
+      const r = await api.runRecording(selectedRecFile, runHeadless);
+      setReport(r);
     } catch (e) {
-      setParseNotice({ tone: "error", text: e.detail || e.message });
+      setRunError(e.detail || e.message);
     } finally {
-      setParsing(false);
+      setRunBusy(false);
     }
   }
 
-  function saveFormIntoList() {
-    if (NEEDS_SELECTOR.has(form.action) && form.locators.length === 0) {
-      setParseNotice({ tone: "error", text: "This step type needs a selector - paste one above and click \"Parse selector\" first." });
+  async function handleRegenerate() {
+    if (!selectedRecFile) return;
+    setRegenNotice(null);
+    setRegenFiles(null);
+    setRegenBusy(true);
+    try {
+      const r = await recordingsApi.regenerate(selectedRecFile);
+      setRegenNotice({
+        tone: "success",
+        text: `Regenerated (${r.build_result.step_count} steps) - download the scripts below, or just run this recording, which already uses the current code either way.`,
+      });
+      setRegenFiles({
+        feature_file: r.build_result.feature_file,
+        steps_file: r.build_result.steps_file,
+        page_file: r.build_result.page_file,
+        locators_file: r.build_result.locators_file,
+      });
+    } catch (e) {
+      setRegenNotice({ tone: "error", text: e.detail || e.message });
+    } finally {
+      setRegenBusy(false);
+    }
+  }
+
+  async function handleDownloadRegenFile(path, label) {
+    setDownloadingRegen(path);
+    try {
+      await recordingsApi.downloadRegeneratedFile(path);
+    } catch (e) {
+      setRegenNotice({ tone: "error", text: `Could not download ${label}: ${e.detail || e.message}` });
+    } finally {
+      setDownloadingRegen(null);
+    }
+  }
+
+  async function handleImportFileChosen(file) {
+    setImportFile(file);
+    setImportNotice(null);
+    setImportSheets(null);
+    setSelectedSheets([]);
+    if (!file) return;
+    setImportSheetsLoading(true);
+    try {
+      const r = await recordingsApi.listUipathSheets(file);
+      // A single-sheet workbook needs no picker at all - just import its
+      // one (active) sheet directly, exactly like before this feature
+      // existed. Only a genuinely multi-sheet file shows the checklist.
+      if (r.sheets.length > 1) {
+        setImportSheets(r.sheets);
+        setSelectedSheets(r.sheets); // default to "all sheets" selected - the common case
+      } else {
+        setImportSheets([]);
+      }
+    } catch (e) {
+      setImportNotice({ tone: "error", text: e.detail || e.message });
+      setImportFile(null);
+    } finally {
+      setImportSheetsLoading(false);
+    }
+  }
+
+  function toggleSheetSelection(sheetName) {
+    setSelectedSheets((prev) =>
+      prev.includes(sheetName) ? prev.filter((s) => s !== sheetName) : [...prev, sheetName]
+    );
+  }
+
+  async function handleImportUipath() {
+    if (!importFile) return;
+    if (importSheets && importSheets.length > 0 && selectedSheets.length === 0) {
+      setImportNotice({ tone: "error", text: "Select at least one sheet to import, or use \"Select all\"." });
       return;
     }
-    const { selectorText, ...stepData } = form;
-    const next = [...steps];
-    if (editingIndex === -1) next.push(stepData);
-    else next[editingIndex] = stepData;
-    setSteps(next);
-    setEditingIndex(null);
-    setNotice({ tone: "info", text: 'Step added to the list below - click "Save changes" to make it permanent.' });
-  }
-
-  async function saveAll() {
-    setSaving(true);
-    setNotice(null);
+    setImportNotice(null);
+    setImportBusy(true);
     try {
-      const r = await recordingsApi.updateSteps(recordingFile, steps);
-      setSteps(r.steps);
-      setNotice({ tone: "success", text: `Saved - this recording now has ${r.steps.length} steps.` });
-      if (onSaved) onSaved();
+      const r = await recordingsApi.importUipathExcel(importFile, importName, selectedSheets.length ? selectedSheets : undefined);
+      const succeeded = r.results.filter((res) => !res.error);
+      const failed = r.results.filter((res) => res.error);
+      const totalWarnings = succeeded.reduce((n, res) => n + res.warnings.length, 0);
+
+      const parts = [];
+      if (succeeded.length) {
+        const label = succeeded.length === 1 ? "1 recording" : `${succeeded.length} recordings`;
+        parts.push(`Imported ${label} from ${importFile.name}${totalWarnings ? ` (${totalWarnings} warning${totalWarnings > 1 ? "s" : ""} - check each recording's steps)` : ""}.`);
+      }
+      if (failed.length) {
+        parts.push(`${failed.length} sheet${failed.length > 1 ? "s" : ""} could not be imported: ${failed.map((f) => `${f.sheet_name || "sheet"} (${f.error})`).join("; ")}.`);
+      }
+      setImportNotice({
+        tone: failed.length && !succeeded.length ? "error" : failed.length || totalWarnings ? "warning" : "success",
+        text: parts.join(" "),
+      });
+      setImportFile(null);
+      setImportName("");
+      setImportSheets(null);
+      setSelectedSheets([]);
+      await loadRecordings();
+      if (succeeded.length) setSelectedRecFile(succeeded[0].recording_file);
     } catch (e) {
-      setNotice({ tone: "error", text: e.detail || e.message });
+      setImportNotice({ tone: "error", text: e.detail || e.message });
     } finally {
-      setSaving(false);
+      setImportBusy(false);
     }
   }
 
   return (
-    <Panel>
-      <div className="px-5 py-4">
-        <Disclosure title="Edit steps" defaultOpen>
-      <div className="space-y-3">
-        <p className="text-xs text-muted">
-          Add, delete, reorder, or edit any step here - changes apply once you click &quot;Save changes&quot; below, no
-          need to re-import the spreadsheet for a small edit.
-        </p>
+    <div className="grid min-w-0 gap-6 lg:grid-cols-[360px_1fr]">
+      <Panel>
+        <PanelHeader title="Run a saved recording" caption="Pick a recording, review/edit its test data, then run it." />
+        <div className="space-y-4 px-5 py-5">
+          <Callout>
+            Running as <strong>{user?.first_name} {user?.last_name}</strong> ({user?.username}). Every run is logged
+            against your account.
+          </Callout>
 
-        {loading && <Spinner label="Loading steps..." />}
-        {loadError && <Callout tone="error">Could not load steps: {loadError}</Callout>}
+          <Disclosure title="Import from a UiPath Excel sheet">
+            <div className="space-y-3">
+              <p className="text-xs text-muted">
+                Upload a spreadsheet with Steps / NAME / Action-Method / present element / input columns - it's
+                converted into a saved recording here, ready to run or regenerate like any other. A workbook with
+                several sheets (e.g. one per test case) lets you pick which to import below.
+              </p>
+              <Field label="Excel file (.xlsx)">
+                <input
+                  type="file"
+                  accept=".xlsx,.xlsm"
+                  onChange={(e) => handleImportFileChosen(e.target.files?.[0] || null)}
+                  className="block w-full text-sm text-ink file:mr-3 file:rounded-sm file:border-0 file:bg-rail file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-ink hover:file:bg-line"
+                />
+              </Field>
 
-        {!loading && !loadError && (
-          <>
-            <div className="max-h-96 space-y-1 overflow-y-auto scroll-thin">
-              {steps.map((s, i) => (
-                <div key={i} className="flex items-center gap-2 rounded-sm border border-line bg-panel px-3 py-2">
-                  <span className="w-6 shrink-0 text-xs text-muted">#{i + 1}</span>
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-sm text-ink">
-                      <span className="font-medium">{ACTION_LABELS[s.action] || s.action}</span>
-                      {s.label ? ` — ${s.label}` : ""}
-                      {s.value ? ` = "${s.value}"` : ""}
+              {importSheetsLoading && <Spinner label="Checking sheets in this file..." />}
+
+              {importSheets && importSheets.length > 0 && (
+                <div className="border border-line bg-rail px-3 py-2.5">
+                  <div className="mb-1.5 flex items-center justify-between">
+                    <span className="text-xs font-medium text-ink">
+                      This file has {importSheets.length} sheets - pick which to import as separate recordings:
+                    </span>
+                    <div className="flex gap-2 text-xs">
+                      <button type="button" className="text-brand-blue hover:underline" onClick={() => setSelectedSheets(importSheets)}>
+                        Select all
+                      </button>
+                      <button type="button" className="text-brand-blue hover:underline" onClick={() => setSelectedSheets([])}>
+                        Select none
+                      </button>
                     </div>
-                    {NEEDS_SELECTOR.has(s.action) && (
-                      <div className="truncate font-mono text-xs text-muted">{summarizeLocators(s.locators)}</div>
-                    )}
                   </div>
-                  <div className="flex shrink-0 items-center gap-1">
-                    <button type="button" className="px-1 text-muted hover:text-ink disabled:opacity-30" disabled={i === 0} onClick={() => moveStep(i, -1)} title="Move up">
-                      ↑
-                    </button>
-                    <button type="button" className="px-1 text-muted hover:text-ink disabled:opacity-30" disabled={i === steps.length - 1} onClick={() => moveStep(i, 1)} title="Move down">
-                      ↓
-                    </button>
-                    <button type="button" className="px-2 text-xs font-medium text-brand-blue hover:underline" onClick={() => startEdit(i)}>
-                      Edit
-                    </button>
-                    <button type="button" className="px-2 text-xs font-medium text-signal-rust hover:underline" onClick={() => deleteStep(i)}>
-                      Delete
-                    </button>
-                  </div>
-                </div>
-              ))}
-              {steps.length === 0 && <p className="px-1 py-3 text-sm text-muted">No steps yet - add one below.</p>}
-            </div>
-
-            {editingIndex === null && (
-              <Button variant="secondary" onClick={startAdd} className="w-full">
-                + Add step
-              </Button>
-            )}
-
-            {editingIndex !== null && (
-              <div className="space-y-3 rounded-sm border border-brand-blue/30 bg-brand-blueLight/40 p-3">
-                <h4 className="text-sm font-semibold text-ink">{editingIndex === -1 ? "Add a step" : `Edit step ${editingIndex + 1}`}</h4>
-
-                <Field label="Action">
-                  <Select value={form.action} onChange={(e) => setForm((f) => ({ ...f, action: e.target.value }))}>
-                    {Object.entries(ACTION_LABELS).map(([value, label]) => (
-                      <option key={value} value={value}>
-                        {label}
-                      </option>
-                    ))}
-                  </Select>
-                </Field>
-
-                <Field label="Label (for your own reference)">
-                  <TextInput value={form.label} onChange={(e) => setForm((f) => ({ ...f, label: e.target.value }))} placeholder="e.g. Submit button" />
-                </Field>
-
-                {NEEDS_VALUE.has(form.action) && (
-                  <Field label={form.action === "file_upload" ? "File name (must exist in output/fixtures/)" : form.action === "assert_text" ? "Text expected to appear" : "Value"}>
-                    <TextInput value={form.value || ""} onChange={(e) => setForm((f) => ({ ...f, value: e.target.value }))} />
-                  </Field>
-                )}
-
-                {(form.action === "copy" || form.action === "ocr_capture") && (
-                  <Field label="Variable name" hint="Reuse this later as {{name}} in another step's value.">
-                    <TextInput value={form.captured_as || ""} onChange={(e) => setForm((f) => ({ ...f, captured_as: e.target.value }))} />
-                  </Field>
-                )}
-
-                {form.action === "delay" && (
-                  <Field label="Seconds to wait">
-                    <TextInput
-                      type="number"
-                      min="0"
-                      step="0.5"
-                      value={form.delay_seconds}
-                      onChange={(e) => setForm((f) => ({ ...f, delay_seconds: parseFloat(e.target.value) || 0 }))}
-                    />
-                  </Field>
-                )}
-
-                {form.action === "scroll" && (
-                  <div className="grid grid-cols-2 gap-3">
-                    <Field label="Direction">
-                      <Select value={form.scroll_direction} onChange={(e) => setForm((f) => ({ ...f, scroll_direction: e.target.value }))}>
-                        <option value="down">Down</option>
-                        <option value="up">Up</option>
-                      </Select>
-                    </Field>
-                    <Field label="Amount">
-                      <TextInput
-                        type="number"
-                        min="1"
-                        value={form.scroll_amount}
-                        onChange={(e) => setForm((f) => ({ ...f, scroll_amount: parseInt(e.target.value, 10) || 1 }))}
+                  <div className="max-h-40 space-y-1 overflow-y-auto">
+                    {importSheets.map((sheet) => (
+                      <Checkbox
+                        key={sheet}
+                        label={sheet}
+                        checked={selectedSheets.includes(sheet)}
+                        onChange={() => toggleSheetSelection(sheet)}
                       />
-                    </Field>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <Field label={importSheets && importSheets.length > 0 ? "Name prefix for these recordings (optional)" : "Name this recording (optional)"}>
+                <TextInput
+                  value={importName}
+                  onChange={(e) => setImportName(e.target.value)}
+                  placeholder="e.g. LLMS Lite MCC Flow"
+                />
+              </Field>
+              <Button variant="secondary" onClick={handleImportUipath} disabled={!importFile || importBusy || importSheetsLoading} className="w-full">
+                {importBusy
+                  ? "Importing..."
+                  : importSheets && importSheets.length > 0
+                  ? `Import ${selectedSheets.length} sheet${selectedSheets.length === 1 ? "" : "s"}`
+                  : "Import"}
+              </Button>
+              {importNotice && <Callout tone={importNotice.tone}>{importNotice.text}</Callout>}
+            </div>
+          </Disclosure>
+
+          {recordingsError && <Callout tone="error">Could not load recordings: {recordingsError}</Callout>}
+
+          {recordings.length === 0 ? (
+            <Callout>No saved recordings found yet. Record one in the &ldquo;Record &amp; Generate&rdquo; tab first.</Callout>
+          ) : (
+            <>
+              <Field label="Saved recording">
+                <Select value={selectedRecFile} onChange={(e) => setSelectedRecFile(e.target.value)}>
+                  {recordings.map((r) => (
+                    <option key={r.file} value={r.file}>
+                      {r.name} — {r.target_url} ({r.action_count} actions)
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+
+              <Checkbox label="headless" checked={runHeadless} onChange={setRunHeadless} />
+
+              <Button onClick={handleRun} disabled={runBusy} className="w-full">
+                {runBusy ? "Running..." : "Run recording"}
+              </Button>
+
+              {runBusy && <Spinner label="Running the saved recording..." />}
+              {runError && <Callout tone="error">Run failed: {runError}</Callout>}
+
+              <div className="border-t border-line pt-4">
+                <Button variant="secondary" onClick={handleRegenerate} disabled={regenBusy} className="w-full">
+                  {regenBusy ? "Regenerating..." : "Regenerate (no run)"}
+                </Button>
+                <p className="mt-1.5 text-xs text-muted">
+                  Refreshes this recording's generated feature/steps/page files from the latest generator code -
+                  without re-recording or running anything. Useful right after a code/template fix, to confirm it
+                  applies here.
+                </p>
+                {regenNotice && (
+                  <div className="mt-2">
+                    <Callout tone={regenNotice.tone}>{regenNotice.text}</Callout>
                   </div>
                 )}
-
-                {NEEDS_SELECTOR.has(form.action) && (
-                  <Field
-                    label="Selector"
-                    hint='Paste the same <webctrl .../> snippet UiPath uses (from "present element" in your spreadsheet), then click Parse selector.'
-                  >
-                    <textarea
-                      className="w-full rounded-sm border border-line bg-panel px-3 py-2 font-mono text-xs text-ink placeholder:text-muted focus:border-brand-blue"
-                      rows={3}
-                      value={form.selectorText}
-                      onChange={(e) => setForm((f) => ({ ...f, selectorText: e.target.value }))}
-                      placeholder="<html app='msedge.exe' />&#10;<webctrl id='username' tag='INPUT' />"
-                    />
-                    <div className="mt-1.5 flex items-center gap-2">
-                      <Button variant="secondary" onClick={handleParseSelector} disabled={parsing || !form.selectorText.trim()}>
-                        {parsing ? "Parsing..." : "Parse selector"}
-                      </Button>
-                      {form.locators.length > 0 && (
-                        <span className="font-mono text-xs text-muted">Current: {summarizeLocators(form.locators)}</span>
-                      )}
-                    </div>
-                    {parseNotice && (
-                      <div className="mt-1.5">
-                        <Callout tone={parseNotice.tone}>{parseNotice.text}</Callout>
-                      </div>
+                {regenFiles && (
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {[
+                      { path: regenFiles.feature_file, label: "Feature file" },
+                      { path: regenFiles.steps_file, label: "Steps (.py)" },
+                      { path: regenFiles.page_file, label: "Page object (.py)" },
+                      { path: regenFiles.locators_file, label: "Locators (.json)" },
+                    ].map(
+                      ({ path, label }) =>
+                        path && (
+                          <button
+                            key={path}
+                            type="button"
+                            className="rounded-sm border border-line bg-panel px-2.5 py-1 text-xs font-medium text-brand-blue hover:border-brand-blue/40 disabled:opacity-40"
+                            disabled={downloadingRegen === path}
+                            onClick={() => handleDownloadRegenFile(path, label)}
+                          >
+                            {downloadingRegen === path ? "Downloading..." : `⬇ ${label}`}
+                          </button>
+                        )
                     )}
-                  </Field>
+                  </div>
                 )}
-
-                <div className="flex gap-2">
-                  <Button onClick={saveFormIntoList}>{editingIndex === -1 ? "Add to list" : "Update step"}</Button>
-                  <Button variant="secondary" onClick={cancelForm}>
-                    Cancel
-                  </Button>
-                </div>
               </div>
-            )}
+            </>
+          )}
+        </div>
+      </Panel>
 
-            <div className="flex items-center gap-2 border-t border-line pt-3">
-              <Button onClick={saveAll} disabled={saving}>
-                {saving ? "Saving..." : "Save changes"}
-              </Button>
-              <Button variant="secondary" onClick={load} disabled={saving}>
-                Discard &amp; reload
-              </Button>
+      <div className="min-w-0 space-y-4">
+        {selectedRecFile && (
+          <Panel>
+            <div className="flex items-center justify-between border-b border-line px-5 py-4">
+              <div>
+                <h2 className="text-sm font-semibold text-ink">Test data</h2>
+                <p className="mt-0.5 text-xs text-muted">
+                  The values this recording types/selects when it runs. Edit anything below, then hit{" "}
+                  <strong>Run recording</strong> - no need to download or re-upload the Excel report; changes save
+                  straight into this recording.
+                </p>
+              </div>
+              {testData.length > 0 && (
+                <Button variant="secondary" onClick={saveTestDataOnly} disabled={savingData}>
+                  {savingData ? "Saving..." : "Save without running"}
+                </Button>
+              )}
             </div>
-            {notice && <Callout tone={notice.tone}>{notice.text}</Callout>}
-          </>
+            <div className="px-5 py-4">
+              {testDataLoading && <Spinner label="Loading test data..." />}
+              {testDataError && <Callout tone="error">{testDataError}</Callout>}
+              {saveDataError && <Callout tone="error">{saveDataError}</Callout>}
+              {saveDataNotice && <Callout tone="success">{saveDataNotice}</Callout>}
+
+              {!testDataLoading && !testDataError && testData.length === 0 && (
+                <p className="text-sm text-muted">
+                  This recording has no typed or selected values to edit (e.g. it's clicks/navigation only).
+                </p>
+              )}
+
+              {testData.length > 0 && (
+                <DataTable
+                  columns={[
+                    { key: "label", label: "Field" },
+                    { key: "action", label: "Type", mono: true },
+                    { key: "value", label: "Value" },
+                  ]}
+                  rows={testData.map((f) => ({
+                    label: f.label,
+                    action: f.action,
+                    value: (
+                      <TextInput
+                        value={editValues[f.index] ?? ""}
+                        onChange={(e) => updateValue(f.index, e.target.value)}
+                      />
+                    ),
+                  }))}
+                />
+              )}
+            </div>
+          </Panel>
+        )}
+
+        {selectedRecFile && <StepEditor recordingFile={selectedRecFile} onSaved={() => loadTestData(selectedRecFile)} />}
+
+        {report && <ReportView key={report.transaction_id} report={report} />}
+
+        {!selectedRecFile && (
+          <Panel>
+            <div className="px-5 py-10 text-center text-sm text-muted">
+              Pick a saved recording to review its test data and run it.
+            </div>
+          </Panel>
         )}
       </div>
-        </Disclosure>
-      </div>
-    </Panel>
+    </div>
   );
 }
