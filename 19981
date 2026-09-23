@@ -1,256 +1,161 @@
 """
-Shared OCR helper, used at BOTH:
-  - RECORD time (recorder/recorder.py, when the user right-clicks an
-    element on the page and chooses "Capture text with OCR" from the
-    custom menu injected by recorder_injector.js)
-  - REPLAY time (generator/templates/page.tmpl's
-    BasePage.capture_value_ocr, called from the generated step - see
-    generator/templates/steps.tmpl's "ocr_capture" branch; also
-    BasePage._ocr_click_fallback - a last-resort locator strategy for
-    click() when every DOM candidate fails - and
-    BasePage.assert_ocr_text_visible - a page-level OCR/visual
-    assertion, with no DOM element involved at all)
+Turns raw "copy"/"paste" actions captured by the injected JS (see
+recorder/recorder_injector.js's copy/cut/paste listeners) into the
+Capture -> Store -> Reuse variable pipeline:
 
-One implementation, so every caller always extracts text the exact same
-way - and critically, REPLAY re-runs the OCR live every single time the
-test executes (a fresh screenshot, fresh OCR pass) rather than reusing
-whatever text was read during recording, the same way a plain
-copy-captured value is re-read live rather than hard-coded (see
-recorder/variable_capture.py's module docstring) - these are usually
-values the application generates fresh each run (a new application
-number, a new reference ID rendered into an image/canvas rather than
-real DOM text), so baking in the recording-time value would make the
-generated test increasingly wrong over time.
+  1. A "copy" action's source field gets a stable {{name}} placeholder
+     derived from its label, e.g. a field labeled "Generated Username"
+     becomes {{username}}, "Generated Application ID" becomes
+     {{application_id}}.
+  2. Any LATER "paste" (or manually retyped "type") action whose recorded
+     value exactly matches a previously copied value is tagged with that
+     same placeholder, so the generator (generator/build.py) can emit a
+     step that resolves it from the LIVE value captured earlier in that
+     same run (see runner/variables.py) instead of a hard-coded literal.
 
-Uses EasyOCR - a pure-Python OCR engine (pip install easyocr, nothing
-else to install separately, unlike Tesseract) built on PyTorch. This is a
-genuine trade-off, not a strictly-better choice, worth understanding:
-  - Nothing to install on the target machine beyond `pip install easyocr`
-    (or whatever's bundled into local_agent's frozen build) - no separate
-    binary, no PATH configuration, no corporate-security exclusion needed
-    for a second executable.
-  - But: it's a MUCH heavier dependency (EasyOCR pulls in PyTorch - use
-    the CPU-only build, `pip install torch --index-url
-    https://download.pytorch.org/whl/cpu`, NOT the default GPU build,
-    which is several GB larger for zero benefit on a laptop with no GPU).
-    This is exactly why OCR support stays OPTIONAL for local_agent (see
-    local_agent/requirements-agent.txt) rather than a hard dependency -
-    _ocr_click_fallback below is written to degrade silently (no
-    fallback attempted, original error still raised) rather than error
-    out, on a lightweight agent install that never installed this.
-  - And: EasyOCR downloads its detection/recognition model weights
-    (~100MB) from the internet the FIRST time a Reader() is ever created
-    on a given machine, caching them (default: ~/.EasyOCR/model/, or
-    wherever EASYOCR_MODULE_PATH points - see _get_reader below) for
-    every run after that. On a machine with restricted/no internet
-    access, this first-run download needs to be pre-staged (copy an
-    already-populated ~/.EasyOCR/model/ folder over, or point
-    EASYOCR_MODULE_PATH at a pre-staged location bundled with the
-    installer) BEFORE the first OCR capture is ever attempted there.
-  - Reader() initialization itself (loading those model weights into
-    memory) takes a few seconds - too slow to redo on every single
-    capture, so _get_reader() below creates it ONCE per process and
-    reuses it for every subsequent OCR call in that process's lifetime.
+This module only ADDS optional keys to the action dicts it's given
+("captured_as" on copy actions, "resolved_var" on paste/type actions) - it
+never removes or rewrites an existing key, so recordings without any
+copy/paste in them (or JSON built before this feature existed) round-trip
+completely unchanged. It's also idempotent: running it twice on the same
+actions list keeps the same names, so generator/build.py can safely call it
+again as a safety net for recordings that were produced without going
+through Recorder.stop()'s hook.
 """
 from __future__ import annotations
-import hashlib
-import io
-import os
-import threading
-from collections import OrderedDict
-from typing import Optional
+from typing import Dict, List
 
-_reader = None
-_reader_lock = threading.Lock()
-
-# Minimum EasyOCR confidence (0-1) for a region to count as a genuine match
-# in best_match() below - picked conservatively low since UI text (small
-# fonts, icon+label buttons) often scores lower than scanned-document text,
-# but still high enough to reject obvious noise/garbage detections.
-DEFAULT_MIN_CONFIDENCE = 0.35
-
-# Bounded cache of find_text_regions() results, keyed by a hash of the exact
-# screenshot bytes - a byte-identical screenshot (checked twice within the
-# same run, e.g. a click fallback immediately followed by an OCR assertion
-# on an unchanged page) skips re-running OCR entirely; any genuinely
-# different screenshot has different bytes, so this can never serve stale
-# results. Bounded (not per-run-scoped) since this module is a
-# process-lifetime singleton shared across every recording/replay in that
-# process, same as _reader above.
-_OCR_CACHE_MAX = 64
-_ocr_cache: "OrderedDict[str, list]" = OrderedDict()
-_ocr_cache_lock = threading.Lock()
+# Words stripped from a source field's label before it becomes a variable
+# name, e.g. "Generated Username" -> "username", "Generated Application ID"
+# -> "application_id".
+_STOPWORDS = {
+    "generated", "generate", "new", "auto", "your", "the", "a", "an",
+    "current", "this", "field", "value", "display", "label", "output",
+}
 
 
-def _cache_get(key: str):
-    with _ocr_cache_lock:
-        value = _ocr_cache.get(key)
-        if value is not None:
-            _ocr_cache.move_to_end(key)
-        return value
+def _locator_identity(action: Dict):
+    """A stable-ish key for 'is this the same physical element' - prefers the
+    first (highest-priority) captured locator, since two different actions
+    on the SAME element should always agree on it; falls back to the
+    element description for the rare case no locator was captured at all."""
+    locs = action.get("locators") or []
+    if locs:
+        top = locs[0]
+        return (top.get("strategy"), top.get("value"))
+    el = action.get("element") or {}
+    return (el.get("tag"), el.get("name"), el.get("placeholder"), el.get("ariaLabel"))
 
 
-def _cache_put(key: str, value: list) -> None:
-    with _ocr_cache_lock:
-        _ocr_cache[key] = value
-        _ocr_cache.move_to_end(key)
-        while len(_ocr_cache) > _OCR_CACHE_MAX:
-            _ocr_cache.popitem(last=False)
+def coalesce_consecutive_types(actions: List[Dict], window_ms: int = 3000) -> List[Dict]:
+    """
+    Merges a 'type' action into the immediately preceding one if both target
+    the SAME element and happened within `window_ms` of each other, keeping
+    the LATER value. Native/masked inputs (date pickers especially) commonly
+    fire more than one 'change' event for what the user experienced as ONE
+    edit - e.g. the browser reformatting "01092026" into "01/09/2026" right
+    after typing, or a native date picker's day/month/year segments each
+    firing their own change - which otherwise shows up as two separate,
+    confusingly-duplicated "enters X into Y" steps for the same field.
+    Only ADJACENT same-element 'type' actions are merged - an intervening
+    click/keypress/other action on something else breaks the chain, since
+    that's very likely a deliberate second visit to the field rather than
+    the same edit settling.
+    """
+    merged: List[Dict] = []
+    for action in actions:
+        if (
+            action.get("action") == "type"
+            and merged
+            and merged[-1].get("action") == "type"
+            and _locator_identity(action) == _locator_identity(merged[-1])
+            and (action.get("ts", 0) - merged[-1].get("ts", 0)) <= window_ms
+        ):
+            merged[-1] = {
+                **merged[-1],
+                "value": action.get("value"),
+                "ts": action.get("ts"),
+                "locators": action.get("locators") or merged[-1].get("locators"),
+            }
+            continue
+        merged.append(action)
+    return merged
 
 
-def _normalize(text: str) -> str:
-    """Whitespace-collapsed, case-folded form used for matching - mirrors
-    recorder/variable_capture.py's _normalize, same rationale (a UI often
-    re-renders/re-wraps text slightly from how it was recorded)."""
-    return " ".join(text.split()).casefold()
+def derive_variable_name(element: Dict, used_names: set) -> str:
+    """Heuristic, LLM-free variable-name generator for a copy source element."""
+    base = (
+        element.get("ariaLabel")
+        or element.get("placeholder")
+        or element.get("name")
+        or element.get("text")
+        or element.get("tag")
+        or "value"
+    )
+    tokens = "".join(c if c.isalnum() else " " for c in base.lower()).split()
+    filtered = [t for t in tokens if t not in _STOPWORDS]
+    tokens = filtered or tokens or ["value"]
+    name = "_".join(tokens)[:40].strip("_") or "value"
+
+    candidate = name
+    n = 2
+    while candidate in used_names:
+        candidate = f"{name}_{n}"
+        n += 1
+    used_names.add(candidate)
+    return candidate
 
 
-def _get_reader():
-    """Lazily creates ONE EasyOCR Reader for this process's whole
-    lifetime (thread-safe) - Reader() itself is slow (loads model
-    weights), so this must never be called fresh per-capture. English
-    only by default; add languages via OCR_LANGUAGES (comma-separated
-    EasyOCR language codes, e.g. "en,hi") if this ever needs to read
-    non-English text."""
-    global _reader
-    if _reader is None:
-        with _reader_lock:
-            if _reader is None:
-                import easyocr
-                languages = os.environ.get("OCR_LANGUAGES", "en").split(",")
-                model_dir = os.environ.get("EASYOCR_MODULE_PATH")  # pre-staged model weights, for a machine with no internet access
-                _reader = easyocr.Reader(
-                    [lang.strip() for lang in languages if lang.strip()],
-                    gpu=False,  # laptops running this agent have no GPU worth using - forcing this off also skips a slow, pointless CUDA availability probe
-                    model_storage_directory=model_dir,
-                    download_enabled=model_dir is None or not os.path.isdir(model_dir),
-                )
-    return _reader
+def _normalize(value: str) -> str:
+    """Whitespace-collapsed, case-folded form of a captured value, used as a
+    fallback correlation key so a copy of "ABC123" still matches a paste
+    that landed in the recording as " abc123 " (trimmed/re-cased by the
+    target field) even though the exact strings differ."""
+    return " ".join(value.split()).casefold()
 
 
-def ocr_available() -> bool:
-    """Best-effort check - used by recorder.py to fail an OCR capture
-    request clearly and immediately (rather than partway through) if
-    EasyOCR genuinely can't run here (not installed, or model weights
-    can't be obtained/found and there's no internet access to fetch
-    them)."""
-    try:
-        _get_reader()
-        return True
-    except Exception:
-        return False
+def annotate_variables(actions: List[Dict]) -> List[Dict]:
+    """
+    Walks the recording in order and stamps "captured_as" / "resolved_var"
+    onto the relevant action dicts in place (and also returns the list, for
+    convenience). See module docstring for the full behavior.
+    """
+    used_names: set = set()
+    captured_values: Dict[str, str] = {}       # exact copied text -> variable name
+    captured_values_norm: Dict[str, str] = {}  # normalized copied text -> variable name
 
+    for action in actions:
+        kind = action.get("action")
+        value = action.get("value")
 
-def find_text_regions(png_bytes: bytes) -> list[dict]:
-    """Structured OCR: every detected text region with its confidence and
-    bounding box, e.g.:
-        {"text": "Submit", "normalized_text": "submit", "confidence": 0.94,
-         "bbox": {"x": 100, "y": 200, "width": 120, "height": 40}}
-    Unlike extract_text_from_png_bytes's plain joined string, this is what
-    BasePage._ocr_click_fallback (a last-resort locator strategy) and
-    BasePage.assert_ocr_text_visible (a page-level OCR/visual assertion)
-    need - "which region, if any, actually matches the text I'm looking
-    for, and how confident was the read." Cached by a hash of the exact
-    screenshot bytes (see module docstring). Preprocessing (grayscale +
-    contrast normalization) is applied before handing the image to
-    EasyOCR - a small, safe accuracy improvement for typical UI
-    screenshots; full skew/rotation correction is deliberately not
-    attempted (UI screenshots are always axis-aligned).
+        if kind in ("copy", "ocr_capture") and value:
+            var_name = (
+                action.get("captured_as")
+                or captured_values.get(value)
+                or captured_values_norm.get(_normalize(value))
+            )
+            if var_name:
+                used_names.add(var_name)
+            else:
+                var_name = derive_variable_name(action.get("element", {}), used_names)
+            captured_values[value] = var_name
+            captured_values_norm[_normalize(value)] = var_name
+            action["captured_as"] = var_name
 
-    Raises the same RuntimeError as extract_text_from_png_bytes if OCR
-    genuinely can't run here (missing deps, EasyOCR init failure) - see
-    that function's docstring for the exact conditions."""
-    cache_key = hashlib.sha1(png_bytes).hexdigest()
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
+        elif kind in ("paste", "type") and value:
+            var_name = (
+                action.get("resolved_var")
+                or captured_values.get(value)
+                or captured_values_norm.get(_normalize(value))
+            )
+            if var_name:
+                action["resolved_var"] = var_name
+            elif kind == "paste":
+                # A real clipboard-paste DOM event (recorder_injector.js) that
+                # didn't correlate to any earlier copy in this recording - the
+                # generator falls back to the record-time literal for it, so
+                # flag that here rather than letting it happen silently (see
+                # generator/build.py's use of this field).
+                action["correlation_status"] = "unresolved"
 
-    try:
-        from PIL import Image, ImageOps
-        import numpy as np
-    except ImportError as e:
-        raise RuntimeError(
-            "OCR support isn't fully installed on this machine - "
-            "pip install easyocr Pillow numpy "
-            "(see local_agent/requirements-agent.txt)."
-        ) from e
-
-    try:
-        reader = _get_reader()
-    except Exception as e:
-        raise RuntimeError(
-            f"EasyOCR could not initialize ({type(e).__name__}: {e}). If this machine has no "
-            "internet access, EasyOCR's model weights need to be pre-staged - copy an already-"
-            "populated ~/.EasyOCR/model/ folder from a machine that has run OCR successfully "
-            "once, or set EASYOCR_MODULE_PATH to a pre-staged model directory bundled with the "
-            "installer."
-        ) from e
-
-    image = Image.open(io.BytesIO(png_bytes)).convert("L")  # grayscale
-    image = ImageOps.autocontrast(image)
-    image_array = np.array(image)
-
-    try:
-        # detail=1 returns (bbox_points, text, confidence) per region -
-        # bbox_points is 4 (x, y) corner points in top-to-bottom,
-        # left-to-right reading order (EasyOCR's natural detection order,
-        # same order detail=0 used to hand back as a flat string list).
-        raw = reader.readtext(image_array, detail=1)
-    except Exception as e:
-        raise RuntimeError(f"OCR failed while reading the captured image: {type(e).__name__}: {e}") from e
-
-    regions = []
-    for bbox_points, text, confidence in raw:
-        # EasyOCR returns numpy scalar types (np.int32/np.float64) for
-        # corner coordinates - cast to plain Python numbers so this dict is
-        # safely JSON-serializable and safe to pass straight into
-        # Playwright's mouse.click(x, y) (page.tmpl's _ocr_click_fallback),
-        # neither of which reliably accepts numpy types.
-        xs = [float(p[0]) for p in bbox_points]
-        ys = [float(p[1]) for p in bbox_points]
-        regions.append({
-            "text": text,
-            "normalized_text": _normalize(text),
-            "confidence": float(confidence),
-            "bbox": {"x": min(xs), "y": min(ys), "width": max(xs) - min(xs), "height": max(ys) - min(ys)},
-        })
-
-    _cache_put(cache_key, regions)
-    return regions
-
-
-def best_match(regions: list[dict], hint: str, min_confidence: float = DEFAULT_MIN_CONFIDENCE) -> Optional[dict]:
-    """Picks the highest-confidence region whose normalized text contains
-    (or is contained by) `hint`, among regions clearing `min_confidence` -
-    or None if nothing qualifies. A PURE function (no I/O, no OCR call) so
-    it's directly unit-testable with hand-built region lists, independent
-    of EasyOCR/a browser/a real screenshot - this is deliberately where
-    the actual "did we find what we were looking for" decision lives,
-    kept separate from find_text_regions' OCR I/O."""
-    target = _normalize(hint)
-    if not target:
-        return None
-    candidates = [
-        r for r in regions
-        if r["confidence"] >= min_confidence and (target in r["normalized_text"] or r["normalized_text"] in target)
-    ]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda r: r["confidence"])
-
-
-def extract_text_from_png_bytes(png_bytes: bytes) -> str:
-    """Runs OCR on a screenshot (PNG bytes, exactly what Playwright's
-    `element.screenshot()` returns) and returns the extracted text.
-    Multiple detected text regions are joined with a single space in
-    EasyOCR's own top-to-bottom, left-to-right reading order - e.g. a
-    reference number rendered as two visually-separate pieces ("REF" and
-    "998877") comes back as one "REF 998877" string, not a list.
-
-    Implemented on top of find_text_regions() - same OCR call, same
-    caching, same preprocessing - so this function's own contract (a
-    plain string, nothing else) is unchanged for its existing callers
-    (recorder/recorder.py's _process_ocr_request, page.tmpl's
-    capture_value_ocr)."""
-    regions = find_text_regions(png_bytes)
-    return " ".join(r["text"] for r in regions).strip()
+    return actions
