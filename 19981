@@ -1,475 +1,139 @@
 """
-Runs an already-SAVED recording (a JSON file under recordings/) end-to-end
-and produces an "exit report":
+File-based storage for "run a saved recording" history - one JSON file per
+run under transactions/, alongside recordings/ (raw recorder JSON) and
+output/ (generated feature/steps/page files + reports).
 
-  1. Load the recording JSON.
-  2. Regenerate the feature/steps/page/locators files for it
-     (generator.build.build_artifacts) - guarantees the run reflects the
-     saved recording, not stale output/ from some earlier run.
-  3. Execute the generated Behave suite, capturing a PER-STEP result via
-     Behave's JSON formatter (pass/fail/error per Playwright step, not just
-     an overall pass/fail).
-  4. Persist the run to a plain JSON file under transactions/ (NOT the
-     database - the database is reserved for auth/session/activity data
-     only; see runner/transaction_store.py) - the run's status, every
-     file it produced, and every step's result.
-  5. Write a human-readable exit report (.txt) to output/reports/ and
-     return the same information as a JSON-serializable dict, so a caller
-     (backend/api.py, main.py, a script) can show/save it either way.
+This intentionally does NOT touch the database. The database
+(database/models.py) is reserved for auth/session/activity data only
+(Users, Sessions, Activity Logs) - everything about what a recording did
+when it ran (status, per-step results, files produced) lives here as plain
+files instead, per-transaction, human-readable and greppable without a
+DB client.
+
+Each run's JSON, transactions/transaction_<id>.json, looks like:
+    {
+      "transaction_id": 7,
+      "user_id": 3,
+      "user": "Jane Doe",
+      "transaction_name": "Loan Application",
+      "status": "Success",
+      "date_time": "2026-09-04T12:00:00",
+      "steps": [{"step_name": "...", "status": "Passed", "error_message": null}, ...],
+      "step_count": 5, "passed_count": 5, "failed_count": 0,
+      "files": [{"file_name": "...", "folder_path": "..."}, ...],
+      "report_file": "output/reports/transaction_7_exit_report.txt"
+    }
 """
 from __future__ import annotations
-import base64
 import json
-import logging
-import subprocess
-import sys
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from typing import Optional
 
-logger = logging.getLogger(__name__)
-
-from database.db import get_session, init_db
-from database import repository as repo
-from runner import transaction_store
-from generator.build import build_artifacts
-from agent.llm_factory import get_llm
-from backend import recording_access
-
 ROOT = Path(__file__).parent.parent
-RECORDINGS_DIR = ROOT / "recordings"
-REPORTS_DIR = ROOT / "output" / "reports"
+TRANSACTIONS_DIR = ROOT / "transactions"
+
+_id_lock = Lock()  # this process is already single-recorder-at-a-time (see backend STATE); this just protects the id counter
 
 
-def list_saved_recordings() -> list[dict]:
-    """Metadata for every recording JSON file saved under recordings/, newest first."""
+def _ensure_dir() -> None:
+    TRANSACTIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def next_transaction_id() -> int:
+    """Highest existing transaction_<id>.json + 1. Good enough for a
+    single-process backend (same assumption the rest of this app already
+    makes - see backend/api.py's global recorder STATE)."""
+    _ensure_dir()
+    with _id_lock:
+        existing = []
+        for f in TRANSACTIONS_DIR.glob("transaction_*.json"):
+            try:
+                existing.append(int(f.stem.split("_")[1]))
+            except (IndexError, ValueError):
+                continue
+        return (max(existing) + 1) if existing else 1
+
+
+def save_transaction(txn: dict) -> Path:
+    _ensure_dir()
+    path = TRANSACTIONS_DIR / f"transaction_{txn['transaction_id']}.json"
+    path.write_text(json.dumps(txn, indent=2, default=str))
+    return path
+
+
+def get_transaction(transaction_id: int) -> Optional[dict]:
+    path = TRANSACTIONS_DIR / f"transaction_{transaction_id}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def list_transactions(user_id: Optional[int] = None, limit: int = 50, recording_id: Optional[int] = None) -> list[dict]:
+    if not TRANSACTIONS_DIR.exists():
+        return []
     out = []
-    if not RECORDINGS_DIR.exists():
-        return out
-    for f in RECORDINGS_DIR.glob("*.json"):
+    for f in TRANSACTIONS_DIR.glob("transaction_*.json"):
         try:
             data = json.loads(f.read_text())
-            out.append({
-                "file": str(f),
-                "name": data.get("recording_name") or f.stem,
-                "target_url": data.get("target_url"),
-                "recorded_at": data.get("recorded_at"),
-                "action_count": len(data.get("actions", [])),
-            })
         except Exception:
             continue
-    out.sort(key=lambda r: r.get("recorded_at") or "", reverse=True)
-    return out
+        if user_id is not None and data.get("user_id") != user_id:
+            continue
+        if recording_id is not None and data.get("recording_id") != recording_id:
+            continue
+        out.append(data)
+    out.sort(key=lambda t: t.get("date_time") or "", reverse=True)
+    return out[:limit]
 
 
-def _run_behave_json(features_dir: Path, headless: bool) -> dict:
-    """Run behave once with the JSON formatter so each step's result (not
-    just the overall pass/fail) is available for the Automation Logs table."""
-    import os
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    results_path = REPORTS_DIR / "last_run_results.json"
-
-    env = {**os.environ, "HEADLESS": "true" if headless else "false"}
-    proc = subprocess.run(
-        [sys.executable, "-m", "behave", str(features_dir),
-         "--no-capture", "--format", "json", "--outfile", str(results_path)],
-        cwd=str(ROOT), capture_output=True, text=True, env=env,
-    )
-
-    parsed: list = []
-    try:
-        parsed = json.loads(results_path.read_text())
-    except Exception:
-        parsed = []
-
-    return {
-        "returncode": proc.returncode,
-        "stdout": proc.stdout,
-        "stderr": proc.stderr,
-        "json": parsed,
-    }
-
-
-def _extract_steps(behave_json: list, screenshots_dir: Optional[Path] = None,
-                    locator_log: Optional[list] = None, step_failures: Optional[list] = None) -> list[dict]:
-    """Flatten behave's nested JSON into one row per executed Playwright
-    step. `screenshots_dir`, if given, attaches a "screenshot" filename to
-    any step a screenshot actually exists for (see runner/environment.py's
-    after_step hook, which writes step_<n>.png there during the run) -
-    the Nth step in this flattened list lines up with step_<n>.png because
-    both walk the same steps in the same order; a step with no screenshot
-    (never executed - undefined/skipped - or the screenshot genuinely
-    failed to save) simply gets no "screenshot" key at all, rather than a
-    reference to a file that doesn't exist.
-
-    `locator_log`, if given, is the same environment.py after_step-produced
-    list (`[{"step_index": ..., "locator": {...} | None}, ...]`) - merged
-    in here by the SAME step_index alignment trick as screenshots.
-
-    `step_failures`, if given, is the environment.py after_all-produced
-    list from continue-on-step-failure mode (see generator/templates/
-    steps.tmpl's _run_step) - a step in this list was CAUGHT internally
-    and never raised, so Behave itself reports it "passed"; this overrides
-    that back to "Failed" with the real reason, same step_index alignment."""
-    locator_by_index = {}
-    for entry in (locator_log or []):
-        idx = entry.get("step_index")
-        if idx is not None and entry.get("locator"):
-            locator_by_index[idx] = entry["locator"]
-
-    failure_by_index = {}
-    for entry in (step_failures or []):
-        idx = entry.get("step_index")
-        if idx is not None:
-            failure_by_index[idx] = entry
-
-    rows = []
-    step_index = 0
-    for feature in behave_json:
-        for element in feature.get("elements", []):
-            if element.get("type") != "scenario":
-                continue
-            for step in element.get("steps", []):
-                step_index += 1
-                result = step.get("result", {}) or {}
-                status = (result.get("status") or "undefined").capitalize()
-                error = result.get("error_message")
-                if isinstance(error, list):
-                    error = "\n".join(error)
-                # Behave itself gives NO explanation for "Undefined"/"Skipped" -
-                # those statuses just mean this step was never reached, because
-                # Behave stops a scenario at its first Failed/Error step by
-                # default (this project never overrides that). Without this,
-                # someone reviewing the report sees a bare "Undefined" badge
-                # with nothing to click or expand to understand why - worth
-                # spelling out explicitly, in the DATA itself (not just a UI
-                # tooltip), so every export format (the live web view, the
-                # downloaded .txt/.html report) carries the same explanation.
-                if status in ("Undefined", "Skipped") and not error:
-                    error = (
-                        "Not executed - an earlier step in this scenario failed or "
-                        "errored, so Behave stopped before reaching this step. See "
-                        "whichever step above shows Failed/Error for the actual cause."
-                    )
-                # A Failed/Error step SHOULD always carry Behave's own
-                # error_message - but on the rare run where it genuinely comes
-                # through empty (an unusual exception type, or a hook-level
-                # failure Behave attributes oddly), leave a clear pointer
-                # rather than an empty cell that looks like nothing went wrong.
-                elif status in ("Failed", "Error") and not error:
-                    error = (
-                        "This step failed, but Behave did not capture a specific error "
-                        "message for it. Check \"Raw Behave output\" below for the full detail."
-                    )
-                # Continue-on-step-failure mode (steps.tmpl's _run_step) caught
-                # this step's exception internally and let it return normally -
-                # Behave itself reports it "Passed" above, since the exception
-                # never reached it. Override that back to "Failed" with the
-                # real reason, so the report stays accurate even though
-                # execution correctly carried on to the steps after this one.
-                failure = failure_by_index.get(step_index)
-                if failure:
-                    status = "Failed"
-                    error = f"{failure.get('error_type')}: {failure.get('error')} (execution continued to the next step)"
-                row = {
-                    "step_name": f'{step.get("keyword", "").strip()} {step.get("name", "")}'.strip(),
-                    "status": status,
-                    "error_message": error,
-                    "duration_seconds": result.get("duration"),
-                }
-                if screenshots_dir is not None:
-                    candidate = screenshots_dir / f"step_{step_index:03d}.png"
-                    if candidate.exists():
-                        row["screenshot"] = candidate.name
-                if step_index in locator_by_index:
-                    row["locator_used"] = locator_by_index[step_index]
-                rows.append(row)
-    return rows
-
-
-def _write_exit_report(path: Path, transaction_id: int, recording_name: str,
-                        user_name: str, status: str, steps: list[dict]) -> None:
-    passed = sum(1 for s in steps if s["status"] == "Passed")
-    # Deliberately "everything that isn't Passed" rather than counting only
-    # a literal "Failed" status - Behave's real per-step statuses include
-    # "passed", "failed", "error" (an uncaught exception, as opposed to a
-    # plain assertion failure - e.g. a Playwright TimeoutError), "skipped",
-    # and "undefined" (a step Behave never even reached, because an
-    # earlier step in the same scenario already failed/errored). Counting
-    # only "Failed" left Error/Undefined/Skipped steps invisible to both
-    # this count and the web UI's pass-rate donut chart - a run where 1
-    # step genuinely errored and the other 94 were never reached (all
-    # "Undefined") was being reported as "6 passed, 0 failed" and a
-    # misleading 100% pass rate, instead of the true ~6%.
-    failed = len(steps) - passed
-    lines = [
-        "=" * 72,
-        "AI TEST RECORDER - EXIT REPORT",
-        "=" * 72,
-        f"Transaction ID : {transaction_id}",
-        f"Recording      : {recording_name}",
-        f"Run by         : {user_name}",
-        f"Run at (UTC)   : {datetime.utcnow().isoformat(timespec='seconds')}",
-        f"Overall Status : {status}",
-        "-" * 72,
-        f"{'#':<4}{'Playwright Step':<42}{'Status':<10}{'Duration':<10}",
-        "-" * 72,
-    ]
-    for i, s in enumerate(steps, start=1):
-        duration = s.get("duration_seconds")
-        duration_str = f"{duration:.2f}s" if isinstance(duration, (int, float)) else ""
-        lines.append(f"{i:<4}{s['step_name'][:40]:<42}{s['status']:<10}{duration_str:<10}")
-        if s.get("error_message"):
-            lines.append(f"     -> ERROR: {s['error_message']}")
-        locator_used = s.get("locator_used")
-        if locator_used:
-            healed = " (self-healed)" if locator_used.get("self_healed") else ""
-            lines.append(
-                f"     -> Locator: {locator_used.get('strategy')}={locator_used.get('value')} "
-                f"({locator_used.get('element_name')}){healed}"
-            )
-    lines += [
-        "-" * 72,
-        f"Passed: {passed}   Failed: {failed}   Total: {len(steps)}",
-        "=" * 72,
-    ]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines))
-
-
-def run_recording(recording_file: str, user_id: int, headless: bool = False,
-                   output_dir: Optional[str] = None, mask_passwords: bool = True,
-                   execute_fn=None) -> dict:
-    """Run one saved recording and return its exit report as a dict.
-
-    Raises FileNotFoundError / ValueError for bad input (missing recording,
-    unknown or Inactive user) before anything is written to disk. `user_id`
-    is still validated against the Users table (auth data, stays in the
-    DB) - only the resulting transaction/files/step-log record is written
-    to transactions/ instead of the database.
-
-    `output_dir`: defaults to a fresh output/runs/<transaction_id>/
-    subfolder (computed below, once the transaction id is known) rather
-    than the shared "output/" - so two people running recordings at the
-    same time (or the live-recording flow's own per-session folder, see
-    backend/recording_sessions.py) never clobber each other's generated
-    feature/steps/page files. Pass an explicit output_dir to opt back into
-    the old shared-folder behavior (e.g. scripting/CLI use where nothing
-    else could possibly be running concurrently).
-
-    `execute_fn`: optional `(output_dir: str, headless: bool) -> dict`
-    returning `{"returncode", "stdout", "stderr", "json"}` - defaults to
-    the local `_run_behave_json` (server-side execution) if not given.
-    backend/api.py passes a function that delegates to a connected desktop
-    agent instead (see local_agent/execution_manager.py's
-    run_test_with_json_report, which returns the exact same shape) - this
-    function itself doesn't need to know or care which one actually ran;
-    everything downstream (step extraction, the exit report, the
-    transaction record) is identical either way.
-    """
-    init_db()
-
-    rec_path = Path(recording_file)
-    if not rec_path.exists():
-        raise FileNotFoundError(f"Recording not found: {recording_file}")
-    recording = json.loads(rec_path.read_text())
-    recording_name = recording.get("recording_name") or recording.get("recorded_at") or rec_path.stem
-
-    with get_session() as session:
-        user = repo.get_user(session, user_id)
-        if user is None:
-            raise ValueError(f"No such user_id={user_id}")
-        if user.status != "Active":
-            raise ValueError(f"User '{user.name}' is Inactive and cannot run recordings")
-        user_name = user.name
-
-    # Best-effort link back to the owning Recording row (see Phase 2's
-    # backend/recording_access.py) - lets the transaction/execution history
-    # be filtered per-recording (GET /api/transactions?recording_id=...,
-    # used by the recording details page's Reports tab). None for a
-    # recording somehow run without ever going through get_or_create -
-    # not expected in practice, but never worth failing a run over.
-    try:
-        with get_session() as session:
-            recording_id = recording_access.get_or_create_recording(session, rec_path).recording_id
-    except Exception:
-        recording_id = None
-
-    transaction_id = transaction_store.next_transaction_id()
-    if output_dir is None:
-        output_dir = str(ROOT / "output" / "runs" / str(transaction_id))
-    files: list[dict] = [{"file_name": rec_path.name, "folder_path": str(rec_path.parent.resolve())}]
-
-    def _save_interim_status(status: str, error: str = "") -> None:
-        """Writes a non-final (or early-failure) transaction record - reused
-        for the initial "Running" write below and for the failure branches
-        further down, since all of them share the same "no step results yet"
-        shape (unlike the full record built once execution actually finishes,
-        around the end of this function)."""
-        transaction_store.save_transaction({
-            "transaction_id": transaction_id,
-            "recording_id": recording_id,
-            "user_id": user_id,
-            "user": user_name,
-            "transaction_name": recording_name,
-            "status": status,
-            "date_time": datetime.utcnow().isoformat(),
-            "steps": [],
-            "step_count": 0,
-            "passed_count": 0,
-            "failed_count": 0,
-            "screenshots_folder": None,
-            "files": files,
-            "raw_output": error,
-            "report_file": None,
-        })
-
-    # Immediate "Running" record so this transaction_id is visible/traceable
-    # from the moment it's allocated, and next_transaction_id() (which just
-    # scans existing files) never silently reuses it for an unrelated later
-    # run. If the backend hard-crashes/restarts before this function reaches
-    # a terminal status below, transaction_store.mark_interrupted_running_
-    # transactions() (called at backend startup) finds this record and flips
-    # it to "Interrupted" instead of it staying stuck or vanishing.
-    _save_interim_status("Running")
-
-    try:
-        # ---- regenerate feature/steps/page files from the saved recording ----
-        llm = get_llm()
-        build_result = build_artifacts(recording, llm=llm, output_dir=output_dir, mask_passwords=mask_passwords)
-
-        for key in ("feature_file", "steps_file", "page_file", "locators_file", "excel_report"):
-            path = build_result.get(key)
-            if path:
-                p = Path(path)
-                files.append({"file_name": p.name, "folder_path": str(p.parent.resolve())})
-
-        # ---- execute the generated Behave/Playwright suite ----------------------
-        if execute_fn is None:
-            features_dir = Path(output_dir) / "features"
-            run_result = _run_behave_json(features_dir, headless=headless)
-        else:
-            run_result = execute_fn(output_dir, headless)
-    except ConnectionError as e:
-        # The local agent dropped mid-run (see backend/agent_registry.py's
-        # unregister()) - still leave a traceable record instead of losing
-        # the attempt entirely, then re-raise so backend/api.py can turn
-        # this into a clean AGENT_DISCONNECTED response instead of a 500.
-        _save_interim_status("Agent Disconnected", str(e))
-        raise
-    except Exception as e:
-        # Anything else (a build_artifacts failure, an unexpected exception
-        # from execute_fn/_run_behave_json) - still a terminal outcome, not
-        # a crash, so record it as "Failed" rather than leaving the "Running"
-        # record above stuck forever. Re-raise so the caller (backend/api.py)
-        # still sees the original error.
-        _save_interim_status("Failed", str(e))
-        raise
-
-    screenshots_dir = Path(output_dir) / "screenshots"
-    # Server-direct execution (execute_fn is None) already writes screenshots
-    # straight to screenshots_dir itself - environment.py's after_step hook
-    # runs in THIS process against THIS output_dir, no transfer needed. Agent
-    # -mode execution runs on a completely different machine, so its
-    # screenshots (base64-encoded - see local_agent/execution_manager.py's
-    # run_test_with_json_report) arrive in run_result and need writing out
-    # here before _extract_steps() below can find them.
-    agent_screenshots = run_result.get("screenshots") or {}
-    if agent_screenshots:
-        screenshots_dir.mkdir(parents=True, exist_ok=True)
-        for file_name, b64_data in agent_screenshots.items():
-            try:
-                safe_name = Path(file_name).name  # defense in depth - see uipath_importer's same pattern
-                (screenshots_dir / safe_name).write_bytes(base64.b64decode(b64_data))
-            except Exception:
-                logger.warning(f"Could not decode/save screenshot '{file_name}' from agent response")
-
-    # Locator-strategy-used per step (see generator/templates/page.tmpl's
-    # BasePage.last_resolution and runner/environment.py's after_step hook).
-    # Server-direct execution wrote it straight to this output_dir/reports/;
-    # agent-mode execution ran on a different machine, so it travels back
-    # over the same WebSocket round-trip screenshots already use (see
-    # local_agent/execution_manager.py's run_test_with_json_report).
-    if execute_fn is None:
-        locator_log_path = Path(output_dir) / "reports" / "locator_log.json"
+def mark_interrupted_running_transactions() -> int:
+    """Crash recovery: called once at backend startup (see backend/api.py's
+    startup event). A transaction only ever stays "Running" if the process
+    that was executing it died before reaching a terminal status (Success/
+    Failed/Agent Disconnected) - runner/run_recording.py's own try/except
+    already turns every in-process failure into a terminal status, so the
+    only way a "Running" record can still exist here is a hard kill/restart
+    mid-run. Rewrites each one found to "Interrupted" so it's visible (and
+    retry-able) in the UI instead of either vanishing or looking like it's
+    still going forever. Returns how many were swept, for a startup log line."""
+    if not TRANSACTIONS_DIR.exists():
+        return 0
+    count = 0
+    for f in TRANSACTIONS_DIR.glob("transaction_*.json"):
         try:
-            locator_log = json.loads(locator_log_path.read_text()) if locator_log_path.exists() else []
+            data = json.loads(f.read_text())
         except Exception:
-            locator_log = []
-    else:
-        locator_log = run_result.get("locator_log") or []
+            continue
+        if data.get("status") != "Running":
+            continue
+        data["status"] = "Interrupted"
+        data["raw_output"] = (data.get("raw_output") or "") + \
+            "\n[Marked Interrupted at backend startup - the process running this execution did not finish.]"
+        f.write_text(json.dumps(data, indent=2, default=str))
+        count += 1
+    return count
 
-    # Steps caught-and-continued-past by continue-on-step-failure mode (see
-    # generator/templates/steps.tmpl's _run_step) - same dual-path read as
-    # locator_log above (disk for server-mode, shipped over the WebSocket
-    # for agent-mode).
-    if execute_fn is None:
-        step_failures_path = Path(output_dir) / "reports" / "step_failures.json"
+
+def count_transactions_since(since: datetime, status: Optional[str] = None) -> int:
+    """Used by the admin dashboard ("runs today" / "passed today") - reads
+    the same JSON files rather than a DB table."""
+    count = 0
+    for t in list_transactions(limit=10_000):
+        dt = t.get("date_time")
+        if not dt:
+            continue
         try:
-            step_failures = json.loads(step_failures_path.read_text()) if step_failures_path.exists() else []
-        except Exception:
-            step_failures = []
-    else:
-        step_failures = run_result.get("step_failures") or []
-
-    steps = _extract_steps(
-        run_result["json"],
-        screenshots_dir=screenshots_dir if screenshots_dir.is_dir() else None,
-        locator_log=locator_log,
-        step_failures=step_failures,
-    )
-    if screenshots_dir.is_dir():
-        files.append({"file_name": "screenshots", "folder_path": str(screenshots_dir.resolve())})
-
-    if not steps:
-        # Behave never got as far as running a step (e.g. import error,
-        # bad feature file) - log that as a single failed automation entry
-        # instead of silently reporting an empty run.
-        steps = [{
-            "step_name": "Behave execution",
-            "status": "Failed",
-            "error_message": (run_result["stderr"] or run_result["stdout"] or "Behave produced no step results").strip()[:4000],
-        }]
-
-    # Behave itself exits 0 even when continue-on-step-failure mode caught
-    # and continued past a real failure (nothing raised, so from Behave's
-    # own perspective every step "passed") - step_failures being non-empty
-    # is what actually tells us a step failed, so it must count here too,
-    # not just the raw Behave exit code.
-    overall_status = "Success" if run_result["returncode"] == 0 and not step_failures else "Failed"
-
-    # ---- write + log the exit report file ---------------------------------
-    report_path = REPORTS_DIR / f"transaction_{transaction_id}_exit_report.txt"
-    _write_exit_report(report_path, transaction_id, recording_name, user_name, overall_status, steps)
-    files.append({"file_name": report_path.name, "folder_path": str(report_path.parent.resolve())})
-
-    date_time = datetime.utcnow().isoformat()
-    transaction = {
-        "transaction_id": transaction_id,
-        "recording_id": recording_id,
-        "user_id": user_id,
-        "user": user_name,
-        "transaction_name": recording_name,
-        "status": overall_status,
-        "date_time": date_time,
-        "steps": steps,
-        "step_count": len(steps),
-        "passed_count": sum(1 for s in steps if s["status"] == "Passed"),
-        # See _write_exit_report's comment above - "everything that isn't
-        # Passed", not just a literal "Failed" status, so Error/Undefined/
-        # Skipped steps are correctly reflected in both this count and the
-        # web UI's pass-rate donut chart instead of silently vanishing
-        # from the denominator.
-        "failed_count": len(steps) - sum(1 for s in steps if s["status"] == "Passed"),
-        # Lets the frontend build a download/view request for any given
-        # step's "screenshot" filename (see _extract_steps above) without
-        # having to know or guess this path structure itself - None when
-        # no screenshots exist at all for this run (e.g. a crash before
-        # before_all ever launched a browser).
-        "screenshots_folder": str(screenshots_dir.resolve()) if screenshots_dir.is_dir() else None,
-        "files": files,
-        "raw_output": run_result["stdout"] + "\n" + run_result["stderr"],
-        "report_file": str(report_path),
-    }
-    transaction_store.save_transaction(transaction)
-    return transaction
+            when = datetime.fromisoformat(dt)
+        except ValueError:
+            continue
+        if when < since:
+            continue
+        if status is not None and t.get("status") != status:
+            continue
+        count += 1
+    return count
