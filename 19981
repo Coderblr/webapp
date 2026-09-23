@@ -1,132 +1,324 @@
 """
-Shared recording-ownership/version/access-control helpers - used by
-backend/api.py (the existing recordings/*.json-path-identified routes) AND
-backend/recording_routes.py (the new recording_id-identified versioning/
-sharing/export/import routes), so there's exactly one implementation of
-"does this user have access" and "how does an edit become a new version",
-not one per route file. Mirrors how backend/agent_registry.py is already a
-shared module both backend/api.py and backend/agent_routes.py import from.
+Recording ownership surface: version history, sharing, and portable
+export/import - everything ADDRESSED BY recording_id (a Recording DB row)
+rather than a raw recordings/*.json path, which is what every
+pre-existing recording route in backend/api.py still uses unchanged (see
+backend/recording_access.py for how the two identify the same underlying
+file). Mounted onto the main app in backend/api.py, matching the existing
+auth_routes.py/admin_routes.py/profile_routes.py/agent_routes.py pattern.
 
-See database/models.py's Recording/RecordingVersion/RecordingShare
-docstrings for the underlying schema and the legacy/unowned (owner_user_id
-IS NULL -> open to everyone) backward-compat rule, and
-database/repository.py for the raw CRUD this builds on.
+Every route here requires a logged-in user (Depends(get_current_user)) -
+per-route ownership/share checks happen in the route body (there's no
+single role that gates the whole router the way get_current_admin gates
+backend/admin_routes.py, since "am I allowed" here depends on the specific
+recording, not just who's logged in).
 """
 from __future__ import annotations
-import hashlib
+import io
 import json
+import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Optional
 
-from fastapi import HTTPException
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi.responses import Response
+from pydantic import BaseModel
 
-from database.models import Recording
+from auth.dependencies import get_current_user, get_client_ip, CurrentUser
+from database.db import get_session
 from database import repository as repo
+from backend import recording_access
+from recorder.recorder import save_recording_json
 
-ROOT = Path(__file__).resolve().parents[1]
-RECORDINGS_DIR = ROOT / "recordings"
-VERSIONS_DIR = RECORDINGS_DIR / "versions"
+router = APIRouter(prefix="/api/recordings", tags=["recordings"])
 
-Permission = Literal["view", "execute", "edit", "export"]
-
-
-def resolve_within_recordings_dir(file: str) -> Path:
-    """The one containment/existence check for a recordings/*.json path -
-    backend/api.py's _safe_recording_path is a thin wrapper around this
-    (single implementation, not two), and it's also used directly by
-    run_saved_recording, which previously had no containment check of its
-    own at all despite taking a raw path string from the client."""
-    recordings_dir = RECORDINGS_DIR.resolve()
-    path = Path(file).resolve()
-    if recordings_dir not in path.parents or path.suffix != ".json":
-        raise HTTPException(status_code=400, detail="Invalid recording file")
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Recording not found")
-    return path
+# Bumped whenever the export package's manifest/recording.json SHAPE changes
+# in a way an importer needs to know about - not the app's own version.
+RECORDER_VERSION = "1.0"
+SUPPORTED_SCHEMA_VERSIONS = {"2.0"}
 
 
-def get_or_create_recording(session: Session, path: Path, owner_user_id: Optional[int] = None) -> Recording:
-    """Looks up the Recording row for this file path, creating one
-    on-demand (as owner_user_id=None / legacy / open-to-everyone unless
-    `owner_user_id` is given) if this is the first time it's been touched
-    since this feature shipped - so every recording that already existed
-    on disk "just works" without a separate startup backfill sweep.
-    `owner_user_id` is only used on first-creation; ignored for a row that
-    already exists."""
-    existing = repo.get_recording_by_path(session, str(path))
-    if existing is not None:
-        return existing
-    return repo.create_recording(session, owner_user_id=owner_user_id, name=path.stem, file_path=str(path))
+class ShareRequest(BaseModel):
+    user_id: int
+    can_execute: bool = True
+    can_edit: bool = False
+    can_export: bool = False
+    expires_at: Optional[str] = None  # ISO 8601, e.g. "2026-12-31T00:00:00" - never expires if omitted
 
 
-def check_access(recording: Recording, current_user, required: Permission) -> bool:
-    if recording.owner_user_id is None:
-        return True  # legacy/unowned - open to everyone, see Recording's docstring
+def _get_recording_or_404(session, recording_id: int):
+    recording = repo.get_recording(session, recording_id)
+    if recording is None:
+        raise HTTPException(status_code=404, detail="Recording not found.")
+    return recording
+
+
+def _require_owner_or_admin(recording, current_user: CurrentUser) -> None:
+    """Sharing/share-management is owner-only (or admin) - deliberately
+    stricter than check_access()'s "legacy = open to everyone", since a
+    legacy (owner_user_id IS NULL) recording has no owner to authorize
+    this on its behalf yet. See database/models.py's Recording docstring."""
     if current_user.is_admin or current_user.user_id == recording.owner_user_id:
-        return True
-    share = next((s for s in recording.shares if s.shared_with_user_id == current_user.user_id), None)
-    if share is None:
-        return False
-    if share.expires_at is not None and share.expires_at < datetime.utcnow():
-        return False
-    if required == "view":
-        return True  # any non-expired share grants at least view
-    return bool(getattr(share, f"can_{required}", False))
+        return
+    raise HTTPException(status_code=403, detail="Only the recording's owner (or an admin) can do this.")
 
 
-def require_access(session: Session, path: Path, current_user, required: Permission) -> Recording:
-    """get_or_create_recording + check_access, raising HTTPException(403)
-    on denial - the one-liner every gated route in backend/api.py and
-    backend/recording_routes.py calls."""
-    recording = get_or_create_recording(session, path)
-    if not check_access(recording, current_user, required):
-        raise HTTPException(status_code=403, detail=f"You don't have {required} access to this recording.")
-    return recording
+# ---- Single recording's own metadata -----------------------------------------
+
+@router.get("/{recording_id:int}")
+def get_recording_detail(recording_id: int, current_user: CurrentUser = Depends(get_current_user)):
+    """A single recording's own metadata (owner, version, share status,
+    target URL, action count) - for frontend/pages/recordings/[id].js.
+    Uses an explicit `:int` path converter (unlike this router's other
+    routes, which don't need one) specifically so this single-segment GET
+    can never shadow the pre-existing single-segment GET routes registered
+    directly on the app in backend/api.py (/api/recordings/data,
+    /api/recordings/steps) - without it, Starlette would match e.g.
+    GET /api/recordings/data against this route first (binding
+    recording_id="data") and 422 instead of falling through to the real
+    handler, since this router is included before those routes are
+    defined."""
+    with get_session() as session:
+        recording = _get_recording_or_404(session, recording_id)
+        if not recording_access.check_access(recording, current_user, "view"):
+            raise HTTPException(status_code=403, detail="You don't have view access to this recording.")
+        try:
+            content = json.loads(Path(recording.file_path).read_text())
+        except Exception:
+            content = {}
+        return {
+            "recording_id": recording.recording_id,
+            "name": recording.name,
+            "file": recording.file_path,
+            "owner_user_id": recording.owner_user_id,
+            "is_owner": recording.owner_user_id == current_user.user_id,
+            "is_shared": recording.owner_user_id is not None and recording.owner_user_id != current_user.user_id,
+            "schema_version": recording.schema_version,
+            "current_version_number": recording.current_version_number,
+            "created_at": recording.created_at.isoformat(),
+            "updated_at": recording.updated_at.isoformat(),
+            "target_url": content.get("target_url"),
+            "action_count": len(content.get("actions", [])),
+        }
 
 
-def hash_actions(actions: list) -> str:
-    return hashlib.sha256(json.dumps(actions, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+# ---- Version history --------------------------------------------------------
+
+@router.get("/{recording_id}/versions")
+def list_versions(recording_id: int, current_user: CurrentUser = Depends(get_current_user)):
+    with get_session() as session:
+        recording = _get_recording_or_404(session, recording_id)
+        if not recording_access.check_access(recording, current_user, "view"):
+            raise HTTPException(status_code=403, detail="You don't have view access to this recording.")
+        versions = repo.list_recording_versions(session, recording_id)
+        return [
+            {
+                "version_number": v.version_number,
+                "created_at": v.created_at.isoformat(),
+                "created_by_user_id": v.created_by_user_id,
+                "change_summary": v.change_summary,
+                "recording_hash": v.recording_hash,
+            }
+            for v in versions
+        ]
 
 
-def snapshot_version(
-    session: Session, *, recording: Recording, recording_json: dict, version_number: int,
-    created_by_user_id: Optional[int], change_summary: Optional[str] = None,
-) -> None:
-    """Writes `recording_json` to a new version snapshot file under
-    recordings/versions/<recording_id>/v<N>.json AND to the Recording's
-    main file_path (so every existing reader keeps seeing "current" at the
-    exact same path it always has - nothing about the main file's location
-    or the fact that it holds the full/current content changes). Inserts
-    the RecordingVersion row and bumps Recording.current_version_number/
-    updated_at. Called both at initial creation (version_number=1) and on
-    every edit (version_number=recording.current_version_number + 1)."""
-    version_dir = VERSIONS_DIR / str(recording.recording_id)
-    version_dir.mkdir(parents=True, exist_ok=True)
-    version_path = version_dir / f"v{version_number}.json"
-    payload = json.dumps(recording_json, indent=2, default=str)
-    version_path.write_text(payload)
-    Path(recording.file_path).write_text(payload)
-
-    repo.create_recording_version(
-        session, recording_id=recording.recording_id, version_number=version_number,
-        file_path=str(version_path), created_by_user_id=created_by_user_id,
-        change_summary=change_summary, recording_hash=hash_actions(recording_json.get("actions", [])),
-    )
-    repo.touch_recording(session, recording.recording_id, current_version_number=version_number)
+@router.get("/{recording_id}/versions/{version_number}")
+def get_version_content(recording_id: int, version_number: int, current_user: CurrentUser = Depends(get_current_user)):
+    with get_session() as session:
+        recording = _get_recording_or_404(session, recording_id)
+        if not recording_access.check_access(recording, current_user, "view"):
+            raise HTTPException(status_code=403, detail="You don't have view access to this recording.")
+        version = repo.get_recording_version(session, recording_id, version_number)
+        if version is None:
+            raise HTTPException(status_code=404, detail="Version not found.")
+        content = json.loads(Path(version.file_path).read_text())
+        return {"version_number": version.version_number, "change_summary": version.change_summary, "recording": content}
 
 
-def create_recording_with_initial_version(
-    session: Session, *, owner_user_id: Optional[int], name: str, path: Path, recording_json: dict,
-) -> Recording:
-    """The 3 recording-creation call sites (stop_and_save's agent/server
-    branches, UiPath import, and package import) all funnel through this -
-    create the Recording row, then snapshot version 1 from the content
-    that was just written to `path`."""
-    recording = repo.create_recording(session, owner_user_id=owner_user_id, name=name, file_path=str(path))
-    snapshot_version(
-        session, recording=recording, recording_json=recording_json, version_number=1,
-        created_by_user_id=owner_user_id, change_summary="Initial recording",
-    )
-    return recording
+# ---- Sharing -----------------------------------------------------------------
+
+@router.post("/{recording_id}/share")
+def share_recording(recording_id: int, req: ShareRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    ip = get_client_ip(request)
+    with get_session() as session:
+        recording = _get_recording_or_404(session, recording_id)
+        _require_owner_or_admin(recording, current_user)
+        if req.user_id == recording.owner_user_id:
+            raise HTTPException(status_code=400, detail="This user already owns the recording.")
+        target_user = repo.get_user(session, req.user_id)
+        if target_user is None:
+            raise HTTPException(status_code=404, detail="User not found.")
+
+        expires_at = None
+        if req.expires_at:
+            try:
+                expires_at = datetime.fromisoformat(req.expires_at)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="expires_at must be an ISO 8601 datetime string.")
+
+        share = repo.upsert_share(
+            session, recording_id=recording_id, shared_with_user_id=req.user_id,
+            shared_by_user_id=current_user.user_id, can_execute=req.can_execute,
+            can_edit=req.can_edit, can_export=req.can_export, expires_at=expires_at,
+        )
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id, action="RECORDING_SHARED",
+            status="SUCCESS",
+            details={"recording_id": recording_id, "shared_with_user_id": req.user_id, "can_execute": req.can_execute,
+                     "can_edit": req.can_edit, "can_export": req.can_export},
+            endpoint=f"/api/recordings/{recording_id}/share", ip_address=ip,
+        )
+        return {
+            "id": share.id, "recording_id": share.recording_id, "shared_with_user_id": share.shared_with_user_id,
+            "shared_with_name": target_user.name, "can_execute": share.can_execute, "can_edit": share.can_edit,
+            "can_export": share.can_export, "expires_at": share.expires_at.isoformat() if share.expires_at else None,
+        }
+
+
+@router.get("/{recording_id}/shares")
+def list_shares(recording_id: int, current_user: CurrentUser = Depends(get_current_user)):
+    with get_session() as session:
+        recording = _get_recording_or_404(session, recording_id)
+        _require_owner_or_admin(recording, current_user)
+        out = []
+        for s in repo.list_shares_for_recording(session, recording_id):
+            user = repo.get_user(session, s.shared_with_user_id)
+            out.append({
+                "id": s.id, "shared_with_user_id": s.shared_with_user_id,
+                "shared_with_name": user.name if user else None,
+                "can_execute": s.can_execute, "can_edit": s.can_edit, "can_export": s.can_export,
+                "created_at": s.created_at.isoformat(), "expires_at": s.expires_at.isoformat() if s.expires_at else None,
+            })
+        return out
+
+
+@router.delete("/{recording_id}/shares/{share_id}")
+def revoke_share(recording_id: int, share_id: int, request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    ip = get_client_ip(request)
+    with get_session() as session:
+        recording = _get_recording_or_404(session, recording_id)
+        _require_owner_or_admin(recording, current_user)
+        share = repo.get_share_by_id(session, share_id)
+        if share is None or share.recording_id != recording_id:
+            raise HTTPException(status_code=404, detail="Share not found.")
+        repo.delete_share(session, share_id)
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id,
+            action="RECORDING_SHARE_REVOKED", status="SUCCESS",
+            details={"recording_id": recording_id, "shared_with_user_id": share.shared_with_user_id},
+            endpoint=f"/api/recordings/{recording_id}/shares/{share_id}", ip_address=ip,
+        )
+        return {"ok": True}
+
+
+# ---- Export / import ---------------------------------------------------------
+
+@router.get("/{recording_id}/export")
+def export_recording(recording_id: int, request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    """Downloads a portable .zip package (manifest.json + recording.json) -
+    no credentials/secrets, no machine-specific paths/ports/agent ids, just
+    the recording's own content plus provenance metadata. See
+    POST /import below for the other half."""
+    ip = get_client_ip(request)
+    with get_session() as session:
+        recording = _get_recording_or_404(session, recording_id)
+        if not recording_access.check_access(recording, current_user, "export"):
+            raise HTTPException(status_code=403, detail="You don't have export access to this recording.")
+
+        owner = repo.get_user(session, recording.owner_user_id) if recording.owner_user_id else None
+        recording_content = json.loads(Path(recording.file_path).read_text())
+        manifest = {
+            "schema_version": recording.schema_version,
+            "recording_id": recording.recording_id,
+            "name": recording.name,
+            "created_by": owner.username if owner else None,
+            "created_at": recording.created_at.isoformat(),
+            "updated_at": recording.updated_at.isoformat(),
+            "recorder_version": RECORDER_VERSION,
+            "action_count": len(recording_content.get("actions", [])),
+            "exported_at": datetime.utcnow().isoformat(),
+            "exported_by": current_user.username,
+        }
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+            zf.writestr("recording.json", json.dumps(recording_content, indent=2))
+
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id, action="RECORDING_EXPORTED",
+            status="SUCCESS", details={"recording_id": recording_id}, endpoint=f"/api/recordings/{recording_id}/export",
+            ip_address=ip,
+        )
+
+        slug = "".join(c if c.isalnum() else "_" for c in recording.name.strip()) or "recording"
+        return Response(
+            content=buf.getvalue(), media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{slug}.zip"'},
+        )
+
+
+@router.post("/import")
+async def import_recording_package(
+    request: Request, file: UploadFile = File(...), current_user: CurrentUser = Depends(get_current_user),
+):
+    """Imports a .zip package produced by GET /{recording_id}/export above.
+    Always creates a BRAND-NEW, independent Recording (new DB row, new file
+    under recordings/, owned by the importing user) via the same
+    save_recording_json() every other recording-creation path already
+    uses - it never touches or overwrites whatever the export came from,
+    even on a re-import of the same package."""
+    ip = get_client_ip(request)
+    contents = await file.read()
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(contents))
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Not a valid recording package (.zip).")
+
+    names = set(zf.namelist())
+    if "manifest.json" not in names or "recording.json" not in names:
+        raise HTTPException(status_code=400, detail="Invalid recording package - missing manifest.json or recording.json.")
+
+    try:
+        manifest = json.loads(zf.read("manifest.json"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="manifest.json is not valid JSON.")
+    try:
+        recording_content = json.loads(zf.read("recording.json"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="recording.json is not valid JSON.")
+
+    schema_version = manifest.get("schema_version")
+    if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported schema_version {schema_version!r} - this server supports {sorted(SUPPORTED_SCHEMA_VERSIONS)}.",
+        )
+    if not isinstance(recording_content.get("actions"), list):
+        raise HTTPException(status_code=400, detail="recording.json is missing a valid 'actions' list.")
+
+    warnings = []
+    if not recording_content.get("target_url"):
+        warnings.append("This recording has no target_url set.")
+
+    imported_name = f"{manifest.get('name') or Path(file.filename).stem} (imported)"
+    path = save_recording_json(recording_content.get("target_url", ""), recording_content["actions"], name=imported_name)
+
+    with get_session() as session:
+        recording = recording_access.create_recording_with_initial_version(
+            session, owner_user_id=current_user.user_id, name=imported_name,
+            path=Path(path), recording_json=recording_content,
+        )
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id, action="RECORDING_IMPORTED",
+            status="SUCCESS",
+            details={"source_file": file.filename, "new_recording_id": recording.recording_id,
+                     "action_count": len(recording_content["actions"])},
+            endpoint="/api/recordings/import", ip_address=ip,
+        )
+        return {
+            "ok": True, "recording_id": recording.recording_id, "name": recording.name,
+            "action_count": len(recording_content["actions"]), "warnings": warnings,
+        }
