@@ -1,139 +1,155 @@
 """
-File-based storage for "run a saved recording" history - one JSON file per
-run under transactions/, alongside recordings/ (raw recorder JSON) and
-output/ (generated feature/steps/page files + reports).
-
-This intentionally does NOT touch the database. The database
-(database/models.py) is reserved for auth/session/activity data only
-(Users, Sessions, Activity Logs) - everything about what a recording did
-when it ran (status, per-step results, files produced) lives here as plain
-files instead, per-transaction, human-readable and greppable without a
-DB client.
-
-Each run's JSON, transactions/transaction_<id>.json, looks like:
-    {
-      "transaction_id": 7,
-      "user_id": 3,
-      "user": "Jane Doe",
-      "transaction_name": "Loan Application",
-      "status": "Success",
-      "date_time": "2026-09-04T12:00:00",
-      "steps": [{"step_name": "...", "status": "Passed", "error_message": null}, ...],
-      "step_count": 5, "passed_count": 5, "failed_count": 0,
-      "files": [{"file_name": "...", "folder_path": "..."}, ...],
-      "report_file": "output/reports/transaction_7_exit_report.txt"
-    }
+Behave environment hooks. Copied verbatim into output/features/environment.py
+by generator/build.py. Launches a Playwright browser (Edge by default, see
+recorder/browser_factory.py - set BROWSER=chrome in .env to switch) for the
+whole run and exposes context.page (RecordedPage) to every step definition,
+plus context.raw_page (the underlying Playwright Page) for the Given/Then
+steps in steps.tmpl that need it directly.
+Also wires the self-healing callback so a broken locator triggers the LLM
+repair agent (agent/self_healer.py) before the step fails.
 """
-from __future__ import annotations
 import json
-from datetime import datetime
+import os
+import sys
 from pathlib import Path
-from threading import Lock
-from typing import Optional
 
-ROOT = Path(__file__).parent.parent
-TRANSACTIONS_DIR = ROOT / "transactions"
+# make both the project root (for `agent`/`recorder`) and the output dir (for `pages`) importable
+_features_dir = Path(__file__).resolve().parent
+_output_dir = _features_dir.parent          # .../output
+_project_root = _output_dir.parent           # project root
+sys.path.insert(0, str(_project_root))
+sys.path.insert(0, str(_output_dir))
 
-_id_lock = Lock()  # this process is already single-recorder-at-a-time (see backend STATE); this just protects the id counter
+from recorder.browser_factory import launch_browser
 
-
-def _ensure_dir() -> None:
-    TRANSACTIONS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def next_transaction_id() -> int:
-    """Highest existing transaction_<id>.json + 1. Good enough for a
-    single-process backend (same assumption the rest of this app already
-    makes - see backend/api.py's global recorder STATE)."""
-    _ensure_dir()
-    with _id_lock:
-        existing = []
-        for f in TRANSACTIONS_DIR.glob("transaction_*.json"):
-            try:
-                existing.append(int(f.stem.split("_")[1]))
-            except (IndexError, ValueError):
-                continue
-        return (max(existing) + 1) if existing else 1
+from pages.recorded_page import RecordedPage
+from agent.llm_factory import get_llm
+from agent.self_healer import propose_fix, validate_locator
+from runner.variables import VariableStore
 
 
-def save_transaction(txn: dict) -> Path:
-    _ensure_dir()
-    path = TRANSACTIONS_DIR / f"transaction_{txn['transaction_id']}.json"
-    path.write_text(json.dumps(txn, indent=2, default=str))
-    return path
+def _make_heal_callback():
+    llm = get_llm()
 
-
-def get_transaction(transaction_id: int) -> Optional[dict]:
-    path = TRANSACTIONS_DIR / f"transaction_{transaction_id}.json"
-    if not path.exists():
+    def heal(element_name, page):
+        if llm is None:
+            return None
+        page_html = page.content()
+        fix = propose_fix(llm, element_name, {"note": "see locators.json for original strategies"}, page_html)
+        if fix and validate_locator(page, fix["strategy"], fix["value"]):
+            print(f"[self-heal] repaired locator for '{element_name}' -> {fix}")
+            return fix
         return None
+
+    return heal
+
+
+def before_all(context):
+    headless = os.getenv("HEADLESS", "false").lower() == "true"
+    context.browser_session = launch_browser(headless=headless)
+    context.raw_page = context.browser_session.new_page()
+    context.page = RecordedPage(context.raw_page, heal_callback=_make_heal_callback())
+    # Capture -> Store -> Reuse: {{username}}/{{application_id}}-style variables
+    # captured during THIS run (see runner/variables.py) - resolved at playback
+    # time from live values, never from the static values baked in when the
+    # recording was made.
+    context.variables = VariableStore()
+    # Which locator strategy resolved each executed step (see page.tmpl's
+    # BasePage.last_resolution) - written out in after_all as
+    # output/reports/locator_log.json, read back by runner/run_recording.py's
+    # _extract_steps() (via the SAME step_counter alignment already used for
+    # screenshots below) to populate the execution report's "locator used"
+    # field.
+    context.locator_log = []
+    # Per-step failures caught and continued-past by steps.tmpl's _run_step
+    # (continue-on-step-failure mode - CONTINUE_ON_STEP_FAILURE env var,
+    # default on) - written out in after_all as output/reports/
+    # step_failures.json, read back by runner/run_recording.py's
+    # _extract_steps() to override Behave's own (misleadingly "passed",
+    # since the exception never reached it) per-step status back to
+    # "Failed" with the real reason, without stopping the rest of the scenario.
+    context.step_failures = []
+
+    # Auto-accept native alert/confirm/prompt/beforeunload dialogs on the
+    # ORIGINAL page - mirrors recorder/recorder.py's own _on_dialog (a
+    # dialog left unhandled suspends the page indefinitely, hanging the run).
+    context.raw_page.on("dialog", lambda dialog: dialog.accept())
+    # Safety net for popups/new tabs/new windows: auto-accepts native
+    # alert/confirm/prompt/beforeunload dialogs on ANY page opened under
+    # this browser context during replay, including ones the generated
+    # steps don't explicitly track via expect_page() (see steps.tmpl's
+    # new_page_wrapper macro) - without this, an unexpected dialog on a
+    # popup would hang the whole run instead of just getting accepted, the
+    # same way the recorder itself auto-accepts them (see
+    # recorder/recorder.py's _on_dialog).
+    context.browser_session.context.on("page", lambda p: p.on("dialog", lambda dialog: dialog.accept()))
+    # Ordered list of every browser tab/window page.tmpl's BasePage.switch_page()
+    # has been pointed at during this run - index 0 is always the original
+    # tab. Generated steps append to this as popups/new tabs/new windows open
+    # (see steps.tmpl's new_page_wrapper macro) and index back into it to
+    # switch tabs/windows (see steps.tmpl's maybe_switch macro).
+    context.recorder_pages = [context.raw_page]
+
+
+def after_all(context):
     try:
-        return json.loads(path.read_text())
+        reports_dir = _output_dir / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        (reports_dir / "locator_log.json").write_text(json.dumps(getattr(context, "locator_log", []), indent=2))
+        (reports_dir / "step_failures.json").write_text(json.dumps(getattr(context, "step_failures", []), indent=2))
     except Exception:
-        return None
+        pass
+    try:
+        context.browser_session.close()
+    except Exception:
+        pass
 
 
-def list_transactions(user_id: Optional[int] = None, limit: int = 50, recording_id: Optional[int] = None) -> list[dict]:
-    if not TRANSACTIONS_DIR.exists():
-        return []
-    out = []
-    for f in TRANSACTIONS_DIR.glob("transaction_*.json"):
-        try:
-            data = json.loads(f.read_text())
-        except Exception:
-            continue
-        if user_id is not None and data.get("user_id") != user_id:
-            continue
-        if recording_id is not None and data.get("recording_id") != recording_id:
-            continue
-        out.append(data)
-    out.sort(key=lambda t: t.get("date_time") or "", reverse=True)
-    return out[:limit]
+def after_step(context, step):
+    """
+    Screenshots the CURRENTLY ACTIVE page/tab after every step that
+    actually executed (passed, failed, or errored) - not undefined/
+    skipped ones, since nothing ran for those and a screenshot would just
+    show misleadingly stale state left over from whatever came before.
 
+    Saved under output/screenshots/step_<n>.png, where <n> is this
+    scenario's 1-based step position - the SAME position
+    runner/run_recording.py's _extract_steps() assigns each step when it
+    parses behave's own JSON output afterward (both walk the identical,
+    in-order step list Behave produces), so the two line up without
+    needing any extra bookkeeping passed between them. The counter
+    advances for every step Behave attempts, including undefined/skipped
+    ones - only the FILE is skipped for those, keeping the numbering
+    aligned even though there's a gap in which numbers actually exist on
+    disk.
 
-def mark_interrupted_running_transactions() -> int:
-    """Crash recovery: called once at backend startup (see backend/api.py's
-    startup event). A transaction only ever stays "Running" if the process
-    that was executing it died before reaching a terminal status (Success/
-    Failed/Agent Disconnected) - runner/run_recording.py's own try/except
-    already turns every in-process failure into a terminal status, so the
-    only way a "Running" record can still exist here is a hard kill/restart
-    mid-run. Rewrites each one found to "Interrupted" so it's visible (and
-    retry-able) in the UI instead of either vanishing or looking like it's
-    still going forever. Returns how many were swept, for a startup log line."""
-    if not TRANSACTIONS_DIR.exists():
-        return 0
-    count = 0
-    for f in TRANSACTIONS_DIR.glob("transaction_*.json"):
-        try:
-            data = json.loads(f.read_text())
-        except Exception:
-            continue
-        if data.get("status") != "Running":
-            continue
-        data["status"] = "Interrupted"
-        data["raw_output"] = (data.get("raw_output") or "") + \
-            "\n[Marked Interrupted at backend startup - the process running this execution did not finish.]"
-        f.write_text(json.dumps(data, indent=2, default=str))
-        count += 1
-    return count
+    Wrapped in a broad try/except deliberately: a screenshot failure
+    (the page just closed, crashed, or is mid-navigation) must never mask
+    or interfere with the step's own actual pass/fail result - at worst,
+    this one step's screenshot is silently missing, which the report
+    already handles as a normal case (no screenshot available yet, or
+    ever, for that step).
+    """
+    context.step_counter = getattr(context, "step_counter", 0) + 1
+    status_name = getattr(step.status, "name", str(step.status))
 
+    page_obj = getattr(context, "page", None)
+    if status_name in ("passed", "failed", "error"):
+        context.locator_log.append({
+            "step_index": context.step_counter,
+            "locator": getattr(page_obj, "last_resolution", None) if page_obj is not None else None,
+        })
+    # Reset so a step that doesn't call _find() (e.g. a wait/navigate/assert
+    # step) can't inherit and misreport the PREVIOUS step's locator.
+    if page_obj is not None:
+        page_obj.last_resolution = None
 
-def count_transactions_since(since: datetime, status: Optional[str] = None) -> int:
-    """Used by the admin dashboard ("runs today" / "passed today") - reads
-    the same JSON files rather than a DB table."""
-    count = 0
-    for t in list_transactions(limit=10_000):
-        dt = t.get("date_time")
-        if not dt:
-            continue
-        try:
-            when = datetime.fromisoformat(dt)
-        except ValueError:
-            continue
-        if when < since:
-            continue
-        if status is not None and t.get("status") != status:
-            continue
-        count += 1
-    return count
+    if status_name not in ("passed", "failed", "error"):
+        return
+    try:
+        screenshots_dir = _output_dir / "screenshots"
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+        active_page = context.page.page if hasattr(context, "page") and context.page else context.raw_page
+        active_page.screenshot(path=str(screenshots_dir / f"step_{context.step_counter:03d}.png"))
+    except Exception:
+        pass
