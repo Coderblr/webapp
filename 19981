@@ -1,406 +1,153 @@
 """
-Small CRUD helpers over the ORM models, used by backend/api.py,
-backend/auth_routes.py, backend/admin_routes.py, backend/profile_routes.py,
-backend/recording_access.py, and backend/recording_routes.py. Scoped to
-auth/session/activity/recording-ownership data - see
-runner/transaction_store.py for recording-RUN history (file-based, not
-here) and recordings/ for recording CONTENT (also file-based - see
-database/models.py's Recording/RecordingVersion for how the two relate).
+Shared recording-ownership/version/access-control helpers - used by
+backend/api.py (the existing recordings/*.json-path-identified routes) AND
+backend/recording_routes.py (the new recording_id-identified versioning/
+sharing/export/import routes), so there's exactly one implementation of
+"does this user have access" and "how does an edit become a new version",
+not one per route file. Mirrors how backend/agent_registry.py is already a
+shared module both backend/api.py and backend/agent_routes.py import from.
+
+See database/models.py's Recording/RecordingVersion/RecordingShare
+docstrings for the underlying schema and the legacy/unowned (owner_user_id
+IS NULL -> open to everyone) backward-compat rule, and
+database/repository.py for the raw CRUD this builds on.
 """
 from __future__ import annotations
+import hashlib
 import json
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import datetime
+from pathlib import Path
+from typing import Literal, Optional
 
+from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from database.models import User, UserSession, ActivityLog, Recording, RecordingVersion, RecordingShare
-
-
-# ---- Users --------------------------------------------------------------
-
-def create_user(session: Session, name: str, department: Optional[str] = None, status: str = "Active") -> User:
-    """Legacy helper (pre-auth). Still used to satisfy the NOT NULL legacy
-    `name`/`department` columns when creating an account via create_user_account
-    below - not intended to be called directly for new accounts."""
-    user = User(name=name.strip(), department=(department or "").strip() or None, status=status)
-    session.add(user)
-    session.flush()
-    return user
-
-
-def create_user_account(
-    session: Session,
-    *,
-    username: str,
-    first_name: str,
-    last_name: str,
-    department_code: Optional[str],
-    email: Optional[str],
-    password_hash: str,
-    role: str = "user",
-) -> User:
-    """Creates a full auth-enabled account (used by the admin panel)."""
-    user = User(
-        username=username.strip(),
-        first_name=first_name.strip(),
-        last_name=last_name.strip(),
-        department_code=(department_code or "").strip() or None,
-        email=(email or "").strip() or None,
-        role=role,
-        password_hash=password_hash,
-        must_change_password=True,
-        auth_provider="local",
-        # legacy mirror fields, kept in sync so the recorder/report code
-        # (which only knows about `name`/`department`) keeps working as-is
-        name=f"{first_name.strip()} {last_name.strip()}".strip(),
-        department=(department_code or "").strip() or None,
-        status="Active",
-    )
-    session.add(user)
-    session.flush()
-    return user
-
-
-def get_user_by_username(session: Session, username: str) -> Optional[User]:
-    return session.query(User).filter(User.username == username.strip()).first()
-
-
-def update_user_account(
-    session: Session,
-    user_id: int,
-    *,
-    first_name: Optional[str] = None,
-    last_name: Optional[str] = None,
-    department_code: Optional[str] = None,
-    email: Optional[str] = None,
-    role: Optional[str] = None,
-    status: Optional[str] = None,
-) -> Optional[User]:
-    user = session.get(User, user_id)
-    if user is None:
-        return None
-    if first_name is not None:
-        user.first_name = first_name.strip()
-    if last_name is not None:
-        user.last_name = last_name.strip()
-    if department_code is not None:
-        user.department_code = department_code.strip() or None
-        user.department = user.department_code
-    if email is not None:
-        user.email = email.strip() or None
-    if role is not None:
-        user.role = role
-    if status is not None:
-        user.status = status
-    # keep legacy display name in sync
-    user.name = f"{user.first_name} {user.last_name}".strip() or user.username
-    session.flush()
-    return user
-
-
-def set_user_password(session: Session, user_id: int, password_hash: str, must_change_password: bool) -> Optional[User]:
-    user = session.get(User, user_id)
-    if user:
-        user.password_hash = password_hash
-        user.must_change_password = must_change_password
-        session.flush()
-    return user
-
-
-def mark_login(session: Session, user_id: int) -> None:
-    user = session.get(User, user_id)
-    if user:
-        user.last_login_at = datetime.utcnow()
-        session.flush()
-
-
-def list_users(session: Session, active_only: bool = False):
-    q = session.query(User)
-    if active_only:
-        q = q.filter(User.status == "Active")
-    return q.order_by(User.name).all()
-
-
-def list_user_accounts(session: Session, status: Optional[str] = None, role: Optional[str] = None, search: Optional[str] = None):
-    q = session.query(User)
-    if status:
-        q = q.filter(User.status == status)
-    if role:
-        q = q.filter(User.role == role)
-    if search:
-        like = f"%{search.strip()}%"
-        q = q.filter(
-            (User.username.ilike(like))
-            | (User.first_name.ilike(like))
-            | (User.last_name.ilike(like))
-            | (User.email.ilike(like))
-        )
-    return q.order_by(User.created_date.desc()).all()
-
-
-def get_user(session: Session, user_id: int) -> Optional[User]:
-    return session.get(User, user_id)
-
-
-def set_user_status(session: Session, user_id: int, status: str) -> Optional[User]:
-    user = session.get(User, user_id)
-    if user:
-        user.status = status
-        session.flush()
-    return user
-
-
-def soft_delete_user(session: Session, user_id: int) -> Optional[User]:
-    """Deletion never removes the row (that would orphan the audit trail /
-    transaction history) - it marks the account Deleted, which blocks login
-    and drops it out of the active user/recording-owner lists."""
-    return set_user_status(session, user_id, "Deleted")
-
-
-def count_users_by_status(session: Session) -> dict:
-    from sqlalchemy import func
-    rows = session.query(User.status, func.count(User.user_id)).group_by(User.status).all()
-    return {status: count for status, count in rows}
-
-
-# ---- Sessions -------------------------------------------------------------
-
-def create_session(
-    session: Session, user_id: int, ip_address: Optional[str], user_agent: Optional[str],
-    session_max_hours: int, is_agent: bool = False,
-) -> UserSession:
-    now = datetime.utcnow()
-    sess = UserSession(
-        user_id=user_id,
-        created_at=now,
-        last_activity_at=now,
-        expires_at=now + timedelta(hours=session_max_hours),
-        ip_address=ip_address,
-        user_agent=(user_agent or "")[:255],
-        is_agent=is_agent,
-    )
-    session.add(sess)
-    session.flush()
-    return sess
-
-
-def get_active_session(session: Session, session_id: str) -> Optional[UserSession]:
-    return (
-        session.query(UserSession)
-        .filter(UserSession.session_id == session_id, UserSession.revoked.is_(False))
-        .first()
-    )
-
-
-def touch_session(session: Session, session_id: str) -> None:
-    sess = session.get(UserSession, session_id)
-    if sess:
-        sess.last_activity_at = datetime.utcnow()
-        session.flush()
-
-
-def revoke_session(session: Session, session_id: str, reason: str = "logout") -> Optional[UserSession]:
-    sess = session.get(UserSession, session_id)
-    if sess:
-        sess.revoked = True
-        sess.revoked_reason = reason
-        session.flush()
-    return sess
-
-
-def revoke_all_sessions_for_user(session: Session, user_id: int, reason: str = "admin_revoked") -> int:
-    sessions = (
-        session.query(UserSession)
-        .filter(UserSession.user_id == user_id, UserSession.revoked.is_(False))
-        .all()
-    )
-    for s in sessions:
-        s.revoked = True
-        s.revoked_reason = reason
-    session.flush()
-    return len(sessions)
-
-
-def list_active_sessions(session: Session, idle_cutoff: datetime):
-    """Sessions that are not revoked, not past their hard expiry, and have
-    had activity more recently than idle_cutoff - i.e. genuinely "online
-    right now" for the admin's live view."""
-    return (
-        session.query(UserSession)
-        .filter(
-            UserSession.revoked.is_(False),
-            UserSession.expires_at > datetime.utcnow(),
-            UserSession.last_activity_at >= idle_cutoff,
-        )
-        .order_by(UserSession.last_activity_at.desc())
-        .all()
-    )
-
-
-# ---- Activity log -----------------------------------------------------------
-
-def log_activity(
-    session: Session,
-    *,
-    user_id: Optional[int],
-    session_id: Optional[str],
-    action: str,
-    status: str = "SUCCESS",
-    details: Optional[dict] = None,
-    endpoint: Optional[str] = None,
-    ip_address: Optional[str] = None,
-) -> ActivityLog:
-    entry = ActivityLog(
-        user_id=user_id,
-        session_id=session_id,
-        action=action,
-        status=status,
-        details=json.dumps(details) if details is not None else None,
-        endpoint=endpoint,
-        ip_address=ip_address,
-    )
-    session.add(entry)
-    session.flush()
-    return entry
-
-
-def list_activity(
-    session: Session,
-    user_id: Optional[int] = None,
-    action: Optional[str] = None,
-    since: Optional[datetime] = None,
-    until: Optional[datetime] = None,
-    limit: int = 200,
-):
-    q = session.query(ActivityLog).order_by(ActivityLog.timestamp.desc())
-    if user_id is not None:
-        q = q.filter(ActivityLog.user_id == user_id)
-    if action:
-        q = q.filter(ActivityLog.action == action)
-    if since:
-        q = q.filter(ActivityLog.timestamp >= since)
-    if until:
-        q = q.filter(ActivityLog.timestamp <= until)
-    return q.limit(limit).all()
-
-
-# ---- Recordings (ownership/versions/shares) --------------------------------
-
-def create_recording(
-    session: Session, *, owner_user_id: Optional[int], name: str, file_path: str,
-    schema_version: str = "2.0",
-) -> Recording:
-    rec = Recording(
-        owner_user_id=owner_user_id, name=name, file_path=file_path,
-        schema_version=schema_version, current_version_number=1,
-    )
-    session.add(rec)
-    session.flush()
-    return rec
-
-
-def get_recording(session: Session, recording_id: int) -> Optional[Recording]:
-    return session.get(Recording, recording_id)
-
-
-def get_recording_by_path(session: Session, file_path: str) -> Optional[Recording]:
-    return session.query(Recording).filter(Recording.file_path == file_path).first()
-
-
-def touch_recording(session: Session, recording_id: int, *, current_version_number: int) -> Optional[Recording]:
-    rec = session.get(Recording, recording_id)
-    if rec:
-        rec.current_version_number = current_version_number
-        rec.updated_at = datetime.utcnow()
-        session.flush()
-    return rec
-
-
-def create_recording_version(
-    session: Session, *, recording_id: int, version_number: int, file_path: str,
-    created_by_user_id: Optional[int], change_summary: Optional[str] = None,
-    recording_hash: Optional[str] = None,
-) -> RecordingVersion:
-    ver = RecordingVersion(
-        recording_id=recording_id, version_number=version_number, file_path=file_path,
-        created_by_user_id=created_by_user_id, change_summary=change_summary, recording_hash=recording_hash,
-    )
-    session.add(ver)
-    session.flush()
-    return ver
-
-
-def list_recording_versions(session: Session, recording_id: int):
-    return (
-        session.query(RecordingVersion)
-        .filter(RecordingVersion.recording_id == recording_id)
-        .order_by(RecordingVersion.version_number.desc())
-        .all()
-    )
-
-
-def get_recording_version(session: Session, recording_id: int, version_number: int) -> Optional[RecordingVersion]:
-    return (
-        session.query(RecordingVersion)
-        .filter(RecordingVersion.recording_id == recording_id, RecordingVersion.version_number == version_number)
-        .first()
-    )
-
-
-def upsert_share(
-    session: Session, *, recording_id: int, shared_with_user_id: int, shared_by_user_id: int,
-    can_execute: bool = True, can_edit: bool = False, can_export: bool = False,
-    expires_at: Optional[datetime] = None,
-) -> RecordingShare:
-    """Re-sharing with the same user updates the existing row (permissions,
-    expiry, who most recently granted it) rather than creating a duplicate -
-    see RecordingShare's UniqueConstraint(recording_id, shared_with_user_id)."""
-    share = (
-        session.query(RecordingShare)
-        .filter(
-            RecordingShare.recording_id == recording_id,
-            RecordingShare.shared_with_user_id == shared_with_user_id,
-        )
-        .first()
-    )
-    if share is None:
-        share = RecordingShare(recording_id=recording_id, shared_with_user_id=shared_with_user_id)
-        session.add(share)
-    share.shared_by_user_id = shared_by_user_id
-    share.can_execute = can_execute
-    share.can_edit = can_edit
-    share.can_export = can_export
-    share.expires_at = expires_at
-    session.flush()
-    return share
-
-
-def list_shares_for_recording(session: Session, recording_id: int):
-    return session.query(RecordingShare).filter(RecordingShare.recording_id == recording_id).all()
-
-
-def list_shares_for_user(session: Session, user_id: int):
-    """Every share GRANTED TO this user - i.e. their "Shared With Me" list."""
-    return session.query(RecordingShare).filter(RecordingShare.shared_with_user_id == user_id).all()
-
-
-def get_share_by_id(session: Session, share_id: int) -> Optional[RecordingShare]:
-    return session.get(RecordingShare, share_id)
-
-
-def get_share(session: Session, recording_id: int, user_id: int) -> Optional[RecordingShare]:
-    return (
-        session.query(RecordingShare)
-        .filter(RecordingShare.recording_id == recording_id, RecordingShare.shared_with_user_id == user_id)
-        .first()
-    )
-
-
-def delete_share(session: Session, share_id: int) -> bool:
-    share = session.get(RecordingShare, share_id)
+from database.models import Recording
+from database import repository as repo
+
+ROOT = Path(__file__).resolve().parents[1]
+RECORDINGS_DIR = ROOT / "recordings"
+VERSIONS_DIR = RECORDINGS_DIR / "versions"
+
+Permission = Literal["view", "execute", "edit", "export"]
+
+
+def resolve_within_recordings_dir(file: str) -> Path:
+    """The one containment/existence check for a recordings/*.json path -
+    backend/api.py's _safe_recording_path is a thin wrapper around this
+    (single implementation, not two), and it's also used directly by
+    run_saved_recording, which previously had no containment check of its
+    own at all despite taking a raw path string from the client."""
+    recordings_dir = RECORDINGS_DIR.resolve()
+    path = Path(file).resolve()
+    if recordings_dir not in path.parents or path.suffix != ".json":
+        raise HTTPException(status_code=400, detail="Invalid recording file")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Recording not found")
+    return path
+
+
+def get_or_create_recording(session: Session, path: Path, owner_user_id: Optional[int] = None) -> Recording:
+    """Looks up the Recording row for this file path, creating one
+    on-demand (as owner_user_id=None / legacy / open-to-everyone unless
+    `owner_user_id` is given) if this is the first time it's been touched
+    since this feature shipped - so every recording that already existed
+    on disk "just works" without a separate startup backfill sweep.
+    `owner_user_id` is only used on first-creation; ignored for a row that
+    already exists.
+
+    The check-then-insert below is NOT atomic, and this function is called
+    once per file on every GET /api/recordings (backend/api.py) - a plain
+    sync FastAPI route runs in a threadpool, so two near-simultaneous
+    requests for the same not-yet-adopted file (a second browser tab, a
+    background poll racing a page load, etc.) can both see "no row yet"
+    and both attempt the INSERT, one of them hitting a UNIQUE constraint
+    violation on file_path. Recover from that specific race by retrying
+    the SELECT inside a SAVEPOINT (session.begin_nested()) rather than
+    just letting it raise - a savepoint rollback only undoes THIS insert
+    attempt, not the whole caller's session/transaction, which may already
+    have created rows for other recordings earlier in the same request's
+    loop (see backend/api.py's get_recordings)."""
+    existing = repo.get_recording_by_path(session, str(path))
+    if existing is not None:
+        return existing
+    try:
+        with session.begin_nested():
+            return repo.create_recording(session, owner_user_id=owner_user_id, name=path.stem, file_path=str(path))
+    except IntegrityError:
+        existing = repo.get_recording_by_path(session, str(path))
+        if existing is not None:
+            return existing
+        raise
+
+
+def check_access(recording: Recording, current_user, required: Permission) -> bool:
+    if recording.owner_user_id is None:
+        return True  # legacy/unowned - open to everyone, see Recording's docstring
+    if current_user.is_admin or current_user.user_id == recording.owner_user_id:
+        return True
+    share = next((s for s in recording.shares if s.shared_with_user_id == current_user.user_id), None)
     if share is None:
         return False
-    session.delete(share)
-    session.flush()
-    return True
+    if share.expires_at is not None and share.expires_at < datetime.utcnow():
+        return False
+    if required == "view":
+        return True  # any non-expired share grants at least view
+    return bool(getattr(share, f"can_{required}", False))
+
+
+def require_access(session: Session, path: Path, current_user, required: Permission) -> Recording:
+    """get_or_create_recording + check_access, raising HTTPException(403)
+    on denial - the one-liner every gated route in backend/api.py and
+    backend/recording_routes.py calls."""
+    recording = get_or_create_recording(session, path)
+    if not check_access(recording, current_user, required):
+        raise HTTPException(status_code=403, detail=f"You don't have {required} access to this recording.")
+    return recording
+
+
+def hash_actions(actions: list) -> str:
+    return hashlib.sha256(json.dumps(actions, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def snapshot_version(
+    session: Session, *, recording: Recording, recording_json: dict, version_number: int,
+    created_by_user_id: Optional[int], change_summary: Optional[str] = None,
+) -> None:
+    """Writes `recording_json` to a new version snapshot file under
+    recordings/versions/<recording_id>/v<N>.json AND to the Recording's
+    main file_path (so every existing reader keeps seeing "current" at the
+    exact same path it always has - nothing about the main file's location
+    or the fact that it holds the full/current content changes). Inserts
+    the RecordingVersion row and bumps Recording.current_version_number/
+    updated_at. Called both at initial creation (version_number=1) and on
+    every edit (version_number=recording.current_version_number + 1)."""
+    version_dir = VERSIONS_DIR / str(recording.recording_id)
+    version_dir.mkdir(parents=True, exist_ok=True)
+    version_path = version_dir / f"v{version_number}.json"
+    payload = json.dumps(recording_json, indent=2, default=str)
+    version_path.write_text(payload)
+    Path(recording.file_path).write_text(payload)
+
+    repo.create_recording_version(
+        session, recording_id=recording.recording_id, version_number=version_number,
+        file_path=str(version_path), created_by_user_id=created_by_user_id,
+        change_summary=change_summary, recording_hash=hash_actions(recording_json.get("actions", [])),
+    )
+    repo.touch_recording(session, recording.recording_id, current_version_number=version_number)
+
+
+def create_recording_with_initial_version(
+    session: Session, *, owner_user_id: Optional[int], name: str, path: Path, recording_json: dict,
+) -> Recording:
+    """The 3 recording-creation call sites (stop_and_save's agent/server
+    branches, UiPath import, and package import) all funnel through this -
+    create the Recording row, then snapshot version 1 from the content
+    that was just written to `path`."""
+    recording = repo.create_recording(session, owner_user_id=owner_user_id, name=name, file_path=str(path))
+    snapshot_version(
+        session, recording=recording, recording_json=recording_json, version_number=1,
+        created_by_user_id=owner_user_id, change_summary="Initial recording",
+    )
+    return recording
