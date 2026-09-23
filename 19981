@@ -1,475 +1,711 @@
-"""
-Runs an already-SAVED recording (a JSON file under recordings/) end-to-end
-and produces an "exit report":
+/*
+Injected via Playwright's page.add_init_script() so it re-attaches on every
+navigation (including SPA route changes that reload the document, and full
+page loads). Captures click + input/change events and builds MULTIPLE
+independent locator strategies per element so the generated tests don't
+depend on a single brittle selector. Actions are queued here and drained
+by the Python side polling window.__flushActions() (see
+recorder/recorder.py) from the single worker thread that owns the page.
+*/
+(function () {
+  if (window.__recorderInstalled) return;
+  window.__recorderInstalled = true;
 
-  1. Load the recording JSON.
-  2. Regenerate the feature/steps/page/locators files for it
-     (generator.build.build_artifacts) - guarantees the run reflects the
-     saved recording, not stale output/ from some earlier run.
-  3. Execute the generated Behave suite, capturing a PER-STEP result via
-     Behave's JSON formatter (pass/fail/error per Playwright step, not just
-     an overall pass/fail).
-  4. Persist the run to a plain JSON file under transactions/ (NOT the
-     database - the database is reserved for auth/session/activity data
-     only; see runner/transaction_store.py) - the run's status, every
-     file it produced, and every step's result.
-  5. Write a human-readable exit report (.txt) to output/reports/ and
-     return the same information as a JSON-serializable dict, so a caller
-     (backend/api.py, main.py, a script) can show/save it either way.
-"""
-from __future__ import annotations
-import base64
-import json
-import logging
-import subprocess
-import sys
-from datetime import datetime
-from pathlib import Path
-from typing import Optional
+  // Actions are also mirrored to sessionStorage (same-origin, survives a
+  // navigation) so a queued action isn't lost if the page navigates/reloads
+  // (e.g. pressing Enter submits the form) before the Python side's next
+  // poll had a chance to flush window.__recordedQueue - that race is why
+  // Enter/submit-triggered actions could intermittently go unrecorded.
+  var STORAGE_KEY = '__recorderQueue';
 
-logger = logging.getLogger(__name__)
+  // id of the right-click capture menu's Shadow DOM host (see
+  // showCaptureMenu below) - every OTHER listener in this file that
+  // records page activity (click/change/keydown/copy/cut/paste) needs to
+  // ignore events that originate from INSIDE this menu, or interacting
+  // with the recorder's own capture UI (choosing a mode, typing a
+  // variable name, clicking Capture) would itself get recorded as bogus
+  // click/type/copy actions targeting an element that won't even exist
+  // during replay. Shadow DOM automatically RETARGETS any such event's
+  // target/activeElement to this host id when observed from a
+  // document-level listener outside the shadow tree, so a single ==
+  // check against this constant is enough everywhere.
+  var CAPTURE_MENU_HOST_ID = '__ai_tr_capture_menu_host__';
 
-from database.db import get_session, init_db
-from database import repository as repo
-from runner import transaction_store
-from generator.build import build_artifacts
-from agent.llm_factory import get_llm
-from backend import recording_access
+  function loadPersistedQueue() {
+    try {
+      var raw = sessionStorage.getItem(STORAGE_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch (e) {
+      return [];
+    }
+  }
 
-ROOT = Path(__file__).parent.parent
-RECORDINGS_DIR = ROOT / "recordings"
-REPORTS_DIR = ROOT / "output" / "reports"
+  function persistQueue() {
+    try {
+      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(window.__recordedQueue));
+    } catch (e) { /* storage unavailable/full - keep going in-memory only */ }
+  }
 
+  window.__recordedQueue = loadPersistedQueue();
 
-def list_saved_recordings() -> list[dict]:
-    """Metadata for every recording JSON file saved under recordings/, newest first."""
-    out = []
-    if not RECORDINGS_DIR.exists():
-        return out
-    for f in RECORDINGS_DIR.glob("*.json"):
-        try:
-            data = json.loads(f.read_text())
-            out.append({
-                "file": str(f),
-                "name": data.get("recording_name") or f.stem,
-                "target_url": data.get("target_url"),
-                "recorded_at": data.get("recorded_at"),
-                "action_count": len(data.get("actions", [])),
-            })
-        except Exception:
-            continue
-    out.sort(key=lambda r: r.get("recorded_at") or "", reverse=True)
-    return out
+  function cssEscape(s) {
+    return (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/([^a-zA-Z0-9_-])/g, '\\$1');
+  }
 
+  function isUnique(selector) {
+    try {
+      return document.querySelectorAll(selector).length === 1;
+    } catch (e) {
+      return false;
+    }
+  }
 
-def _run_behave_json(features_dir: Path, headless: bool) -> dict:
-    """Run behave once with the JSON formatter so each step's result (not
-    just the overall pass/fail) is available for the Automation Logs table."""
-    import os
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    results_path = REPORTS_DIR / "last_run_results.json"
+  function cssPath(el) {
+    if (!(el instanceof Element)) return null;
+    var path = [];
+    while (el && el.nodeType === Node.ELEMENT_NODE && el.tagName.toLowerCase() !== 'html') {
+      var selector = el.tagName.toLowerCase();
+      if (el.id) {
+        selector = '#' + cssEscape(el.id);
+        path.unshift(selector);
+        break;
+      } else {
+        var sib = el, nth = 1;
+        while ((sib = sib.previousElementSibling)) {
+          if (sib.tagName === el.tagName) nth++;
+        }
+        selector += ':nth-of-type(' + nth + ')';
+      }
+      path.unshift(selector);
+      el = el.parentElement;
+    }
+    return path.join(' > ');
+  }
 
-    env = {**os.environ, "HEADLESS": "true" if headless else "false"}
-    proc = subprocess.run(
-        [sys.executable, "-m", "behave", str(features_dir),
-         "--no-capture", "--format", "json", "--outfile", str(results_path)],
-        cwd=str(ROOT), capture_output=True, text=True, env=env,
-    )
+  function xpathOf(el) {
+    if (el.id) return '//*[@id="' + el.id + '"]';
+    var parts = [];
+    while (el && el.nodeType === Node.ELEMENT_NODE) {
+      var idx = 1;
+      var sib = el.previousElementSibling;
+      while (sib) {
+        if (sib.tagName === el.tagName) idx++;
+        sib = sib.previousElementSibling;
+      }
+      parts.unshift(el.tagName.toLowerCase() + '[' + idx + ']');
+      el = el.parentElement;
+    }
+    return '/' + parts.join('/');
+  }
 
-    parsed: list = []
-    try:
-        parsed = json.loads(results_path.read_text())
-    except Exception:
-        parsed = []
+  function textXPath(el) {
+    var text = (el.innerText || el.textContent || '').trim();
+    if (!text || text.length > 60) return null;
+    var tag = el.tagName.toLowerCase();
+    return "//" + tag + "[normalize-space(.)=\"" + text.replace(/"/g, '') + "\"]";
+  }
 
+  function isUniqueXPath(xpath) {
+    try {
+      var result = document.evaluate('count(' + xpath + ')', document, null, XPathResult.NUMBER_TYPE, null);
+      return result.numberValue === 1;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function ancestorTextXPath(el) {
+    // Radio/checkbox inputs usually have NO text content of their own - the
+    // visible option label lives on a wrapping component instead (e.g.
+    // Angular Material's <mat-radio-button>/<mat-checkbox>, or a plain
+    // wrapping <label>), so textXPath(el) above returns null for them. That
+    // leaves the input's auto-generated id (e.g. Angular's "mat-radio-9-input")
+    // as the only usable locator - and that id is NOT stable across page
+    // loads, since frameworks like Angular/React generate it from a global
+    // counter that depends on everything else rendered earlier on the page.
+    // Climbing to the nearest wrapper with short, meaningful text and
+    // anchoring an XPath on THAT text (then navigating back down to the
+    // input) gives a locator based on what a real user actually sees - e.g.
+    // //mat-radio-button[normalize-space(.)="Yes"]//input - which stays
+    // correct regardless of what id Angular happens to generate this time.
+    if (!(el.tagName === 'INPUT' && (el.type === 'radio' || el.type === 'checkbox'))) return null;
+    var wrapper = el.closest('mat-radio-button, mat-checkbox, [role="radio"], [role="checkbox"], label') || el.parentElement;
+    var depth = 0;
+    while (wrapper && depth < 4) {
+      var text = (wrapper.innerText || wrapper.textContent || '').trim();
+      if (text && text.length <= 60) {
+        var tag = wrapper.tagName.toLowerCase();
+        var xp = "//" + tag + "[normalize-space(.)=\"" + text.replace(/"/g, '') + "\"]//input[@type=\"" + el.type + "\"]";
+        if (isUniqueXPath(xp)) return xp;
+      }
+      wrapper = wrapper.parentElement;
+      depth++;
+    }
+    return null;
+  }
+
+  function buildLocators(el) {
+    var locs = [];
+
+    if (el.getAttribute('data-testid')) {
+      var v = el.getAttribute('data-testid');
+      var sel = '[data-testid="' + cssEscape(v) + '"]';
+      if (isUnique(sel)) locs.push({ strategy: 'CSS', value: sel, note: 'data-testid' });
+    }
+    if (el.id) {
+      var idSel = '#' + cssEscape(el.id);
+      if (isUnique(idSel)) locs.push({ strategy: 'ID', value: el.id });
+    }
+    if (el.name) {
+      var nameSel = '[name="' + cssEscape(el.name) + '"]';
+      if (isUnique(nameSel)) locs.push({ strategy: 'NAME', value: el.name });
+    }
+    if (el.getAttribute('aria-label')) {
+      var al = el.getAttribute('aria-label');
+      var alSel = '[aria-label="' + cssEscape(al) + '"]';
+      if (isUnique(alSel)) locs.push({ strategy: 'CSS', value: alSel, note: 'aria-label' });
+    }
+    if (el.getAttribute('placeholder')) {
+      var ph = el.getAttribute('placeholder');
+      var phSel = '[placeholder="' + cssEscape(ph) + '"]';
+      if (isUnique(phSel)) locs.push({ strategy: 'CSS', value: phSel, note: 'placeholder' });
+    }
+    var txp = textXPath(el);
+    if (txp) locs.push({ strategy: 'XPATH', value: txp, note: 'text' });
+
+    var atxp = ancestorTextXPath(el);
+    if (atxp) locs.push({ strategy: 'XPATH', value: atxp, note: 'text' });
+
+    var cp = cssPath(el);
+    if (cp) locs.push({ strategy: 'CSS', value: cp, note: 'generated-path' });
+
+    var xp = xpathOf(el);
+    if (xp) locs.push({ strategy: 'XPATH', value: xp, note: 'generated-path' });
+
+    return locs;
+  }
+
+  function describe(el) {
     return {
-        "returncode": proc.returncode,
-        "stdout": proc.stdout,
-        "stderr": proc.stderr,
-        "json": parsed,
+      tag: el.tagName.toLowerCase(),
+      type: el.getAttribute('type') || '',
+      text: (el.innerText || el.textContent || '').trim().slice(0, 60),
+      placeholder: el.getAttribute('placeholder') || '',
+      name: el.name || '',
+      ariaLabel: el.getAttribute('aria-label') || ''
+    };
+  }
+
+  function record(action, el, value) {
+    window.__recordedQueue.push({
+      ts: Date.now(),
+      action: action,
+      value: value === undefined ? null : value,
+      element: describe(el),
+      locators: buildLocators(el),
+      url: window.location.href
+    });
+    persistQueue();
+  }
+
+  document.addEventListener('click', function (e) {
+    var el = e.target;
+    if (!el || el === document || el === document.body || el.id === CAPTURE_MENU_HOST_ID) return;
+    // walk up to nearest clickable-ish element if the click landed on an inline text node wrapper.
+    // Includes radio/checkbox inputs and <label> so clicks on custom-styled radio/checkbox UIs
+    // (where the visible click target is a label or wrapping span, not the native input) still
+    // resolve to the actual underlying <input>.
+    var clickable = el.closest(
+      'button, a, [role="button"], input[type="submit"], input[type="button"], ' +
+      'input[type="radio"], input[type="checkbox"], label, [onclick]'
+    ) || el;
+
+    if (clickable.tagName && clickable.tagName.toLowerCase() === 'label') {
+      var forId = clickable.getAttribute('for');
+      var resolved = forId ? document.getElementById(forId) : clickable.querySelector('input, select');
+      if (resolved) clickable = resolved;
     }
 
-
-def _extract_steps(behave_json: list, screenshots_dir: Optional[Path] = None,
-                    locator_log: Optional[list] = None, step_failures: Optional[list] = None) -> list[dict]:
-    """Flatten behave's nested JSON into one row per executed Playwright
-    step. `screenshots_dir`, if given, attaches a "screenshot" filename to
-    any step a screenshot actually exists for (see runner/environment.py's
-    after_step hook, which writes step_<n>.png there during the run) -
-    the Nth step in this flattened list lines up with step_<n>.png because
-    both walk the same steps in the same order; a step with no screenshot
-    (never executed - undefined/skipped - or the screenshot genuinely
-    failed to save) simply gets no "screenshot" key at all, rather than a
-    reference to a file that doesn't exist.
-
-    `locator_log`, if given, is the same environment.py after_step-produced
-    list (`[{"step_index": ..., "locator": {...} | None}, ...]`) - merged
-    in here by the SAME step_index alignment trick as screenshots.
-
-    `step_failures`, if given, is the environment.py after_all-produced
-    list from continue-on-step-failure mode (see generator/templates/
-    steps.tmpl's _run_step) - a step in this list was CAUGHT internally
-    and never raised, so Behave itself reports it "passed"; this overrides
-    that back to "Failed" with the real reason, same step_index alignment."""
-    locator_by_index = {}
-    for entry in (locator_log or []):
-        idx = entry.get("step_index")
-        if idx is not None and entry.get("locator"):
-            locator_by_index[idx] = entry["locator"]
-
-    failure_by_index = {}
-    for entry in (step_failures or []):
-        idx = entry.get("step_index")
-        if idx is not None:
-            failure_by_index[idx] = entry
-
-    rows = []
-    step_index = 0
-    for feature in behave_json:
-        for element in feature.get("elements", []):
-            if element.get("type") != "scenario":
-                continue
-            for step in element.get("steps", []):
-                step_index += 1
-                result = step.get("result", {}) or {}
-                status = (result.get("status") or "undefined").capitalize()
-                error = result.get("error_message")
-                if isinstance(error, list):
-                    error = "\n".join(error)
-                # Behave itself gives NO explanation for "Undefined"/"Skipped" -
-                # those statuses just mean this step was never reached, because
-                # Behave stops a scenario at its first Failed/Error step by
-                # default (this project never overrides that). Without this,
-                # someone reviewing the report sees a bare "Undefined" badge
-                # with nothing to click or expand to understand why - worth
-                # spelling out explicitly, in the DATA itself (not just a UI
-                # tooltip), so every export format (the live web view, the
-                # downloaded .txt/.html report) carries the same explanation.
-                if status in ("Undefined", "Skipped") and not error:
-                    error = (
-                        "Not executed - an earlier step in this scenario failed or "
-                        "errored, so Behave stopped before reaching this step. See "
-                        "whichever step above shows Failed/Error for the actual cause."
-                    )
-                # A Failed/Error step SHOULD always carry Behave's own
-                # error_message - but on the rare run where it genuinely comes
-                # through empty (an unusual exception type, or a hook-level
-                # failure Behave attributes oddly), leave a clear pointer
-                # rather than an empty cell that looks like nothing went wrong.
-                elif status in ("Failed", "Error") and not error:
-                    error = (
-                        "This step failed, but Behave did not capture a specific error "
-                        "message for it. Check \"Raw Behave output\" below for the full detail."
-                    )
-                # Continue-on-step-failure mode (steps.tmpl's _run_step) caught
-                # this step's exception internally and let it return normally -
-                # Behave itself reports it "Passed" above, since the exception
-                # never reached it. Override that back to "Failed" with the
-                # real reason, so the report stays accurate even though
-                # execution correctly carried on to the steps after this one.
-                failure = failure_by_index.get(step_index)
-                if failure:
-                    status = "Failed"
-                    error = f"{failure.get('error_type')}: {failure.get('error')} (execution continued to the next step)"
-                row = {
-                    "step_name": f'{step.get("keyword", "").strip()} {step.get("name", "")}'.strip(),
-                    "status": status,
-                    "error_message": error,
-                    "duration_seconds": result.get("duration"),
-                }
-                if screenshots_dir is not None:
-                    candidate = screenshots_dir / f"step_{step_index:03d}.png"
-                    if candidate.exists():
-                        row["screenshot"] = candidate.name
-                if step_index in locator_by_index:
-                    row["locator_used"] = locator_by_index[step_index]
-                rows.append(row)
-    return rows
-
-
-def _write_exit_report(path: Path, transaction_id: int, recording_name: str,
-                        user_name: str, status: str, steps: list[dict]) -> None:
-    passed = sum(1 for s in steps if s["status"] == "Passed")
-    # Deliberately "everything that isn't Passed" rather than counting only
-    # a literal "Failed" status - Behave's real per-step statuses include
-    # "passed", "failed", "error" (an uncaught exception, as opposed to a
-    # plain assertion failure - e.g. a Playwright TimeoutError), "skipped",
-    # and "undefined" (a step Behave never even reached, because an
-    # earlier step in the same scenario already failed/errored). Counting
-    # only "Failed" left Error/Undefined/Skipped steps invisible to both
-    # this count and the web UI's pass-rate donut chart - a run where 1
-    # step genuinely errored and the other 94 were never reached (all
-    # "Undefined") was being reported as "6 passed, 0 failed" and a
-    # misleading 100% pass rate, instead of the true ~6%.
-    failed = len(steps) - passed
-    lines = [
-        "=" * 72,
-        "AI TEST RECORDER - EXIT REPORT",
-        "=" * 72,
-        f"Transaction ID : {transaction_id}",
-        f"Recording      : {recording_name}",
-        f"Run by         : {user_name}",
-        f"Run at (UTC)   : {datetime.utcnow().isoformat(timespec='seconds')}",
-        f"Overall Status : {status}",
-        "-" * 72,
-        f"{'#':<4}{'Playwright Step':<42}{'Status':<10}{'Duration':<10}",
-        "-" * 72,
-    ]
-    for i, s in enumerate(steps, start=1):
-        duration = s.get("duration_seconds")
-        duration_str = f"{duration:.2f}s" if isinstance(duration, (int, float)) else ""
-        lines.append(f"{i:<4}{s['step_name'][:40]:<42}{s['status']:<10}{duration_str:<10}")
-        if s.get("error_message"):
-            lines.append(f"     -> ERROR: {s['error_message']}")
-        locator_used = s.get("locator_used")
-        if locator_used:
-            healed = " (self-healed)" if locator_used.get("self_healed") else ""
-            lines.append(
-                f"     -> Locator: {locator_used.get('strategy')}={locator_used.get('value')} "
-                f"({locator_used.get('element_name')}){healed}"
-            )
-    lines += [
-        "-" * 72,
-        f"Passed: {passed}   Failed: {failed}   Total: {len(steps)}",
-        "=" * 72,
-    ]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines))
-
-
-def run_recording(recording_file: str, user_id: int, headless: bool = False,
-                   output_dir: Optional[str] = None, mask_passwords: bool = True,
-                   execute_fn=None) -> dict:
-    """Run one saved recording and return its exit report as a dict.
-
-    Raises FileNotFoundError / ValueError for bad input (missing recording,
-    unknown or Inactive user) before anything is written to disk. `user_id`
-    is still validated against the Users table (auth data, stays in the
-    DB) - only the resulting transaction/files/step-log record is written
-    to transactions/ instead of the database.
-
-    `output_dir`: defaults to a fresh output/runs/<transaction_id>/
-    subfolder (computed below, once the transaction id is known) rather
-    than the shared "output/" - so two people running recordings at the
-    same time (or the live-recording flow's own per-session folder, see
-    backend/recording_sessions.py) never clobber each other's generated
-    feature/steps/page files. Pass an explicit output_dir to opt back into
-    the old shared-folder behavior (e.g. scripting/CLI use where nothing
-    else could possibly be running concurrently).
-
-    `execute_fn`: optional `(output_dir: str, headless: bool) -> dict`
-    returning `{"returncode", "stdout", "stderr", "json"}` - defaults to
-    the local `_run_behave_json` (server-side execution) if not given.
-    backend/api.py passes a function that delegates to a connected desktop
-    agent instead (see local_agent/execution_manager.py's
-    run_test_with_json_report, which returns the exact same shape) - this
-    function itself doesn't need to know or care which one actually ran;
-    everything downstream (step extraction, the exit report, the
-    transaction record) is identical either way.
-    """
-    init_db()
-
-    rec_path = Path(recording_file)
-    if not rec_path.exists():
-        raise FileNotFoundError(f"Recording not found: {recording_file}")
-    recording = json.loads(rec_path.read_text())
-    recording_name = recording.get("recording_name") or recording.get("recorded_at") or rec_path.stem
-
-    with get_session() as session:
-        user = repo.get_user(session, user_id)
-        if user is None:
-            raise ValueError(f"No such user_id={user_id}")
-        if user.status != "Active":
-            raise ValueError(f"User '{user.name}' is Inactive and cannot run recordings")
-        user_name = user.name
-
-    # Best-effort link back to the owning Recording row (see Phase 2's
-    # backend/recording_access.py) - lets the transaction/execution history
-    # be filtered per-recording (GET /api/transactions?recording_id=...,
-    # used by the recording details page's Reports tab). None for a
-    # recording somehow run without ever going through get_or_create -
-    # not expected in practice, but never worth failing a run over.
-    try:
-        with get_session() as session:
-            recording_id = recording_access.get_or_create_recording(session, rec_path).recording_id
-    except Exception:
-        recording_id = None
-
-    transaction_id = transaction_store.next_transaction_id()
-    if output_dir is None:
-        output_dir = str(ROOT / "output" / "runs" / str(transaction_id))
-    files: list[dict] = [{"file_name": rec_path.name, "folder_path": str(rec_path.parent.resolve())}]
-
-    def _save_interim_status(status: str, error: str = "") -> None:
-        """Writes a non-final (or early-failure) transaction record - reused
-        for the initial "Running" write below and for the failure branches
-        further down, since all of them share the same "no step results yet"
-        shape (unlike the full record built once execution actually finishes,
-        around the end of this function)."""
-        transaction_store.save_transaction({
-            "transaction_id": transaction_id,
-            "recording_id": recording_id,
-            "user_id": user_id,
-            "user": user_name,
-            "transaction_name": recording_name,
-            "status": status,
-            "date_time": datetime.utcnow().isoformat(),
-            "steps": [],
-            "step_count": 0,
-            "passed_count": 0,
-            "failed_count": 0,
-            "screenshots_folder": None,
-            "files": files,
-            "raw_output": error,
-            "report_file": None,
-        })
-
-    # Immediate "Running" record so this transaction_id is visible/traceable
-    # from the moment it's allocated, and next_transaction_id() (which just
-    # scans existing files) never silently reuses it for an unrelated later
-    # run. If the backend hard-crashes/restarts before this function reaches
-    # a terminal status below, transaction_store.mark_interrupted_running_
-    # transactions() (called at backend startup) finds this record and flips
-    # it to "Interrupted" instead of it staying stuck or vanishing.
-    _save_interim_status("Running")
-
-    try:
-        # ---- regenerate feature/steps/page files from the saved recording ----
-        llm = get_llm()
-        build_result = build_artifacts(recording, llm=llm, output_dir=output_dir, mask_passwords=mask_passwords)
-
-        for key in ("feature_file", "steps_file", "page_file", "locators_file", "excel_report"):
-            path = build_result.get(key)
-            if path:
-                p = Path(path)
-                files.append({"file_name": p.name, "folder_path": str(p.parent.resolve())})
-
-        # ---- execute the generated Behave/Playwright suite ----------------------
-        if execute_fn is None:
-            features_dir = Path(output_dir) / "features"
-            run_result = _run_behave_json(features_dir, headless=headless)
-        else:
-            run_result = execute_fn(output_dir, headless)
-    except ConnectionError as e:
-        # The local agent dropped mid-run (see backend/agent_registry.py's
-        # unregister()) - still leave a traceable record instead of losing
-        # the attempt entirely, then re-raise so backend/api.py can turn
-        # this into a clean AGENT_DISCONNECTED response instead of a 500.
-        _save_interim_status("Agent Disconnected", str(e))
-        raise
-    except Exception as e:
-        # Anything else (a build_artifacts failure, an unexpected exception
-        # from execute_fn/_run_behave_json) - still a terminal outcome, not
-        # a crash, so record it as "Failed" rather than leaving the "Running"
-        # record above stuck forever. Re-raise so the caller (backend/api.py)
-        # still sees the original error.
-        _save_interim_status("Failed", str(e))
-        raise
-
-    screenshots_dir = Path(output_dir) / "screenshots"
-    # Server-direct execution (execute_fn is None) already writes screenshots
-    # straight to screenshots_dir itself - environment.py's after_step hook
-    # runs in THIS process against THIS output_dir, no transfer needed. Agent
-    # -mode execution runs on a completely different machine, so its
-    # screenshots (base64-encoded - see local_agent/execution_manager.py's
-    # run_test_with_json_report) arrive in run_result and need writing out
-    # here before _extract_steps() below can find them.
-    agent_screenshots = run_result.get("screenshots") or {}
-    if agent_screenshots:
-        screenshots_dir.mkdir(parents=True, exist_ok=True)
-        for file_name, b64_data in agent_screenshots.items():
-            try:
-                safe_name = Path(file_name).name  # defense in depth - see uipath_importer's same pattern
-                (screenshots_dir / safe_name).write_bytes(base64.b64decode(b64_data))
-            except Exception:
-                logger.warning(f"Could not decode/save screenshot '{file_name}' from agent response")
-
-    # Locator-strategy-used per step (see generator/templates/page.tmpl's
-    # BasePage.last_resolution and runner/environment.py's after_step hook).
-    # Server-direct execution wrote it straight to this output_dir/reports/;
-    # agent-mode execution ran on a different machine, so it travels back
-    # over the same WebSocket round-trip screenshots already use (see
-    # local_agent/execution_manager.py's run_test_with_json_report).
-    if execute_fn is None:
-        locator_log_path = Path(output_dir) / "reports" / "locator_log.json"
-        try:
-            locator_log = json.loads(locator_log_path.read_text()) if locator_log_path.exists() else []
-        except Exception:
-            locator_log = []
-    else:
-        locator_log = run_result.get("locator_log") or []
-
-    # Steps caught-and-continued-past by continue-on-step-failure mode (see
-    # generator/templates/steps.tmpl's _run_step) - same dual-path read as
-    # locator_log above (disk for server-mode, shipped over the WebSocket
-    # for agent-mode).
-    if execute_fn is None:
-        step_failures_path = Path(output_dir) / "reports" / "step_failures.json"
-        try:
-            step_failures = json.loads(step_failures_path.read_text()) if step_failures_path.exists() else []
-        except Exception:
-            step_failures = []
-    else:
-        step_failures = run_result.get("step_failures") or []
-
-    steps = _extract_steps(
-        run_result["json"],
-        screenshots_dir=screenshots_dir if screenshots_dir.is_dir() else None,
-        locator_log=locator_log,
-        step_failures=step_failures,
-    )
-    if screenshots_dir.is_dir():
-        files.append({"file_name": "screenshots", "folder_path": str(screenshots_dir.resolve())})
-
-    if not steps:
-        # Behave never got as far as running a step (e.g. import error,
-        # bad feature file) - log that as a single failed automation entry
-        # instead of silently reporting an empty run.
-        steps = [{
-            "step_name": "Behave execution",
-            "status": "Failed",
-            "error_message": (run_result["stderr"] or run_result["stdout"] or "Behave produced no step results").strip()[:4000],
-        }]
-
-    # Behave itself exits 0 even when continue-on-step-failure mode caught
-    # and continued past a real failure (nothing raised, so from Behave's
-    # own perspective every step "passed") - step_failures being non-empty
-    # is what actually tells us a step failed, so it must count here too,
-    # not just the raw Behave exit code.
-    overall_status = "Success" if run_result["returncode"] == 0 and not step_failures else "Failed"
-
-    # ---- write + log the exit report file ---------------------------------
-    report_path = REPORTS_DIR / f"transaction_{transaction_id}_exit_report.txt"
-    _write_exit_report(report_path, transaction_id, recording_name, user_name, overall_status, steps)
-    files.append({"file_name": report_path.name, "folder_path": str(report_path.parent.resolve())})
-
-    date_time = datetime.utcnow().isoformat()
-    transaction = {
-        "transaction_id": transaction_id,
-        "recording_id": recording_id,
-        "user_id": user_id,
-        "user": user_name,
-        "transaction_name": recording_name,
-        "status": overall_status,
-        "date_time": date_time,
-        "steps": steps,
-        "step_count": len(steps),
-        "passed_count": sum(1 for s in steps if s["status"] == "Passed"),
-        # See _write_exit_report's comment above - "everything that isn't
-        # Passed", not just a literal "Failed" status, so Error/Undefined/
-        # Skipped steps are correctly reflected in both this count and the
-        # web UI's pass-rate donut chart instead of silently vanishing
-        # from the denominator.
-        "failed_count": len(steps) - sum(1 for s in steps if s["status"] == "Passed"),
-        # Lets the frontend build a download/view request for any given
-        # step's "screenshot" filename (see _extract_steps above) without
-        # having to know or guess this path structure itself - None when
-        # no screenshots exist at all for this run (e.g. a crash before
-        # before_all ever launched a browser).
-        "screenshots_folder": str(screenshots_dir.resolve()) if screenshots_dir.is_dir() else None,
-        "files": files,
-        "raw_output": run_result["stdout"] + "\n" + run_result["stderr"],
-        "report_file": str(report_path),
+    if (clickable.tagName === 'INPUT' && (clickable.type === 'radio' || clickable.type === 'checkbox')) {
+      // The browser applies the click's default action (actually flipping
+      // .checked) AFTER all capture/bubble listeners have run, so reading
+      // clickable.checked synchronously here would still see the OLD value.
+      // Deferring to the next tick lets us record the RESULTING checked
+      // state as this action's value - the generated replay step then uses
+      // that as an explicit target state (Playwright's check()/uncheck())
+      // instead of a blind click, so replay can never double-toggle it.
+      var target = clickable;
+      setTimeout(function () {
+        record('click', target, target.checked);
+      }, 0);
+      return;
     }
-    transaction_store.save_transaction(transaction)
-    return transaction
+
+    record('click', clickable);
+  }, true);
+
+  document.addEventListener('change', function (e) {
+    var el = e.target;
+    if (!el || el.id === CAPTURE_MENU_HOST_ID) return;
+    var tag = el.tagName.toLowerCase();
+
+    if (tag === 'select') {
+      var opt = el.options[el.selectedIndex];
+      record('select', el, opt ? opt.text.trim() : el.value);
+      return;
+    }
+    if (tag === 'input' && el.type === 'file') {
+      // el.value is ALWAYS a browser-fabricated "C:\fakepath\<name>" string
+      // for security - never the real absolute disk path, and there's no
+      // way to type/set a file input back to it on replay. BUT the File
+      // API DOES let JS read the chosen file's actual CONTENT (just not
+      // its path) - so instead of requiring a human to manually go find
+      // and copy the same file into a fixtures folder before every
+      // replay, capture the real bytes here, right now, while the file is
+      // actually available, and ship them along with this action.
+      // generator/build.py writes them straight into output/fixtures/<name>
+      // automatically - by the time replay runs, the exact file used at
+      // recording time is already sitting there, whatever its name was.
+      var file = el.files && el.files.length ? el.files[0] : null;
+      var chosenName = file ? file.name : '';
+      var MAX_INLINE_BYTES = 4 * 1024 * 1024; // ~4MB - stays well under the
+      // ~5-10MB per-origin sessionStorage quota this queue is mirrored
+      // into (see persistQueue), leaving room for other queued actions.
+      if (!file || file.size > MAX_INLINE_BYTES) {
+        // Too large to safely inline (or no file object available for some
+        // reason) - fall back to name-only capture; upload_file() at
+        // replay time will still work fine if a file with this name is
+        // placed in fixtures/ manually.
+        record('file_upload', el, chosenName);
+        return;
+      }
+      var reader = new FileReader();
+      reader.onload = function () {
+        // reader.result is a "data:<mime>;base64,<data>" URL - strip the
+        // prefix down to just the base64 payload.
+        var dataUrl = reader.result || '';
+        var comma = dataUrl.indexOf(',');
+        var base64 = comma >= 0 ? dataUrl.slice(comma + 1) : '';
+        window.__recordedQueue.push({
+          ts: Date.now(),
+          action: 'file_upload',
+          value: chosenName,
+          fileDataBase64: base64,
+          element: describe(el),
+          locators: buildLocators(el),
+          url: window.location.href
+        });
+        persistQueue();
+      };
+      reader.onerror = function () {
+        // Reading failed for some reason - still record the name so
+        // upload_file()'s manual-fallback path remains available.
+        record('file_upload', el, chosenName);
+      };
+      reader.readAsDataURL(file);
+      return;
+    }
+    if (tag === 'input' && (el.type === 'radio' || el.type === 'checkbox')) {
+      // handled by the click listener above (clicking IS the interaction for these;
+      // recording it again here would create a duplicate/redundant step)
+      return;
+    }
+    if (tag === 'input' || tag === 'textarea') {
+      record('type', el, el.value);
+    }
+  }, true);
+
+  // Capture keyboard-driven actions (Enter to submit, Backspace to clear/edit,
+  // Arrow Up/Down to move through suggestion lists, Ctrl combos, function keys,
+  // etc.) separately from typed text, since these are user-initiated key presses
+  // rather than a change to the field's value.
+  //
+  // CTRL+C / CTRL+V / CTRL+X are deliberately NOT recorded here - they're
+  // captured with richer data (the actual copied/pasted text and the source/
+  // target element) by the dedicated copy/cut/paste listeners below instead,
+  // so recording them again here would just be a redundant, value-less entry.
+  var SIMPLE_KEY_MAP = {
+    'Enter': 'ENTER',
+    'Backspace': 'BACKSPACE',
+    'Escape': 'ESCAPE',
+    'Delete': 'DELETE',
+    ' ': 'SPACE',
+    'Spacebar': 'SPACE',
+    'ArrowUp': 'ARROW_UP',
+    'ArrowDown': 'ARROW_DOWN',
+    'ArrowLeft': 'ARROW_LEFT',
+    'ArrowRight': 'ARROW_RIGHT',
+    'Home': 'HOME',
+    'End': 'END'
+  };
+  for (var _f = 1; _f <= 12; _f++) SIMPLE_KEY_MAP['F' + _f] = 'F' + _f;
+
+  // Ctrl/Cmd combos recorded generically as a single keypress action (so
+  // playback can literally re-press them via Playwright). 'c'/'v'/'x' are
+  // excluded here on purpose - see note above.
+  var CTRL_COMBO_MAP = {
+    'a': 'CTRL+A',
+    'p': 'CTRL+P',
+    's': 'CTRL+S'
+  };
+
+  function keyComboLabel(e) {
+    var key = e.key;
+    var ctrlLike = e.ctrlKey || e.metaKey;
+
+    if (ctrlLike && !e.altKey) {
+      var combo = CTRL_COMBO_MAP[(key || '').toLowerCase()];
+      if (combo) return combo;
+      if (['c', 'v', 'x'].indexOf((key || '').toLowerCase()) !== -1) return null;
+    }
+    if (e.shiftKey && key === 'Tab') return 'SHIFT+TAB';
+    if (!ctrlLike && !e.altKey) {
+      if (key === 'Tab') return 'TAB';
+      return SIMPLE_KEY_MAP[key] || null;
+    }
+    return null;
+  }
+
+  document.addEventListener('keydown', function (e) {
+    var el = e.target;
+    if (!el || el.id === CAPTURE_MENU_HOST_ID) return;
+    var label = keyComboLabel(e);
+    if (label) {
+      record('keypress', el, label);
+    }
+  }, true);
+
+  // Real-time copy/cut/paste capture: records not just THAT a copy/paste
+  // happened, but the actual text value and the source (copy/cut) or target
+  // (paste) element, so the variable Capture -> Store -> Reuse pipeline (see
+  // recorder/variable_capture.py) can later recognize "this pasted value is
+  // the same one copied earlier from that generated-username field" and turn
+  // it into a {{username}}-style placeholder instead of baking in the
+  // literal string.
+  function selectedTextFrom(el) {
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') &&
+        typeof el.selectionStart === 'number' && el.selectionStart !== el.selectionEnd) {
+      return el.value.substring(el.selectionStart, el.selectionEnd);
+    }
+    var sel = window.getSelection();
+    return sel ? sel.toString() : '';
+  }
+
+  function recordCopyLike() {
+    var el = document.activeElement;
+    if (el && el.id === CAPTURE_MENU_HOST_ID) return;
+    var text = selectedTextFrom(el);
+    if (!text) return;
+    record('copy', (el instanceof Element) ? el : document.body, text);
+  }
+
+  document.addEventListener('copy', recordCopyLike, true);
+  document.addEventListener('cut', recordCopyLike, true);
+
+  document.addEventListener('paste', function (e) {
+    var el = e.target;
+    if (el && el.id === CAPTURE_MENU_HOST_ID) return;
+    var text = '';
+    try {
+      text = (e.clipboardData || window.clipboardData).getData('text');
+    } catch (err) { /* clipboard not readable here - resolved at build/runtime instead */ }
+    record('paste', el, text);
+  }, true);
+
+  // --- Right-click capture: two related but distinct mechanisms behind
+  // one gesture -
+  //
+  //   "text" - reads the element's DISPLAYED TEXT DIRECTLY (input value,
+  //   or innerText/textContent for read-only labels/divs/spans) - no
+  //   image processing at all, resolved instantly, entirely in this
+  //   script. This is what most values actually need: a plain-text field
+  //   or label that the person just never happened to Ctrl+C during
+  //   recording (the existing copy/paste listeners above only fire on a
+  //   REAL clipboard event - looking at a value and typing the same thing
+  //   into another field, with no copy gesture at all, leaves nothing for
+  //   them to correlate). Reuses the EXISTING "copy" action type end to
+  //   end (see recorder.py's handling below, which just relabels the
+  //   request rather than reprocessing it) - a value captured this way is
+  //   stored, correlated, and re-read live at replay through the exact
+  //   same {{var}} pipeline a real Ctrl+C copy already uses; nothing
+  //   downstream needs to know or care which gesture produced it.
+  //
+  //   "ocr" - for values rendered as an IMAGE or CANVAS (a scanned
+  //   reference number, a canvas-drawn amount) that have no real
+  //   selectable/readable DOM text at all - see recorder.py's
+  //   "ocr_capture_request" handling, which screenshots the element and
+  //   runs OCR on it instead.
+  //
+  // Uses a custom, IN-PAGE overlay (showCaptureMenu below), rendered
+  // inside a Shadow DOM for style isolation from the target page's own
+  // CSS - NOT window.prompt()/window.confirm(). A previous version of
+  // this used native dialogs instead, but that turned out to be a dead
+  // end: once Playwright (or any CDP-based automation) is attached to a
+  // page, it ALWAYS intercepts native alert/confirm/prompt dialogs -
+  // recorder.py's _on_dialog has to auto-accept EVERY dialog (so the
+  // TARGET application's own alerts/confirms don't hang the recording),
+  // and it has no way to tell "the target app's dialog" apart from "this
+  // recorder's own menu asking a question". A native dialog here was
+  // therefore auto-dismissed (using its own default value) before a
+  // human could ever actually answer it - it would visibly flash and
+  // disappear instantly, and the "ocr" choice was never reachable at all
+  // since the FIRST prompt always auto-resolved to its default ("text")
+  // before the person could type anything.
+  //
+  // An EVEN EARLIER attempt (before native dialogs were tried as a
+  // workaround) already used an in-page menu, and was abandoned for a
+  // different reason: its "click outside the menu closes it" listener
+  // was registered SYNCHRONOUSLY inside the contextmenu handler, so it
+  // could catch a trailing mouse event from the SAME right-click gesture
+  // that opened the menu, closing it before it was ever visible. Fixed
+  // here by deferring that listener's registration to the next
+  // event-loop tick (setTimeout(fn, 0) - see showCaptureMenu) so it can
+  // only ever react to a LATER, separate interaction - combined with
+  // Shadow DOM's automatic event retargeting (a click anywhere INSIDE
+  // the menu reports e.target as the shadow HOST when observed from a
+  // document-level listener, never the page's own elements), so "was
+  // this click inside or outside the menu" needs no manual
+  // stopPropagation() bookkeeping in every button handler either.
+  //
+  // Deliberately intercepts EVERY right-click on the page while recording
+  // (not just on <img>/<canvas>/inputs) and replaces the native context
+  // menu with this - many apps render meaningful text via SVG,
+  // background-image, or other non-<img> elements too, and there's no
+  // reliable way to detect "this element visually contains text" from the
+  // DOM alone. The trade-off: the browser's own right-click menu
+  // (Inspect, "Save image as", etc.) isn't available during recording,
+  // and every right-click now shows this menu (click Cancel, Escape, or
+  // anywhere outside it, for a normal right-click you don't want captured).
+  function recordTextCaptureRequest(el, varName) {
+    var text = '';
+    if ('value' in el && el.value) {
+      text = el.value;
+    } else {
+      text = (el.innerText || el.textContent || '');
+    }
+    text = text.trim();
+    // Reuses the SAME "copy" action shape a real Ctrl+C produces
+    // (recordCopyLike above) - captured_as is the one addition, carrying
+    // the user's explicitly CHOSEN name through instead of leaving it to
+    // be auto-derived from the element the way an incidental real copy
+    // event's name is (see recorder/variable_capture.py's
+    // derive_variable_name) - the person picked this name on purpose here,
+    // so it should win.
+    window.__recordedQueue.push({
+      ts: Date.now(),
+      action: 'copy',
+      value: text,
+      captured_as: varName,
+      element: describe(el),
+      locators: buildLocators(el),
+      url: window.location.href
+    });
+    persistQueue();
+    // Best-effort convenience so the person recording can genuinely Ctrl+V
+    // this into the next field instead of retyping it by hand - done
+    // directly here in JS (unlike the OCR path below, which has to do this
+    // from Python after its screenshot/OCR round trip) since the value is
+    // already known immediately, with no round trip needed at all.
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        // writeText() returns a Promise that can REJECT asynchronously
+        // (e.g. clipboard-write permission denied, common under headless/
+        // automated contexts) - the try/catch here only guards the
+        // synchronous call itself, so the rejection needs its own .catch()
+        // or it surfaces as an unhandled promise rejection.
+        navigator.clipboard.writeText(text).catch(function () { /* non-fatal - the captured value is already stored regardless */ });
+      }
+    } catch (err) { /* non-fatal - the captured value is already stored regardless */ }
+  }
+
+  function recordOcrCaptureRequest(el, varName) {
+    window.__recordedQueue.push({
+      ts: Date.now(),
+      action: 'ocr_capture_request',
+      value: null,
+      requested_var_name: varName,
+      element: describe(el),
+      locators: buildLocators(el),
+      url: window.location.href
+    });
+    persistQueue();
+  }
+
+  // Small transient in-page notification, replacing window.alert() (which
+  // has the exact same native-dialog-interception problem described in
+  // the big comment above) for the "captured as {{name}}" confirmation
+  // after a successful capture. Auto-dismisses; never blocks anything.
+  function showToast(message) {
+    var host = document.createElement('div');
+    host.style.cssText = 'all:initial; position:fixed; left:0; right:0; bottom:24px; ' +
+      'z-index:2147483647; display:flex; justify-content:center; pointer-events:none;';
+    document.documentElement.appendChild(host);
+    var shadow = host.attachShadow({ mode: 'open' });
+    shadow.innerHTML =
+      '<style>' +
+      '.toast { font: 13px/1.4 -apple-system, Segoe UI, Arial, sans-serif; background:#163C8C; ' +
+      'color:#fff; padding:10px 16px; border-radius:6px; box-shadow:0 4px 16px rgba(0,0,0,0.35); ' +
+      'max-width:420px; text-align:center; opacity:0; transform:translateY(8px); ' +
+      'transition:opacity .15s ease, transform .15s ease; }' +
+      '.toast.show { opacity:1; transform:translateY(0); }' +
+      '</style>' +
+      '<div class="toast" id="t"></div>';
+    var toastEl = shadow.getElementById('t');
+    toastEl.textContent = message;  // textContent, not innerHTML - message may contain recorded values verbatim
+    requestAnimationFrame(function () { toastEl.className = 'toast show'; });
+    setTimeout(function () {
+      toastEl.className = 'toast';
+      setTimeout(function () { host.remove(); }, 200);
+    }, 2600);
+  }
+
+  // The in-page replacement for the old window.prompt() chain - see the
+  // big comment above recordTextCaptureRequest for the full "why" behind
+  // both the Shadow DOM isolation and the deferred outside-click listener.
+  function showCaptureMenu(el, x, y) {
+    var existing = document.getElementById(CAPTURE_MENU_HOST_ID);
+    if (existing) existing.remove();
+
+    var host = document.createElement('div');
+    host.id = CAPTURE_MENU_HOST_ID;
+    host.style.cssText = 'all:initial; position:fixed; left:' + x + 'px; top:' + y + 'px; z-index:2147483647;';
+    document.documentElement.appendChild(host);
+
+    var shadow = host.attachShadow({ mode: 'open' });
+    shadow.innerHTML =
+      '<style>' +
+      '.menu { font: 13px/1.4 -apple-system, Segoe UI, Arial, sans-serif; background:#fff; ' +
+      'color:#0B1E3D; border:1px solid #D8E1EF; border-radius:8px; ' +
+      'box-shadow:0 8px 28px rgba(11,30,61,0.25); width:280px; padding:12px; box-sizing:border-box; }' +
+      '.menu h4 { margin:0 0 8px; font-size:13px; font-weight:600; }' +
+      '.menu .modes { display:flex; gap:6px; margin-bottom:8px; }' +
+      '.menu button { font:inherit; cursor:pointer; border-radius:5px; border:1px solid #D8E1EF; ' +
+      'background:#EAF1FA; color:#163C8C; padding:6px 10px; }' +
+      '.menu button:hover { filter:brightness(0.96); }' +
+      '.menu button.chosen { background:#163C8C; color:#fff; border-color:#163C8C; }' +
+      '.menu button.primary { background:#163C8C; color:#fff; border-color:#163C8C; }' +
+      '.menu input { font:inherit; width:100%; box-sizing:border-box; padding:6px 8px; ' +
+      'border:1px solid #D8E1EF; border-radius:5px; margin:8px 0; }' +
+      '.menu .row { display:flex; gap:6px; justify-content:flex-end; }' +
+      '.menu .hint { color:#5B6B85; font-size:11px; margin-top:-4px; margin-bottom:8px; }' +
+      '.hidden { display:none; }' +
+      '</style>' +
+      '<div class="menu">' +
+      '  <h4>Capture a value from this element</h4>' +
+      '  <div class="modes">' +
+      '    <button type="button" id="modeText">Capture Text</button>' +
+      '    <button type="button" id="modeOcr">Capture via OCR</button>' +
+      '  </div>' +
+      '  <div id="nameSection" class="hidden">' +
+      '    <input type="text" id="varName" value="captured_value" placeholder="variable_name" />' +
+      '    <div class="hint">Letters, numbers, underscore only.</div>' +
+      '    <div class="row">' +
+      '      <button type="button" id="cancelBtn">Cancel</button>' +
+      '      <button type="button" id="confirmBtn" class="primary">Capture</button>' +
+      '    </div>' +
+      '  </div>' +
+      '</div>';
+
+    // Keep the menu fully on screen regardless of where the right-click
+    // landed - a click near the right/bottom edge would otherwise render
+    // it partially or fully off-viewport.
+    requestAnimationFrame(function () {
+      var rect = host.getBoundingClientRect();
+      if (rect.right > window.innerWidth) host.style.left = Math.max(8, window.innerWidth - rect.width - 8) + 'px';
+      if (rect.bottom > window.innerHeight) host.style.top = Math.max(8, window.innerHeight - rect.height - 8) + 'px';
+    });
+
+    var modeTextBtn = shadow.getElementById('modeText');
+    var modeOcrBtn = shadow.getElementById('modeOcr');
+    var nameSection = shadow.getElementById('nameSection');
+    var nameInput = shadow.getElementById('varName');
+    var confirmBtn = shadow.getElementById('confirmBtn');
+    var cancelBtn = shadow.getElementById('cancelBtn');
+    var chosenMode = null;
+
+    function selectMode(mode, btn) {
+      chosenMode = mode;
+      modeTextBtn.classList.remove('chosen');
+      modeOcrBtn.classList.remove('chosen');
+      btn.classList.add('chosen');
+      nameSection.classList.remove('hidden');
+      nameInput.focus();
+      nameInput.select();
+    }
+    modeTextBtn.addEventListener('click', function () { selectMode('text', modeTextBtn); });
+    modeOcrBtn.addEventListener('click', function () { selectMode('ocr', modeOcrBtn); });
+
+    function closeMenu() {
+      host.remove();
+      document.removeEventListener('mousedown', onOutsideMouseDown, true);
+      document.removeEventListener('keydown', onKeyDown, true);
+    }
+    cancelBtn.addEventListener('click', closeMenu);
+
+    function confirmCapture() {
+      if (!chosenMode) return;
+      var varName = (nameInput.value || '').trim().replace(/[^a-zA-Z0-9_]/g, '_');
+      if (!varName) { nameInput.focus(); return; }
+      closeMenu();
+      if (chosenMode === 'ocr') {
+        recordOcrCaptureRequest(el, varName);
+        showToast('Marked for OCR capture as {{' + varName + '}} - re-read live every time this test runs.');
+      } else {
+        recordTextCaptureRequest(el, varName);
+        showToast('Marked "{{' + varName + '}}" for live text capture - re-read every time this test runs.');
+      }
+    }
+    confirmBtn.addEventListener('click', confirmCapture);
+    nameInput.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); confirmCapture(); }
+      else if (e.key === 'Escape') { closeMenu(); }
+    });
+
+    // Shadow DOM automatically RETARGETS events that cross the shadow
+    // boundary: from a document-level listener's point of view, ANY click
+    // inside this menu reports e.target as `host` itself (never the real
+    // inner button/input) - so this one check correctly distinguishes
+    // "inside the menu" from "outside it" with no manual
+    // stopPropagation() needed in any of the handlers above.
+    function onOutsideMouseDown(e) {
+      if (e.target !== host) closeMenu();
+    }
+    function onKeyDown(e) {
+      if (e.key === 'Escape') closeMenu();
+    }
+    // Deferred to the next event-loop tick - see the big comment above
+    // recordTextCaptureRequest for exactly why this can't be attached
+    // synchronously here (it would catch the tail of the SAME right-click
+    // gesture that's opening this menu).
+    setTimeout(function () {
+      document.addEventListener('mousedown', onOutsideMouseDown, true);
+      document.addEventListener('keydown', onKeyDown, true);
+    }, 0);
+  }
+
+  document.addEventListener('contextmenu', function (e) {
+    var el = e.target;
+    if (!el || el === document || el === document.body) return;
+    e.preventDefault();
+    if (el.id === CAPTURE_MENU_HOST_ID) return;  // right-clicking the menu itself - not a real capture target
+    showCaptureMenu(el, e.clientX, e.clientY);
+  }, true);
+
+  window.__flushActions = function () {
+    var q = window.__recordedQueue;
+    window.__recordedQueue = [];
+    persistQueue();
+    return q;
+  };
+
+  // Exposed so the Python side (recorder/recorder.py) can compute a stable
+  // CSS path for an <iframe>/<frame> DOM ELEMENT from *inside the PARENT
+  // frame's context* (Playwright's Frame.frame_element() returns that
+  // element handle, but it has to be evaluated against the parent frame,
+  // not the iframe's own document) - this is how mainframe/iframe support
+  // builds a "frame_path" (a chain of selectors from the top page down to
+  // the frame an action happened in) without needing any new JS of its
+  // own; it just reuses the same cssPath() this file already uses for
+  // in-page elements. See Recorder._frame_path_for.
+  window.__recorderCssPathFor = cssPath;
+})();
