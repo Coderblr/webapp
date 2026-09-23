@@ -1,321 +1,110 @@
 import { useEffect, useState } from "react";
 import { recordingsApi } from "@/lib/api";
-import { Panel, Disclosure, Callout, Spinner, Button, Select } from "@/components/ui";
+import { Callout, Spinner } from "@/components/ui";
 
 const ACTION_LABELS = {
-  click: "CLICK-C",
-  type: "INPUT-C",
-  select: "DROPDOWN-S",
-  keypress: "KEYPRESS",
-  delay: "DELAY",
-  scroll: "SCROLL",
-  window_closed: "CLOSETAB",
-  assert_text: "VERIFICATION",
-  assert_ocr_text: "VERIFY-OCR",
-  file_upload: "UPLOAD",
-  copy: "CAPTURE",
-  ocr_capture: "CAPTURE-OCR",
+  click: "Click",
+  type: "Type",
+  select: "Select",
+  keypress: "Key press",
+  delay: "Wait",
+  scroll: "Scroll",
+  window_closed: "Close tab",
+  assert_text: "Verify text",
+  assert_ocr_text: "Verify text (OCR)",
+  file_upload: "Upload file",
+  copy: "Copy",
+  ocr_capture: "Capture (OCR)",
 };
-
-const NEEDS_SELECTOR = new Set(["click", "type", "select", "assert_text", "file_upload", "copy", "ocr_capture"]);
-const NEEDS_NAME = new Set(["click", "type", "select", "assert_text", "file_upload", "copy", "ocr_capture"]);
-const INPUT_PLACEHOLDER = {
-  delay: "seconds, e.g. 3",
-  scroll: "DOWN-4 or UP-2",
-  type: "value to type",
-  select: "option to select",
-  assert_text: "text expected to appear",
-  // Page-level (no element/selector needed) - checks the text is visible
-  // ANYWHERE on screen via OCR, not inside one specific DOM element - see
-  // generator/templates/page.tmpl's assert_ocr_text_visible.
-  assert_ocr_text: "text expected to appear on screen (via OCR)",
-  file_upload: "file name",
-  copy: "variable name",
-  ocr_capture: "variable name",
-};
-
-function blankStep() {
-  return { action: "click", label: "", value: "", locators: [], raw_selector: "" };
-}
-
-function selectorCellText(step, drafts, index) {
-  if (index in drafts) return drafts[index];
-  // Prefer the EXACT text from the spreadsheet's "present element" column
-  // (if this step came from a UiPath import, or was previously edited via
-  // a pasted selector) - a reconstructed "ID: username" summary from the
-  // parsed locators is a fallback for steps that never had raw selector
-  // text at all (e.g. a real browser recording, which only ever produces
-  // parsed locators - there's no spreadsheet cell to preserve for those).
-  if (step.raw_selector) return step.raw_selector;
-  if (!step.locators || step.locators.length === 0) return "";
-  return step.locators.map((l) => `${l.strategy}: ${l.value}`).join("\n");
-}
 
 /**
- * A 5-column grid - Action/Method, Name, Present element, Input - matching
- * the UiPath spreadsheet's own layout exactly, so editing a saved
- * recording here feels like editing the same Excel sheet, not a
- * different kind of form. Every cell is directly editable inline (click
- * in, type, tab/click away) rather than opening a separate edit dialog.
- *
- * The "present element" cell accepts the SAME <webctrl .../> snippet
- * format the spreadsheet's own column does - pasted text is parsed into
- * real locators automatically when you click out of the cell (see
- * recordingsApi.parseSelector, reusing the Excel importer's own parser).
+ * Read-only, numbered timeline of a recording's actions - reuses the
+ * SAME data StepEditor.js's editable grid already fetches
+ * (recordingsApi.getSteps), just rendered for reading rather than
+ * editing. Purpose-built to surface the Capture -> Store -> Reuse
+ * relationship (spec's "COPY/PASTE relationship" requirement) that
+ * StepEditor's Excel-style grid has no room to show: a "copy" row
+ * displays the {{variable}} it was captured as, and a "paste"/"type" row
+ * whose value was runtime-resolved from an earlier copy (see
+ * recorder/variable_capture.py, backend/api.py's resolved_var field)
+ * displays which one.
  */
-export default function StepEditor({ recordingFile, onSaved }) {
+export default function ActionTimeline({ recordingFile }) {
   const [steps, setSteps] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [loadError, setLoadError] = useState(null);
-  const [notice, setNotice] = useState(null);
-
-  const [selectorDrafts, setSelectorDrafts] = useState({});
-  const [parsingRow, setParsingRow] = useState(null);
-  const [selectorErrors, setSelectorErrors] = useState({});
+  const [error, setError] = useState(null);
+  const [expanded, setExpanded] = useState(null);
 
   useEffect(() => {
-    if (recordingFile) load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    setSteps([]);
+    setError(null);
+    if (!recordingFile) return;
+    setLoading(true);
+    recordingsApi
+      .getSteps(recordingFile)
+      .then((r) => setSteps(r.steps))
+      .catch((e) => setError(e.detail || e.message))
+      .finally(() => setLoading(false));
   }, [recordingFile]);
 
-  async function load() {
-    setLoading(true);
-    setLoadError(null);
-    setSelectorDrafts({});
-    setSelectorErrors({});
-    try {
-      const r = await recordingsApi.getSteps(recordingFile);
-      setSteps(r.steps);
-    } catch (e) {
-      setLoadError(e.detail || e.message);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  function updateField(i, field, value) {
-    setSteps((prev) =>
-      prev.map((s, idx) => {
-        if (idx !== i) return s;
-        const updated = { ...s, [field]: value };
-        // For capture-type steps, "Name" doubles as the variable name
-        // (captured_as) - there's no separate column for it, to keep this
-        // grid exactly 5 columns like the spreadsheet.
-        if (field === "label" && (s.action === "copy" || s.action === "ocr_capture")) {
-          updated.captured_as = value;
-        }
-        return updated;
-      })
-    );
-  }
-
-  function addRow() {
-    setSteps((prev) => [...prev, blankStep()]);
-  }
-
-  function deleteRow(i) {
-    setSteps((prev) => prev.filter((_, idx) => idx !== i));
-    setSelectorDrafts((prev) => {
-      const next = {};
-      Object.entries(prev).forEach(([k, v]) => {
-        const idx = parseInt(k, 10);
-        if (idx < i) next[idx] = v;
-        else if (idx > i) next[idx - 1] = v;
-      });
-      return next;
-    });
-  }
-
-  function moveRow(i, delta) {
-    const target = i + delta;
-    if (target < 0 || target >= steps.length) return;
-    setSteps((prev) => {
-      const next = [...prev];
-      [next[i], next[target]] = [next[target], next[i]];
-      return next;
-    });
-  }
-
-  async function handleSelectorBlur(i, text) {
-    setSelectorDrafts((prev) => ({ ...prev, [i]: text }));
-    updateField(i, "raw_selector", text);
-    if (!text.trim()) {
-      updateField(i, "locators", []);
-      return;
-    }
-    setParsingRow(i);
-    setSelectorErrors((prev) => ({ ...prev, [i]: null }));
-    try {
-      const r = await recordingsApi.parseSelector(text);
-      if (r.locators.length === 0) {
-        setSelectorErrors((prev) => ({ ...prev, [i]: "No selector found in this text." }));
-        return;
-      }
-      updateField(i, "locators", r.locators);
-      setSteps((prev) =>
-        prev.map((s, idx) => (idx === i && !s.label && r.suggested_label ? { ...s, label: r.suggested_label } : s))
-      );
-    } catch (e) {
-      setSelectorErrors((prev) => ({ ...prev, [i]: e.detail || e.message }));
-    } finally {
-      setParsingRow(null);
-    }
-  }
-
-  async function saveAll() {
-    const missingSelector = steps.findIndex((s) => NEEDS_SELECTOR.has(s.action) && s.locators.length === 0);
-    if (missingSelector !== -1) {
-      setNotice({ tone: "error", text: `Row ${missingSelector + 1} needs a selector in "Present element" before saving.` });
-      return;
-    }
-    setSaving(true);
-    setNotice(null);
-    try {
-      const r = await recordingsApi.updateSteps(recordingFile, steps);
-      setSteps(r.steps);
-      setSelectorDrafts({});
-      setNotice({ tone: "success", text: `Saved - this recording now has ${r.steps.length} steps.` });
-      if (onSaved) onSaved();
-    } catch (e) {
-      setNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  const cellClass = "border border-line px-0 py-0 align-top";
-  const inputClass = "w-full min-w-[7rem] border-0 bg-transparent px-2 py-1.5 text-sm text-ink focus:bg-brand-blueLight focus:outline-none";
+  if (loading) return <Spinner label="Loading actions..." />;
+  if (error) return <Callout tone="error">Could not load actions: {error}</Callout>;
+  if (steps.length === 0) return <p className="text-sm text-muted">This recording has no actions yet.</p>;
 
   return (
-    <Panel>
-      <div className="px-5 py-4">
-        <Disclosure title="Edit steps (Excel-style)" defaultOpen>
-          <div className="space-y-3">
-            <p className="text-xs text-muted">
-              Same columns as your spreadsheet - click any cell to edit. Paste a selector into &quot;Present element&quot;
-              exactly like the Excel column; it parses automatically when you click away. Changes apply once you click
-              &quot;Save changes&quot; below.
-            </p>
-
-            {loading && <Spinner label="Loading steps..." />}
-            {loadError && <Callout tone="error">Could not load steps: {loadError}</Callout>}
-
-            {!loading && !loadError && (
-              <>
-                <div className="max-h-[32rem] w-full overflow-auto rounded-sm border border-line scroll-thin">
-                  <table className="w-full min-w-[50rem] border-collapse text-left text-sm">
-                    <thead className="sticky top-0 z-10 bg-rail">
-                      <tr>
-                        <th className="border border-line px-2 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">#</th>
-                        <th className="border border-line px-2 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">Action/Method</th>
-                        <th className="border border-line px-2 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">Name</th>
-                        <th className="border border-line px-2 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">Present element</th>
-                        <th className="border border-line px-2 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">Input</th>
-                        <th className="border border-line px-2 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600"></th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {steps.map((s, i) => (
-                        <tr key={i} className="odd:bg-panel even:bg-[#FBFDFF]">
-                          <td className="border border-line px-2 py-1.5 text-xs text-muted">{i + 1}</td>
-                          <td className={cellClass}>
-                            <Select
-                              value={s.action}
-                              onChange={(e) => {
-                                const newAction = e.target.value;
-                                updateField(i, "action", newAction);
-                                if (newAction === "copy" || newAction === "ocr_capture") updateField(i, "captured_as", s.label || "");
-                              }}
-                              className="border-0 bg-transparent px-2 py-1.5 text-sm focus:outline-none"
-                            >
-                              {Object.entries(ACTION_LABELS).map(([value, label]) => (
-                                <option key={value} value={value}>
-                                  {label}
-                                </option>
-                              ))}
-                            </Select>
-                          </td>
-                          <td className={cellClass}>
-                            {NEEDS_NAME.has(s.action) ? (
-                              <input
-                                className={inputClass}
-                                value={s.label || ""}
-                                onChange={(e) => updateField(i, "label", e.target.value)}
-                                placeholder="e.g. Login Button"
-                              />
-                            ) : (
-                              <span className="block px-2 py-1.5 text-xs text-muted">—</span>
-                            )}
-                          </td>
-                          <td className={cellClass}>
-                            {NEEDS_SELECTOR.has(s.action) ? (
-                              <div>
-                                <textarea
-                                  className="w-full min-w-[16rem] resize-y border-0 bg-transparent px-2 py-1.5 font-mono text-xs text-ink focus:bg-brand-blueLight focus:outline-none"
-                                  rows={2}
-                                  defaultValue={selectorCellText(s, selectorDrafts, i)}
-                                  onBlur={(e) => handleSelectorBlur(i, e.target.value)}
-                                  placeholder="<html app='msedge.exe' />&#10;<webctrl id='username' tag='INPUT' />"
-                                />
-                                {parsingRow === i && <div className="px-2 pb-1 text-xs text-muted">Parsing...</div>}
-                                {selectorErrors[i] && <div className="px-2 pb-1 text-xs text-signal-rust">{selectorErrors[i]}</div>}
-                              </div>
-                            ) : (
-                              <span className="block px-2 py-1.5 text-xs text-muted">—</span>
-                            )}
-                          </td>
-                          <td className={cellClass}>
-                            <input
-                              className={inputClass}
-                              value={s.value || ""}
-                              onChange={(e) => updateField(i, "value", e.target.value)}
-                              placeholder={INPUT_PLACEHOLDER[s.action] || ""}
-                            />
-                          </td>
-                          <td className="border border-line px-1 py-1.5 text-center">
-                            <div className="flex items-center justify-center gap-1">
-                              <button type="button" className="px-1 text-muted hover:text-ink disabled:opacity-30" disabled={i === 0} onClick={() => moveRow(i, -1)} title="Move up">
-                                ↑
-                              </button>
-                              <button type="button" className="px-1 text-muted hover:text-ink disabled:opacity-30" disabled={i === steps.length - 1} onClick={() => moveRow(i, 1)} title="Move down">
-                                ↓
-                              </button>
-                              <button type="button" className="px-1 text-signal-rust hover:opacity-70" onClick={() => deleteRow(i)} title="Delete row">
-                                ✕
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      ))}
-                      {steps.length === 0 && (
-                        <tr>
-                          <td colSpan={6} className="border border-line px-3 py-4 text-center text-sm text-muted">
-                            No steps yet - add one below.
-                          </td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2">
-                  <Button variant="secondary" onClick={addRow}>
-                    + Add row
-                  </Button>
-                  <Button onClick={saveAll} disabled={saving}>
-                    {saving ? "Saving..." : "Save changes"}
-                  </Button>
-                  <Button variant="secondary" onClick={load} disabled={saving}>
-                    Discard &amp; reload
-                  </Button>
-                </div>
-                {notice && <Callout tone={notice.tone}>{notice.text}</Callout>}
-              </>
+    <div className="space-y-1.5">
+      {steps.map((s, i) => {
+        const isOpen = expanded === i;
+        return (
+          <div key={i} className="rounded-sm border border-line bg-panel">
+            <button
+              type="button"
+              className="flex w-full items-center gap-3 px-3 py-2 text-left hover:bg-rail"
+              onClick={() => setExpanded(isOpen ? null : i)}
+            >
+              <span className="w-8 shrink-0 font-mono text-xs text-muted">{String(i + 1).padStart(2, "0")}</span>
+              <span className="w-32 shrink-0 text-xs font-semibold uppercase tracking-wide text-signal-slate">
+                {ACTION_LABELS[s.action] || s.action}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-sm text-ink">{s.label || <span className="text-muted">—</span>}</span>
+              {s.captured_as && (
+                <span className="shrink-0 rounded-sm bg-brand-blueLight px-1.5 py-0.5 font-mono text-xs text-brand-blue">
+                  {"{{" + s.captured_as + "}}"}
+                </span>
+              )}
+              {s.resolved_var && (
+                <span className="shrink-0 rounded-sm bg-[#EAF5F2] px-1.5 py-0.5 font-mono text-xs text-signal-tealDark">
+                  ← {"{{" + s.resolved_var + "}}"}
+                </span>
+              )}
+              <span className="shrink-0 text-muted">{isOpen ? "⌄" : "›"}</span>
+            </button>
+            {isOpen && (
+              <div className="space-y-1 border-t border-line px-3 py-2 text-xs text-muted">
+                {s.value != null && s.value !== "" && (
+                  <div>
+                    <span className="font-medium text-ink">Value: </span>
+                    <span className="font-mono">{s.value}</span>
+                  </div>
+                )}
+                {s.resolved_var && (
+                  <div>
+                    Resolved at runtime from the earlier <span className="font-mono">{"{{" + s.resolved_var + "}}"}</span> copy -
+                    not the recording-time value shown above.
+                  </div>
+                )}
+                {s.locators?.length > 0 && (
+                  <div>
+                    <span className="font-medium text-ink">Locators: </span>
+                    {s.locators.map((l) => `${l.strategy}=${l.value}`).join("  |  ")}
+                  </div>
+                )}
+                {(!s.locators || s.locators.length === 0) && <div>No locator - page-level action.</div>}
+              </div>
             )}
           </div>
-        </Disclosure>
-      </div>
-    </Panel>
+        );
+      })}
+    </div>
   );
 }
