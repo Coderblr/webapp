@@ -1,256 +1,514 @@
 """
-Shared OCR helper, used at BOTH:
-  - RECORD time (recorder/recorder.py, when the user right-clicks an
-    element on the page and chooses "Capture text with OCR" from the
-    custom menu injected by recorder_injector.js)
-  - REPLAY time (generator/templates/page.tmpl's
-    BasePage.capture_value_ocr, called from the generated step - see
-    generator/templates/steps.tmpl's "ocr_capture" branch; also
-    BasePage._ocr_click_fallback - a last-resort locator strategy for
-    click() when every DOM candidate fails - and
-    BasePage.assert_ocr_text_visible - a page-level OCR/visual
-    assertion, with no DOM element involved at all)
+Takes a raw recording (list of actions from recorder.Recorder) and produces:
+  - output/features/recorded.feature
+  - output/features/steps/recorded_steps.py
+  - output/features/environment.py   (copied static file, see runner/environment.py)
+  - output/pages/recorded_page.py
+  - output/pages/locators.json
 
-One implementation, so every caller always extracts text the exact same
-way - and critically, REPLAY re-runs the OCR live every single time the
-test executes (a fresh screenshot, fresh OCR pass) rather than reusing
-whatever text was read during recording, the same way a plain
-copy-captured value is re-read live rather than hard-coded (see
-recorder/variable_capture.py's module docstring) - these are usually
-values the application generates fresh each run (a new application
-number, a new reference ID rendered into an image/canvas rather than
-real DOM text), so baking in the recording-time value would make the
-generated test increasingly wrong over time.
-
-Uses EasyOCR - a pure-Python OCR engine (pip install easyocr, nothing
-else to install separately, unlike Tesseract) built on PyTorch. This is a
-genuine trade-off, not a strictly-better choice, worth understanding:
-  - Nothing to install on the target machine beyond `pip install easyocr`
-    (or whatever's bundled into local_agent's frozen build) - no separate
-    binary, no PATH configuration, no corporate-security exclusion needed
-    for a second executable.
-  - But: it's a MUCH heavier dependency (EasyOCR pulls in PyTorch - use
-    the CPU-only build, `pip install torch --index-url
-    https://download.pytorch.org/whl/cpu`, NOT the default GPU build,
-    which is several GB larger for zero benefit on a laptop with no GPU).
-    This is exactly why OCR support stays OPTIONAL for local_agent (see
-    local_agent/requirements-agent.txt) rather than a hard dependency -
-    _ocr_click_fallback below is written to degrade silently (no
-    fallback attempted, original error still raised) rather than error
-    out, on a lightweight agent install that never installed this.
-  - And: EasyOCR downloads its detection/recognition model weights
-    (~100MB) from the internet the FIRST time a Reader() is ever created
-    on a given machine, caching them (default: ~/.EasyOCR/model/, or
-    wherever EASYOCR_MODULE_PATH points - see _get_reader below) for
-    every run after that. On a machine with restricted/no internet
-    access, this first-run download needs to be pre-staged (copy an
-    already-populated ~/.EasyOCR/model/ folder over, or point
-    EASYOCR_MODULE_PATH at a pre-staged location bundled with the
-    installer) BEFORE the first OCR capture is ever attempted there.
-  - Reader() initialization itself (loading those model weights into
-    memory) takes a few seconds - too slow to redo on every single
-    capture, so _get_reader() below creates it ONCE per process and
-    reuses it for every subsequent OCR call in that process's lifetime.
+This is deterministic scaffolding; the only place an LLM is optionally
+consulted is agent/step_namer.py (naming elements + phrasing steps).
 """
 from __future__ import annotations
-import hashlib
-import io
-import os
-import threading
-from collections import OrderedDict
-from typing import Optional
+import base64
+import json
+import logging
+import math
+import re
+import shutil
+from pathlib import Path
+from datetime import datetime
 
-_reader = None
-_reader_lock = threading.Lock()
+from jinja2 import Environment, FileSystemLoader
 
-# Minimum EasyOCR confidence (0-1) for a region to count as a genuine match
-# in best_match() below - picked conservatively low since UI text (small
-# fonts, icon+label buttons) often scores lower than scanned-document text,
-# but still high enough to reject obvious noise/garbage detections.
-DEFAULT_MIN_CONFIDENCE = 0.35
+from recorder.locator_strategy import order_locators
+from agent.step_namer import name_step, key_label
 
-# Bounded cache of find_text_regions() results, keyed by a hash of the exact
-# screenshot bytes - a byte-identical screenshot (checked twice within the
-# same run, e.g. a click fallback immediately followed by an OCR assertion
-# on an unchanged page) skips re-running OCR entirely; any genuinely
-# different screenshot has different bytes, so this can never serve stale
-# results. Bounded (not per-run-scoped) since this module is a
-# process-lifetime singleton shared across every recording/replay in that
-# process, same as _reader above.
-_OCR_CACHE_MAX = 64
-_ocr_cache: "OrderedDict[str, list]" = OrderedDict()
-_ocr_cache_lock = threading.Lock()
+logger = logging.getLogger(__name__)
+
+TEMPLATES_DIR = Path(__file__).parent / "templates"
+ROOT = Path(__file__).parent.parent
+
+# Floor for the measured recording-to-recording wait, so two actions that
+# happened to be recorded a fraction of a second apart don't generate an
+# unrealistically tight timeout.
+MIN_WAIT_SECONDS = 5
+# Used when no timing data is available at all (e.g. a hand-built recording).
+DEFAULT_WAIT_SECONDS = 10
 
 
-def _cache_get(key: str):
-    with _ocr_cache_lock:
-        value = _ocr_cache.get(key)
-        if value is not None:
-            _ocr_cache.move_to_end(key)
-        return value
+def build_artifacts(recording: dict, llm=None, output_dir: str = "output", mask_passwords: bool = True) -> dict:
+    out = Path(output_dir)
+    (out / "features" / "steps").mkdir(parents=True, exist_ok=True)
+    (out / "pages").mkdir(parents=True, exist_ok=True)
+    (out / "fixtures").mkdir(parents=True, exist_ok=True)
 
+    target_url = recording["target_url"]
+    actions = recording["actions"]
 
-def _cache_put(key: str, value: list) -> None:
-    with _ocr_cache_lock:
-        _ocr_cache[key] = value
-        _ocr_cache.move_to_end(key)
-        while len(_ocr_cache) > _OCR_CACHE_MAX:
-            _ocr_cache.popitem(last=False)
-
-
-def _normalize(text: str) -> str:
-    """Whitespace-collapsed, case-folded form used for matching - mirrors
-    recorder/variable_capture.py's _normalize, same rationale (a UI often
-    re-renders/re-wraps text slightly from how it was recorded)."""
-    return " ".join(text.split()).casefold()
-
-
-def _get_reader():
-    """Lazily creates ONE EasyOCR Reader for this process's whole
-    lifetime (thread-safe) - Reader() itself is slow (loads model
-    weights), so this must never be called fresh per-capture. English
-    only by default; add languages via OCR_LANGUAGES (comma-separated
-    EasyOCR language codes, e.g. "en,hi") if this ever needs to read
-    non-English text."""
-    global _reader
-    if _reader is None:
-        with _reader_lock:
-            if _reader is None:
-                import easyocr
-                languages = os.environ.get("OCR_LANGUAGES", "en").split(",")
-                model_dir = os.environ.get("EASYOCR_MODULE_PATH")  # pre-staged model weights, for a machine with no internet access
-                _reader = easyocr.Reader(
-                    [lang.strip() for lang in languages if lang.strip()],
-                    gpu=False,  # laptops running this agent have no GPU worth using - forcing this off also skips a slow, pointless CUDA availability probe
-                    model_storage_directory=model_dir,
-                    download_enabled=model_dir is None or not os.path.isdir(model_dir),
-                )
-    return _reader
-
-
-def ocr_available() -> bool:
-    """Best-effort check - used by recorder.py to fail an OCR capture
-    request clearly and immediately (rather than partway through) if
-    EasyOCR genuinely can't run here (not installed, or model weights
-    can't be obtained/found and there's no internet access to fetch
-    them)."""
+    # Best-effort: merge same-element 'type' actions that fired within a
+    # short window of each other (see coalesce_consecutive_types's docstring)
+    # in case this recording predates that fix, or was regenerated from a
+    # previously-saved recording. Runs BEFORE variable annotation below so
+    # {{var}} correlation sees the final, de-duplicated values.
     try:
-        _get_reader()
-        return True
+        from recorder.variable_capture import coalesce_consecutive_types
+        actions = coalesce_consecutive_types(actions)
     except Exception:
-        return False
+        pass
 
-
-def find_text_regions(png_bytes: bytes) -> list[dict]:
-    """Structured OCR: every detected text region with its confidence and
-    bounding box, e.g.:
-        {"text": "Submit", "normalized_text": "submit", "confidence": 0.94,
-         "bbox": {"x": 100, "y": 200, "width": 120, "height": 40}}
-    Unlike extract_text_from_png_bytes's plain joined string, this is what
-    BasePage._ocr_click_fallback (a last-resort locator strategy) and
-    BasePage.assert_ocr_text_visible (a page-level OCR/visual assertion)
-    need - "which region, if any, actually matches the text I'm looking
-    for, and how confident was the read." Cached by a hash of the exact
-    screenshot bytes (see module docstring). Preprocessing (grayscale +
-    contrast normalization) is applied before handing the image to
-    EasyOCR - a small, safe accuracy improvement for typical UI
-    screenshots; full skew/rotation correction is deliberately not
-    attempted (UI screenshots are always axis-aligned).
-
-    Raises the same RuntimeError as extract_text_from_png_bytes if OCR
-    genuinely can't run here (missing deps, EasyOCR init failure) - see
-    that function's docstring for the exact conditions."""
-    cache_key = hashlib.sha1(png_bytes).hexdigest()
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
-
+    # Best-effort: derive/refresh the Capture -> Store -> Reuse {{var}} metadata
+    # (see recorder/variable_capture.py) in case this recording was produced
+    # before that hook existed in Recorder.stop(), or was built by hand. Safe
+    # to call even if it already ran - it's idempotent.
     try:
-        from PIL import Image, ImageOps
-        import numpy as np
-    except ImportError as e:
-        raise RuntimeError(
-            "OCR support isn't fully installed on this machine - "
-            "pip install easyocr Pillow numpy "
-            "(see local_agent/requirements-agent.txt)."
-        ) from e
+        from recorder.variable_capture import annotate_variables
+        actions = annotate_variables(actions)
+    except Exception:
+        pass
 
-    try:
-        reader = _get_reader()
-    except Exception as e:
-        raise RuntimeError(
-            f"EasyOCR could not initialize ({type(e).__name__}: {e}). If this machine has no "
-            "internet access, EasyOCR's model weights need to be pre-staged - copy an already-"
-            "populated ~/.EasyOCR/model/ folder from a machine that has run OCR successfully "
-            "once, or set EASYOCR_MODULE_PATH to a pre-staged model directory bundled with the "
-            "installer."
-        ) from e
+    # Materialize any file(s) actually uploaded during recording into
+    # output/fixtures/ under their original name (see recorder_injector.js's
+    # file_upload handling) - this is what lets a tester upload literally
+    # any file, with any name, and have replay just work with no manual
+    # "go copy the file into fixtures/" step. Only skipped when a file was
+    # too large to have been captured inline (see MAX_INLINE_BYTES in the
+    # injector) or predates this feature - BasePage.upload_file()'s
+    # FileNotFoundError message tells the user exactly what to do in that
+    # fallback case.
+    for action in actions:
+        if action.get("action") != "file_upload":
+            continue
+        b64 = action.get("fileDataBase64")
+        file_name = action.get("value")
+        if not b64 or not file_name:
+            continue
+        try:
+            file_bytes = base64.b64decode(b64)
+            # Strip any path-like characters from the recorded name before
+            # using it as a filename - defense in depth, since this is
+            # ultimately attacker-controllable browser-reported input.
+            # Deliberately NOT just Path(file_name).name: that only splits
+            # on the CURRENT platform's separator - on Linux, a Windows-
+            # style "C:\fakepath\name.pdf" string (exactly what a real
+            # recorded file_upload value looks like, per
+            # recorder_injector.js) has no "/" in it at all, so .name
+            # would return the WHOLE fake path unchanged, not just the
+            # filename. Splitting on both slash characters explicitly
+            # works the same regardless of which OS actually runs this.
+            safe_name = re.split(r"[\\/]", file_name)[-1] or "uploaded_file"
+            (out / "fixtures" / safe_name).write_bytes(file_bytes)
+        except Exception:
+            # Corrupt/partial base64, disk issue, etc. - don't fail the
+            # whole build over one file; upload_file()'s own error message
+            # at replay time will make the problem obvious if it matters.
+            pass
 
-    image = Image.open(io.BytesIO(png_bytes)).convert("L")  # grayscale
-    image = ImageOps.autocontrast(image)
-    image_array = np.array(image)
+    used_names = set()
+    steps = []
+    locators_map = {}
+    # element_name -> visible text/aria-label, for BasePage._ocr_click_fallback
+    # (page.tmpl) - a last-resort, no-DOM-selector-required fallback for
+    # click() when every locator candidate fails. Kept separate from
+    # locators_map (not merged in until locators.json is written below) so
+    # it never leaks into element_names -> the per-element click_X()/type_X()
+    # convenience methods page.tmpl generates at the bottom of the file.
+    ocr_hints = {}
+    prev_ts = None
 
-    try:
-        # detail=1 returns (bbox_points, text, confidence) per region -
-        # bbox_points is 4 (x, y) corner points in top-to-bottom,
-        # left-to-right reading order (EasyOCR's natural detection order,
-        # same order detail=0 used to hand back as a flat string list).
-        raw = reader.readtext(image_array, detail=1)
-    except Exception as e:
-        raise RuntimeError(f"OCR failed while reading the captured image: {type(e).__name__}: {e}") from e
+    # Tracks which browser tab/window index (0 = the one the recording
+    # started on) replay currently considers "active", as we walk the
+    # recording in order - lets each real interactive step know whether it
+    # needs to switch tabs/windows first (see step["switch_to_page"] below),
+    # and lets a "new_window"/"window_closed" synthetic action fold its
+    # effect into the step it belongs with instead of needing its own.
+    current_page_index = 0
 
-    regions = []
-    for bbox_points, text, confidence in raw:
-        # EasyOCR returns numpy scalar types (np.int32/np.float64) for
-        # corner coordinates - cast to plain Python numbers so this dict is
-        # safely JSON-serializable and safe to pass straight into
-        # Playwright's mouse.click(x, y) (page.tmpl's _ocr_click_fallback),
-        # neither of which reliably accepts numpy types.
-        xs = [float(p[0]) for p in bbox_points]
-        ys = [float(p[1]) for p in bbox_points]
-        regions.append({
-            "text": text,
-            "normalized_text": _normalize(text),
-            "confidence": float(confidence),
-            "bbox": {"x": min(xs), "y": min(ys), "width": max(xs) - min(xs), "height": max(ys) - min(ys)},
+    # Parallel to `actions` (NOT to `steps` - a "new_window" action folds
+    # into the PRECEDING step and produces no step of its own, so the two
+    # lists can differ in length) - used for the Excel report below, which
+    # needs one label per ACTION, including the synthetic ones.
+    excel_labels = []
+
+    for action in actions:
+        kind = action["action"]
+        page_index = action.get("page_index", 0)
+        frame_path = action.get("frame_path") or []
+
+        # Explicit wait: how long the app actually took, during recording, to
+        # reach the state this action needed (i.e. the gap between the
+        # previous recorded action and this one) - so a step that recorded
+        # slow (e.g. a 50s dashboard load) gets a matching wait_ready()
+        # timeout, while a fast one doesn't sit around waiting needlessly.
+        # Computed here (before the branches below) so it's available for
+        # synthetic popup/dialog/window actions too, not just the "normal"
+        # interactive ones further down.
+        ts = action.get("ts")
+        if prev_ts is None or ts is None:
+            wait_seconds = DEFAULT_WAIT_SECONDS
+        else:
+            wait_seconds = max(MIN_WAIT_SECONDS, math.ceil((ts - prev_ts) / 1000.0))
+        if ts is not None:
+            prev_ts = ts
+
+        # --- popup / new tab / new window --------------------------------
+        # Doesn't get its own replay step: Playwright can only reliably
+        # catch a new page by wrapping the ACTION THAT CAUSED IT in
+        # context.expect_page() (see steps.tmpl's new_page_wrapper macro),
+        # so this folds forward onto the step that was just appended
+        # (almost always the click that opened it) instead. If this is
+        # somehow the very first action in the whole recording (no
+        # preceding step to fold onto - e.g. the app pops a window
+        # immediately on load), falls back to a standalone step that just
+        # waits for one to appear.
+        if kind == "new_window":
+            if steps:
+                steps[-1]["opens_new_page"] = True
+                steps[-1]["new_page_index"] = page_index
+            else:
+                steps.append({
+                    "action": "new_window_wait",
+                    "element_name": None,
+                    "step_phrase": "waits for a new browser tab or window to open",
+                    "wait_seconds": wait_seconds,
+                    "new_page_index": page_index,
+                })
+            current_page_index = page_index
+            excel_labels.append(f"(new browser tab/window #{page_index} opens)")
+            continue
+
+        # --- tab/window closed --------------------------------------------
+        if kind == "window_closed":
+            opener_index = action.get("opener_page_index", 0) or 0
+            steps.append({
+                "action": "window_closed",
+                "element_name": None,
+                "step_phrase": "closes the browser tab or window",
+                "wait_seconds": wait_seconds,
+                "closed_page_index": page_index,
+                "switch_back_to_index": opener_index,
+            })
+            current_page_index = opener_index
+            excel_labels.append(f"(browser tab/window #{page_index} closed)")
+            continue
+
+        # --- native alert/confirm/prompt/beforeunload dialog --------------
+        if kind == "dialog":
+            steps.append({
+                "action": "dialog",
+                "element_name": None,
+                "step_phrase": "handles a browser dialog",
+                "wait_seconds": wait_seconds,
+                "dialog_type": action.get("dialog_type") or "alert",
+                "dialog_message": action.get("value") or "",
+            })
+            excel_labels.append(f"(dialog: {action.get('dialog_type') or 'alert'})")
+            continue
+
+        # --- explicit delay/pause (e.g. imported from a UiPath-style Excel
+        # flow's DELAY step - see generator/uipath_importer.py) - a plain
+        # wait with no element/locator involved at all.
+        if kind == "delay":
+            delay_seconds = float(action.get("value") or 1)
+            steps.append({
+                "action": "delay",
+                "element_name": None,
+                "step_phrase": f"waits {delay_seconds:g} seconds",
+                "wait_seconds": 0,  # the delay IS the wait - don't also apply the normal inter-step timing heuristic
+                "delay_seconds": delay_seconds,
+            })
+            excel_labels.append(f"(delay {delay_seconds:g}s)")
+            continue
+
+        # --- page scroll (e.g. imported from a UiPath-style Excel flow's
+        # SCROLL step - "DOWN-4"/"UP-2" etc., direction + a rough
+        # magnitude - see generator/uipath_importer.py) - no element
+        # involved, scrolls the whole page/viewport.
+        if kind == "scroll":
+            steps.append({
+                "action": "scroll",
+                "element_name": None,
+                "step_phrase": f"scrolls {action.get('scroll_direction', 'down')}",
+                "wait_seconds": wait_seconds,
+                "scroll_direction": action.get("scroll_direction", "down"),
+                "scroll_amount": int(action.get("scroll_amount", 1)),
+            })
+            excel_labels.append(f"(scroll {action.get('scroll_direction', 'down')})")
+            continue
+
+        # --- text assertion (e.g. imported from a UiPath-style Excel
+        # flow's VERIFICATION step - see generator/uipath_importer.py) -
+        # checks that an element's text/value contains the expected
+        # string, without clicking/typing anything. Needs its own branch
+        # (not the generic name_step() path below) because it's a pure
+        # check, not an interactive action - there's no "value that was
+        # typed", just an expected value to compare against.
+        if kind == "assert_text":
+            ordered = order_locators(action.get("locators") or [])
+            # name_step() is intentionally never called for this action -
+            # it's tuned for interactive elements (buttons,
+            # inputs) and would produce a misleading name/phrase for a
+            # pure assertion target. A plain, predictable name based on
+            # the expected text is clearer to read in the generated code.
+            base_name = re.sub(r"[^a-z0-9]+", "_", (action.get("value") or "assertion").lower()).strip("_") or "assertion"
+            element_name = f"{base_name}_check"
+            n = 2
+            while element_name in locators_map or element_name in used_names:
+                element_name = f"{base_name}_check_{n}"
+                n += 1
+            used_names.add(element_name)
+            locators_map[element_name] = [
+                {"strategy": l["strategy"], "value": l["value"], "frame_path": frame_path} for l in ordered
+            ]
+            switch_to_page = page_index != current_page_index
+            current_page_index = page_index
+            steps.append({
+                "action": "assert_text",
+                "element_name": element_name,
+                "step_phrase": None,
+                "wait_seconds": wait_seconds,
+                "expected_text": action.get("value") or "",
+                "page_index": page_index,
+                "switch_to_page": switch_to_page,
+                "opens_new_page": False,
+                "new_page_index": None,
+            })
+            excel_labels.append(element_name)
+            continue
+
+        # --- OCR/visual text assertion - page-level, no DOM element/locator
+        # at all (unlike assert_text above, which needs one). Verifies text
+        # is visibly present SOMEWHERE on screen via OCR - for content with
+        # no DOM node to check in the first place (canvas-rendered text,
+        # image-based labels, scanned/embedded content). See
+        # generator/templates/page.tmpl's BasePage.assert_ocr_text_visible.
+        if kind == "assert_ocr_text":
+            switch_to_page = page_index != current_page_index
+            current_page_index = page_index
+            expected_text = action.get("value") or ""
+            steps.append({
+                "action": "assert_ocr_text",
+                "element_name": None,  # deliberately no locators_map entry - nothing to select, see docstring above
+                "step_phrase": None,
+                "wait_seconds": wait_seconds,
+                "expected_text": expected_text,
+                "page_index": page_index,
+                "switch_to_page": switch_to_page,
+                "opens_new_page": False,
+                "new_page_index": None,
+            })
+            excel_labels.append(f"(OCR assertion: {expected_text})")
+            continue
+
+        # --- OCR capture (right-click on the page -> "Capture text with
+        # OCR" - see recorder_injector.js's showOcrMenu and
+        # recorder.py's _process_ocr_request). Needs its own branch (not
+        # the generic name_step() path below) because its replay behavior
+        # is fundamentally different from a normal "copy" capture -
+        # screenshot + OCR, not a DOM/clipboard read - and it deserves its
+        # own clearly distinct step wording rather than reusing "captures
+        # the value of..." in a way that would misleadingly suggest a
+        # plain DOM read. Still needs a real locator (to know what to
+        # screenshot at replay time), so it's NOT folded away like
+        # new_window/dialog are.
+        if kind == "ocr_capture":
+            var_name = action.get("captured_as") or "ocr_value"
+            element_name = f"{var_name}_ocr_target"
+            n = 2
+            while element_name in locators_map or element_name in used_names:
+                element_name = f"{var_name}_ocr_target_{n}"
+                n += 1
+            used_names.add(element_name)
+            ordered = order_locators(action.get("locators") or [])
+            locators_map[element_name] = [
+                {"strategy": l["strategy"], "value": l["value"], "frame_path": frame_path} for l in ordered
+            ]
+            switch_to_page = page_index != current_page_index
+            current_page_index = page_index
+            steps.append({
+                "action": "ocr_capture",
+                "element_name": element_name,
+                "step_phrase": None,
+                "wait_seconds": wait_seconds,
+                "var_name": var_name,
+                "var_placeholder": "{{" + var_name + "}}",
+                "var_placeholder_escaped": "{{{{" + var_name + "}}}}",
+                "page_index": page_index,
+                "switch_to_page": switch_to_page,
+                "opens_new_page": False,
+                "new_page_index": None,
+            })
+            excel_labels.append(element_name)
+            continue
+
+        # --- normal interactive action -------------------------------------
+        naming = name_step(llm, action, used_names)
+        element_name = naming["element_name"]
+        ordered = order_locators(action["locators"])
+        locators_map[element_name] = [
+            {"strategy": l["strategy"], "value": l["value"], "frame_path": frame_path} for l in ordered
+        ]
+        is_keypress = action["action"] == "keypress"
+        key_name = action.get("value") if is_keypress else None
+
+        # If this action happened on a different tab/window than the one
+        # replay currently has "active", the generated step needs to switch
+        # to it FIRST (see steps.tmpl's maybe_switch macro) - covers both
+        # continuing in a just-opened popup and coming back to the original
+        # window after closing one.
+        switch_to_page = page_index != current_page_index
+        current_page_index = page_index
+
+        # Capture -> Store -> Reuse: "copy" actions get the derived variable
+        # name they were captured as; "paste"/"type" actions get the variable
+        # name they were correlated to (if their recorded value matched an
+        # earlier copy). Both drive a {{name}} placeholder used in the
+        # generated feature/steps text and resolved live at playback time
+        # (see runner/variables.py) instead of a hard-coded literal.
+        var_name = None
+        if action["action"] == "copy":
+            var_name = action.get("captured_as")
+        elif action["action"] in ("paste", "type"):
+            var_name = action.get("resolved_var")
+        var_placeholder = "{{" + var_name + "}}" if var_name else None
+        if not var_name and action["action"] == "paste" and action.get("correlation_status") == "unresolved":
+            logger.warning(
+                "Recording '%s': paste on '%s' could not be correlated to an earlier COPY action - "
+                "the generated test will replay the value recorded at capture time (%r) instead of a "
+                "live runtime value.",
+                recording.get("recording_name", "?"), element_name, action.get("value"),
+            )
+        # behave matches step text with the `parse` library, which treats "{{" / "}}"
+        # in a @when(...) pattern as escaped literal single braces (str.format()-style) -
+        # so the DECORATOR needs 4 braces to literally match the feature file's 2-brace
+        # "{{name}}" text. Only the decorator pattern needs this; the runtime code that
+        # builds/resolves the value uses var_placeholder as-is.
+        var_placeholder_escaped = "{{{{" + var_name + "}}}}" if var_name else None
+
+        # Radio/checkbox clicks are recorded with the RESULTING checked state
+        # as their value (see recorder_injector.js's click listener) - route
+        # these to an explicit "toggle" step (Playwright's idempotent
+        # check()/uncheck() via BasePage.set_checked) instead of a plain
+        # click, so replay sets the exact recorded state instead of blindly
+        # toggling - a blind click is what risked a double-toggle if an
+        # earlier click fallback tier actually succeeded before a later
+        # tier ran anyway, and it can't tell "already correct" from "needs
+        # a click" the way an explicit target state can.
+        element_type = (action.get("element") or {}).get("type", "")
+        is_toggle = action["action"] == "click" and element_type in ("radio", "checkbox")
+        checked_value = bool(action.get("value")) if is_toggle else None
+
+        # OCR fallback hint (see generator/templates/page.tmpl's
+        # BasePage._ocr_click_fallback) - only for a plain click(), since
+        # that's the only action with an OCR-coordinate fallback (toggles
+        # go through set_checked(), not click()). Recorded from whatever
+        # visible text/aria-label the element had, so replay can click by
+        # SCREEN TEXT as a last resort if every DOM locator candidate
+        # fails - the only way a canvas/image-button click (no real DOM
+        # node to select at all) could ever be recovered.
+        if action["action"] == "click" and not is_toggle:
+            hint_text = ((action.get("element") or {}).get("text") or (action.get("element") or {}).get("ariaLabel") or "").strip()
+            if hint_text:
+                ocr_hints[element_name] = hint_text
+
+        steps.append({
+            "action": "toggle" if is_toggle else action["action"],
+            "element_name": element_name,
+            "value": action.get("value") or "",
+            "checked_value": checked_value,
+            "step_phrase": naming["step_phrase"],
+            # Only set for "keypress" actions - the recorded key (e.g. "ENTER", "ARROW_DOWN",
+            # "CTRL+A") and its human-readable label, used by feature.tmpl/steps.tmpl to
+            # generate a step per key rather than assuming Enter.
+            "key_name": key_name,
+            "key_label": key_label(key_name) if key_name else None,
+            # Only set when this action is part of a Capture -> Store -> Reuse chain.
+            "var_name": var_name,
+            "var_placeholder": var_placeholder,
+            "var_placeholder_escaped": var_placeholder_escaped,
+            # Explicit wait timeout (seconds) measured from the recording -
+            # see BasePage.wait_ready in page.tmpl / steps.tmpl.
+            "wait_seconds": wait_seconds,
+            # Popup/new-tab/new-window support (see comments above) - which
+            # tab/window this action runs on, whether the step needs to
+            # switch to it first, and whether IT is the action that causes a
+            # new tab/window to open (set retroactively above when a later
+            # "new_window" action is folded onto this one).
+            "page_index": page_index,
+            "switch_to_page": switch_to_page,
+            "opens_new_page": False,
+            "new_page_index": None,
         })
+        excel_labels.append(element_name)
 
-    _cache_put(cache_key, regions)
-    return regions
+    env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)), trim_blocks=True, lstrip_blocks=True)
 
+    def pyesc(value):
+        """Escapes a value for safe embedding inside a double-quoted Python
+        string literal in generated code (steps.tmpl). Plain interpolation
+        of a raw value is unsafe: a backslash (e.g. a Windows file-upload
+        path like C:\\fakepath\\image (55).png - see the new "file_upload"
+        action) gets reinterpreted as a Python escape sequence when the
+        generated .py file is parsed - \\f silently becomes an actual
+        form-feed character, which then no longer matches the plain-text
+        version of the same value in the .feature file, and behave reports
+        the step as undefined. Escaping backslashes and double quotes up
+        front keeps the parsed Python string identical to the original
+        recorded value."""
+        return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
-def best_match(regions: list[dict], hint: str, min_confidence: float = DEFAULT_MIN_CONFIDENCE) -> Optional[dict]:
-    """Picks the highest-confidence region whose normalized text contains
-    (or is contained by) `hint`, among regions clearing `min_confidence` -
-    or None if nothing qualifies. A PURE function (no I/O, no OCR call) so
-    it's directly unit-testable with hand-built region lists, independent
-    of EasyOCR/a browser/a real screenshot - this is deliberately where
-    the actual "did we find what we were looking for" decision lives,
-    kept separate from find_text_regions' OCR I/O."""
-    target = _normalize(hint)
-    if not target:
-        return None
-    candidates = [
-        r for r in regions
-        if r["confidence"] >= min_confidence and (target in r["normalized_text"] or r["normalized_text"] in target)
-    ]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda r: r["confidence"])
+    env.filters["pyesc"] = pyesc
 
+    feature_text = env.get_template("feature.tmpl").render(
+        scenario_name="Recorded transaction",
+        recorded_at=recording.get("recorded_at", datetime.now().isoformat()),
+        target_url=target_url,
+        steps=steps,
+    )
+    steps_text = env.get_template("steps.tmpl").render(steps=steps)
+    page_text = env.get_template("page.tmpl").render(element_names=list(locators_map.keys()))
 
-def extract_text_from_png_bytes(png_bytes: bytes) -> str:
-    """Runs OCR on a screenshot (PNG bytes, exactly what Playwright's
-    `element.screenshot()` returns) and returns the extracted text.
-    Multiple detected text regions are joined with a single space in
-    EasyOCR's own top-to-bottom, left-to-right reading order - e.g. a
-    reference number rendered as two visually-separate pieces ("REF" and
-    "998877") comes back as one "REF 998877" string, not a list.
+    (out / "features" / "recorded.feature").write_text(feature_text)
+    (out / "features" / "steps" / "recorded_steps.py").write_text(steps_text)
+    (out / "pages" / "recorded_page.py").write_text(page_text)
+    # "__ocr_hints__" is a sibling key, not a real element - kept out of
+    # locators_map itself throughout the loop above so it never appears in
+    # element_names (the per-element click_X()/type_X() methods page.tmpl
+    # generates). BasePage.__init__ pops it back off on load.
+    locators_payload = {**locators_map, "__ocr_hints__": ocr_hints}
+    (out / "pages" / "locators.json").write_text(json.dumps(locators_payload, indent=2))
 
-    Implemented on top of find_text_regions() - same OCR call, same
-    caching, same preprocessing - so this function's own contract (a
-    plain string, nothing else) is unchanged for its existing callers
-    (recorder/recorder.py's _process_ocr_request, page.tmpl's
-    capture_value_ocr)."""
-    regions = find_text_regions(png_bytes)
-    return " ".join(r["text"] for r in regions).strip()
+    # environment.py is static (Playwright browser setup/teardown) - copy it in
+    env_src = ROOT / "runner" / "environment.py"
+    if env_src.exists():
+        shutil.copy(env_src, out / "features" / "environment.py")
+
+    (out / "pages" / "__init__.py").touch()
+
+    excel_path = None
+    try:
+        # imported lazily (not at module load time) so a missing/broken
+        # pandas or openpyxl install - or a stale extraction missing this
+        # file - degrades to "no Excel report" instead of crashing the
+        # whole backend at startup.
+        from generator.excel_export import build_excel_report
+        excel_path = build_excel_report(
+            recording,
+            element_names=excel_labels,
+            output_path=str(out / "recorded_steps.xlsx"),
+            mask_passwords=mask_passwords,
+            actions=actions,
+        )
+    except Exception as e:
+        print(f"[warning] Skipped Excel report ({type(e).__name__}: {e}). "
+              f"Feature/steps/page files were still generated normally.")
+
+    return {
+        "feature_file": str(out / "features" / "recorded.feature"),
+        "steps_file": str(out / "features" / "steps" / "recorded_steps.py"),
+        "page_file": str(out / "pages" / "recorded_page.py"),
+        "locators_file": str(out / "pages" / "locators.json"),
+        "excel_report": excel_path,
+        "element_count": len(locators_map),
+        "step_count": len(steps),
+    }
