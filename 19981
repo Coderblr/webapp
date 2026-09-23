@@ -1,181 +1,237 @@
-import { useEffect, useState } from "react";
-import { useRouter } from "next/router";
-import Head from "next/head";
-import Link from "next/link";
-import Layout from "@/components/Layout";
-import RequireAuth from "@/components/RequireAuth";
-import { Tabs } from "@/components/Tabs";
-import ActionTimeline from "@/components/ActionTimeline";
-import VersionHistory from "@/components/VersionHistory";
-import ShareDialog from "@/components/ShareDialog";
-import ReportView from "@/components/ReportView";
-import { recordingsApi, transactionsApi } from "@/lib/api";
-import { Panel, Callout, Spinner, Metric, StatusBadge } from "@/components/ui";
+"""
+ORM models - the database is scoped to auth/admin data ONLY:
 
-function OverviewTab({ recording }) {
-  return (
-    <div className="space-y-4">
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <Metric label="Version" value={`v${recording.current_version_number}`} />
-        <Metric label="Actions" value={recording.action_count} />
-        <Metric
-          label="Ownership"
-          value={recording.is_owner ? "Owned by you" : recording.is_shared ? "Shared with you" : "Open (legacy)"}
-        />
-        <Metric label="Schema" value={recording.schema_version} />
-      </div>
-      <Panel>
-        <div className="space-y-2 px-5 py-4 text-sm">
-          <div>
-            <span className="font-medium text-ink">Target URL: </span>
-            <span className="break-all text-muted">{recording.target_url || "—"}</span>
-          </div>
-          <div>
-            <span className="font-medium text-ink">Created: </span>
-            <span className="text-muted">{new Date(recording.created_at).toLocaleString()}</span>
-          </div>
-          <div>
-            <span className="font-medium text-ink">Last updated: </span>
-            <span className="text-muted">{new Date(recording.updated_at).toLocaleString()}</span>
-          </div>
-        </div>
-      </Panel>
-      <Callout>
-        To run, edit test data, or edit steps, open this recording in{" "}
-        <Link href="/tool" className="font-medium text-brand-blue hover:underline">
-          Record &amp; Run
-        </Link>{" "}
-        and select it from the dropdown there.
-      </Callout>
-    </div>
-  );
-}
+  Users            auth + profile (who can log in, and their role)
+  Sessions         one row per login - powers the 5-minute idle timeout and
+                   the admin "who's online" view
+  Activity Logs    one row per action a user takes (login, recording
+                   started, test run, admin user-management actions, ...) -
+                   powers the admin activity monitor and each user's own
+                   "my activity" tab
 
-function ReportsTab({ recordingId }) {
-  const [transactions, setTransactions] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [selectedId, setSelectedId] = useState(null);
-  const [selectedReport, setSelectedReport] = useState(null);
-  const [reportLoading, setReportLoading] = useState(false);
+Recording-run history (what got run, its pass/fail steps, the files it
+produced) is deliberately NOT modeled here - it lives as plain JSON files
+under transactions/ instead (see runner/transaction_store.py), same as
+output/ (generated feature/steps/page files). The database only ever holds
+who-did-what-when for runs, not the run output itself.
 
-  useEffect(() => {
-    setLoading(true);
-    setError(null);
-    transactionsApi
-      .list({ recording_id: recordingId, limit: 50 })
-      .then(setTransactions)
-      .catch((e) => setError(e.detail || e.message))
-      .finally(() => setLoading(false));
-  }, [recordingId]);
+Recording OWNERSHIP/VERSIONING/SHARING (Recording, RecordingVersion,
+RecordingShare below), by contrast, IS modeled here - the recording's own
+CONTENT still lives as plain JSON under recordings/ (and
+recordings/versions/<recording_id>/ for version snapshots) exactly as
+before, but who owns it, its version history, and who it's shared with are
+relational data that needs querying/filtering (see backend/recording_access.py,
+which resolves a recordings/*.json file path to/from its Recording row).
+"""
+from __future__ import annotations
+import uuid
+from datetime import datetime
 
-  async function handleView(transactionId) {
-    setSelectedId(transactionId);
-    setReportLoading(true);
-    try {
-      setSelectedReport(await transactionsApi.get(transactionId));
-    } catch (e) {
-      setError(e.detail || e.message);
-    } finally {
-      setReportLoading(false);
-    }
-  }
+from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Boolean, UniqueConstraint
+from sqlalchemy.orm import declarative_base, relationship
 
-  if (loading) return <Spinner label="Loading execution history..." />;
-  if (error) return <Callout tone="error">{error}</Callout>;
-  if (transactions.length === 0) return <p className="text-sm text-muted">No executions of this recording yet.</p>;
+Base = declarative_base()
 
-  return (
-    <div className="grid min-w-0 grid-cols-1 gap-6 lg:grid-cols-[22rem_1fr]">
-      <div className="max-h-[32rem] space-y-1 overflow-y-auto scroll-thin">
-        {transactions.map((t) => (
-          <button
-            key={t.transaction_id}
-            type="button"
-            onClick={() => handleView(t.transaction_id)}
-            className={`block w-full rounded-sm border px-3 py-2.5 text-left transition-colors ${
-              selectedId === t.transaction_id ? "border-brand-blue bg-brand-blueLight" : "border-line bg-panel hover:border-brand-blue/40"
-            }`}
-          >
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-sm text-ink">{t.date_time}</span>
-              <StatusBadge status={t.status} />
-            </div>
-            <div className="mt-1 text-xs text-muted">
-              {t.passed_count ?? "—"}/{t.step_count ?? "—"} passed
-            </div>
-          </button>
-        ))}
-      </div>
-      <div className="min-w-0">
-        {reportLoading && <Spinner label="Loading report..." />}
-        {!reportLoading && selectedReport && <ReportView key={selectedReport.transaction_id} report={selectedReport} />}
-        {!reportLoading && !selectedReport && <p className="text-sm text-muted">Pick an execution to see its report.</p>}
-      </div>
-    </div>
-  );
-}
 
-export default function RecordingDetailPage() {
-  const router = useRouter();
-  const { id } = router.query;
+def _uuid() -> str:
+    return uuid.uuid4().hex
 
-  const [recording, setRecording] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
 
-  useEffect(() => {
-    if (!id) return;
-    setLoading(true);
-    setError(null);
-    recordingsApi
-      .get(id)
-      .then(setRecording)
-      .catch((e) => setError(e.detail || e.message))
-      .finally(() => setLoading(false));
-  }, [id]);
+class User(Base):
+    """A person who can log into the tool.
 
-  return (
-    <RequireAuth>
-      <Layout>
-        <Head>
-          <title>{recording ? `${recording.name} - AI Test Recorder` : "Recording - AI Test Recorder"}</title>
-        </Head>
+    `name` / `department` are kept (derived from first/last name + the
+    department code) so the file-based recorder/report code - which only
+    knows about `name`/`department`, not the auth fields - keeps working
+    unmodified.
+    """
+    __tablename__ = "users"
 
-        <div className="mb-6">
-          <Link href="/tool" className="text-xs font-medium text-muted hover:text-ink">
-            ← Back to Record &amp; Run
-          </Link>
-          <h1 className="mt-1 text-2xl font-semibold tracking-tight text-ink">{recording?.name || "Recording"}</h1>
-          {recording && (
-            <p className="mt-1 text-sm text-muted">
-              {recording.is_owner ? "You own this recording." : recording.is_shared ? "Shared with you." : "Open to everyone (legacy recording)."}
-            </p>
-          )}
-        </div>
+    user_id = Column(Integer, primary_key=True, autoincrement=True)
 
-        {loading && <Spinner label="Loading recording..." />}
-        {error && <Callout tone="error">Could not load this recording: {error}</Callout>}
+    # ---- identity / auth ------------------------------------------------
+    username = Column(String(64), unique=True, nullable=False, index=True)  # ADID / SSO login id
+    first_name = Column(String(80), nullable=False, default="")
+    last_name = Column(String(80), nullable=False, default="")
+    department_code = Column(String(40), nullable=True)
+    email = Column(String(160), nullable=True)
+    role = Column(String(20), default="user", nullable=False)  # "admin" / "user"
 
-        {!loading && !error && recording && (
-          <Tabs
-            tabs={[
-              { label: "Overview", content: <OverviewTab recording={recording} /> },
-              { label: "Actions", content: <ActionTimeline recordingFile={recording.file} /> },
-              { label: "Versions", content: <VersionHistory recordingId={recording.recording_id} bare /> },
-              {
-                label: "Sharing",
-                content: recording.is_owner ? (
-                  <ShareDialog recordingId={recording.recording_id} recordingName={recording.name} inline />
-                ) : (
-                  <Callout>Only this recording's owner can manage sharing.</Callout>
-                ),
-              },
-              { label: "Reports", content: <ReportsTab recordingId={recording.recording_id} /> },
-            ]}
-          />
-        )}
-      </Layout>
-    </RequireAuth>
-  );
-}
+    password_hash = Column(String(255), nullable=True)  # null once SSO-only for this account
+    must_change_password = Column(Boolean, default=True, nullable=False)
+    auth_provider = Column(String(20), default="local", nullable=False)  # "local" / "sso"
+
+    last_login_at = Column(DateTime, nullable=True)
+
+    # ---- legacy fields (kept for the file-based recorder/report code) ---
+    name = Column(String(120), nullable=False)
+    department = Column(String(120), nullable=True)
+
+    created_date = Column(DateTime, default=datetime.utcnow, nullable=False)
+    status = Column(String(20), default="Active", nullable=False)  # Active / Inactive / Deleted
+
+    sessions = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
+    activity_logs = relationship("ActivityLog", back_populates="user", cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"<User {self.user_id} {self.username!r} {self.role} {self.status}>"
+
+
+class UserSession(Base):
+    """One row per login. `last_activity_at` is bumped on every authenticated
+    request, and the auth dependency rejects the session once it's been idle
+    for longer than IDLE_TIMEOUT_MINUTES (see auth/config.py) - independent
+    of the JWT's own expiry, so an idle-but-not-yet-expired token still gets
+    logged out. `expires_at` is a hard ceiling on session lifetime even with
+    continuous activity.
+
+    `is_agent`: a session created via POST /api/agent/pair (see
+    backend/auth_routes.py) for a desktop agent's long-lived connection,
+    as opposed to a normal human browser login. Agent sessions use
+    AGENT_IDLE_TIMEOUT_MINUTES instead of the human IDLE_TIMEOUT_MINUTES -
+    a background process that's asleep/offline for an hour hasn't "gone
+    idle" the way an unattended browser tab has, and shouldn't force the
+    person to re-type their password just because their laptop slept
+    through a meeting."""
+    __tablename__ = "sessions"
+
+    session_id = Column(String(32), primary_key=True, default=_uuid)
+    user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    last_activity_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+
+    ip_address = Column(String(64), nullable=True)
+    user_agent = Column(String(255), nullable=True)
+    is_agent = Column(Boolean, default=False, nullable=False)
+
+    revoked = Column(Boolean, default=False, nullable=False)
+    revoked_reason = Column(String(120), nullable=True)  # "logout" / "idle_timeout" / "admin_revoked"
+
+    user = relationship("User", back_populates="sessions")
+
+    def __repr__(self):
+        return f"<UserSession {self.session_id} user={self.user_id} revoked={self.revoked}>"
+
+
+class ActivityLog(Base):
+    """One row per user action - login/logout, tool usage (start/stop
+    recording, run tests), profile changes, and every admin user-management
+    action. This is what powers the admin's "what is everyone doing" view
+    and each user's own activity history / export. NOTE: this logs THAT a
+    recording was started/run and by whom - the recording's own content and
+    run results live in files (recordings/, output/, transactions/), not
+    here."""
+    __tablename__ = "activity_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.user_id"), nullable=True)  # null for failed logins on unknown usernames
+    session_id = Column(String(32), ForeignKey("sessions.session_id"), nullable=True)
+
+    action = Column(String(60), nullable=False)      # e.g. "LOGIN", "START_RECORDING", "USER_CREATED"
+    status = Column(String(20), default="SUCCESS", nullable=False)  # SUCCESS / FAILURE
+    details = Column(Text, nullable=True)             # free-form JSON string
+    endpoint = Column(String(120), nullable=True)
+    ip_address = Column(String(64), nullable=True)
+
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User", back_populates="activity_logs")
+
+    def __repr__(self):
+        return f"<ActivityLog {self.action} user={self.user_id} {self.status}>"
+
+
+class Recording(Base):
+    """Ownership/version-pointer for one recordings/*.json file.
+
+    `owner_user_id` is nullable - NULL means "legacy/unowned": a recording
+    that existed (or was touched) before this table did, or was created
+    before ownership tracking existed. Legacy recordings stay visible/
+    runnable/editable by every logged-in user, exactly as ALL recordings
+    behaved before this table was introduced - see
+    backend/recording_access.py's check_access(), which treats
+    owner_user_id IS NULL as "always allow". Only recordings created AFTER
+    this feature shipped get a real owner and become private-by-default
+    (owner + admins + explicit RecordingShare grants only).
+
+    `file_path` always points at the CURRENT version's content (the same
+    file every pre-existing endpoint already reads/writes) - editing a
+    recording keeps writing to this same path, it just ALSO snapshots the
+    new content into a RecordingVersion row/file first (see
+    backend/api.py's update_recording_test_data/update_recording_steps)."""
+    __tablename__ = "recordings"
+
+    recording_id = Column(Integer, primary_key=True, autoincrement=True)
+    owner_user_id = Column(Integer, ForeignKey("users.user_id"), nullable=True)  # NULL = legacy/unowned, open to everyone
+
+    name = Column(String(200), nullable=False)
+    file_path = Column(String(500), unique=True, nullable=False)
+    schema_version = Column(String(20), default="2.0", nullable=False)
+    current_version_number = Column(Integer, default=1, nullable=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    versions = relationship("RecordingVersion", back_populates="recording", cascade="all, delete-orphan")
+    shares = relationship("RecordingShare", back_populates="recording", cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"<Recording {self.recording_id} owner={self.owner_user_id} v{self.current_version_number} {self.name!r}>"
+
+
+class RecordingVersion(Base):
+    """One immutable snapshot of a Recording's content at a point in time.
+    `file_path` is a REAL COPY (not a diff) under
+    recordings/versions/<recording_id>/v<version_number>.json - matching
+    how the main recordings/*.json file already works, so a version can be
+    inspected/downloaded exactly like the current recording can. Created
+    on every meaningful edit (see backend/api.py's update_recording_*
+    endpoints) plus once at initial creation (version 1)."""
+    __tablename__ = "recording_versions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    recording_id = Column(Integer, ForeignKey("recordings.recording_id"), nullable=False)
+    version_number = Column(Integer, nullable=False)
+    file_path = Column(String(500), nullable=False)
+    change_summary = Column(String(500), nullable=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.user_id"), nullable=True)
+    recording_hash = Column(String(64), nullable=True)  # sha256 of the actions list - cheap "did this actually change" signal
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    recording = relationship("Recording", back_populates="versions")
+
+    def __repr__(self):
+        return f"<RecordingVersion recording={self.recording_id} v{self.version_number}>"
+
+
+class RecordingShare(Base):
+    """Grants one OTHER user access to a Recording its owner doesn't
+    otherwise have. `can_execute`/`can_edit`/`can_export` are independent
+    flags (a share can grant any combination); VIEW itself is implicit -
+    the mere existence of a share row grants at least view access (see
+    backend/recording_access.py's check_access()). One row per
+    (recording, shared_with_user) - re-sharing updates the existing row
+    (see database/repository.py's upsert_share) rather than creating
+    duplicates."""
+    __tablename__ = "recording_shares"
+    __table_args__ = (UniqueConstraint("recording_id", "shared_with_user_id", name="uq_recording_share_target"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    recording_id = Column(Integer, ForeignKey("recordings.recording_id"), nullable=False)
+    shared_with_user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False)
+    shared_by_user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False)
+
+    can_execute = Column(Boolean, default=True, nullable=False)
+    can_edit = Column(Boolean, default=False, nullable=False)
+    can_export = Column(Boolean, default=False, nullable=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=True)  # NULL = never expires
+
+    recording = relationship("Recording", back_populates="shares")
+
+    def __repr__(self):
+        return f"<RecordingShare recording={self.recording_id} -> user={self.shared_with_user_id}>"
