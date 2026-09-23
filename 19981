@@ -1,514 +1,475 @@
 """
-Takes a raw recording (list of actions from recorder.Recorder) and produces:
-  - output/features/recorded.feature
-  - output/features/steps/recorded_steps.py
-  - output/features/environment.py   (copied static file, see runner/environment.py)
-  - output/pages/recorded_page.py
-  - output/pages/locators.json
+Runs an already-SAVED recording (a JSON file under recordings/) end-to-end
+and produces an "exit report":
 
-This is deterministic scaffolding; the only place an LLM is optionally
-consulted is agent/step_namer.py (naming elements + phrasing steps).
+  1. Load the recording JSON.
+  2. Regenerate the feature/steps/page/locators files for it
+     (generator.build.build_artifacts) - guarantees the run reflects the
+     saved recording, not stale output/ from some earlier run.
+  3. Execute the generated Behave suite, capturing a PER-STEP result via
+     Behave's JSON formatter (pass/fail/error per Playwright step, not just
+     an overall pass/fail).
+  4. Persist the run to a plain JSON file under transactions/ (NOT the
+     database - the database is reserved for auth/session/activity data
+     only; see runner/transaction_store.py) - the run's status, every
+     file it produced, and every step's result.
+  5. Write a human-readable exit report (.txt) to output/reports/ and
+     return the same information as a JSON-serializable dict, so a caller
+     (backend/api.py, main.py, a script) can show/save it either way.
 """
 from __future__ import annotations
 import base64
 import json
 import logging
-import math
-import re
-import shutil
-from pathlib import Path
+import subprocess
+import sys
 from datetime import datetime
-
-from jinja2 import Environment, FileSystemLoader
-
-from recorder.locator_strategy import order_locators
-from agent.step_namer import name_step, key_label
+from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-TEMPLATES_DIR = Path(__file__).parent / "templates"
+from database.db import get_session, init_db
+from database import repository as repo
+from runner import transaction_store
+from generator.build import build_artifacts
+from agent.llm_factory import get_llm
+from backend import recording_access
+
 ROOT = Path(__file__).parent.parent
-
-# Floor for the measured recording-to-recording wait, so two actions that
-# happened to be recorded a fraction of a second apart don't generate an
-# unrealistically tight timeout.
-MIN_WAIT_SECONDS = 5
-# Used when no timing data is available at all (e.g. a hand-built recording).
-DEFAULT_WAIT_SECONDS = 10
+RECORDINGS_DIR = ROOT / "recordings"
+REPORTS_DIR = ROOT / "output" / "reports"
 
 
-def build_artifacts(recording: dict, llm=None, output_dir: str = "output", mask_passwords: bool = True) -> dict:
-    out = Path(output_dir)
-    (out / "features" / "steps").mkdir(parents=True, exist_ok=True)
-    (out / "pages").mkdir(parents=True, exist_ok=True)
-    (out / "fixtures").mkdir(parents=True, exist_ok=True)
-
-    target_url = recording["target_url"]
-    actions = recording["actions"]
-
-    # Best-effort: merge same-element 'type' actions that fired within a
-    # short window of each other (see coalesce_consecutive_types's docstring)
-    # in case this recording predates that fix, or was regenerated from a
-    # previously-saved recording. Runs BEFORE variable annotation below so
-    # {{var}} correlation sees the final, de-duplicated values.
-    try:
-        from recorder.variable_capture import coalesce_consecutive_types
-        actions = coalesce_consecutive_types(actions)
-    except Exception:
-        pass
-
-    # Best-effort: derive/refresh the Capture -> Store -> Reuse {{var}} metadata
-    # (see recorder/variable_capture.py) in case this recording was produced
-    # before that hook existed in Recorder.stop(), or was built by hand. Safe
-    # to call even if it already ran - it's idempotent.
-    try:
-        from recorder.variable_capture import annotate_variables
-        actions = annotate_variables(actions)
-    except Exception:
-        pass
-
-    # Materialize any file(s) actually uploaded during recording into
-    # output/fixtures/ under their original name (see recorder_injector.js's
-    # file_upload handling) - this is what lets a tester upload literally
-    # any file, with any name, and have replay just work with no manual
-    # "go copy the file into fixtures/" step. Only skipped when a file was
-    # too large to have been captured inline (see MAX_INLINE_BYTES in the
-    # injector) or predates this feature - BasePage.upload_file()'s
-    # FileNotFoundError message tells the user exactly what to do in that
-    # fallback case.
-    for action in actions:
-        if action.get("action") != "file_upload":
-            continue
-        b64 = action.get("fileDataBase64")
-        file_name = action.get("value")
-        if not b64 or not file_name:
-            continue
+def list_saved_recordings() -> list[dict]:
+    """Metadata for every recording JSON file saved under recordings/, newest first."""
+    out = []
+    if not RECORDINGS_DIR.exists():
+        return out
+    for f in RECORDINGS_DIR.glob("*.json"):
         try:
-            file_bytes = base64.b64decode(b64)
-            # Strip any path-like characters from the recorded name before
-            # using it as a filename - defense in depth, since this is
-            # ultimately attacker-controllable browser-reported input.
-            # Deliberately NOT just Path(file_name).name: that only splits
-            # on the CURRENT platform's separator - on Linux, a Windows-
-            # style "C:\fakepath\name.pdf" string (exactly what a real
-            # recorded file_upload value looks like, per
-            # recorder_injector.js) has no "/" in it at all, so .name
-            # would return the WHOLE fake path unchanged, not just the
-            # filename. Splitting on both slash characters explicitly
-            # works the same regardless of which OS actually runs this.
-            safe_name = re.split(r"[\\/]", file_name)[-1] or "uploaded_file"
-            (out / "fixtures" / safe_name).write_bytes(file_bytes)
+            data = json.loads(f.read_text())
+            out.append({
+                "file": str(f),
+                "name": data.get("recording_name") or f.stem,
+                "target_url": data.get("target_url"),
+                "recorded_at": data.get("recorded_at"),
+                "action_count": len(data.get("actions", [])),
+            })
         except Exception:
-            # Corrupt/partial base64, disk issue, etc. - don't fail the
-            # whole build over one file; upload_file()'s own error message
-            # at replay time will make the problem obvious if it matters.
-            pass
-
-    used_names = set()
-    steps = []
-    locators_map = {}
-    # element_name -> visible text/aria-label, for BasePage._ocr_click_fallback
-    # (page.tmpl) - a last-resort, no-DOM-selector-required fallback for
-    # click() when every locator candidate fails. Kept separate from
-    # locators_map (not merged in until locators.json is written below) so
-    # it never leaks into element_names -> the per-element click_X()/type_X()
-    # convenience methods page.tmpl generates at the bottom of the file.
-    ocr_hints = {}
-    prev_ts = None
-
-    # Tracks which browser tab/window index (0 = the one the recording
-    # started on) replay currently considers "active", as we walk the
-    # recording in order - lets each real interactive step know whether it
-    # needs to switch tabs/windows first (see step["switch_to_page"] below),
-    # and lets a "new_window"/"window_closed" synthetic action fold its
-    # effect into the step it belongs with instead of needing its own.
-    current_page_index = 0
-
-    # Parallel to `actions` (NOT to `steps` - a "new_window" action folds
-    # into the PRECEDING step and produces no step of its own, so the two
-    # lists can differ in length) - used for the Excel report below, which
-    # needs one label per ACTION, including the synthetic ones.
-    excel_labels = []
-
-    for action in actions:
-        kind = action["action"]
-        page_index = action.get("page_index", 0)
-        frame_path = action.get("frame_path") or []
-
-        # Explicit wait: how long the app actually took, during recording, to
-        # reach the state this action needed (i.e. the gap between the
-        # previous recorded action and this one) - so a step that recorded
-        # slow (e.g. a 50s dashboard load) gets a matching wait_ready()
-        # timeout, while a fast one doesn't sit around waiting needlessly.
-        # Computed here (before the branches below) so it's available for
-        # synthetic popup/dialog/window actions too, not just the "normal"
-        # interactive ones further down.
-        ts = action.get("ts")
-        if prev_ts is None or ts is None:
-            wait_seconds = DEFAULT_WAIT_SECONDS
-        else:
-            wait_seconds = max(MIN_WAIT_SECONDS, math.ceil((ts - prev_ts) / 1000.0))
-        if ts is not None:
-            prev_ts = ts
-
-        # --- popup / new tab / new window --------------------------------
-        # Doesn't get its own replay step: Playwright can only reliably
-        # catch a new page by wrapping the ACTION THAT CAUSED IT in
-        # context.expect_page() (see steps.tmpl's new_page_wrapper macro),
-        # so this folds forward onto the step that was just appended
-        # (almost always the click that opened it) instead. If this is
-        # somehow the very first action in the whole recording (no
-        # preceding step to fold onto - e.g. the app pops a window
-        # immediately on load), falls back to a standalone step that just
-        # waits for one to appear.
-        if kind == "new_window":
-            if steps:
-                steps[-1]["opens_new_page"] = True
-                steps[-1]["new_page_index"] = page_index
-            else:
-                steps.append({
-                    "action": "new_window_wait",
-                    "element_name": None,
-                    "step_phrase": "waits for a new browser tab or window to open",
-                    "wait_seconds": wait_seconds,
-                    "new_page_index": page_index,
-                })
-            current_page_index = page_index
-            excel_labels.append(f"(new browser tab/window #{page_index} opens)")
             continue
+    out.sort(key=lambda r: r.get("recorded_at") or "", reverse=True)
+    return out
 
-        # --- tab/window closed --------------------------------------------
-        if kind == "window_closed":
-            opener_index = action.get("opener_page_index", 0) or 0
-            steps.append({
-                "action": "window_closed",
-                "element_name": None,
-                "step_phrase": "closes the browser tab or window",
-                "wait_seconds": wait_seconds,
-                "closed_page_index": page_index,
-                "switch_back_to_index": opener_index,
-            })
-            current_page_index = opener_index
-            excel_labels.append(f"(browser tab/window #{page_index} closed)")
-            continue
 
-        # --- native alert/confirm/prompt/beforeunload dialog --------------
-        if kind == "dialog":
-            steps.append({
-                "action": "dialog",
-                "element_name": None,
-                "step_phrase": "handles a browser dialog",
-                "wait_seconds": wait_seconds,
-                "dialog_type": action.get("dialog_type") or "alert",
-                "dialog_message": action.get("value") or "",
-            })
-            excel_labels.append(f"(dialog: {action.get('dialog_type') or 'alert'})")
-            continue
+def _run_behave_json(features_dir: Path, headless: bool) -> dict:
+    """Run behave once with the JSON formatter so each step's result (not
+    just the overall pass/fail) is available for the Automation Logs table."""
+    import os
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    results_path = REPORTS_DIR / "last_run_results.json"
 
-        # --- explicit delay/pause (e.g. imported from a UiPath-style Excel
-        # flow's DELAY step - see generator/uipath_importer.py) - a plain
-        # wait with no element/locator involved at all.
-        if kind == "delay":
-            delay_seconds = float(action.get("value") or 1)
-            steps.append({
-                "action": "delay",
-                "element_name": None,
-                "step_phrase": f"waits {delay_seconds:g} seconds",
-                "wait_seconds": 0,  # the delay IS the wait - don't also apply the normal inter-step timing heuristic
-                "delay_seconds": delay_seconds,
-            })
-            excel_labels.append(f"(delay {delay_seconds:g}s)")
-            continue
-
-        # --- page scroll (e.g. imported from a UiPath-style Excel flow's
-        # SCROLL step - "DOWN-4"/"UP-2" etc., direction + a rough
-        # magnitude - see generator/uipath_importer.py) - no element
-        # involved, scrolls the whole page/viewport.
-        if kind == "scroll":
-            steps.append({
-                "action": "scroll",
-                "element_name": None,
-                "step_phrase": f"scrolls {action.get('scroll_direction', 'down')}",
-                "wait_seconds": wait_seconds,
-                "scroll_direction": action.get("scroll_direction", "down"),
-                "scroll_amount": int(action.get("scroll_amount", 1)),
-            })
-            excel_labels.append(f"(scroll {action.get('scroll_direction', 'down')})")
-            continue
-
-        # --- text assertion (e.g. imported from a UiPath-style Excel
-        # flow's VERIFICATION step - see generator/uipath_importer.py) -
-        # checks that an element's text/value contains the expected
-        # string, without clicking/typing anything. Needs its own branch
-        # (not the generic name_step() path below) because it's a pure
-        # check, not an interactive action - there's no "value that was
-        # typed", just an expected value to compare against.
-        if kind == "assert_text":
-            ordered = order_locators(action.get("locators") or [])
-            # name_step() is intentionally never called for this action -
-            # it's tuned for interactive elements (buttons,
-            # inputs) and would produce a misleading name/phrase for a
-            # pure assertion target. A plain, predictable name based on
-            # the expected text is clearer to read in the generated code.
-            base_name = re.sub(r"[^a-z0-9]+", "_", (action.get("value") or "assertion").lower()).strip("_") or "assertion"
-            element_name = f"{base_name}_check"
-            n = 2
-            while element_name in locators_map or element_name in used_names:
-                element_name = f"{base_name}_check_{n}"
-                n += 1
-            used_names.add(element_name)
-            locators_map[element_name] = [
-                {"strategy": l["strategy"], "value": l["value"], "frame_path": frame_path} for l in ordered
-            ]
-            switch_to_page = page_index != current_page_index
-            current_page_index = page_index
-            steps.append({
-                "action": "assert_text",
-                "element_name": element_name,
-                "step_phrase": None,
-                "wait_seconds": wait_seconds,
-                "expected_text": action.get("value") or "",
-                "page_index": page_index,
-                "switch_to_page": switch_to_page,
-                "opens_new_page": False,
-                "new_page_index": None,
-            })
-            excel_labels.append(element_name)
-            continue
-
-        # --- OCR/visual text assertion - page-level, no DOM element/locator
-        # at all (unlike assert_text above, which needs one). Verifies text
-        # is visibly present SOMEWHERE on screen via OCR - for content with
-        # no DOM node to check in the first place (canvas-rendered text,
-        # image-based labels, scanned/embedded content). See
-        # generator/templates/page.tmpl's BasePage.assert_ocr_text_visible.
-        if kind == "assert_ocr_text":
-            switch_to_page = page_index != current_page_index
-            current_page_index = page_index
-            expected_text = action.get("value") or ""
-            steps.append({
-                "action": "assert_ocr_text",
-                "element_name": None,  # deliberately no locators_map entry - nothing to select, see docstring above
-                "step_phrase": None,
-                "wait_seconds": wait_seconds,
-                "expected_text": expected_text,
-                "page_index": page_index,
-                "switch_to_page": switch_to_page,
-                "opens_new_page": False,
-                "new_page_index": None,
-            })
-            excel_labels.append(f"(OCR assertion: {expected_text})")
-            continue
-
-        # --- OCR capture (right-click on the page -> "Capture text with
-        # OCR" - see recorder_injector.js's showOcrMenu and
-        # recorder.py's _process_ocr_request). Needs its own branch (not
-        # the generic name_step() path below) because its replay behavior
-        # is fundamentally different from a normal "copy" capture -
-        # screenshot + OCR, not a DOM/clipboard read - and it deserves its
-        # own clearly distinct step wording rather than reusing "captures
-        # the value of..." in a way that would misleadingly suggest a
-        # plain DOM read. Still needs a real locator (to know what to
-        # screenshot at replay time), so it's NOT folded away like
-        # new_window/dialog are.
-        if kind == "ocr_capture":
-            var_name = action.get("captured_as") or "ocr_value"
-            element_name = f"{var_name}_ocr_target"
-            n = 2
-            while element_name in locators_map or element_name in used_names:
-                element_name = f"{var_name}_ocr_target_{n}"
-                n += 1
-            used_names.add(element_name)
-            ordered = order_locators(action.get("locators") or [])
-            locators_map[element_name] = [
-                {"strategy": l["strategy"], "value": l["value"], "frame_path": frame_path} for l in ordered
-            ]
-            switch_to_page = page_index != current_page_index
-            current_page_index = page_index
-            steps.append({
-                "action": "ocr_capture",
-                "element_name": element_name,
-                "step_phrase": None,
-                "wait_seconds": wait_seconds,
-                "var_name": var_name,
-                "var_placeholder": "{{" + var_name + "}}",
-                "var_placeholder_escaped": "{{{{" + var_name + "}}}}",
-                "page_index": page_index,
-                "switch_to_page": switch_to_page,
-                "opens_new_page": False,
-                "new_page_index": None,
-            })
-            excel_labels.append(element_name)
-            continue
-
-        # --- normal interactive action -------------------------------------
-        naming = name_step(llm, action, used_names)
-        element_name = naming["element_name"]
-        ordered = order_locators(action["locators"])
-        locators_map[element_name] = [
-            {"strategy": l["strategy"], "value": l["value"], "frame_path": frame_path} for l in ordered
-        ]
-        is_keypress = action["action"] == "keypress"
-        key_name = action.get("value") if is_keypress else None
-
-        # If this action happened on a different tab/window than the one
-        # replay currently has "active", the generated step needs to switch
-        # to it FIRST (see steps.tmpl's maybe_switch macro) - covers both
-        # continuing in a just-opened popup and coming back to the original
-        # window after closing one.
-        switch_to_page = page_index != current_page_index
-        current_page_index = page_index
-
-        # Capture -> Store -> Reuse: "copy" actions get the derived variable
-        # name they were captured as; "paste"/"type" actions get the variable
-        # name they were correlated to (if their recorded value matched an
-        # earlier copy). Both drive a {{name}} placeholder used in the
-        # generated feature/steps text and resolved live at playback time
-        # (see runner/variables.py) instead of a hard-coded literal.
-        var_name = None
-        if action["action"] == "copy":
-            var_name = action.get("captured_as")
-        elif action["action"] in ("paste", "type"):
-            var_name = action.get("resolved_var")
-        var_placeholder = "{{" + var_name + "}}" if var_name else None
-        if not var_name and action["action"] == "paste" and action.get("correlation_status") == "unresolved":
-            logger.warning(
-                "Recording '%s': paste on '%s' could not be correlated to an earlier COPY action - "
-                "the generated test will replay the value recorded at capture time (%r) instead of a "
-                "live runtime value.",
-                recording.get("recording_name", "?"), element_name, action.get("value"),
-            )
-        # behave matches step text with the `parse` library, which treats "{{" / "}}"
-        # in a @when(...) pattern as escaped literal single braces (str.format()-style) -
-        # so the DECORATOR needs 4 braces to literally match the feature file's 2-brace
-        # "{{name}}" text. Only the decorator pattern needs this; the runtime code that
-        # builds/resolves the value uses var_placeholder as-is.
-        var_placeholder_escaped = "{{{{" + var_name + "}}}}" if var_name else None
-
-        # Radio/checkbox clicks are recorded with the RESULTING checked state
-        # as their value (see recorder_injector.js's click listener) - route
-        # these to an explicit "toggle" step (Playwright's idempotent
-        # check()/uncheck() via BasePage.set_checked) instead of a plain
-        # click, so replay sets the exact recorded state instead of blindly
-        # toggling - a blind click is what risked a double-toggle if an
-        # earlier click fallback tier actually succeeded before a later
-        # tier ran anyway, and it can't tell "already correct" from "needs
-        # a click" the way an explicit target state can.
-        element_type = (action.get("element") or {}).get("type", "")
-        is_toggle = action["action"] == "click" and element_type in ("radio", "checkbox")
-        checked_value = bool(action.get("value")) if is_toggle else None
-
-        # OCR fallback hint (see generator/templates/page.tmpl's
-        # BasePage._ocr_click_fallback) - only for a plain click(), since
-        # that's the only action with an OCR-coordinate fallback (toggles
-        # go through set_checked(), not click()). Recorded from whatever
-        # visible text/aria-label the element had, so replay can click by
-        # SCREEN TEXT as a last resort if every DOM locator candidate
-        # fails - the only way a canvas/image-button click (no real DOM
-        # node to select at all) could ever be recovered.
-        if action["action"] == "click" and not is_toggle:
-            hint_text = ((action.get("element") or {}).get("text") or (action.get("element") or {}).get("ariaLabel") or "").strip()
-            if hint_text:
-                ocr_hints[element_name] = hint_text
-
-        steps.append({
-            "action": "toggle" if is_toggle else action["action"],
-            "element_name": element_name,
-            "value": action.get("value") or "",
-            "checked_value": checked_value,
-            "step_phrase": naming["step_phrase"],
-            # Only set for "keypress" actions - the recorded key (e.g. "ENTER", "ARROW_DOWN",
-            # "CTRL+A") and its human-readable label, used by feature.tmpl/steps.tmpl to
-            # generate a step per key rather than assuming Enter.
-            "key_name": key_name,
-            "key_label": key_label(key_name) if key_name else None,
-            # Only set when this action is part of a Capture -> Store -> Reuse chain.
-            "var_name": var_name,
-            "var_placeholder": var_placeholder,
-            "var_placeholder_escaped": var_placeholder_escaped,
-            # Explicit wait timeout (seconds) measured from the recording -
-            # see BasePage.wait_ready in page.tmpl / steps.tmpl.
-            "wait_seconds": wait_seconds,
-            # Popup/new-tab/new-window support (see comments above) - which
-            # tab/window this action runs on, whether the step needs to
-            # switch to it first, and whether IT is the action that causes a
-            # new tab/window to open (set retroactively above when a later
-            # "new_window" action is folded onto this one).
-            "page_index": page_index,
-            "switch_to_page": switch_to_page,
-            "opens_new_page": False,
-            "new_page_index": None,
-        })
-        excel_labels.append(element_name)
-
-    env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)), trim_blocks=True, lstrip_blocks=True)
-
-    def pyesc(value):
-        """Escapes a value for safe embedding inside a double-quoted Python
-        string literal in generated code (steps.tmpl). Plain interpolation
-        of a raw value is unsafe: a backslash (e.g. a Windows file-upload
-        path like C:\\fakepath\\image (55).png - see the new "file_upload"
-        action) gets reinterpreted as a Python escape sequence when the
-        generated .py file is parsed - \\f silently becomes an actual
-        form-feed character, which then no longer matches the plain-text
-        version of the same value in the .feature file, and behave reports
-        the step as undefined. Escaping backslashes and double quotes up
-        front keeps the parsed Python string identical to the original
-        recorded value."""
-        return str(value).replace("\\", "\\\\").replace('"', '\\"')
-
-    env.filters["pyesc"] = pyesc
-
-    feature_text = env.get_template("feature.tmpl").render(
-        scenario_name="Recorded transaction",
-        recorded_at=recording.get("recorded_at", datetime.now().isoformat()),
-        target_url=target_url,
-        steps=steps,
+    env = {**os.environ, "HEADLESS": "true" if headless else "false"}
+    proc = subprocess.run(
+        [sys.executable, "-m", "behave", str(features_dir),
+         "--no-capture", "--format", "json", "--outfile", str(results_path)],
+        cwd=str(ROOT), capture_output=True, text=True, env=env,
     )
-    steps_text = env.get_template("steps.tmpl").render(steps=steps)
-    page_text = env.get_template("page.tmpl").render(element_names=list(locators_map.keys()))
 
-    (out / "features" / "recorded.feature").write_text(feature_text)
-    (out / "features" / "steps" / "recorded_steps.py").write_text(steps_text)
-    (out / "pages" / "recorded_page.py").write_text(page_text)
-    # "__ocr_hints__" is a sibling key, not a real element - kept out of
-    # locators_map itself throughout the loop above so it never appears in
-    # element_names (the per-element click_X()/type_X() methods page.tmpl
-    # generates). BasePage.__init__ pops it back off on load.
-    locators_payload = {**locators_map, "__ocr_hints__": ocr_hints}
-    (out / "pages" / "locators.json").write_text(json.dumps(locators_payload, indent=2))
-
-    # environment.py is static (Playwright browser setup/teardown) - copy it in
-    env_src = ROOT / "runner" / "environment.py"
-    if env_src.exists():
-        shutil.copy(env_src, out / "features" / "environment.py")
-
-    (out / "pages" / "__init__.py").touch()
-
-    excel_path = None
+    parsed: list = []
     try:
-        # imported lazily (not at module load time) so a missing/broken
-        # pandas or openpyxl install - or a stale extraction missing this
-        # file - degrades to "no Excel report" instead of crashing the
-        # whole backend at startup.
-        from generator.excel_export import build_excel_report
-        excel_path = build_excel_report(
-            recording,
-            element_names=excel_labels,
-            output_path=str(out / "recorded_steps.xlsx"),
-            mask_passwords=mask_passwords,
-            actions=actions,
-        )
-    except Exception as e:
-        print(f"[warning] Skipped Excel report ({type(e).__name__}: {e}). "
-              f"Feature/steps/page files were still generated normally.")
+        parsed = json.loads(results_path.read_text())
+    except Exception:
+        parsed = []
 
     return {
-        "feature_file": str(out / "features" / "recorded.feature"),
-        "steps_file": str(out / "features" / "steps" / "recorded_steps.py"),
-        "page_file": str(out / "pages" / "recorded_page.py"),
-        "locators_file": str(out / "pages" / "locators.json"),
-        "excel_report": excel_path,
-        "element_count": len(locators_map),
-        "step_count": len(steps),
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "json": parsed,
     }
+
+
+def _extract_steps(behave_json: list, screenshots_dir: Optional[Path] = None,
+                    locator_log: Optional[list] = None, step_failures: Optional[list] = None) -> list[dict]:
+    """Flatten behave's nested JSON into one row per executed Playwright
+    step. `screenshots_dir`, if given, attaches a "screenshot" filename to
+    any step a screenshot actually exists for (see runner/environment.py's
+    after_step hook, which writes step_<n>.png there during the run) -
+    the Nth step in this flattened list lines up with step_<n>.png because
+    both walk the same steps in the same order; a step with no screenshot
+    (never executed - undefined/skipped - or the screenshot genuinely
+    failed to save) simply gets no "screenshot" key at all, rather than a
+    reference to a file that doesn't exist.
+
+    `locator_log`, if given, is the same environment.py after_step-produced
+    list (`[{"step_index": ..., "locator": {...} | None}, ...]`) - merged
+    in here by the SAME step_index alignment trick as screenshots.
+
+    `step_failures`, if given, is the environment.py after_all-produced
+    list from continue-on-step-failure mode (see generator/templates/
+    steps.tmpl's _run_step) - a step in this list was CAUGHT internally
+    and never raised, so Behave itself reports it "passed"; this overrides
+    that back to "Failed" with the real reason, same step_index alignment."""
+    locator_by_index = {}
+    for entry in (locator_log or []):
+        idx = entry.get("step_index")
+        if idx is not None and entry.get("locator"):
+            locator_by_index[idx] = entry["locator"]
+
+    failure_by_index = {}
+    for entry in (step_failures or []):
+        idx = entry.get("step_index")
+        if idx is not None:
+            failure_by_index[idx] = entry
+
+    rows = []
+    step_index = 0
+    for feature in behave_json:
+        for element in feature.get("elements", []):
+            if element.get("type") != "scenario":
+                continue
+            for step in element.get("steps", []):
+                step_index += 1
+                result = step.get("result", {}) or {}
+                status = (result.get("status") or "undefined").capitalize()
+                error = result.get("error_message")
+                if isinstance(error, list):
+                    error = "\n".join(error)
+                # Behave itself gives NO explanation for "Undefined"/"Skipped" -
+                # those statuses just mean this step was never reached, because
+                # Behave stops a scenario at its first Failed/Error step by
+                # default (this project never overrides that). Without this,
+                # someone reviewing the report sees a bare "Undefined" badge
+                # with nothing to click or expand to understand why - worth
+                # spelling out explicitly, in the DATA itself (not just a UI
+                # tooltip), so every export format (the live web view, the
+                # downloaded .txt/.html report) carries the same explanation.
+                if status in ("Undefined", "Skipped") and not error:
+                    error = (
+                        "Not executed - an earlier step in this scenario failed or "
+                        "errored, so Behave stopped before reaching this step. See "
+                        "whichever step above shows Failed/Error for the actual cause."
+                    )
+                # A Failed/Error step SHOULD always carry Behave's own
+                # error_message - but on the rare run where it genuinely comes
+                # through empty (an unusual exception type, or a hook-level
+                # failure Behave attributes oddly), leave a clear pointer
+                # rather than an empty cell that looks like nothing went wrong.
+                elif status in ("Failed", "Error") and not error:
+                    error = (
+                        "This step failed, but Behave did not capture a specific error "
+                        "message for it. Check \"Raw Behave output\" below for the full detail."
+                    )
+                # Continue-on-step-failure mode (steps.tmpl's _run_step) caught
+                # this step's exception internally and let it return normally -
+                # Behave itself reports it "Passed" above, since the exception
+                # never reached it. Override that back to "Failed" with the
+                # real reason, so the report stays accurate even though
+                # execution correctly carried on to the steps after this one.
+                failure = failure_by_index.get(step_index)
+                if failure:
+                    status = "Failed"
+                    error = f"{failure.get('error_type')}: {failure.get('error')} (execution continued to the next step)"
+                row = {
+                    "step_name": f'{step.get("keyword", "").strip()} {step.get("name", "")}'.strip(),
+                    "status": status,
+                    "error_message": error,
+                    "duration_seconds": result.get("duration"),
+                }
+                if screenshots_dir is not None:
+                    candidate = screenshots_dir / f"step_{step_index:03d}.png"
+                    if candidate.exists():
+                        row["screenshot"] = candidate.name
+                if step_index in locator_by_index:
+                    row["locator_used"] = locator_by_index[step_index]
+                rows.append(row)
+    return rows
+
+
+def _write_exit_report(path: Path, transaction_id: int, recording_name: str,
+                        user_name: str, status: str, steps: list[dict]) -> None:
+    passed = sum(1 for s in steps if s["status"] == "Passed")
+    # Deliberately "everything that isn't Passed" rather than counting only
+    # a literal "Failed" status - Behave's real per-step statuses include
+    # "passed", "failed", "error" (an uncaught exception, as opposed to a
+    # plain assertion failure - e.g. a Playwright TimeoutError), "skipped",
+    # and "undefined" (a step Behave never even reached, because an
+    # earlier step in the same scenario already failed/errored). Counting
+    # only "Failed" left Error/Undefined/Skipped steps invisible to both
+    # this count and the web UI's pass-rate donut chart - a run where 1
+    # step genuinely errored and the other 94 were never reached (all
+    # "Undefined") was being reported as "6 passed, 0 failed" and a
+    # misleading 100% pass rate, instead of the true ~6%.
+    failed = len(steps) - passed
+    lines = [
+        "=" * 72,
+        "AI TEST RECORDER - EXIT REPORT",
+        "=" * 72,
+        f"Transaction ID : {transaction_id}",
+        f"Recording      : {recording_name}",
+        f"Run by         : {user_name}",
+        f"Run at (UTC)   : {datetime.utcnow().isoformat(timespec='seconds')}",
+        f"Overall Status : {status}",
+        "-" * 72,
+        f"{'#':<4}{'Playwright Step':<42}{'Status':<10}{'Duration':<10}",
+        "-" * 72,
+    ]
+    for i, s in enumerate(steps, start=1):
+        duration = s.get("duration_seconds")
+        duration_str = f"{duration:.2f}s" if isinstance(duration, (int, float)) else ""
+        lines.append(f"{i:<4}{s['step_name'][:40]:<42}{s['status']:<10}{duration_str:<10}")
+        if s.get("error_message"):
+            lines.append(f"     -> ERROR: {s['error_message']}")
+        locator_used = s.get("locator_used")
+        if locator_used:
+            healed = " (self-healed)" if locator_used.get("self_healed") else ""
+            lines.append(
+                f"     -> Locator: {locator_used.get('strategy')}={locator_used.get('value')} "
+                f"({locator_used.get('element_name')}){healed}"
+            )
+    lines += [
+        "-" * 72,
+        f"Passed: {passed}   Failed: {failed}   Total: {len(steps)}",
+        "=" * 72,
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines))
+
+
+def run_recording(recording_file: str, user_id: int, headless: bool = False,
+                   output_dir: Optional[str] = None, mask_passwords: bool = True,
+                   execute_fn=None) -> dict:
+    """Run one saved recording and return its exit report as a dict.
+
+    Raises FileNotFoundError / ValueError for bad input (missing recording,
+    unknown or Inactive user) before anything is written to disk. `user_id`
+    is still validated against the Users table (auth data, stays in the
+    DB) - only the resulting transaction/files/step-log record is written
+    to transactions/ instead of the database.
+
+    `output_dir`: defaults to a fresh output/runs/<transaction_id>/
+    subfolder (computed below, once the transaction id is known) rather
+    than the shared "output/" - so two people running recordings at the
+    same time (or the live-recording flow's own per-session folder, see
+    backend/recording_sessions.py) never clobber each other's generated
+    feature/steps/page files. Pass an explicit output_dir to opt back into
+    the old shared-folder behavior (e.g. scripting/CLI use where nothing
+    else could possibly be running concurrently).
+
+    `execute_fn`: optional `(output_dir: str, headless: bool) -> dict`
+    returning `{"returncode", "stdout", "stderr", "json"}` - defaults to
+    the local `_run_behave_json` (server-side execution) if not given.
+    backend/api.py passes a function that delegates to a connected desktop
+    agent instead (see local_agent/execution_manager.py's
+    run_test_with_json_report, which returns the exact same shape) - this
+    function itself doesn't need to know or care which one actually ran;
+    everything downstream (step extraction, the exit report, the
+    transaction record) is identical either way.
+    """
+    init_db()
+
+    rec_path = Path(recording_file)
+    if not rec_path.exists():
+        raise FileNotFoundError(f"Recording not found: {recording_file}")
+    recording = json.loads(rec_path.read_text())
+    recording_name = recording.get("recording_name") or recording.get("recorded_at") or rec_path.stem
+
+    with get_session() as session:
+        user = repo.get_user(session, user_id)
+        if user is None:
+            raise ValueError(f"No such user_id={user_id}")
+        if user.status != "Active":
+            raise ValueError(f"User '{user.name}' is Inactive and cannot run recordings")
+        user_name = user.name
+
+    # Best-effort link back to the owning Recording row (see Phase 2's
+    # backend/recording_access.py) - lets the transaction/execution history
+    # be filtered per-recording (GET /api/transactions?recording_id=...,
+    # used by the recording details page's Reports tab). None for a
+    # recording somehow run without ever going through get_or_create -
+    # not expected in practice, but never worth failing a run over.
+    try:
+        with get_session() as session:
+            recording_id = recording_access.get_or_create_recording(session, rec_path).recording_id
+    except Exception:
+        recording_id = None
+
+    transaction_id = transaction_store.next_transaction_id()
+    if output_dir is None:
+        output_dir = str(ROOT / "output" / "runs" / str(transaction_id))
+    files: list[dict] = [{"file_name": rec_path.name, "folder_path": str(rec_path.parent.resolve())}]
+
+    def _save_interim_status(status: str, error: str = "") -> None:
+        """Writes a non-final (or early-failure) transaction record - reused
+        for the initial "Running" write below and for the failure branches
+        further down, since all of them share the same "no step results yet"
+        shape (unlike the full record built once execution actually finishes,
+        around the end of this function)."""
+        transaction_store.save_transaction({
+            "transaction_id": transaction_id,
+            "recording_id": recording_id,
+            "user_id": user_id,
+            "user": user_name,
+            "transaction_name": recording_name,
+            "status": status,
+            "date_time": datetime.utcnow().isoformat(),
+            "steps": [],
+            "step_count": 0,
+            "passed_count": 0,
+            "failed_count": 0,
+            "screenshots_folder": None,
+            "files": files,
+            "raw_output": error,
+            "report_file": None,
+        })
+
+    # Immediate "Running" record so this transaction_id is visible/traceable
+    # from the moment it's allocated, and next_transaction_id() (which just
+    # scans existing files) never silently reuses it for an unrelated later
+    # run. If the backend hard-crashes/restarts before this function reaches
+    # a terminal status below, transaction_store.mark_interrupted_running_
+    # transactions() (called at backend startup) finds this record and flips
+    # it to "Interrupted" instead of it staying stuck or vanishing.
+    _save_interim_status("Running")
+
+    try:
+        # ---- regenerate feature/steps/page files from the saved recording ----
+        llm = get_llm()
+        build_result = build_artifacts(recording, llm=llm, output_dir=output_dir, mask_passwords=mask_passwords)
+
+        for key in ("feature_file", "steps_file", "page_file", "locators_file", "excel_report"):
+            path = build_result.get(key)
+            if path:
+                p = Path(path)
+                files.append({"file_name": p.name, "folder_path": str(p.parent.resolve())})
+
+        # ---- execute the generated Behave/Playwright suite ----------------------
+        if execute_fn is None:
+            features_dir = Path(output_dir) / "features"
+            run_result = _run_behave_json(features_dir, headless=headless)
+        else:
+            run_result = execute_fn(output_dir, headless)
+    except ConnectionError as e:
+        # The local agent dropped mid-run (see backend/agent_registry.py's
+        # unregister()) - still leave a traceable record instead of losing
+        # the attempt entirely, then re-raise so backend/api.py can turn
+        # this into a clean AGENT_DISCONNECTED response instead of a 500.
+        _save_interim_status("Agent Disconnected", str(e))
+        raise
+    except Exception as e:
+        # Anything else (a build_artifacts failure, an unexpected exception
+        # from execute_fn/_run_behave_json) - still a terminal outcome, not
+        # a crash, so record it as "Failed" rather than leaving the "Running"
+        # record above stuck forever. Re-raise so the caller (backend/api.py)
+        # still sees the original error.
+        _save_interim_status("Failed", str(e))
+        raise
+
+    screenshots_dir = Path(output_dir) / "screenshots"
+    # Server-direct execution (execute_fn is None) already writes screenshots
+    # straight to screenshots_dir itself - environment.py's after_step hook
+    # runs in THIS process against THIS output_dir, no transfer needed. Agent
+    # -mode execution runs on a completely different machine, so its
+    # screenshots (base64-encoded - see local_agent/execution_manager.py's
+    # run_test_with_json_report) arrive in run_result and need writing out
+    # here before _extract_steps() below can find them.
+    agent_screenshots = run_result.get("screenshots") or {}
+    if agent_screenshots:
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+        for file_name, b64_data in agent_screenshots.items():
+            try:
+                safe_name = Path(file_name).name  # defense in depth - see uipath_importer's same pattern
+                (screenshots_dir / safe_name).write_bytes(base64.b64decode(b64_data))
+            except Exception:
+                logger.warning(f"Could not decode/save screenshot '{file_name}' from agent response")
+
+    # Locator-strategy-used per step (see generator/templates/page.tmpl's
+    # BasePage.last_resolution and runner/environment.py's after_step hook).
+    # Server-direct execution wrote it straight to this output_dir/reports/;
+    # agent-mode execution ran on a different machine, so it travels back
+    # over the same WebSocket round-trip screenshots already use (see
+    # local_agent/execution_manager.py's run_test_with_json_report).
+    if execute_fn is None:
+        locator_log_path = Path(output_dir) / "reports" / "locator_log.json"
+        try:
+            locator_log = json.loads(locator_log_path.read_text()) if locator_log_path.exists() else []
+        except Exception:
+            locator_log = []
+    else:
+        locator_log = run_result.get("locator_log") or []
+
+    # Steps caught-and-continued-past by continue-on-step-failure mode (see
+    # generator/templates/steps.tmpl's _run_step) - same dual-path read as
+    # locator_log above (disk for server-mode, shipped over the WebSocket
+    # for agent-mode).
+    if execute_fn is None:
+        step_failures_path = Path(output_dir) / "reports" / "step_failures.json"
+        try:
+            step_failures = json.loads(step_failures_path.read_text()) if step_failures_path.exists() else []
+        except Exception:
+            step_failures = []
+    else:
+        step_failures = run_result.get("step_failures") or []
+
+    steps = _extract_steps(
+        run_result["json"],
+        screenshots_dir=screenshots_dir if screenshots_dir.is_dir() else None,
+        locator_log=locator_log,
+        step_failures=step_failures,
+    )
+    if screenshots_dir.is_dir():
+        files.append({"file_name": "screenshots", "folder_path": str(screenshots_dir.resolve())})
+
+    if not steps:
+        # Behave never got as far as running a step (e.g. import error,
+        # bad feature file) - log that as a single failed automation entry
+        # instead of silently reporting an empty run.
+        steps = [{
+            "step_name": "Behave execution",
+            "status": "Failed",
+            "error_message": (run_result["stderr"] or run_result["stdout"] or "Behave produced no step results").strip()[:4000],
+        }]
+
+    # Behave itself exits 0 even when continue-on-step-failure mode caught
+    # and continued past a real failure (nothing raised, so from Behave's
+    # own perspective every step "passed") - step_failures being non-empty
+    # is what actually tells us a step failed, so it must count here too,
+    # not just the raw Behave exit code.
+    overall_status = "Success" if run_result["returncode"] == 0 and not step_failures else "Failed"
+
+    # ---- write + log the exit report file ---------------------------------
+    report_path = REPORTS_DIR / f"transaction_{transaction_id}_exit_report.txt"
+    _write_exit_report(report_path, transaction_id, recording_name, user_name, overall_status, steps)
+    files.append({"file_name": report_path.name, "folder_path": str(report_path.parent.resolve())})
+
+    date_time = datetime.utcnow().isoformat()
+    transaction = {
+        "transaction_id": transaction_id,
+        "recording_id": recording_id,
+        "user_id": user_id,
+        "user": user_name,
+        "transaction_name": recording_name,
+        "status": overall_status,
+        "date_time": date_time,
+        "steps": steps,
+        "step_count": len(steps),
+        "passed_count": sum(1 for s in steps if s["status"] == "Passed"),
+        # See _write_exit_report's comment above - "everything that isn't
+        # Passed", not just a literal "Failed" status, so Error/Undefined/
+        # Skipped steps are correctly reflected in both this count and the
+        # web UI's pass-rate donut chart instead of silently vanishing
+        # from the denominator.
+        "failed_count": len(steps) - sum(1 for s in steps if s["status"] == "Passed"),
+        # Lets the frontend build a download/view request for any given
+        # step's "screenshot" filename (see _extract_steps above) without
+        # having to know or guess this path structure itself - None when
+        # no screenshots exist at all for this run (e.g. a crash before
+        # before_all ever launched a browser).
+        "screenshots_folder": str(screenshots_dir.resolve()) if screenshots_dir.is_dir() else None,
+        "files": files,
+        "raw_output": run_result["stdout"] + "\n" + run_result["stderr"],
+        "report_file": str(report_path),
+    }
+    transaction_store.save_transaction(transaction)
+    return transaction
