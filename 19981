@@ -1,711 +1,256 @@
-/*
-Injected via Playwright's page.add_init_script() so it re-attaches on every
-navigation (including SPA route changes that reload the document, and full
-page loads). Captures click + input/change events and builds MULTIPLE
-independent locator strategies per element so the generated tests don't
-depend on a single brittle selector. Actions are queued here and drained
-by the Python side polling window.__flushActions() (see
-recorder/recorder.py) from the single worker thread that owns the page.
-*/
-(function () {
-  if (window.__recorderInstalled) return;
-  window.__recorderInstalled = true;
+"""
+Shared OCR helper, used at BOTH:
+  - RECORD time (recorder/recorder.py, when the user right-clicks an
+    element on the page and chooses "Capture text with OCR" from the
+    custom menu injected by recorder_injector.js)
+  - REPLAY time (generator/templates/page.tmpl's
+    BasePage.capture_value_ocr, called from the generated step - see
+    generator/templates/steps.tmpl's "ocr_capture" branch; also
+    BasePage._ocr_click_fallback - a last-resort locator strategy for
+    click() when every DOM candidate fails - and
+    BasePage.assert_ocr_text_visible - a page-level OCR/visual
+    assertion, with no DOM element involved at all)
 
-  // Actions are also mirrored to sessionStorage (same-origin, survives a
-  // navigation) so a queued action isn't lost if the page navigates/reloads
-  // (e.g. pressing Enter submits the form) before the Python side's next
-  // poll had a chance to flush window.__recordedQueue - that race is why
-  // Enter/submit-triggered actions could intermittently go unrecorded.
-  var STORAGE_KEY = '__recorderQueue';
+One implementation, so every caller always extracts text the exact same
+way - and critically, REPLAY re-runs the OCR live every single time the
+test executes (a fresh screenshot, fresh OCR pass) rather than reusing
+whatever text was read during recording, the same way a plain
+copy-captured value is re-read live rather than hard-coded (see
+recorder/variable_capture.py's module docstring) - these are usually
+values the application generates fresh each run (a new application
+number, a new reference ID rendered into an image/canvas rather than
+real DOM text), so baking in the recording-time value would make the
+generated test increasingly wrong over time.
 
-  // id of the right-click capture menu's Shadow DOM host (see
-  // showCaptureMenu below) - every OTHER listener in this file that
-  // records page activity (click/change/keydown/copy/cut/paste) needs to
-  // ignore events that originate from INSIDE this menu, or interacting
-  // with the recorder's own capture UI (choosing a mode, typing a
-  // variable name, clicking Capture) would itself get recorded as bogus
-  // click/type/copy actions targeting an element that won't even exist
-  // during replay. Shadow DOM automatically RETARGETS any such event's
-  // target/activeElement to this host id when observed from a
-  // document-level listener outside the shadow tree, so a single ==
-  // check against this constant is enough everywhere.
-  var CAPTURE_MENU_HOST_ID = '__ai_tr_capture_menu_host__';
+Uses EasyOCR - a pure-Python OCR engine (pip install easyocr, nothing
+else to install separately, unlike Tesseract) built on PyTorch. This is a
+genuine trade-off, not a strictly-better choice, worth understanding:
+  - Nothing to install on the target machine beyond `pip install easyocr`
+    (or whatever's bundled into local_agent's frozen build) - no separate
+    binary, no PATH configuration, no corporate-security exclusion needed
+    for a second executable.
+  - But: it's a MUCH heavier dependency (EasyOCR pulls in PyTorch - use
+    the CPU-only build, `pip install torch --index-url
+    https://download.pytorch.org/whl/cpu`, NOT the default GPU build,
+    which is several GB larger for zero benefit on a laptop with no GPU).
+    This is exactly why OCR support stays OPTIONAL for local_agent (see
+    local_agent/requirements-agent.txt) rather than a hard dependency -
+    _ocr_click_fallback below is written to degrade silently (no
+    fallback attempted, original error still raised) rather than error
+    out, on a lightweight agent install that never installed this.
+  - And: EasyOCR downloads its detection/recognition model weights
+    (~100MB) from the internet the FIRST time a Reader() is ever created
+    on a given machine, caching them (default: ~/.EasyOCR/model/, or
+    wherever EASYOCR_MODULE_PATH points - see _get_reader below) for
+    every run after that. On a machine with restricted/no internet
+    access, this first-run download needs to be pre-staged (copy an
+    already-populated ~/.EasyOCR/model/ folder over, or point
+    EASYOCR_MODULE_PATH at a pre-staged location bundled with the
+    installer) BEFORE the first OCR capture is ever attempted there.
+  - Reader() initialization itself (loading those model weights into
+    memory) takes a few seconds - too slow to redo on every single
+    capture, so _get_reader() below creates it ONCE per process and
+    reuses it for every subsequent OCR call in that process's lifetime.
+"""
+from __future__ import annotations
+import hashlib
+import io
+import os
+import threading
+from collections import OrderedDict
+from typing import Optional
 
-  function loadPersistedQueue() {
-    try {
-      var raw = sessionStorage.getItem(STORAGE_KEY);
-      return raw ? JSON.parse(raw) : [];
-    } catch (e) {
-      return [];
-    }
-  }
+_reader = None
+_reader_lock = threading.Lock()
 
-  function persistQueue() {
-    try {
-      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(window.__recordedQueue));
-    } catch (e) { /* storage unavailable/full - keep going in-memory only */ }
-  }
+# Minimum EasyOCR confidence (0-1) for a region to count as a genuine match
+# in best_match() below - picked conservatively low since UI text (small
+# fonts, icon+label buttons) often scores lower than scanned-document text,
+# but still high enough to reject obvious noise/garbage detections.
+DEFAULT_MIN_CONFIDENCE = 0.35
 
-  window.__recordedQueue = loadPersistedQueue();
+# Bounded cache of find_text_regions() results, keyed by a hash of the exact
+# screenshot bytes - a byte-identical screenshot (checked twice within the
+# same run, e.g. a click fallback immediately followed by an OCR assertion
+# on an unchanged page) skips re-running OCR entirely; any genuinely
+# different screenshot has different bytes, so this can never serve stale
+# results. Bounded (not per-run-scoped) since this module is a
+# process-lifetime singleton shared across every recording/replay in that
+# process, same as _reader above.
+_OCR_CACHE_MAX = 64
+_ocr_cache: "OrderedDict[str, list]" = OrderedDict()
+_ocr_cache_lock = threading.Lock()
 
-  function cssEscape(s) {
-    return (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/([^a-zA-Z0-9_-])/g, '\\$1');
-  }
 
-  function isUnique(selector) {
-    try {
-      return document.querySelectorAll(selector).length === 1;
-    } catch (e) {
-      return false;
-    }
-  }
+def _cache_get(key: str):
+    with _ocr_cache_lock:
+        value = _ocr_cache.get(key)
+        if value is not None:
+            _ocr_cache.move_to_end(key)
+        return value
 
-  function cssPath(el) {
-    if (!(el instanceof Element)) return null;
-    var path = [];
-    while (el && el.nodeType === Node.ELEMENT_NODE && el.tagName.toLowerCase() !== 'html') {
-      var selector = el.tagName.toLowerCase();
-      if (el.id) {
-        selector = '#' + cssEscape(el.id);
-        path.unshift(selector);
-        break;
-      } else {
-        var sib = el, nth = 1;
-        while ((sib = sib.previousElementSibling)) {
-          if (sib.tagName === el.tagName) nth++;
-        }
-        selector += ':nth-of-type(' + nth + ')';
-      }
-      path.unshift(selector);
-      el = el.parentElement;
-    }
-    return path.join(' > ');
-  }
 
-  function xpathOf(el) {
-    if (el.id) return '//*[@id="' + el.id + '"]';
-    var parts = [];
-    while (el && el.nodeType === Node.ELEMENT_NODE) {
-      var idx = 1;
-      var sib = el.previousElementSibling;
-      while (sib) {
-        if (sib.tagName === el.tagName) idx++;
-        sib = sib.previousElementSibling;
-      }
-      parts.unshift(el.tagName.toLowerCase() + '[' + idx + ']');
-      el = el.parentElement;
-    }
-    return '/' + parts.join('/');
-  }
+def _cache_put(key: str, value: list) -> None:
+    with _ocr_cache_lock:
+        _ocr_cache[key] = value
+        _ocr_cache.move_to_end(key)
+        while len(_ocr_cache) > _OCR_CACHE_MAX:
+            _ocr_cache.popitem(last=False)
 
-  function textXPath(el) {
-    var text = (el.innerText || el.textContent || '').trim();
-    if (!text || text.length > 60) return null;
-    var tag = el.tagName.toLowerCase();
-    return "//" + tag + "[normalize-space(.)=\"" + text.replace(/"/g, '') + "\"]";
-  }
 
-  function isUniqueXPath(xpath) {
-    try {
-      var result = document.evaluate('count(' + xpath + ')', document, null, XPathResult.NUMBER_TYPE, null);
-      return result.numberValue === 1;
-    } catch (e) {
-      return false;
-    }
-  }
+def _normalize(text: str) -> str:
+    """Whitespace-collapsed, case-folded form used for matching - mirrors
+    recorder/variable_capture.py's _normalize, same rationale (a UI often
+    re-renders/re-wraps text slightly from how it was recorded)."""
+    return " ".join(text.split()).casefold()
 
-  function ancestorTextXPath(el) {
-    // Radio/checkbox inputs usually have NO text content of their own - the
-    // visible option label lives on a wrapping component instead (e.g.
-    // Angular Material's <mat-radio-button>/<mat-checkbox>, or a plain
-    // wrapping <label>), so textXPath(el) above returns null for them. That
-    // leaves the input's auto-generated id (e.g. Angular's "mat-radio-9-input")
-    // as the only usable locator - and that id is NOT stable across page
-    // loads, since frameworks like Angular/React generate it from a global
-    // counter that depends on everything else rendered earlier on the page.
-    // Climbing to the nearest wrapper with short, meaningful text and
-    // anchoring an XPath on THAT text (then navigating back down to the
-    // input) gives a locator based on what a real user actually sees - e.g.
-    // //mat-radio-button[normalize-space(.)="Yes"]//input - which stays
-    // correct regardless of what id Angular happens to generate this time.
-    if (!(el.tagName === 'INPUT' && (el.type === 'radio' || el.type === 'checkbox'))) return null;
-    var wrapper = el.closest('mat-radio-button, mat-checkbox, [role="radio"], [role="checkbox"], label') || el.parentElement;
-    var depth = 0;
-    while (wrapper && depth < 4) {
-      var text = (wrapper.innerText || wrapper.textContent || '').trim();
-      if (text && text.length <= 60) {
-        var tag = wrapper.tagName.toLowerCase();
-        var xp = "//" + tag + "[normalize-space(.)=\"" + text.replace(/"/g, '') + "\"]//input[@type=\"" + el.type + "\"]";
-        if (isUniqueXPath(xp)) return xp;
-      }
-      wrapper = wrapper.parentElement;
-      depth++;
-    }
-    return null;
-  }
 
-  function buildLocators(el) {
-    var locs = [];
+def _get_reader():
+    """Lazily creates ONE EasyOCR Reader for this process's whole
+    lifetime (thread-safe) - Reader() itself is slow (loads model
+    weights), so this must never be called fresh per-capture. English
+    only by default; add languages via OCR_LANGUAGES (comma-separated
+    EasyOCR language codes, e.g. "en,hi") if this ever needs to read
+    non-English text."""
+    global _reader
+    if _reader is None:
+        with _reader_lock:
+            if _reader is None:
+                import easyocr
+                languages = os.environ.get("OCR_LANGUAGES", "en").split(",")
+                model_dir = os.environ.get("EASYOCR_MODULE_PATH")  # pre-staged model weights, for a machine with no internet access
+                _reader = easyocr.Reader(
+                    [lang.strip() for lang in languages if lang.strip()],
+                    gpu=False,  # laptops running this agent have no GPU worth using - forcing this off also skips a slow, pointless CUDA availability probe
+                    model_storage_directory=model_dir,
+                    download_enabled=model_dir is None or not os.path.isdir(model_dir),
+                )
+    return _reader
 
-    if (el.getAttribute('data-testid')) {
-      var v = el.getAttribute('data-testid');
-      var sel = '[data-testid="' + cssEscape(v) + '"]';
-      if (isUnique(sel)) locs.push({ strategy: 'CSS', value: sel, note: 'data-testid' });
-    }
-    if (el.id) {
-      var idSel = '#' + cssEscape(el.id);
-      if (isUnique(idSel)) locs.push({ strategy: 'ID', value: el.id });
-    }
-    if (el.name) {
-      var nameSel = '[name="' + cssEscape(el.name) + '"]';
-      if (isUnique(nameSel)) locs.push({ strategy: 'NAME', value: el.name });
-    }
-    if (el.getAttribute('aria-label')) {
-      var al = el.getAttribute('aria-label');
-      var alSel = '[aria-label="' + cssEscape(al) + '"]';
-      if (isUnique(alSel)) locs.push({ strategy: 'CSS', value: alSel, note: 'aria-label' });
-    }
-    if (el.getAttribute('placeholder')) {
-      var ph = el.getAttribute('placeholder');
-      var phSel = '[placeholder="' + cssEscape(ph) + '"]';
-      if (isUnique(phSel)) locs.push({ strategy: 'CSS', value: phSel, note: 'placeholder' });
-    }
-    var txp = textXPath(el);
-    if (txp) locs.push({ strategy: 'XPATH', value: txp, note: 'text' });
 
-    var atxp = ancestorTextXPath(el);
-    if (atxp) locs.push({ strategy: 'XPATH', value: atxp, note: 'text' });
+def ocr_available() -> bool:
+    """Best-effort check - used by recorder.py to fail an OCR capture
+    request clearly and immediately (rather than partway through) if
+    EasyOCR genuinely can't run here (not installed, or model weights
+    can't be obtained/found and there's no internet access to fetch
+    them)."""
+    try:
+        _get_reader()
+        return True
+    except Exception:
+        return False
 
-    var cp = cssPath(el);
-    if (cp) locs.push({ strategy: 'CSS', value: cp, note: 'generated-path' });
 
-    var xp = xpathOf(el);
-    if (xp) locs.push({ strategy: 'XPATH', value: xp, note: 'generated-path' });
+def find_text_regions(png_bytes: bytes) -> list[dict]:
+    """Structured OCR: every detected text region with its confidence and
+    bounding box, e.g.:
+        {"text": "Submit", "normalized_text": "submit", "confidence": 0.94,
+         "bbox": {"x": 100, "y": 200, "width": 120, "height": 40}}
+    Unlike extract_text_from_png_bytes's plain joined string, this is what
+    BasePage._ocr_click_fallback (a last-resort locator strategy) and
+    BasePage.assert_ocr_text_visible (a page-level OCR/visual assertion)
+    need - "which region, if any, actually matches the text I'm looking
+    for, and how confident was the read." Cached by a hash of the exact
+    screenshot bytes (see module docstring). Preprocessing (grayscale +
+    contrast normalization) is applied before handing the image to
+    EasyOCR - a small, safe accuracy improvement for typical UI
+    screenshots; full skew/rotation correction is deliberately not
+    attempted (UI screenshots are always axis-aligned).
 
-    return locs;
-  }
+    Raises the same RuntimeError as extract_text_from_png_bytes if OCR
+    genuinely can't run here (missing deps, EasyOCR init failure) - see
+    that function's docstring for the exact conditions."""
+    cache_key = hashlib.sha1(png_bytes).hexdigest()
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
 
-  function describe(el) {
-    return {
-      tag: el.tagName.toLowerCase(),
-      type: el.getAttribute('type') || '',
-      text: (el.innerText || el.textContent || '').trim().slice(0, 60),
-      placeholder: el.getAttribute('placeholder') || '',
-      name: el.name || '',
-      ariaLabel: el.getAttribute('aria-label') || ''
-    };
-  }
+    try:
+        from PIL import Image, ImageOps
+        import numpy as np
+    except ImportError as e:
+        raise RuntimeError(
+            "OCR support isn't fully installed on this machine - "
+            "pip install easyocr Pillow numpy "
+            "(see local_agent/requirements-agent.txt)."
+        ) from e
 
-  function record(action, el, value) {
-    window.__recordedQueue.push({
-      ts: Date.now(),
-      action: action,
-      value: value === undefined ? null : value,
-      element: describe(el),
-      locators: buildLocators(el),
-      url: window.location.href
-    });
-    persistQueue();
-  }
+    try:
+        reader = _get_reader()
+    except Exception as e:
+        raise RuntimeError(
+            f"EasyOCR could not initialize ({type(e).__name__}: {e}). If this machine has no "
+            "internet access, EasyOCR's model weights need to be pre-staged - copy an already-"
+            "populated ~/.EasyOCR/model/ folder from a machine that has run OCR successfully "
+            "once, or set EASYOCR_MODULE_PATH to a pre-staged model directory bundled with the "
+            "installer."
+        ) from e
 
-  document.addEventListener('click', function (e) {
-    var el = e.target;
-    if (!el || el === document || el === document.body || el.id === CAPTURE_MENU_HOST_ID) return;
-    // walk up to nearest clickable-ish element if the click landed on an inline text node wrapper.
-    // Includes radio/checkbox inputs and <label> so clicks on custom-styled radio/checkbox UIs
-    // (where the visible click target is a label or wrapping span, not the native input) still
-    // resolve to the actual underlying <input>.
-    var clickable = el.closest(
-      'button, a, [role="button"], input[type="submit"], input[type="button"], ' +
-      'input[type="radio"], input[type="checkbox"], label, [onclick]'
-    ) || el;
+    image = Image.open(io.BytesIO(png_bytes)).convert("L")  # grayscale
+    image = ImageOps.autocontrast(image)
+    image_array = np.array(image)
 
-    if (clickable.tagName && clickable.tagName.toLowerCase() === 'label') {
-      var forId = clickable.getAttribute('for');
-      var resolved = forId ? document.getElementById(forId) : clickable.querySelector('input, select');
-      if (resolved) clickable = resolved;
-    }
+    try:
+        # detail=1 returns (bbox_points, text, confidence) per region -
+        # bbox_points is 4 (x, y) corner points in top-to-bottom,
+        # left-to-right reading order (EasyOCR's natural detection order,
+        # same order detail=0 used to hand back as a flat string list).
+        raw = reader.readtext(image_array, detail=1)
+    except Exception as e:
+        raise RuntimeError(f"OCR failed while reading the captured image: {type(e).__name__}: {e}") from e
 
-    if (clickable.tagName === 'INPUT' && (clickable.type === 'radio' || clickable.type === 'checkbox')) {
-      // The browser applies the click's default action (actually flipping
-      // .checked) AFTER all capture/bubble listeners have run, so reading
-      // clickable.checked synchronously here would still see the OLD value.
-      // Deferring to the next tick lets us record the RESULTING checked
-      // state as this action's value - the generated replay step then uses
-      // that as an explicit target state (Playwright's check()/uncheck())
-      // instead of a blind click, so replay can never double-toggle it.
-      var target = clickable;
-      setTimeout(function () {
-        record('click', target, target.checked);
-      }, 0);
-      return;
-    }
+    regions = []
+    for bbox_points, text, confidence in raw:
+        # EasyOCR returns numpy scalar types (np.int32/np.float64) for
+        # corner coordinates - cast to plain Python numbers so this dict is
+        # safely JSON-serializable and safe to pass straight into
+        # Playwright's mouse.click(x, y) (page.tmpl's _ocr_click_fallback),
+        # neither of which reliably accepts numpy types.
+        xs = [float(p[0]) for p in bbox_points]
+        ys = [float(p[1]) for p in bbox_points]
+        regions.append({
+            "text": text,
+            "normalized_text": _normalize(text),
+            "confidence": float(confidence),
+            "bbox": {"x": min(xs), "y": min(ys), "width": max(xs) - min(xs), "height": max(ys) - min(ys)},
+        })
 
-    record('click', clickable);
-  }, true);
+    _cache_put(cache_key, regions)
+    return regions
 
-  document.addEventListener('change', function (e) {
-    var el = e.target;
-    if (!el || el.id === CAPTURE_MENU_HOST_ID) return;
-    var tag = el.tagName.toLowerCase();
 
-    if (tag === 'select') {
-      var opt = el.options[el.selectedIndex];
-      record('select', el, opt ? opt.text.trim() : el.value);
-      return;
-    }
-    if (tag === 'input' && el.type === 'file') {
-      // el.value is ALWAYS a browser-fabricated "C:\fakepath\<name>" string
-      // for security - never the real absolute disk path, and there's no
-      // way to type/set a file input back to it on replay. BUT the File
-      // API DOES let JS read the chosen file's actual CONTENT (just not
-      // its path) - so instead of requiring a human to manually go find
-      // and copy the same file into a fixtures folder before every
-      // replay, capture the real bytes here, right now, while the file is
-      // actually available, and ship them along with this action.
-      // generator/build.py writes them straight into output/fixtures/<name>
-      // automatically - by the time replay runs, the exact file used at
-      // recording time is already sitting there, whatever its name was.
-      var file = el.files && el.files.length ? el.files[0] : null;
-      var chosenName = file ? file.name : '';
-      var MAX_INLINE_BYTES = 4 * 1024 * 1024; // ~4MB - stays well under the
-      // ~5-10MB per-origin sessionStorage quota this queue is mirrored
-      // into (see persistQueue), leaving room for other queued actions.
-      if (!file || file.size > MAX_INLINE_BYTES) {
-        // Too large to safely inline (or no file object available for some
-        // reason) - fall back to name-only capture; upload_file() at
-        // replay time will still work fine if a file with this name is
-        // placed in fixtures/ manually.
-        record('file_upload', el, chosenName);
-        return;
-      }
-      var reader = new FileReader();
-      reader.onload = function () {
-        // reader.result is a "data:<mime>;base64,<data>" URL - strip the
-        // prefix down to just the base64 payload.
-        var dataUrl = reader.result || '';
-        var comma = dataUrl.indexOf(',');
-        var base64 = comma >= 0 ? dataUrl.slice(comma + 1) : '';
-        window.__recordedQueue.push({
-          ts: Date.now(),
-          action: 'file_upload',
-          value: chosenName,
-          fileDataBase64: base64,
-          element: describe(el),
-          locators: buildLocators(el),
-          url: window.location.href
-        });
-        persistQueue();
-      };
-      reader.onerror = function () {
-        // Reading failed for some reason - still record the name so
-        // upload_file()'s manual-fallback path remains available.
-        record('file_upload', el, chosenName);
-      };
-      reader.readAsDataURL(file);
-      return;
-    }
-    if (tag === 'input' && (el.type === 'radio' || el.type === 'checkbox')) {
-      // handled by the click listener above (clicking IS the interaction for these;
-      // recording it again here would create a duplicate/redundant step)
-      return;
-    }
-    if (tag === 'input' || tag === 'textarea') {
-      record('type', el, el.value);
-    }
-  }, true);
+def best_match(regions: list[dict], hint: str, min_confidence: float = DEFAULT_MIN_CONFIDENCE) -> Optional[dict]:
+    """Picks the highest-confidence region whose normalized text contains
+    (or is contained by) `hint`, among regions clearing `min_confidence` -
+    or None if nothing qualifies. A PURE function (no I/O, no OCR call) so
+    it's directly unit-testable with hand-built region lists, independent
+    of EasyOCR/a browser/a real screenshot - this is deliberately where
+    the actual "did we find what we were looking for" decision lives,
+    kept separate from find_text_regions' OCR I/O."""
+    target = _normalize(hint)
+    if not target:
+        return None
+    candidates = [
+        r for r in regions
+        if r["confidence"] >= min_confidence and (target in r["normalized_text"] or r["normalized_text"] in target)
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda r: r["confidence"])
 
-  // Capture keyboard-driven actions (Enter to submit, Backspace to clear/edit,
-  // Arrow Up/Down to move through suggestion lists, Ctrl combos, function keys,
-  // etc.) separately from typed text, since these are user-initiated key presses
-  // rather than a change to the field's value.
-  //
-  // CTRL+C / CTRL+V / CTRL+X are deliberately NOT recorded here - they're
-  // captured with richer data (the actual copied/pasted text and the source/
-  // target element) by the dedicated copy/cut/paste listeners below instead,
-  // so recording them again here would just be a redundant, value-less entry.
-  var SIMPLE_KEY_MAP = {
-    'Enter': 'ENTER',
-    'Backspace': 'BACKSPACE',
-    'Escape': 'ESCAPE',
-    'Delete': 'DELETE',
-    ' ': 'SPACE',
-    'Spacebar': 'SPACE',
-    'ArrowUp': 'ARROW_UP',
-    'ArrowDown': 'ARROW_DOWN',
-    'ArrowLeft': 'ARROW_LEFT',
-    'ArrowRight': 'ARROW_RIGHT',
-    'Home': 'HOME',
-    'End': 'END'
-  };
-  for (var _f = 1; _f <= 12; _f++) SIMPLE_KEY_MAP['F' + _f] = 'F' + _f;
 
-  // Ctrl/Cmd combos recorded generically as a single keypress action (so
-  // playback can literally re-press them via Playwright). 'c'/'v'/'x' are
-  // excluded here on purpose - see note above.
-  var CTRL_COMBO_MAP = {
-    'a': 'CTRL+A',
-    'p': 'CTRL+P',
-    's': 'CTRL+S'
-  };
+def extract_text_from_png_bytes(png_bytes: bytes) -> str:
+    """Runs OCR on a screenshot (PNG bytes, exactly what Playwright's
+    `element.screenshot()` returns) and returns the extracted text.
+    Multiple detected text regions are joined with a single space in
+    EasyOCR's own top-to-bottom, left-to-right reading order - e.g. a
+    reference number rendered as two visually-separate pieces ("REF" and
+    "998877") comes back as one "REF 998877" string, not a list.
 
-  function keyComboLabel(e) {
-    var key = e.key;
-    var ctrlLike = e.ctrlKey || e.metaKey;
-
-    if (ctrlLike && !e.altKey) {
-      var combo = CTRL_COMBO_MAP[(key || '').toLowerCase()];
-      if (combo) return combo;
-      if (['c', 'v', 'x'].indexOf((key || '').toLowerCase()) !== -1) return null;
-    }
-    if (e.shiftKey && key === 'Tab') return 'SHIFT+TAB';
-    if (!ctrlLike && !e.altKey) {
-      if (key === 'Tab') return 'TAB';
-      return SIMPLE_KEY_MAP[key] || null;
-    }
-    return null;
-  }
-
-  document.addEventListener('keydown', function (e) {
-    var el = e.target;
-    if (!el || el.id === CAPTURE_MENU_HOST_ID) return;
-    var label = keyComboLabel(e);
-    if (label) {
-      record('keypress', el, label);
-    }
-  }, true);
-
-  // Real-time copy/cut/paste capture: records not just THAT a copy/paste
-  // happened, but the actual text value and the source (copy/cut) or target
-  // (paste) element, so the variable Capture -> Store -> Reuse pipeline (see
-  // recorder/variable_capture.py) can later recognize "this pasted value is
-  // the same one copied earlier from that generated-username field" and turn
-  // it into a {{username}}-style placeholder instead of baking in the
-  // literal string.
-  function selectedTextFrom(el) {
-    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') &&
-        typeof el.selectionStart === 'number' && el.selectionStart !== el.selectionEnd) {
-      return el.value.substring(el.selectionStart, el.selectionEnd);
-    }
-    var sel = window.getSelection();
-    return sel ? sel.toString() : '';
-  }
-
-  function recordCopyLike() {
-    var el = document.activeElement;
-    if (el && el.id === CAPTURE_MENU_HOST_ID) return;
-    var text = selectedTextFrom(el);
-    if (!text) return;
-    record('copy', (el instanceof Element) ? el : document.body, text);
-  }
-
-  document.addEventListener('copy', recordCopyLike, true);
-  document.addEventListener('cut', recordCopyLike, true);
-
-  document.addEventListener('paste', function (e) {
-    var el = e.target;
-    if (el && el.id === CAPTURE_MENU_HOST_ID) return;
-    var text = '';
-    try {
-      text = (e.clipboardData || window.clipboardData).getData('text');
-    } catch (err) { /* clipboard not readable here - resolved at build/runtime instead */ }
-    record('paste', el, text);
-  }, true);
-
-  // --- Right-click capture: two related but distinct mechanisms behind
-  // one gesture -
-  //
-  //   "text" - reads the element's DISPLAYED TEXT DIRECTLY (input value,
-  //   or innerText/textContent for read-only labels/divs/spans) - no
-  //   image processing at all, resolved instantly, entirely in this
-  //   script. This is what most values actually need: a plain-text field
-  //   or label that the person just never happened to Ctrl+C during
-  //   recording (the existing copy/paste listeners above only fire on a
-  //   REAL clipboard event - looking at a value and typing the same thing
-  //   into another field, with no copy gesture at all, leaves nothing for
-  //   them to correlate). Reuses the EXISTING "copy" action type end to
-  //   end (see recorder.py's handling below, which just relabels the
-  //   request rather than reprocessing it) - a value captured this way is
-  //   stored, correlated, and re-read live at replay through the exact
-  //   same {{var}} pipeline a real Ctrl+C copy already uses; nothing
-  //   downstream needs to know or care which gesture produced it.
-  //
-  //   "ocr" - for values rendered as an IMAGE or CANVAS (a scanned
-  //   reference number, a canvas-drawn amount) that have no real
-  //   selectable/readable DOM text at all - see recorder.py's
-  //   "ocr_capture_request" handling, which screenshots the element and
-  //   runs OCR on it instead.
-  //
-  // Uses a custom, IN-PAGE overlay (showCaptureMenu below), rendered
-  // inside a Shadow DOM for style isolation from the target page's own
-  // CSS - NOT window.prompt()/window.confirm(). A previous version of
-  // this used native dialogs instead, but that turned out to be a dead
-  // end: once Playwright (or any CDP-based automation) is attached to a
-  // page, it ALWAYS intercepts native alert/confirm/prompt dialogs -
-  // recorder.py's _on_dialog has to auto-accept EVERY dialog (so the
-  // TARGET application's own alerts/confirms don't hang the recording),
-  // and it has no way to tell "the target app's dialog" apart from "this
-  // recorder's own menu asking a question". A native dialog here was
-  // therefore auto-dismissed (using its own default value) before a
-  // human could ever actually answer it - it would visibly flash and
-  // disappear instantly, and the "ocr" choice was never reachable at all
-  // since the FIRST prompt always auto-resolved to its default ("text")
-  // before the person could type anything.
-  //
-  // An EVEN EARLIER attempt (before native dialogs were tried as a
-  // workaround) already used an in-page menu, and was abandoned for a
-  // different reason: its "click outside the menu closes it" listener
-  // was registered SYNCHRONOUSLY inside the contextmenu handler, so it
-  // could catch a trailing mouse event from the SAME right-click gesture
-  // that opened the menu, closing it before it was ever visible. Fixed
-  // here by deferring that listener's registration to the next
-  // event-loop tick (setTimeout(fn, 0) - see showCaptureMenu) so it can
-  // only ever react to a LATER, separate interaction - combined with
-  // Shadow DOM's automatic event retargeting (a click anywhere INSIDE
-  // the menu reports e.target as the shadow HOST when observed from a
-  // document-level listener, never the page's own elements), so "was
-  // this click inside or outside the menu" needs no manual
-  // stopPropagation() bookkeeping in every button handler either.
-  //
-  // Deliberately intercepts EVERY right-click on the page while recording
-  // (not just on <img>/<canvas>/inputs) and replaces the native context
-  // menu with this - many apps render meaningful text via SVG,
-  // background-image, or other non-<img> elements too, and there's no
-  // reliable way to detect "this element visually contains text" from the
-  // DOM alone. The trade-off: the browser's own right-click menu
-  // (Inspect, "Save image as", etc.) isn't available during recording,
-  // and every right-click now shows this menu (click Cancel, Escape, or
-  // anywhere outside it, for a normal right-click you don't want captured).
-  function recordTextCaptureRequest(el, varName) {
-    var text = '';
-    if ('value' in el && el.value) {
-      text = el.value;
-    } else {
-      text = (el.innerText || el.textContent || '');
-    }
-    text = text.trim();
-    // Reuses the SAME "copy" action shape a real Ctrl+C produces
-    // (recordCopyLike above) - captured_as is the one addition, carrying
-    // the user's explicitly CHOSEN name through instead of leaving it to
-    // be auto-derived from the element the way an incidental real copy
-    // event's name is (see recorder/variable_capture.py's
-    // derive_variable_name) - the person picked this name on purpose here,
-    // so it should win.
-    window.__recordedQueue.push({
-      ts: Date.now(),
-      action: 'copy',
-      value: text,
-      captured_as: varName,
-      element: describe(el),
-      locators: buildLocators(el),
-      url: window.location.href
-    });
-    persistQueue();
-    // Best-effort convenience so the person recording can genuinely Ctrl+V
-    // this into the next field instead of retyping it by hand - done
-    // directly here in JS (unlike the OCR path below, which has to do this
-    // from Python after its screenshot/OCR round trip) since the value is
-    // already known immediately, with no round trip needed at all.
-    try {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        // writeText() returns a Promise that can REJECT asynchronously
-        // (e.g. clipboard-write permission denied, common under headless/
-        // automated contexts) - the try/catch here only guards the
-        // synchronous call itself, so the rejection needs its own .catch()
-        // or it surfaces as an unhandled promise rejection.
-        navigator.clipboard.writeText(text).catch(function () { /* non-fatal - the captured value is already stored regardless */ });
-      }
-    } catch (err) { /* non-fatal - the captured value is already stored regardless */ }
-  }
-
-  function recordOcrCaptureRequest(el, varName) {
-    window.__recordedQueue.push({
-      ts: Date.now(),
-      action: 'ocr_capture_request',
-      value: null,
-      requested_var_name: varName,
-      element: describe(el),
-      locators: buildLocators(el),
-      url: window.location.href
-    });
-    persistQueue();
-  }
-
-  // Small transient in-page notification, replacing window.alert() (which
-  // has the exact same native-dialog-interception problem described in
-  // the big comment above) for the "captured as {{name}}" confirmation
-  // after a successful capture. Auto-dismisses; never blocks anything.
-  function showToast(message) {
-    var host = document.createElement('div');
-    host.style.cssText = 'all:initial; position:fixed; left:0; right:0; bottom:24px; ' +
-      'z-index:2147483647; display:flex; justify-content:center; pointer-events:none;';
-    document.documentElement.appendChild(host);
-    var shadow = host.attachShadow({ mode: 'open' });
-    shadow.innerHTML =
-      '<style>' +
-      '.toast { font: 13px/1.4 -apple-system, Segoe UI, Arial, sans-serif; background:#163C8C; ' +
-      'color:#fff; padding:10px 16px; border-radius:6px; box-shadow:0 4px 16px rgba(0,0,0,0.35); ' +
-      'max-width:420px; text-align:center; opacity:0; transform:translateY(8px); ' +
-      'transition:opacity .15s ease, transform .15s ease; }' +
-      '.toast.show { opacity:1; transform:translateY(0); }' +
-      '</style>' +
-      '<div class="toast" id="t"></div>';
-    var toastEl = shadow.getElementById('t');
-    toastEl.textContent = message;  // textContent, not innerHTML - message may contain recorded values verbatim
-    requestAnimationFrame(function () { toastEl.className = 'toast show'; });
-    setTimeout(function () {
-      toastEl.className = 'toast';
-      setTimeout(function () { host.remove(); }, 200);
-    }, 2600);
-  }
-
-  // The in-page replacement for the old window.prompt() chain - see the
-  // big comment above recordTextCaptureRequest for the full "why" behind
-  // both the Shadow DOM isolation and the deferred outside-click listener.
-  function showCaptureMenu(el, x, y) {
-    var existing = document.getElementById(CAPTURE_MENU_HOST_ID);
-    if (existing) existing.remove();
-
-    var host = document.createElement('div');
-    host.id = CAPTURE_MENU_HOST_ID;
-    host.style.cssText = 'all:initial; position:fixed; left:' + x + 'px; top:' + y + 'px; z-index:2147483647;';
-    document.documentElement.appendChild(host);
-
-    var shadow = host.attachShadow({ mode: 'open' });
-    shadow.innerHTML =
-      '<style>' +
-      '.menu { font: 13px/1.4 -apple-system, Segoe UI, Arial, sans-serif; background:#fff; ' +
-      'color:#0B1E3D; border:1px solid #D8E1EF; border-radius:8px; ' +
-      'box-shadow:0 8px 28px rgba(11,30,61,0.25); width:280px; padding:12px; box-sizing:border-box; }' +
-      '.menu h4 { margin:0 0 8px; font-size:13px; font-weight:600; }' +
-      '.menu .modes { display:flex; gap:6px; margin-bottom:8px; }' +
-      '.menu button { font:inherit; cursor:pointer; border-radius:5px; border:1px solid #D8E1EF; ' +
-      'background:#EAF1FA; color:#163C8C; padding:6px 10px; }' +
-      '.menu button:hover { filter:brightness(0.96); }' +
-      '.menu button.chosen { background:#163C8C; color:#fff; border-color:#163C8C; }' +
-      '.menu button.primary { background:#163C8C; color:#fff; border-color:#163C8C; }' +
-      '.menu input { font:inherit; width:100%; box-sizing:border-box; padding:6px 8px; ' +
-      'border:1px solid #D8E1EF; border-radius:5px; margin:8px 0; }' +
-      '.menu .row { display:flex; gap:6px; justify-content:flex-end; }' +
-      '.menu .hint { color:#5B6B85; font-size:11px; margin-top:-4px; margin-bottom:8px; }' +
-      '.hidden { display:none; }' +
-      '</style>' +
-      '<div class="menu">' +
-      '  <h4>Capture a value from this element</h4>' +
-      '  <div class="modes">' +
-      '    <button type="button" id="modeText">Capture Text</button>' +
-      '    <button type="button" id="modeOcr">Capture via OCR</button>' +
-      '  </div>' +
-      '  <div id="nameSection" class="hidden">' +
-      '    <input type="text" id="varName" value="captured_value" placeholder="variable_name" />' +
-      '    <div class="hint">Letters, numbers, underscore only.</div>' +
-      '    <div class="row">' +
-      '      <button type="button" id="cancelBtn">Cancel</button>' +
-      '      <button type="button" id="confirmBtn" class="primary">Capture</button>' +
-      '    </div>' +
-      '  </div>' +
-      '</div>';
-
-    // Keep the menu fully on screen regardless of where the right-click
-    // landed - a click near the right/bottom edge would otherwise render
-    // it partially or fully off-viewport.
-    requestAnimationFrame(function () {
-      var rect = host.getBoundingClientRect();
-      if (rect.right > window.innerWidth) host.style.left = Math.max(8, window.innerWidth - rect.width - 8) + 'px';
-      if (rect.bottom > window.innerHeight) host.style.top = Math.max(8, window.innerHeight - rect.height - 8) + 'px';
-    });
-
-    var modeTextBtn = shadow.getElementById('modeText');
-    var modeOcrBtn = shadow.getElementById('modeOcr');
-    var nameSection = shadow.getElementById('nameSection');
-    var nameInput = shadow.getElementById('varName');
-    var confirmBtn = shadow.getElementById('confirmBtn');
-    var cancelBtn = shadow.getElementById('cancelBtn');
-    var chosenMode = null;
-
-    function selectMode(mode, btn) {
-      chosenMode = mode;
-      modeTextBtn.classList.remove('chosen');
-      modeOcrBtn.classList.remove('chosen');
-      btn.classList.add('chosen');
-      nameSection.classList.remove('hidden');
-      nameInput.focus();
-      nameInput.select();
-    }
-    modeTextBtn.addEventListener('click', function () { selectMode('text', modeTextBtn); });
-    modeOcrBtn.addEventListener('click', function () { selectMode('ocr', modeOcrBtn); });
-
-    function closeMenu() {
-      host.remove();
-      document.removeEventListener('mousedown', onOutsideMouseDown, true);
-      document.removeEventListener('keydown', onKeyDown, true);
-    }
-    cancelBtn.addEventListener('click', closeMenu);
-
-    function confirmCapture() {
-      if (!chosenMode) return;
-      var varName = (nameInput.value || '').trim().replace(/[^a-zA-Z0-9_]/g, '_');
-      if (!varName) { nameInput.focus(); return; }
-      closeMenu();
-      if (chosenMode === 'ocr') {
-        recordOcrCaptureRequest(el, varName);
-        showToast('Marked for OCR capture as {{' + varName + '}} - re-read live every time this test runs.');
-      } else {
-        recordTextCaptureRequest(el, varName);
-        showToast('Marked "{{' + varName + '}}" for live text capture - re-read every time this test runs.');
-      }
-    }
-    confirmBtn.addEventListener('click', confirmCapture);
-    nameInput.addEventListener('keydown', function (e) {
-      if (e.key === 'Enter') { e.preventDefault(); confirmCapture(); }
-      else if (e.key === 'Escape') { closeMenu(); }
-    });
-
-    // Shadow DOM automatically RETARGETS events that cross the shadow
-    // boundary: from a document-level listener's point of view, ANY click
-    // inside this menu reports e.target as `host` itself (never the real
-    // inner button/input) - so this one check correctly distinguishes
-    // "inside the menu" from "outside it" with no manual
-    // stopPropagation() needed in any of the handlers above.
-    function onOutsideMouseDown(e) {
-      if (e.target !== host) closeMenu();
-    }
-    function onKeyDown(e) {
-      if (e.key === 'Escape') closeMenu();
-    }
-    // Deferred to the next event-loop tick - see the big comment above
-    // recordTextCaptureRequest for exactly why this can't be attached
-    // synchronously here (it would catch the tail of the SAME right-click
-    // gesture that's opening this menu).
-    setTimeout(function () {
-      document.addEventListener('mousedown', onOutsideMouseDown, true);
-      document.addEventListener('keydown', onKeyDown, true);
-    }, 0);
-  }
-
-  document.addEventListener('contextmenu', function (e) {
-    var el = e.target;
-    if (!el || el === document || el === document.body) return;
-    e.preventDefault();
-    if (el.id === CAPTURE_MENU_HOST_ID) return;  // right-clicking the menu itself - not a real capture target
-    showCaptureMenu(el, e.clientX, e.clientY);
-  }, true);
-
-  window.__flushActions = function () {
-    var q = window.__recordedQueue;
-    window.__recordedQueue = [];
-    persistQueue();
-    return q;
-  };
-
-  // Exposed so the Python side (recorder/recorder.py) can compute a stable
-  // CSS path for an <iframe>/<frame> DOM ELEMENT from *inside the PARENT
-  // frame's context* (Playwright's Frame.frame_element() returns that
-  // element handle, but it has to be evaluated against the parent frame,
-  // not the iframe's own document) - this is how mainframe/iframe support
-  // builds a "frame_path" (a chain of selectors from the top page down to
-  // the frame an action happened in) without needing any new JS of its
-  // own; it just reuses the same cssPath() this file already uses for
-  // in-page elements. See Recorder._frame_path_for.
-  window.__recorderCssPathFor = cssPath;
-})();
+    Implemented on top of find_text_regions() - same OCR call, same
+    caching, same preprocessing - so this function's own contract (a
+    plain string, nothing else) is unchanged for its existing callers
+    (recorder/recorder.py's _process_ocr_request, page.tmpl's
+    capture_value_ocr)."""
+    regions = find_text_regions(png_bytes)
+    return " ".join(r["text"] for r in regions).strip()
