@@ -1,367 +1,110 @@
 """
-Auto-generated behave step definitions.
-Regenerating from a new recording will overwrite this file - customize
-downstream (e.g. add real assertions to the Then step) in a copy if needed.
+Behave environment hooks for LOCAL AGENT execution. Copied into an
+execution workspace's features/environment.py by
+local_agent/execution_manager.py INSTEAD OF runner/environment.py -
+identical Playwright browser setup/teardown, but deliberately WITHOUT
+self-healing, so the local agent (and therefore the end user's desktop
+installation) never needs the `agent/` AI package or an LLM API key at
+all - both stay strictly server-side, matching the requirement that users
+receive only local_agent/ + recorder/ + runner/, never backend/,
+database/, generator/, or agent/.
+
+Trade-off, stated plainly: a locator that's gone stale will simply fail
+the step here, instead of being auto-repaired mid-run the way a
+server-executed test can be (see runner/environment.py, used server-side
+and by ALLOW_SERVER_FALLBACK's dev-only path). See
+docs/electron-local-agent-architecture.md's "Remaining work" for the
+proper fix (an agent -> server "propose a locator fix" callback endpoint)
+if closing that gap becomes a priority - it's a real, deliberate
+architecture decision, not an oversight.
 """
-import logging
+import json
 import os
+import sys
+from pathlib import Path
 
-from behave import given, when, then
+# make both the "project root" (for `recorder`) and the output dir (for
+# `pages`) importable - same mechanism runner/environment.py uses (see
+# local_agent/execution_manager.py's module docstring for why `cwd` at
+# invocation time, not this path arithmetic, is what actually makes
+# `recorder` importable - this insert is still needed for `pages`).
+_features_dir = Path(__file__).resolve().parent
+_output_dir = _features_dir.parent
+_project_root = _output_dir.parent
+sys.path.insert(0, str(_project_root))
+sys.path.insert(0, str(_output_dir))
 
-logger = logging.getLogger(__name__)
+from recorder.browser_factory import launch_browser
 
-# Set CONTINUE_ON_STEP_FAILURE=false to restore the old behavior (a failed
-# step stops the whole scenario, everything after it shows "Undefined") -
-# default is to continue, logging clearly why each step that failed did,
-# so one flaky/changed field doesn't kill an otherwise-working flow. See
-# _run_step below.
-_CONTINUE_ON_FAILURE = os.getenv("CONTINUE_ON_STEP_FAILURE", "true").lower() != "false"
+from pages.recorded_page import RecordedPage
+from runner.variables import VariableStore
 
 
-def _run_step(context, description, fn, element_name=None, default=None):
-    """
-    Runs `fn()` (a zero-arg callable wrapping one step's real action/
-    assertion) and returns (ok, value). On success, ok=True and value is
-    whatever fn() returned. On any exception, ok=False, value=`default`,
-    and the failure is recorded on context.step_failures (written out in
-    after_all as output/reports/step_failures.json - see
-    runner/environment.py, local_agent/agent_environment.py) instead of
-    being re-raised.
+def before_all(context):
+    headless = os.getenv("HEADLESS", "false").lower() == "true"
+    context.browser_session = launch_browser(headless=headless)
+    context.raw_page = context.browser_session.new_page()
+    # heal_callback=None (vs runner/environment.py's LLM-backed one) - see
+    # this file's module docstring for why.
+    context.page = RecordedPage(context.raw_page, heal_callback=None)
+    context.variables = VariableStore()
+    # See runner/environment.py's before_all - kept in sync deliberately.
+    context.locator_log = []
+    context.step_failures = []
 
-    Why not just let it raise: Behave stops a SCENARIO at its first
-    failed step, marking everything after it "Undefined" (never
-    attempted) - there's no supported "continue after failed step" mode
-    in Behave itself. Catching it HERE, before Behave ever sees it, means
-    this step reports "passed" at the framework level and Behave moves on
-    to the next one normally - runner/run_recording.py's _extract_steps()
-    then overrides that back to "Failed" (with the real reason) using
-    context.step_failures, so the report is still accurate even though
-    Behave's own per-step status isn't.
-    """
-    if not _CONTINUE_ON_FAILURE:
-        return True, fn()
+    # Auto-accept native alert/confirm/prompt/beforeunload dialogs - both on
+    # the original page and on any popup/new tab/new window opened during
+    # this run - mirrors recorder/recorder.py's own _on_dialog (an
+    # unhandled dialog suspends the page indefinitely, hanging the run).
+    # Kept identical to runner/environment.py's version even though this
+    # file otherwise deliberately omits self-healing - dialog handling
+    # doesn't need an LLM, so there's no reason for local execution to
+    # behave differently here.
+    context.raw_page.on("dialog", lambda dialog: dialog.accept())
+    context.browser_session.context.on("page", lambda p: p.on("dialog", lambda dialog: dialog.accept()))
+    # Ordered list of every browser tab/window page.tmpl's BasePage.switch_page()
+    # has been pointed at during this run - see steps.tmpl's maybe_switch/
+    # new_page_wrapper macros, which append to and index into this.
+    context.recorder_pages = [context.raw_page]
+
+
+def after_all(context):
     try:
-        return True, fn()
-    except Exception as e:
-        context.step_failures.append({
-            "step_index": context.step_counter + 1,  # same alignment as context.locator_log - see environment.py's after_step
-            "step_name": description,
-            "element_name": element_name,
-            "error_type": type(e).__name__,
-            "error": str(e),
+        reports_dir = _output_dir / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        (reports_dir / "locator_log.json").write_text(json.dumps(getattr(context, "locator_log", []), indent=2))
+        (reports_dir / "step_failures.json").write_text(json.dumps(getattr(context, "step_failures", []), indent=2))
+    except Exception:
+        pass
+    try:
+        context.browser_session.close()
+    except Exception:
+        pass
+
+
+def after_step(context, step):
+    """See runner/environment.py's after_step - identical logic, kept in
+    sync deliberately (screenshot/locator-log capture doesn't need an LLM,
+    so there's no reason for local execution to behave differently here,
+    the same principle already applied to dialog handling above)."""
+    context.step_counter = getattr(context, "step_counter", 0) + 1
+    status_name = getattr(step.status, "name", str(step.status))
+
+    page_obj = getattr(context, "page", None)
+    if status_name in ("passed", "failed", "error"):
+        context.locator_log.append({
+            "step_index": context.step_counter,
+            "locator": getattr(page_obj, "last_resolution", None) if page_obj is not None else None,
         })
-        logger.warning(f"Step failed but continuing: {description} - {type(e).__name__}: {e}")
-        return False, default
+    if page_obj is not None:
+        page_obj.last_resolution = None
 
-
-@given('the user opens "{url}"')
-def step_open(context, url):
-    # Deliberately NOT routed through _run_step - nothing meaningful can
-    # continue without a page having actually loaded, so a navigation
-    # failure should still stop the scenario outright.
-    context.raw_page.goto(url)
-
-
-{% macro explicit_wait(step) %}
-    # Recording showed this step's target took ~{{ step.wait_seconds }}s to become ready.
-    # No sleep() - wait_ready() polls every known locator strategy and continues
-    # the moment one resolves, up to this measured timeout, so a fast response
-    # doesn't sit around waiting.
-    context.page.wait_ready("{{ step.element_name }}", timeout={{ step.wait_seconds }})
-{%- endmacro %}
-{% macro maybe_switch(step) %}
-{% if step.switch_to_page %}
-    # Recorded on browser tab/window #{{ step.page_index }} - switch to it
-    # first (see generator/build.py's page_index/switch_to_page and
-    # RecordedPage.switch_page). Covers both continuing in a popup/new tab
-    # that just opened and coming back to an earlier tab/window.
-    context.page.switch_page(context.recorder_pages[{{ step.page_index }}])
-{% endif %}
-{%- endmacro %}
-{% macro new_page_wrapper(step) %}
-{% if step.opens_new_page %}
-    # This action opens a new browser tab/window (a target="_blank" link,
-    # "open in new window", window.open(), etc.) - expect_page() is the only
-    # reliable way to catch it: it must wrap the exact call that triggers it.
-    # The caller block below sets _ok via _run_step - only wait on the new
-    # page if the action that was supposed to open it actually succeeded;
-    # otherwise expect_page() would hang waiting for a popup that a failed
-    # (but continued-past) click never actually triggered.
-    with context.browser_session.context.expect_page() as _new_page_info:
-{{ caller() | indent(4, true) }}
-    if _ok:
-        _new_pg = _new_page_info.value
-        _new_pg.wait_for_load_state()
-        context.recorder_pages.append(_new_pg)
-        context.page.switch_page(_new_pg)
-{% else %}
-{{ caller() }}
-{% endif %}
-{%- endmacro %}
-{% for step in steps -%}
-{%- if step.action == "click" %}
-@when('the user clicks "{{ step.element_name }}"')
-def step_click_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{% call new_page_wrapper(step) %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.click("{{ step.element_name }}")
-    _ok, _ = _run_step(context, 'click "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
-
-{% elif step.action == "click_optional" %}
-@when('the user clicks "{{ step.element_name }}" if it appears')
-def step_click_optional_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-    # Optional step (imported from a UiPath CLICK-CONDITIONAL) - clicks
-    # if this appears, otherwise moves on without failing the scenario.
-    # See BasePage.click_if_present. Wrapped in _run_step (not just
-    # relying on click_if_present's own non-throwing design) because
-    # explicit_wait's wait_ready() call - now INSIDE _do(), see below -
-    # would otherwise still raise and stop the scenario if the element
-    # never appears at all, defeating this step's whole "optional" point.
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.click_if_present("{{ step.element_name }}")
-    _run_step(context, 'click "{{ step.element_name }}" if present', _do, element_name="{{ step.element_name }}")
-
-{% elif step.action == "toggle" %}
-{% if step.checked_value %}
-@when('the user checks "{{ step.element_name }}"')
-def step_check_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-    # Idempotent by design (BasePage.set_checked reads the current state
-    # first) - this is what avoids the double-toggle risk a blind click()
-    # has for checkbox/radio inputs.
-{% call new_page_wrapper(step) %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.set_checked("{{ step.element_name }}", True)
-    _ok, _ = _run_step(context, 'check "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
-
-{% else %}
-@when('the user unchecks "{{ step.element_name }}"')
-def step_uncheck_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{% call new_page_wrapper(step) %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.set_checked("{{ step.element_name }}", False)
-    _ok, _ = _run_step(context, 'uncheck "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
-
-{% endif %}
-{% elif step.action in ("type", "paste") %}
-{% if step.var_placeholder %}
-@when('the user enters "{{ step.var_placeholder_escaped }}" into "{{ step.element_name }}"')
-def step_type_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-    # Reuse: resolved from the LIVE value captured earlier in THIS run (see
-    # context.variables, seeded by a "captures the value of ..." step below)
-    # instead of the literal value that happened to be recorded originally.
-    value = context.variables.resolve("{{ step.var_placeholder }}")
-{% call new_page_wrapper(step) %}
-{% if step.action == "paste" %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.paste_text("{{ step.element_name }}", value)
-{% else %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.type_text("{{ step.element_name }}", value)
-{% endif %}
-    _ok, _ = _run_step(context, 'enter value into "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
-
-{% else %}
-@when('the user enters "{{ step.value }}" into "{{ step.element_name }}"')
-def step_type_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{% call new_page_wrapper(step) %}
-{% if step.action == "paste" %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.paste_text("{{ step.element_name }}", "{{ step.value }}")
-{% else %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.type_text("{{ step.element_name }}", "{{ step.value }}")
-{% endif %}
-    _ok, _ = _run_step(context, 'enter value into "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
-
-{% endif %}
-{% elif step.action == "file_upload" %}
-@when('the user uploads the file "{{ step.value | pyesc }}" into "{{ step.element_name }}"')
-def step_upload_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{% call new_page_wrapper(step) %}
-    # Only the file NAME was ever recordable - browsers never expose the
-    # real local path of a chosen file to JavaScript (el.value is a
-    # fabricated "C:\fakepath\<name>" string for security). BasePage.
-    # upload_file() resolves this name to a real file for replay - see
-    # its docstring in page.tmpl for where it looks.
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.upload_file("{{ step.element_name }}", "{{ step.value | pyesc }}")
-    _ok, _ = _run_step(context, 'upload file into "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
-
-{% elif step.action == "select" %}
-@when('the user selects "{{ step.value }}" from "{{ step.element_name }}"')
-def step_select_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{% call new_page_wrapper(step) %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.select_option("{{ step.element_name }}", "{{ step.value }}")
-    _ok, _ = _run_step(context, 'select from "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
-
-{% elif step.action == "keypress" %}
-@when('the user presses {{ step.key_label }} on "{{ step.element_name }}"')
-def step_keypress_{{ step.element_name }}_{{ step.key_name|lower|replace("+", "_") }}(context):
-{{ maybe_switch(step) }}
-{% call new_page_wrapper(step) %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.press_key("{{ step.element_name }}", "{{ step.key_name }}")
-    _ok, _ = _run_step(context, 'press {{ step.key_label }} on "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
-
-{% elif step.action == "copy" %}
-@when('the user captures the value of "{{ step.element_name }}" as "{{ step.var_placeholder_escaped }}"')
-def step_capture_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-    # Capture: prefers reading the live DOM value/text via Playwright
-    # (input_value() / text_content()) and only falls back to the browser's
-    # own clipboard (still entirely through Playwright) if the element itself
-    # doesn't expose the value - see BasePage.capture_value in the page object.
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        return context.page.capture_value("{{ step.element_name }}")
-    _ok, value = _run_step(context, 'capture value of "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-    if _ok:
-        context.variables.store("{{ step.var_name }}", value)
-
-{% elif step.action == "ocr_capture" %}
-@when('the user captures the value of "{{ step.element_name }}" via OCR as "{{ step.var_placeholder_escaped }}"')
-def step_ocr_capture_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-    # OCR capture: screenshots this element fresh and re-reads its text via
-    # OCR on EVERY run (never baked in from recording time) - for a value
-    # with no real selectable DOM text at all (an image or canvas-rendered
-    # reference number, a scanned document field, etc.) that a plain
-    # capture_value() can't see. See recorder/ocr_engine.py (the same
-    # module used when this was first captured during recording).
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        return context.page.capture_value_ocr("{{ step.element_name }}")
-    _ok, value = _run_step(context, 'capture value of "{{ step.element_name }}" via OCR', _do, element_name="{{ step.element_name }}")
-    if _ok:
-        context.variables.store("{{ step.var_name }}", value)
-
-{% elif step.action == "window_closed" %}
-@when('the user closes the current browser tab or window (step {{ loop.index }})')
-def step_close_window_{{ loop.index }}(context):
-    # Recorded browser tab/window #{{ step.closed_page_index }} being closed -
-    # switch replay back to whichever tab/window opened it (#{{ step.switch_back_to_index }}).
-    def _do():
-        context.page.page.close()
-        context.page.switch_page(context.recorder_pages[{{ step.switch_back_to_index }}])
-    _run_step(context, "close browser tab/window (step {{ loop.index }})", _do)
-
-{% elif step.action == "dialog" %}
-@when('a "{{ step.dialog_type }}" dialog appears and is accepted (step {{ loop.index }})')
-def step_dialog_{{ loop.index }}(context):
-    # Native alert/confirm/prompt/beforeunload dialogs are auto-accepted
-    # globally for every page/tab/window (see environment.py's page.on(
-    # "dialog", ...) handlers) - this step performs no action of its own and
-    # exists purely so the generated feature/report show that the recording
-    # encountered one. Recorded message: {{ step.dialog_message }}
-    pass
-
-{% elif step.action == "delay" %}
-@when('the flow waits {{ step.delay_seconds }} seconds (step {{ loop.index }})')
-def step_delay_{{ loop.index }}(context):
-    context.page.page.wait_for_timeout({{ (step.delay_seconds * 1000) | int }})
-
-{% elif step.action == "assert_text" %}
-@when('the page shows "{{ step.expected_text | pyesc }}" in "{{ step.element_name }}"')
-def step_assert_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.assert_text_contains("{{ step.element_name }}", "{{ step.expected_text | pyesc }}")
-    _run_step(context, 'verify text in "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-
-{% elif step.action == "assert_ocr_text" %}
-@when('the page visually shows "{{ step.expected_text | pyesc }}" (via OCR) (step {{ loop.index }})')
-def step_assert_ocr_{{ loop.index }}(context):
-{{ maybe_switch(step) }}
-    def _do():
-        context.page.assert_ocr_text_visible("{{ step.expected_text | pyesc }}")
-    _run_step(context, 'verify text visible via OCR (step {{ loop.index }})', _do)
-
-{% elif step.action == "scroll" %}
-@when('the page scrolls {{ step.scroll_direction }} (step {{ loop.index }})')
-def step_scroll_{{ loop.index }}(context):
-    def _do():
-        _dy = {{ step.scroll_amount }} * 400 * (1 if "{{ step.scroll_direction }}" == "down" else -1)
-        context.page.page.mouse.wheel(0, _dy)
-        context.page.page.wait_for_timeout(300)
-    _run_step(context, "scroll {{ step.scroll_direction }} (step {{ loop.index }})", _do)
-
-{% elif step.action == "new_window_wait" %}
-@when('a new browser tab or window opens (step {{ loop.index }})')
-def step_new_window_wait_{{ loop.index }}(context):
-    # Fallback path: this recording's very first captured event was a new
-    # tab/window opening (no earlier click/type step to fold expect_page()
-    # onto - e.g. the app pops one immediately on load), so there's nothing
-    # to wrap; just wait for the context to report one directly.
-    def _do():
-        _new_pg = context.browser_session.context.wait_for_event("page", timeout={{ step.wait_seconds * 1000 }})
-        _new_pg.wait_for_load_state()
-        context.recorder_pages.append(_new_pg)
-        context.page.switch_page(_new_pg)
-    _run_step(context, "wait for new browser tab/window (step {{ loop.index }})", _do)
-
-{% endif -%}
-{% if step.opens_new_page %}
-@when('the new browser tab or window is now active (step {{ loop.index }})')
-def step_new_page_now_active_{{ loop.index }}(context):
-    # Purely informational/traceability line for the feature file and exit
-    # report - the actual expect_page()/switch_page() handoff already
-    # happened inside the PREVIOUS step (the click/type/etc. that caused
-    # this tab/window to open - see steps.tmpl's new_page_wrapper macro),
-    # so there's nothing left to do here.
-    pass
-
-{% endif %}
-{% endfor %}
-
-@then('the flow should complete without errors')
-def step_verify_no_errors(context):
-    # Generic post-condition: no unhandled browser alert/JS error banner.
-    # Checks the CURRENTLY ACTIVE tab/window (context.page.page - see
-    # RecordedPage.switch_page), not always the original one, so this still
-    # works for a flow that ends on a popup/new tab/new window.
-    #
-    # A recorded flow can legitimately end by closing its own tab/window
-    # (see the "the user closes the current browser tab or window" step,
-    # generated for a recorded window/tab-close action) - at that point
-    # there is nothing left to check a title on, and that's a successful
-    # end state, not a failure. Checking is_closed() first (a local state
-    # check, safe to call on an already-closed page) avoids ever calling
-    # .title() on a closed page in the first place - .title() talks to the
-    # browser process and raises TargetClosedError there instead of
-    # returning some default value, which would otherwise fail this
-    # deliberately generic, no-op-by-default final check for a flow that
-    # did nothing wrong.
-    if context.page.page.is_closed():
+    if status_name not in ("passed", "failed", "error"):
         return
-    assert context.page.page.title() is not None
-    # Replace with an assertion specific to the target application
-    # (e.g. checking a confirmation message or success banner).
+    try:
+        screenshots_dir = _output_dir / "screenshots"
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+        active_page = context.page.page if hasattr(context, "page") and context.page else context.raw_page
+        active_page.screenshot(path=str(screenshots_dir / f"step_{context.step_counter:03d}.png"))
+    except Exception:
+        pass
