@@ -1,161 +1,296 @@
 """
-Turns raw "copy"/"paste" actions captured by the injected JS (see
-recorder/recorder_injector.js's copy/cut/paste listeners) into the
-Capture -> Store -> Reuse variable pipeline:
+Vision AI fallback layer - the intelligence tier that runs when every
+DOM-based locator strategy (including LLM self-healing from
+agent/self_healer.py) has already failed.
 
-  1. A "copy" action's source field gets a stable {{name}} placeholder
-     derived from its label, e.g. a field labeled "Generated Username"
-     becomes {{username}}, "Generated Application ID" becomes
-     {{application_id}}.
-  2. Any LATER "paste" (or manually retyped "type") action whose recorded
-     value exactly matches a previously copied value is tagged with that
-     same placeholder, so the generator (generator/build.py) can emit a
-     step that resolves it from the LIVE value captured earlier in that
-     same run (see runner/variables.py) instead of a hard-coded literal.
+Unlike self_healer.py, which reads the page's HTML and proposes a new
+CSS/XPath selector, this module sends an ACTUAL SCREENSHOT to a vision-
+capable model (Claude claude-sonnet-4-6 via Anthropic, or gpt-4o via Azure if
+configured) and asks it to identify WHERE on screen the target element is.
+The response is pixel coordinates, not a selector - so this works even
+when:
+  - The element is rendered purely in canvas/SVG/image with no DOM node
+    a CSS/XPath selector could ever address
+  - The page markup has changed so drastically that NO selector-based
+    approach (including LLM self-healing) can propose anything valid
+  - The element exists but has been visually repositioned or reflowed
 
-This module only ADDS optional keys to the action dicts it's given
-("captured_as" on copy actions, "resolved_var" on paste/type actions) - it
-never removes or rewrites an existing key, so recordings without any
-copy/paste in them (or JSON built before this feature existed) round-trip
-completely unchanged. It's also idempotent: running it twice on the same
-actions list keeps the same names, so generator/build.py can safely call it
-again as a safety net for recordings that were produced without going
-through Recorder.stop()'s hook.
+Two modes, automatically selected:
+  1. CLICK mode (action="click"): the model returns {x, y} pixel
+     coordinates to click. The caller uses page.mouse.click(x, y) -
+     same mechanism as _ocr_click_fallback in page.tmpl, but guided by
+     the model's visual understanding rather than naive OCR text matching.
+  2. LOCATE mode (action="locate"): the model is shown the screenshot
+     and asked to propose a CSS or XPath selector for the visible element
+     - effectively self-healing with visual context, not just HTML source.
+     Falls back gracefully to click-coordinate mode if the model can't
+     propose a reliable selector.
+
+Requires:
+  - ANTHROPIC_API_KEY (preferred, uses Claude's native vision) OR
+  - AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT with a gpt-4o-vision
+    capable deployment (LLM_PROVIDER=azure, same as self_healer.py)
+  OR
+  - VISION_PROVIDER and VISION_API_KEY for a separate, vision-specific
+    key/provider if you want a different model for vision vs. text tasks
+
+Returns None if no vision provider is configured - the caller treats this
+as "tier not available" and falls through to the next tier (or raises the
+original error) - never raises its own error, same contract as
+_ocr_click_fallback.
 """
 from __future__ import annotations
-from typing import Dict, List
 
-# Words stripped from a source field's label before it becomes a variable
-# name, e.g. "Generated Username" -> "username", "Generated Application ID"
-# -> "application_id".
-_STOPWORDS = {
-    "generated", "generate", "new", "auto", "your", "the", "a", "an",
-    "current", "this", "field", "value", "display", "label", "output",
-}
+import base64
+import json
+import logging
+import os
+from typing import Optional
 
-
-def _locator_identity(action: Dict):
-    """A stable-ish key for 'is this the same physical element' - prefers the
-    first (highest-priority) captured locator, since two different actions
-    on the SAME element should always agree on it; falls back to the
-    element description for the rare case no locator was captured at all."""
-    locs = action.get("locators") or []
-    if locs:
-        top = locs[0]
-        return (top.get("strategy"), top.get("value"))
-    el = action.get("element") or {}
-    return (el.get("tag"), el.get("name"), el.get("placeholder"), el.get("ariaLabel"))
+logger = logging.getLogger(__name__)
 
 
-def coalesce_consecutive_types(actions: List[Dict], window_ms: int = 3000) -> List[Dict]:
-    """
-    Merges a 'type' action into the immediately preceding one if both target
-    the SAME element and happened within `window_ms` of each other, keeping
-    the LATER value. Native/masked inputs (date pickers especially) commonly
-    fire more than one 'change' event for what the user experienced as ONE
-    edit - e.g. the browser reformatting "01092026" into "01/09/2026" right
-    after typing, or a native date picker's day/month/year segments each
-    firing their own change - which otherwise shows up as two separate,
-    confusingly-duplicated "enters X into Y" steps for the same field.
-    Only ADJACENT same-element 'type' actions are merged - an intervening
-    click/keypress/other action on something else breaks the chain, since
-    that's very likely a deliberate second visit to the field rather than
-    the same edit settling.
-    """
-    merged: List[Dict] = []
-    for action in actions:
-        if (
-            action.get("action") == "type"
-            and merged
-            and merged[-1].get("action") == "type"
-            and _locator_identity(action) == _locator_identity(merged[-1])
-            and (action.get("ts", 0) - merged[-1].get("ts", 0)) <= window_ms
-        ):
-            merged[-1] = {
-                **merged[-1],
-                "value": action.get("value"),
-                "ts": action.get("ts"),
-                "locators": action.get("locators") or merged[-1].get("locators"),
-            }
-            continue
-        merged.append(action)
-    return merged
-
-
-def derive_variable_name(element: Dict, used_names: set) -> str:
-    """Heuristic, LLM-free variable-name generator for a copy source element."""
-    base = (
-        element.get("ariaLabel")
-        or element.get("placeholder")
-        or element.get("name")
-        or element.get("text")
-        or element.get("tag")
-        or "value"
+def _vision_available() -> bool:
+    return bool(
+        os.getenv("ANTHROPIC_API_KEY")
+        or (os.getenv("AZURE_OPENAI_API_KEY") and os.getenv("AZURE_OPENAI_ENDPOINT"))
+        or os.getenv("VISION_API_KEY")
     )
-    tokens = "".join(c if c.isalnum() else " " for c in base.lower()).split()
-    filtered = [t for t in tokens if t not in _STOPWORDS]
-    tokens = filtered or tokens or ["value"]
-    name = "_".join(tokens)[:40].strip("_") or "value"
-
-    candidate = name
-    n = 2
-    while candidate in used_names:
-        candidate = f"{name}_{n}"
-        n += 1
-    used_names.add(candidate)
-    return candidate
 
 
-def _normalize(value: str) -> str:
-    """Whitespace-collapsed, case-folded form of a captured value, used as a
-    fallback correlation key so a copy of "ABC123" still matches a paste
-    that landed in the recording as " abc123 " (trimmed/re-cased by the
-    target field) even though the exact strings differ."""
-    return " ".join(value.split()).casefold()
+def _encode_screenshot(png_bytes: bytes) -> str:
+    return base64.standard_b64encode(png_bytes).decode("ascii")
 
 
-def annotate_variables(actions: List[Dict]) -> List[Dict]:
+def _ask_claude(png_bytes: bytes, prompt: str) -> Optional[str]:
+    """Send a screenshot + prompt to Claude claude-sonnet-4-6 via Anthropic's API
+    and return the raw text response, or None on any failure."""
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+        message = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=256,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": _encode_screenshot(png_bytes),
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        return message.content[0].text.strip() if message.content else None
+    except Exception as e:
+        logger.debug(f"[vision] Claude call failed: {e}")
+        return None
+
+
+def _ask_azure_vision(png_bytes: bytes, prompt: str) -> Optional[str]:
+    """Send a screenshot + prompt to Azure OpenAI (gpt-4o-vision) and
+    return the raw text response, or None on any failure."""
+    api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    deployment = os.getenv("AZURE_OPENAI_VISION_DEPLOYMENT",
+                           os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o"))
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
+    if not (api_key and endpoint):
+        return None
+    try:
+        import requests
+        url = f"{endpoint.rstrip('/')}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+        payload = {
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{_encode_screenshot(png_bytes)}",
+                            "detail": "high",
+                        },
+                    },
+                ],
+            }],
+            "max_tokens": 256,
+        }
+        r = requests.post(url, headers={"api-key": api_key, "Content-Type": "application/json"},
+                          json=payload, timeout=30)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logger.debug(f"[vision] Azure vision call failed: {e}")
+        return None
+
+
+def _call_vision(png_bytes: bytes, prompt: str) -> Optional[str]:
+    """Try each configured vision provider in priority order:
+    1. Anthropic (Claude claude-sonnet-4-6) - preferred, cleanest vision API
+    2. Azure OpenAI (gpt-4o-vision) - if already configured for self-healing
+    Returns the raw response text or None if nothing is configured/works."""
+    if os.getenv("ANTHROPIC_API_KEY"):
+        result = _ask_claude(png_bytes, prompt)
+        if result:
+            return result
+
+    if os.getenv("AZURE_OPENAI_API_KEY") and os.getenv("AZURE_OPENAI_ENDPOINT"):
+        result = _ask_azure_vision(png_bytes, prompt)
+        if result:
+            return result
+
+    return None
+
+
+def vision_click_coordinates(
+    png_bytes: bytes,
+    element_description: str,
+    action_type: str = "click",
+    page_width: Optional[int] = None,
+    page_height: Optional[int] = None,
+) -> Optional[dict]:
     """
-    Walks the recording in order and stamps "captured_as" / "resolved_var"
-    onto the relevant action dicts in place (and also returns the list, for
-    convenience). See module docstring for the full behavior.
+    Given a full-page screenshot and a description of the element we're
+    looking for, asks the vision model to return PIXEL COORDINATES for
+    where to click/interact.
+
+    Returns {"x": int, "y": int, "confidence": str, "reasoning": str}
+    or None if vision isn't configured or the model can't locate the element.
+
+    `element_description` should be as specific as possible - the element
+    name slug, its label/text, and its action type all help the model:
+    e.g. "a button labelled 'Submit Proposal' (action: click)" is much
+    better than just "submit_proposal_button".
+
+    `page_width`/`page_height` are included in the prompt when available
+    so the model knows the coordinate space it's working in - prevents
+    misinterpretation of coordinates on high-DPI screenshots.
     """
-    used_names: set = set()
-    captured_values: Dict[str, str] = {}       # exact copied text -> variable name
-    captured_values_norm: Dict[str, str] = {}  # normalized copied text -> variable name
+    if not _vision_available():
+        return None
 
-    for action in actions:
-        kind = action.get("action")
-        value = action.get("value")
+    size_hint = ""
+    if page_width and page_height:
+        size_hint = f" The screenshot is {page_width}x{page_height} pixels."
 
-        if kind in ("copy", "ocr_capture") and value:
-            var_name = (
-                action.get("captured_as")
-                or captured_values.get(value)
-                or captured_values_norm.get(_normalize(value))
-            )
-            if var_name:
-                used_names.add(var_name)
-            else:
-                var_name = derive_variable_name(action.get("element", {}), used_names)
-            captured_values[value] = var_name
-            captured_values_norm[_normalize(value)] = var_name
-            action["captured_as"] = var_name
+    prompt = f"""You are helping an automated browser test find an element that failed to locate via CSS/XPath selectors.
 
-        elif kind in ("paste", "type") and value:
-            var_name = (
-                action.get("resolved_var")
-                or captured_values.get(value)
-                or captured_values_norm.get(_normalize(value))
-            )
-            if var_name:
-                action["resolved_var"] = var_name
-            elif kind == "paste":
-                # A real clipboard-paste DOM event (recorder_injector.js) that
-                # didn't correlate to any earlier copy in this recording - the
-                # generator falls back to the record-time literal for it, so
-                # flag that here rather than letting it happen silently (see
-                # generator/build.py's use of this field).
-                action["correlation_status"] = "unresolved"
+Look at this screenshot of the current web page.{size_hint}
 
-    return actions
+I need to perform a {action_type} action on: {element_description}
+
+Find this element in the screenshot and return the pixel coordinates of its CENTER in strict JSON only:
+{{"x": <integer>, "y": <integer>, "confidence": "high"|"medium"|"low", "reasoning": "<one short sentence>"}}
+
+Rules:
+- x and y must be integers within the screenshot bounds
+- confidence: "high" if you can clearly see exactly this element, "medium" if you're reasonably sure, "low" if you're guessing
+- If you truly cannot identify the element, return {{"x": null, "y": null, "confidence": "none", "reasoning": "<why>"}}
+- No prose, no markdown, just JSON."""
+
+    try:
+        raw = _call_vision(png_bytes, prompt)
+        if not raw:
+            return None
+
+        # Strip any markdown fences the model may have added
+        text = raw.strip()
+        if text.startswith("```"):
+            text = text.strip("`").split("\n", 1)[-1].rsplit("\n", 1)[0]
+
+        data = json.loads(text)
+        x = data.get("x")
+        y = data.get("y")
+        confidence = data.get("confidence", "medium")
+        reasoning = data.get("reasoning", "")
+
+        if x is None or y is None or confidence == "none":
+            logger.info(f"[vision] Model could not locate '{element_description}': {reasoning}")
+            return None
+
+        logger.info(f"[vision] Located '{element_description}' at ({x},{y}) confidence={confidence}: {reasoning}")
+        return {
+            "x": int(x), "y": int(y),
+            "confidence": confidence, "reasoning": reasoning,
+            "strategy": "VISION",
+        }
+    except Exception as e:
+        logger.debug(f"[vision] Coordinate parsing failed: {e} | raw={raw!r}")
+        return None
+
+
+def vision_propose_selector(
+    png_bytes: bytes,
+    element_description: str,
+    page_html_snippet: str,
+) -> Optional[dict]:
+    """
+    Visual self-healing: given a screenshot + HTML snippet + element
+    description, ask the model to propose a new CSS/XPath selector by
+    combining what it sees visually with what's in the DOM.
+
+    Returns {"strategy": "CSS"|"XPATH", "value": str, "reasoning": str}
+    or None if unavailable or model can't propose a reliable selector.
+
+    This is strictly better than text-only self-healing (agent/self_healer.py)
+    for pages where the visible layout makes the element obvious but the
+    HTML has changed in a way that makes purely text-based reasoning hard
+    (e.g. generated class names, deeply nested structures, or dynamic IDs
+    that weren't visible in the recorded HTML).
+    """
+    if not _vision_available():
+        return None
+
+    prompt = f"""You are debugging a broken Playwright locator. A test is trying to interact with an element that can no longer be found by its recorded CSS/XPath selectors.
+
+Here is:
+1. A screenshot of the CURRENT page (look at this carefully)
+2. A snippet of the current page HTML
+
+Element we're looking for: {element_description}
+
+Current page HTML (first 8000 chars):
+{page_html_snippet[:8000]}
+
+Using both the screenshot AND the HTML, propose a single reliable CSS or XPath selector that will locate this element.
+
+Respond with STRICT JSON only:
+{{"strategy": "CSS"|"XPATH", "value": "<selector>", "reasoning": "<one short sentence why this will work>"}}
+
+If you truly cannot identify a reliable selector, return:
+{{"strategy": null, "value": null, "reasoning": "<why>"}}
+
+No prose, no markdown, just JSON."""
+
+    try:
+        raw = _call_vision(png_bytes, prompt)
+        if not raw:
+            return None
+
+        text = raw.strip()
+        if text.startswith("```"):
+            text = text.strip("`").split("\n", 1)[-1].rsplit("\n", 1)[0]
+
+        data = json.loads(text)
+        strategy = data.get("strategy")
+        value = data.get("value")
+        reasoning = data.get("reasoning", "")
+
+        if not strategy or not value:
+            logger.info(f"[vision] Could not propose selector for '{element_description}': {reasoning}")
+            return None
+
+        logger.info(f"[vision] Proposed {strategy} selector for '{element_description}': {value} | {reasoning}")
+        return {"strategy": strategy, "value": value, "reasoning": reasoning}
+    except Exception as e:
+        logger.debug(f"[vision] Selector proposal parsing failed: {e} | raw={raw!r}")
+        return None
