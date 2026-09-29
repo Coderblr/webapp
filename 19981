@@ -1,179 +1,209 @@
 """
-The agent's single persistent outbound connection to the backend (spec
-section 8) - the agent always connects TO the server; the server never
-needs an inbound connection to the user's PC (works fine through NAT/
-corporate firewalls with no port-forwarding, since it's just an outgoing
-WSS connection like any browser tab makes).
+In-memory registry of connected local agents (see local_agent/ - the
+Electron-bundled Python process that runs Playwright ON THE USER'S OWN
+PC), plus the request/response correlation that lets an HTTP endpoint
+like POST /api/start "call" an agent and await its answer even though the
+actual communication happens over a persistent WebSocket.
 
-State machine (spec section 8): CONNECTING -> CONNECTED -> (on drop)
-RECONNECTING -> CONNECTING -> ... with exponential backoff, or
-DISCONNECTED once stop() is called deliberately (app shutdown). BUSY is a
-local-agent-level state (see command_handler.py's `busy` flag) surfaced
-separately, not a transport-level state - a busy agent stays CONNECTED,
-it just declines new work.
+One agent belongs to exactly one user (agent_id <-> user_id, established
+at registration - see agent_routes.py's ws_agent). A user may only ever
+have ONE active agent connection at a time in this implementation (a second
+connection from the same agent_id replaces the first) - multiple different
+users each have their own independent entry here, never interfering with
+each other, mirroring the same per-session isolation already built for
+backend/recording_sessions.py.
+
+This is intentionally in-memory only (like recording_sessions.py) - if the
+backend restarts, every agent must reconnect and re-register, which they do
+automatically (see local_agent/connection_manager.py's reconnect loop).
 """
 from __future__ import annotations
 import asyncio
-import json
-from enum import Enum
-from typing import Awaitable, Callable, Optional
-from urllib.parse import urlencode
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Optional
 
-import websockets
-from websockets.exceptions import ConnectionClosed
-
-from local_agent.logger import get_logger
-
-logger = get_logger("server_connection")
+from fastapi import WebSocket
 
 
-class AgentState(str, Enum):
-    CONNECTING = "CONNECTING"
-    CONNECTED = "CONNECTED"
-    RECONNECTING = "RECONNECTING"
-    DISCONNECTED = "DISCONNECTED"
-    ERROR = "ERROR"
+@dataclass
+class AgentConnection:
+    agent_id: str
+    user_id: int
+    websocket: WebSocket
+    hostname: str = ""
+    version: str = ""
+    connected_at: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+    busy: bool = False  # True while a recording/execution is in progress on this agent
+
+    # request_id -> Future the corresponding /api/* endpoint is awaiting.
+    # Not thread-safe by design - this whole module only ever runs inside
+    # the single asyncio event loop FastAPI/uvicorn uses, same as the
+    # /api/ws/record live-view handler.
+    pending: dict[str, "asyncio.Future"] = field(default_factory=dict)
 
 
-class ConnectionManager:
-    def __init__(
-        self,
-        ws_url: str,
-        token: str,
-        agent_id: str,
-        hostname: str,
-        version: str,
-        on_command: Callable[[dict], Awaitable[Optional[dict]]],
-        initial_backoff: float = 1.0,
-        max_backoff: float = 30.0,
-    ):
-        self.ws_url = ws_url
-        self.token = token
-        self.agent_id = agent_id
-        self.hostname = hostname
-        self.version = version
-        self.on_command = on_command  # async callable(message) -> response dict (with request_id) or None
-        self.initial_backoff = initial_backoff
-        self.max_backoff = max_backoff
+# agent_id -> AgentConnection
+_AGENTS: dict[str, AgentConnection] = {}
+# user_id -> agent_id, so "does this user have an agent" is an O(1) lookup
+_USER_TO_AGENT: dict[int, str] = {}
 
-        self.state = AgentState.DISCONNECTED
-        self._stop = False
+COMMAND_TIMEOUT_SECONDS = 30  # generous - START_RECORDING has to actually launch a browser
 
-    def _url(self) -> str:
-        params = urlencode({
-            "token": self.token, "agent_id": self.agent_id,
-            "hostname": self.hostname, "version": self.version,
-        })
-        return f"{self.ws_url}/api/agent/ws?{params}"
 
-    async def run_forever(self) -> None:
-        """The agent's main loop for its whole lifetime - connect, serve
-        commands until the connection drops for any reason, then
-        reconnect with exponential backoff, forever, until stop() is
-        called (app shutdown - see client.py)."""
-        backoff = self.initial_backoff
-        while not self._stop:
-            self.state = AgentState.CONNECTING
-            logger.info(f"Connecting to {self.ws_url} (agent_id={self.agent_id})...")
-            try:
-                async with websockets.connect(self._url(), open_timeout=15) as ws:
-                    self.state = AgentState.CONNECTED
-                    logger.info("Connected to central server.")
-                    backoff = self.initial_backoff  # reset only after a successful connection
-                    heartbeat_task = asyncio.ensure_future(self._heartbeat_loop(ws))
-                    try:
-                        await self._receive_loop(ws)
-                    finally:
-                        heartbeat_task.cancel()
-            except ConnectionClosed as e:
-                logger.warning(f"Connection closed by server: code={e.code} reason={e.reason!r}")
-                self.state = AgentState.ERROR
-                if e.code == 4401:
-                    logger.error("Authentication rejected - the stored token may be expired or revoked. "
-                                 "Restart the desktop app to log in again.")
-            except (OSError, asyncio.TimeoutError) as e:
-                logger.warning(f"Could not reach the central server: {e}")
-                self.state = AgentState.ERROR
-            except Exception:
-                logger.exception("Unexpected error in connection loop")
-                self.state = AgentState.ERROR
+def register(agent_id: str, user_id: int, websocket: WebSocket, hostname: str, version: str) -> AgentConnection:
+    """Called once the agent's WebSocket has been accepted and
+    authenticated (see agent_routes.py). If this user already had a
+    different agent connection open (e.g. they closed and reopened the
+    desktop app), the old one is evicted - a user only ever has one live
+    agent at a time here.
 
-            if self._stop:
-                break
-            self.state = AgentState.RECONNECTING
-            logger.info(f"Reconnecting in {backoff:.1f}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, self.max_backoff)
+    When the SAME agent_id reconnects (brief network drop then reconnect),
+    we UPDATE the existing AgentConnection's websocket IN PLACE rather than
+    replacing the whole object. This means any endpoint that already fetched
+    the AgentConnection via get_for_user() and is holding a reference to it
+    automatically starts using the new WebSocket - preventing the
+    'Cannot call send once a close message has been sent' RuntimeError that
+    happened when an endpoint held a stale AgentConnection after a reconnect
+    and then tried to send a command on the already-closed WebSocket."""
+    existing_agent_id = _USER_TO_AGENT.get(user_id)
+    if existing_agent_id and existing_agent_id != agent_id:
+        # Different agent_id for same user (app was reinstalled/reset) - evict old
+        _AGENTS.pop(existing_agent_id, None)
 
-        self.state = AgentState.DISCONNECTED
-        logger.info("Connection manager stopped.")
+    existing = _AGENTS.get(agent_id)
+    if existing is not None:
+        # Same agent_id reconnecting - update the WebSocket in place so any
+        # held references to this AgentConnection object see the new socket.
+        existing.websocket = websocket
+        existing.last_seen = time.time()
+        existing.connected_at = time.time()
+        existing.busy = False
+        # Cancel any pending futures from the old connection - they can
+        # never be resolved now that the old socket is gone.
+        for fut in list(existing.pending.values()):
+            if not fut.done():
+                fut.set_exception(ConnectionError("Agent reconnected - old command superseded."))
+        existing.pending.clear()
+        _USER_TO_AGENT[user_id] = agent_id
+        return existing
 
-    async def _receive_loop(self, ws) -> None:
-        async for raw in ws:
-            try:
-                message = json.loads(raw)
-            except json.JSONDecodeError:
-                logger.warning(f"Ignoring malformed (non-JSON) message from server: {raw[:200]!r}")
-                continue
-            response = await self.on_command(message)
-            if response is not None:
-                await ws.send(json.dumps(response))
+    conn = AgentConnection(agent_id=agent_id, user_id=user_id, websocket=websocket, hostname=hostname, version=version)
+    _AGENTS[agent_id] = conn
+    _USER_TO_AGENT[user_id] = agent_id
+    return conn
 
-    async def _heartbeat_loop(self, ws, interval: float = 20.0) -> None:
-        """Sends a periodic WebSocket ping frame (not a JSON message) so
-        the underlying TCP connection is kept alive through corporate
-        proxies/load balancers that close idle connections.
 
-        Previously this sent a JSON HEARTBEAT message with request_id=null,
-        which the server correctly ignored as a housekeeping message — but
-        because the server's receive loop calls agent_registry.touch() ONLY
-        after resolving a response (i.e. only for messages that have a
-        request_id), a null-request_id heartbeat never updated last_seen,
-        so the server-side stale-agent reaper would eventually mark this
-        connection as dead even though it was still alive.
+def unregister(agent_id: str) -> None:
+    conn = _AGENTS.pop(agent_id, None)
+    if conn is not None:
+        _USER_TO_AGENT.pop(conn.user_id, None)
+        # Any endpoint still awaiting a response from this agent should
+        # fail fast rather than hang until COMMAND_TIMEOUT_SECONDS.
+        for fut in conn.pending.values():
+            if not fut.done():
+                fut.set_exception(ConnectionError("Agent disconnected before responding."))
 
-        Now we send a proper WebSocket-level ping frame (ws.ping()) which:
-        1. Keeps the TCP connection alive through any proxy that would
-           otherwise close an 'idle' connection (proxies see the ping/pong
-           at the transport layer, not the JSON application layer)
-        2. Causes the server to respond with a pong frame automatically
-           (websockets library handles this transparently on both sides)
-        3. Does NOT go through the JSON message path at all, so there is
-           no risk of the server seeing it as a malformed command
 
-        We ALSO send a JSON HEARTBEAT with a real non-null request_id
-        every interval*3 seconds so agent_registry.touch() is called and
-        last_seen is kept current for the admin's agent listing/monitoring.
-        """
-        tick = 0
-        try:
-            while True:
-                await asyncio.sleep(interval)
-                tick += 1
-                # Transport-level ping every interval seconds — use a timeout
-                # so a broken connection never hangs this coroutine forever.
+def get_by_agent_id(agent_id: str) -> Optional[AgentConnection]:
+    return _AGENTS.get(agent_id)
+
+
+def get_for_user(user_id: int) -> Optional[AgentConnection]:
+    agent_id = _USER_TO_AGENT.get(user_id)
+    return _AGENTS.get(agent_id) if agent_id else None
+
+
+def touch(agent_id: str) -> None:
+    conn = _AGENTS.get(agent_id)
+    if conn:
+        conn.last_seen = time.time()
+
+
+HEARTBEAT_STALE_SECONDS = 45  # a HEARTBEAT is expected roughly every 20s (see connection_manager.py) - 45s of silence means treat as offline
+
+
+def is_stale(conn: AgentConnection) -> bool:
+    return (time.time() - conn.last_seen) > HEARTBEAT_STALE_SECONDS
+
+
+def list_agents() -> list[AgentConnection]:
+    """For the admin panel - see who has a desktop agent connected right now."""
+    return list(_AGENTS.values())
+
+
+async def reap_stale_agents() -> None:
+    """Run forever as a background task (see backend/api.py's startup
+    event) - even a TCP-level connection drop that the WebSocket layer
+    hasn't noticed yet (some network failures never deliver a clean
+    close) shouldn't leave a phantom "Connected" agent in the registry
+    indefinitely. Anything that hasn't sent a message (including its own
+    periodic HEARTBEAT - see connection_manager.py) in
+    HEARTBEAT_STALE_SECONDS is force-closed and unregistered."""
+    while True:
+        await asyncio.sleep(15)
+        for conn in list(_AGENTS.values()):
+            if is_stale(conn):
                 try:
-                    await asyncio.wait_for(ws.ping(), timeout=10.0)
-                except asyncio.TimeoutError:
-                    logger.debug("[heartbeat] ping timed out — connection likely dead")
-                    break
+                    await conn.websocket.close(code=1000, reason="Heartbeat timeout")
                 except Exception:
-                    break  # connection closed, stop the loop cleanly
-                # JSON heartbeat with a real request_id every 3 intervals
-                # so the server's receive loop calls touch() via resolve_response
-                if tick % 3 == 0:
-                    import uuid
-                    await ws.send(json.dumps({
-                        "type": "HEARTBEAT",
-                        "request_id": f"hb-{uuid.uuid4().hex[:8]}",
-                        "payload": {},
-                    }))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.debug(f"Heartbeat loop ending: {e}")
+                    pass
+                unregister(conn.agent_id)
 
-    def stop(self) -> None:
-        """Deliberate shutdown (app quitting) - distinct from a dropped
-        connection, which reconnects instead of stopping."""
-        self._stop = True
+
+async def send_command(conn: AgentConnection, command_type: str, payload: dict,
+                        timeout: float = COMMAND_TIMEOUT_SECONDS) -> dict:
+    """Sends {type, request_id, payload} to the agent and awaits the
+    correlated response (matched on request_id - see local_agent/client.py,
+    which replies with the same id it received). This is what lets
+    backend/api.py's endpoints stay simple, synchronous-looking request/
+    response calls despite the underlying transport being an
+    always-open WebSocket rather than a per-request HTTP round trip."""
+    # Guard: if the WebSocket is already closed, fail fast with a clear
+    # error rather than crashing with RuntimeError: 'Cannot call send
+    # once a close message has been sent' - which is what happens when
+    # an endpoint holds a reference to an AgentConnection whose WebSocket
+    # was replaced by a reconnect that register() processed after the
+    # endpoint called get_for_user() (race condition on reconnect).
+    try:
+        ws_state = conn.websocket.client_state.value  # 0=CONNECTING 1=CONNECTED 2=DISCONNECTED
+    except Exception:
+        ws_state = 0
+    if ws_state == 2:  # DISCONNECTED
+        raise ConnectionError(
+            "Agent WebSocket is closed — the agent may be reconnecting. "
+            "Please wait a moment and try again."
+        )
+
+    request_id = uuid.uuid4().hex
+    loop = asyncio.get_event_loop()
+    future: asyncio.Future = loop.create_future()
+    conn.pending[request_id] = future
+    try:
+        await conn.websocket.send_json({"type": command_type, "request_id": request_id, "payload": payload})
+        return await asyncio.wait_for(future, timeout=timeout)
+    except RuntimeError as e:
+        # WebSocket was closed between the state check and the send —
+        # very narrow race window but handle it cleanly.
+        if "close message" in str(e).lower() or "send" in str(e).lower():
+            raise ConnectionError(
+                "Agent disconnected mid-send. It will reconnect automatically — please retry."
+            ) from e
+        raise
+    finally:
+        conn.pending.pop(request_id, None)
+
+
+def resolve_response(conn: AgentConnection, request_id: str, response: dict) -> bool:
+    """Called by agent_routes.py's ws_agent receive loop for every message
+    that comes back from the agent. Returns False if nothing was waiting
+    on this request_id (e.g. a duplicate/late reply, or the endpoint that
+    sent it already timed out) - the caller can log that but shouldn't
+    treat it as fatal."""
+    future = conn.pending.get(request_id)
+    if future is None or future.done():
+        return False
+    future.set_result(response)
+    return True
