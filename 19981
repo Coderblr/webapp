@@ -1,37 +1,159 @@
-@app.websocket("/api/agent/ws")
-async def agent_ws(
+"""
+POST /api/agent/pair      - exchange a normal login for a long-lived agent session/token (see below)
+GET  /api/agent/status    - does the current user have a connected desktop agent? (drives the frontend's status indicator)
+WS   /api/agent/ws        - the agent's persistent outbound connection (see local_agent/connection_manager.py)
+
+Auth model: the agent still logs in exactly like a normal user
+(POST /api/auth/login, run once - see local_agent/client.py) - no separate
+agent-credential system, no unauthenticated endpoint. What's different
+from a plain reused login token is /api/agent/pair below: it exchanges
+that normal (short, human-idle-timeout-bound) login for a SEPARATE,
+long-lived session/token meant for a background process, so the agent
+doesn't need a human to re-type their password every time the connection
+survives a longer-than-5-minute gap (laptop sleep, network blip, etc.).
+"""
+from __future__ import annotations
+import asyncio
+import logging
+
+from fastapi import APIRouter, Depends, Query, Request, WebSocket, WebSocketDisconnect
+
+from database.db import get_session
+from database import repository as repo
+from auth.dependencies import get_current_user, get_client_ip, validate_token_for_websocket, CurrentUser
+from auth.jwt_utils import create_access_token
+from auth.config import AGENT_SESSION_MAX_HOURS
+from backend import agent_registry
+
+router = APIRouter(prefix="/api/agent", tags=["agent"])
+logger = logging.getLogger("agent")
+
+
+@router.post("/pair")
+def pair_agent(request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    """Called once by local_agent/client.py right after a successful
+    username/password login (see local_agent/client.py's obtain_token) -
+    trades that short-lived human session for a dedicated long-lived
+    "agent" one (UserSession.is_agent=True), which the agent then caches
+    (local_agent/config.py:save_auth_token) and reuses for every future
+    reconnect, skipping the login prompt entirely from then on. Re-pairing
+    (a fresh username/password prompt) is only needed again after
+    AGENT_SESSION_MAX_HOURS (default 90 days) or if an admin explicitly
+    revokes the agent's session (see the admin Sessions page - an agent
+    session shows up there like any other, just with a much longer idle
+    allowance)."""
+    ip = get_client_ip(request)
+    with get_session() as db:
+        sess = repo.create_session(
+            db, current_user.user_id, ip, request.headers.get("user-agent"),
+            session_max_hours=AGENT_SESSION_MAX_HOURS, is_agent=True,
+        )
+        token = create_access_token(
+            user_id=current_user.user_id, username=current_user.username, role=current_user.role,
+            session_id=sess.session_id, expire_minutes=AGENT_SESSION_MAX_HOURS * 60,
+        )
+        repo.log_activity(
+            db, user_id=current_user.user_id, session_id=sess.session_id, action="AGENT_PAIRED",
+            status="SUCCESS", endpoint="/api/agent/pair", ip_address=ip,
+        )
+    return {"access_token": token, "expires_in_hours": AGENT_SESSION_MAX_HOURS}
+
+
+@router.get("/status")
+def agent_status(current_user: CurrentUser = Depends(get_current_user)):
+    """Drives the frontend's "Local Agent: Connected/Offline" indicator
+    (see components/AgentStatus.js) - checked before Start Recording is
+    even offered, and polled periodically while idle. A registered-but-
+    stale connection (missed heartbeats - see agent_registry.HEARTBEAT_STALE_SECONDS)
+    reports connected: false even before the background reaper has
+    gotten around to actually closing it, so the UI never shows "Connected"
+    for a link that's already effectively dead."""
+    conn = agent_registry.get_for_user(current_user.user_id)
+    if conn is None or agent_registry.is_stale(conn):
+        return {"connected": False}
+    return {
+        "connected": True,
+        "agent_id": conn.agent_id,
+        "hostname": conn.hostname,
+        "version": conn.version,
+        "busy": conn.busy,
+        "connected_at": conn.connected_at,
+        "last_seen": conn.last_seen,
+    }
+
+
+@router.websocket("/ws")
+async def ws_agent(
     websocket: WebSocket,
     token: str = Query(...),
     agent_id: str = Query(...),
-    hostname: str = Query(...),
-    version: str = Query(...),
+    hostname: str = Query(default=""),
+    version: str = Query(default=""),
 ):
-    current_user = validate_token_for_websocket(token)
+    """The local agent's single, long-lived connection to the backend.
+    Everything after registration is just {type, request_id, payload}
+    messages in both directions - see local_agent/client.py for the other
+    end, and backend/agent_registry.py for how a command sent from an
+    /api/* endpoint gets matched back up with the agent's reply."""
+    await websocket.accept()
 
+    current_user = validate_token_for_websocket(token)
     if current_user is None:
         await websocket.close(code=4401, reason="Not authenticated")
         return
 
-    await websocket.accept()
+    conn = agent_registry.register(agent_id, current_user.user_id, websocket, hostname, version)
+    logger.info(f"[agent] connected: user={current_user.username} agent_id={agent_id} host={hostname} version={version}")
 
-    # Register this agent
-    agent_registry.register(
-        agent_id=agent_id,
-        websocket=websocket,
-        hostname=hostname,
-        version=version,
-        user_id=current_user.user_id,
-    )
+    # Check if this agent was in the middle of a recording when it disconnected.
+    # If so, log it so the admin can see the reconnect didn't lose state.
+    from backend import recording_sessions as _rs
+    for state in _rs._SESSIONS.values():
+        if (
+            state.get("user_id") == current_user.user_id
+            and state.get("mode") == "agent"
+            and state.get("agent_recording_active")
+        ):
+            logger.info(
+                f"[agent] reconnected mid-recording for user={current_user.username} — "
+                f"agent_recording_active preserved, recording session continues"
+            )
+            break
 
     try:
         while True:
-            message = await websocket.receive_json()
-
-            # Handle heartbeat / command responses
-            ...
-            
+            try:
+                message = await websocket.receive_json()
+            except WebSocketDisconnect:
+                # Clean disconnect - exit the loop normally
+                raise
+            except ValueError:
+                # Non-JSON frame (e.g. a text ping/pong or binary frame) —
+                # safe to skip without exiting the connection
+                continue
+            except Exception as _e:
+                # Unknown exception from receive_json — if we just `continue`
+                # here it creates a tight infinite loop that blocks the entire
+                # asyncio event loop (preventing new connections from
+                # completing their handshake). Yield control first, then
+                # re-raise so the outer except WebSocketDisconnect handles it.
+                await asyncio.sleep(0.1)
+                raise
+            agent_registry.touch(agent_id)
+            request_id = message.get("request_id")
+            if request_id is None:
+                continue  # malformed or old-style null-request_id heartbeat — ignore
+            msg_type = message.get("type", "")
+            if msg_type == "HEARTBEAT":
+                # JSON heartbeat with a real request_id — touch already done above,
+                # no further action needed. Don't try to resolve it as a command response.
+                continue
+            resolved = agent_registry.resolve_response(conn, request_id, message)
+            if not resolved:
+                logger.warning(f"[agent] unmatched response from agent_id={agent_id}: request_id={request_id}")
     except WebSocketDisconnect:
-        agent_registry.unregister(agent_id)
-
+        logger.info(f"[agent] disconnected: agent_id={agent_id}")
+    except Exception as e:
+        logger.warning(f"[agent] error for agent_id={agent_id}: {e}")
     finally:
         agent_registry.unregister(agent_id)
