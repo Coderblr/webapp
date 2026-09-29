@@ -1,428 +1,148 @@
-import { useEffect, useState } from "react";
-import { api, ApiError } from "@/lib/api";
-import LiveRecordingView from "@/components/LiveRecordingView";
-import {
-  Button,
-  Callout,
-  Checkbox,
-  DataTable,
-  Disclosure,
-  Field,
-  Panel,
-  PanelHeader,
-  Select,
-  Spinner,
-  TextInput,
-} from "@/components/ui";
+"""
+POST /api/agent/pair      - exchange a normal login for a long-lived agent session/token (see below)
+GET  /api/agent/status    - does the current user have a connected desktop agent? (drives the frontend's status indicator)
+WS   /api/agent/ws        - the agent's persistent outbound connection (see local_agent/connection_manager.py)
 
-const OTHERS = "Others";
+Auth model: the agent still logs in exactly like a normal user
+(POST /api/auth/login, run once - see local_agent/client.py) - no separate
+agent-credential system, no unauthenticated endpoint. What's different
+from a plain reused login token is /api/agent/pair below: it exchanges
+that normal (short, human-idle-timeout-bound) login for a SEPARATE,
+long-lived session/token meant for a background process, so the agent
+doesn't need a human to re-type their password every time the connection
+survives a longer-than-5-minute gap (laptop sleep, network blip, etc.).
+"""
+from __future__ import annotations
+import logging
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+from fastapi import APIRouter, Depends, Query, Request, WebSocket, WebSocketDisconnect
 
-function actionLabel(a) {
-  const el = a.element || {};
-  return el.ariaLabel || el.placeholder || el.name || el.text || el.tag || "";
-}
+from database.db import get_session
+from database import repository as repo
+from auth.dependencies import get_current_user, get_client_ip, validate_token_for_websocket, CurrentUser
+from auth.jwt_utils import create_access_token
+from auth.config import AGENT_SESSION_MAX_HOURS
+from backend import agent_registry
 
-function actionDetail(a) {
-  let detail = a.value || "";
-  if (a.action === "keypress") {
-    detail = a.value || "";
-  } else if (a.captured_as) {
-    detail = `${detail}  ->  {{${a.captured_as}}}`;
-  } else if (a.resolved_var) {
-    detail = `{{${a.resolved_var}}}  (recorded: ${detail})`;
-  }
-  return detail;
-}
+router = APIRouter(prefix="/api/agent", tags=["agent"])
+logger = logging.getLogger("agent")
 
-export default function RecordTab() {
-  const [applicationNames, setApplicationNames] = useState([]);
-  const [appsError, setAppsError] = useState(null);
-  const [selectedApp, setSelectedApp] = useState(OTHERS);
-  const [customUrl, setCustomUrl] = useState("");
-  const [recordingName, setRecordingName] = useState("");
-  const [headless, setHeadless] = useState(false);
 
-  const [recordingActive, setRecordingActive] = useState(false);
-  const [recordingHeadless, setRecordingHeadless] = useState(false);
-  const [recordingMode, setRecordingMode] = useState("server"); // "server" or "agent" - see backend/agent_registry.py
-  const [backendProcessId, setBackendProcessId] = useState(null);
+@router.post("/pair")
+def pair_agent(request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    """Called once by local_agent/client.py right after a successful
+    username/password login (see local_agent/client.py's obtain_token) -
+    trades that short-lived human session for a dedicated long-lived
+    "agent" one (UserSession.is_agent=True), which the agent then caches
+    (local_agent/config.py:save_auth_token) and reuses for every future
+    reconnect, skipping the login prompt entirely from then on. Re-pairing
+    (a fresh username/password prompt) is only needed again after
+    AGENT_SESSION_MAX_HOURS (default 90 days) or if an admin explicitly
+    revokes the agent's session (see the admin Sessions page - an agent
+    session shows up there like any other, just with a much longer idle
+    allowance)."""
+    ip = get_client_ip(request)
+    with get_session() as db:
+        sess = repo.create_session(
+            db, current_user.user_id, ip, request.headers.get("user-agent"),
+            session_max_hours=AGENT_SESSION_MAX_HOURS, is_agent=True,
+        )
+        token = create_access_token(
+            user_id=current_user.user_id, username=current_user.username, role=current_user.role,
+            session_id=sess.session_id, expire_minutes=AGENT_SESSION_MAX_HOURS * 60,
+        )
+        repo.log_activity(
+            db, user_id=current_user.user_id, session_id=sess.session_id, action="AGENT_PAIRED",
+            status="SUCCESS", endpoint="/api/agent/pair", ip_address=ip,
+        )
+    return {"access_token": token, "expires_in_hours": AGENT_SESSION_MAX_HOURS}
 
-  const [startBusy, setStartBusy] = useState(false);
-  const [startPhase, setStartPhase] = useState(null);
-  const [startError, setStartError] = useState(null);
-  const [startNotice, setStartNotice] = useState(null);
 
-  const [saveBusy, setSaveBusy] = useState(false);
-  const [saveError, setSaveError] = useState(null);
-  const [saveNotice, setSaveNotice] = useState(null);
-
-  const [stopBusy, setStopBusy] = useState(false);
-  const [stopError, setStopError] = useState(null);
-  const [stopNotice, setStopNotice] = useState(null);
-
-  const [runBusy, setRunBusy] = useState(false);
-  const [runError, setRunError] = useState(null);
-
-  const [buildResult, setBuildResult] = useState(null);
-  const [runResult, setRunResult] = useState(null);
-
-  const [statusPreview, setStatusPreview] = useState(null);
-  const [statusPreviewError, setStatusPreviewError] = useState(null);
-
-  useEffect(() => {
-    api
-      .getApplications()
-      .then((r) => setApplicationNames(r.applications))
-      .catch((e) => setAppsError(e.detail));
-  }, []);
-
-  async function handleStart() {
-    setStartError(null);
-    setStartNotice(null);
-    setStopError(null);
-    setStopNotice(null);
-    if (selectedApp === OTHERS && !customUrl.trim()) {
-      setStartError("Enter a target URL for 'Others' first.");
-      return;
+@router.get("/status")
+def agent_status(current_user: CurrentUser = Depends(get_current_user)):
+    """Drives the frontend's "Local Agent: Connected/Offline" indicator
+    (see components/AgentStatus.js) - checked before Start Recording is
+    even offered, and polled periodically while idle. A registered-but-
+    stale connection (missed heartbeats - see agent_registry.HEARTBEAT_STALE_SECONDS)
+    reports connected: false even before the background reaper has
+    gotten around to actually closing it, so the UI never shows "Connected"
+    for a link that's already effectively dead."""
+    conn = agent_registry.get_for_user(current_user.user_id)
+    if conn is None or agent_registry.is_stale(conn):
+        return {"connected": False}
+    return {
+        "connected": True,
+        "agent_id": conn.agent_id,
+        "hostname": conn.hostname,
+        "version": conn.version,
+        "busy": conn.busy,
+        "connected_at": conn.connected_at,
+        "last_seen": conn.last_seen,
     }
-    setStartBusy(true);
-    try {
-      await api.startRecording({
-        app_name: selectedApp === OTHERS ? "" : selectedApp,
-        url: customUrl,
-        recording_name: recordingName,
-        headless,
-      });
 
-      setStartPhase("Launching browser...");
-      let launched = false;
-      let lastStatus = null;
-      for (let i = 0; i < 30; i++) {
-        await sleep(500);
-        try {
-          lastStatus = await api.getStatus();
-        } catch (e) {
-          // Network hiccup during the poll - keep waiting, don't crash.
-          // lastStatus stays as whatever it was on the previous iteration.
-          continue;
-        }
-        if (!lastStatus) continue;
-        if (lastStatus.start_error) {
-          setStartError(`Recording failed to start: ${lastStatus.start_error}`);
-          break;
-        }
-        if (lastStatus.recording_active) {
-          launched = true;
-          break;
-        }
-      }
-      if (!launched && !(lastStatus && lastStatus.start_error)) {
-        setStartError("Browser launch is taking longer than expected - check the backend terminal for errors.");
-      }
-      if (launched && lastStatus) {
-        setRecordingActive(true);
-        setRecordingHeadless(!!lastStatus.headless);
-        setRecordingMode(lastStatus.mode || "server");
-        setBackendProcessId(lastStatus.process_id);
-        setStartNotice(
-          lastStatus.mode === "agent"
-            ? "Recording started on your local agent - a browser window has opened on your PC."
-            : "Recording started."
-        );
-      }
-    } catch (e) {
-      setStartError(e.detail || e.message);
-    } finally {
-      setStartPhase(null);
-      setStartBusy(false);
-    }
-  }
 
-  async function handleStopRecording() {
-    if (!window.confirm("Stop recording? Everything captured so far will be discarded - use 'Save & Generate' instead if you want to keep it.")) {
-      return;
-    }
-    setStopError(null);
-    setStopNotice(null);
-    setStopBusy(true);
-    try {
-      const result = await api.stopRecording();
-      setRecordingActive(false);
-      setRecordingHeadless(false);
-      setStopNotice(`Recording stopped and discarded (${result.actions_discarded} actions).`);
-    } catch (e) {
-      setStopError(e.detail || e.message);
-    } finally {
-      setStopBusy(false);
-    }
-  }
+@router.websocket("/ws")
+async def ws_agent(
+    websocket: WebSocket,
+    token: str = Query(...),
+    agent_id: str = Query(...),
+    hostname: str = Query(default=""),
+    version: str = Query(default=""),
+):
+    """The local agent's single, long-lived connection to the backend.
+    Everything after registration is just {type, request_id, payload}
+    messages in both directions - see local_agent/client.py for the other
+    end, and backend/agent_registry.py for how a command sent from an
+    /api/* endpoint gets matched back up with the agent's reply."""
+    await websocket.accept()
 
-  async function handleSaveAndGenerate() {
-    setSaveError(null);
-    setSaveNotice(null);
-    setSaveBusy(true);
-    try {
-      const status = await api.getStatus().catch(() => null);
-      if (status && status.process_id && status.process_id !== backendProcessId) {
-        setRecordingActive(false);
-        setSaveError(
-          "The backend restarted since this recording started (its in-memory state, including the open browser, was lost) - start a new recording."
-        );
-        return;
-      }
-      const data = await api.stopAndSave();
-      setBuildResult(data);
-      setRecordingActive(false);
-      setSaveNotice(
-        `Generated ${data.build_result.step_count} steps / ${data.build_result.element_count} elements. (LLM used: ${data.llm_used})`
-      );
-    } catch (e) {
-      setSaveError(e.detail || e.message);
-    } finally {
-      setSaveBusy(false);
-    }
-  }
+    current_user = validate_token_for_websocket(token)
+    if current_user is None:
+        await websocket.close(code=4401, reason="Not authenticated")
+        return
 
-  async function handleRun() {
-    setRunError(null);
-    setRunBusy(true);
-    try {
-      const result = await api.runCheck(headless);
-      setRunResult(result);
-    } catch (e) {
-      setRunError(e.detail || e.message);
-    } finally {
-      setRunBusy(false);
-    }
-  }
+    conn = agent_registry.register(agent_id, current_user.user_id, websocket, hostname, version)
+    logger.info(f"[agent] connected: user={current_user.username} agent_id={agent_id} host={hostname} version={version}")
 
-  async function handleRefreshStatus() {
-    setStatusPreviewError(null);
-    try {
-      setStatusPreview(await api.getStatus());
-    } catch (e) {
-      setStatusPreview(null);
-      setStatusPreviewError(e.detail || e.message);
-    }
-  }
+    # Check if this agent was in the middle of a recording when it disconnected.
+    # If so, log it so the admin can see the reconnect didn't lose state.
+    from backend import recording_sessions as _rs
+    for state in _rs._SESSIONS.values():
+        if (
+            state.get("user_id") == current_user.user_id
+            and state.get("mode") == "agent"
+            and state.get("agent_recording_active")
+        ):
+            logger.info(
+                f"[agent] reconnected mid-recording for user={current_user.username} — "
+                f"agent_recording_active preserved, recording session continues"
+            )
+            break
 
-  const variables = (buildResult && buildResult.variables) || {};
-  const recordedActions = (buildResult && buildResult.actions) || [];
-
-  return (
-    <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
-      {/* ---- Configuration panel -------------------------------------- */}
-      <Panel>
-        <PanelHeader title="Session" caption="Choose a target and start capturing." />
-        <div className="space-y-4 px-5 py-5">
-          {appsError && <Callout tone="error">Could not load application list: {appsError}</Callout>}
-
-          <Field label="Application">
-            <Select value={selectedApp} onChange={(e) => setSelectedApp(e.target.value)}>
-              {applicationNames.map((name) => (
-                <option key={name} value={name}>
-                  {name}
-                </option>
-              ))}
-              <option value={OTHERS}>{OTHERS}</option>
-            </Select>
-          </Field>
-
-          {selectedApp === OTHERS && (
-            <Field label="Target application URL">
-              <TextInput
-                placeholder="https://your-app.example.com"
-                value={customUrl}
-                onChange={(e) => setCustomUrl(e.target.value)}
-              />
-            </Field>
-          )}
-
-          <Field
-            label="Recording name"
-            hint="Used to label this recording in 'Run Saved Recording' and in exit reports."
-          >
-            <TextInput
-              placeholder="e.g. a transaction number, or 'New Loan Application'"
-              value={recordingName}
-              onChange={(e) => setRecordingName(e.target.value)}
-            />
-          </Field>
-
-          <Checkbox label="headless" checked={headless} onChange={setHeadless} />
-
-          <div className="flex flex-col gap-2 border-t border-line pt-4">
-            <Button onClick={handleStart} disabled={recordingActive || startBusy}>
-              {startBusy ? "Starting..." : "Start Recording"}
-            </Button>
-            <Button variant="secondary" onClick={handleSaveAndGenerate} disabled={!recordingActive || saveBusy}>
-              {saveBusy ? "Saving..." : "Save & Generate"}
-            </Button>
-            <Button
-              variant="secondary"
-              onClick={handleStopRecording}
-              disabled={!recordingActive || stopBusy}
-              className="!border-signal-rust/40 !text-signal-rust hover:!border-signal-rust"
-            >
-              {stopBusy ? "Stopping..." : "Stop Recording"}
-            </Button>
-            <Button variant="secondary" onClick={handleRun} disabled={!buildResult || runBusy}>
-              {runBusy ? "Running..." : "Run / Check"}
-            </Button>
-          </div>
-
-          <div className="space-y-2 pt-1">
-            {startPhase && <Spinner label={startPhase} />}
-            {startError && <Callout tone="error">{startError}</Callout>}
-            {startNotice && <Callout tone="success">{startNotice}</Callout>}
-            {saveBusy && <Spinner label="Stopping recording and generating feature/steps/page files..." />}
-            {saveError && <Callout tone="error">{saveError}</Callout>}
-            {saveNotice && <Callout tone="success">{saveNotice}</Callout>}
-            {stopBusy && <Spinner label="Stopping and discarding the recording..." />}
-            {stopError && <Callout tone="error">{stopError}</Callout>}
-            {stopNotice && <Callout>{stopNotice}</Callout>}
-            {runBusy && <Spinner label="Running generated Behave suite..." />}
-            {runError && <Callout tone="error">Run failed: {runError}</Callout>}
-            {recordingActive && (
-              <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-signal-rust">
-                <span className="pulse-dot h-2 w-2 rounded-full bg-signal-rust" />
-                Recording in progress
-              </div>
-            )}
-          </div>
-        </div>
-      </Panel>
-
-      {/* ---- Log panel --------------------------------------------------- */}
-      <div className="space-y-4">
-        {recordingActive && recordingMode === "agent" && (
-          <Panel>
-            <div className="px-5 py-5">
-              <Callout>
-                Recording on your local agent - a real browser window has opened on your own PC. Interact with it
-                directly there; nothing is streamed through this page.
-              </Callout>
-            </div>
-          </Panel>
-        )}
-
-        {recordingActive && recordingMode !== "agent" && recordingHeadless && (
-          <Panel>
-            <PanelHeader
-              title="Live view"
-              caption="This runs on the server - what you see and interact with here is the real, remote browser being recorded."
-            />
-            <div className="px-5 py-5">
-              <LiveRecordingView active={recordingActive} />
-            </div>
-          </Panel>
-        )}
-
-        {recordingActive && recordingMode !== "agent" && !recordingHeadless && (
-          <Panel>
-            <div className="px-5 py-5">
-              <Callout>
-                A real Edge browser window has opened on the machine running the backend - interact with it there
-                directly. (This is local/headed mode - the live view above only appears for headless/hosted
-                recordings, where there's no visible window to work with directly.)
-              </Callout>
-            </div>
-          </Panel>
-        )}
-
-        <Panel>
-          <PanelHeader title="Log" caption="Generation output, recorded actions, and the last run." />
-          <div className="space-y-3 px-5 py-5">
-            {runResult && (
-              <Callout tone={runResult.ok ? "success" : "error"}>
-                {runResult.ok ? "PASSED" : "FAILED (see log below)"}
-              </Callout>
-            )}
-
-            {buildResult ? (
-              <div className="space-y-3">
-                <Disclosure title="Generation result">
-                  <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-rail p-3 font-mono text-xs scroll-thin">
-                    {JSON.stringify(buildResult.build_result, null, 2)}
-                  </pre>
-                </Disclosure>
-
-                {Object.keys(variables).length > 0 && (
-                  <Disclosure title={`Captured variables (${Object.keys(variables).length})`}>
-                    <p className="mb-2 text-xs text-muted">
-                      Values captured via copy/CTRL+C during recording, reused later via {"{{name}}"} placeholders.
-                    </p>
-                    <DataTable
-                      columns={[
-                        { key: "variable", label: "Variable", mono: true },
-                        { key: "value", label: "Captured value", mono: true },
-                      ]}
-                      rows={Object.entries(variables).map(([k, v]) => ({
-                        variable: `{{${k}}}`,
-                        value: v,
-                      }))}
-                    />
-                  </Disclosure>
-                )}
-
-                {recordedActions.length > 0 && (
-                  <Disclosure title={`Recorded actions (${recordedActions.length})`}>
-                    <DataTable
-                      columns={[
-                        { key: "n", label: "#" },
-                        { key: "action", label: "Action" },
-                        { key: "element", label: "Element" },
-                        { key: "detail", label: "Value / key", mono: true },
-                      ]}
-                      rows={recordedActions.map((a, i) => ({
-                        n: i + 1,
-                        action: a.action || "",
-                        element: actionLabel(a),
-                        detail: actionDetail(a),
-                      }))}
-                    />
-                  </Disclosure>
-                )}
-              </div>
-            ) : (
-              <p className="text-sm text-muted">Nothing generated yet.</p>
-            )}
-
-            <div className="pt-1">
-              {runResult ? (
-                <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-[#151B22] p-4 font-mono text-xs text-[#D7DDE3] scroll-thin">
-                  {runResult.output || ""}
-                </pre>
-              ) : (
-                <p className="text-sm text-muted">Nothing run yet.</p>
-              )}
-            </div>
-          </div>
-        </Panel>
-
-        <Panel>
-          <div className="flex items-center justify-between px-5 py-4">
-            <div>
-              <h2 className="text-sm font-semibold text-ink">Backend status</h2>
-              {statusPreviewError && <p className="mt-0.5 text-xs text-signal-rust">{statusPreviewError}</p>}
-            </div>
-            <Button variant="secondary" onClick={handleRefreshStatus}>
-              Refresh status
-            </Button>
-          </div>
-          {statusPreview && (
-            <div className="border-t border-line px-5 py-4">
-              <pre className="overflow-auto whitespace-pre-wrap break-words rounded-sm bg-rail p-3 font-mono text-xs scroll-thin">
-                {JSON.stringify(statusPreview, null, 2)}
-              </pre>
-            </div>
-          )}
-        </Panel>
-      </div>
-    </div>
-  );
-}
+    try:
+        while True:
+            try:
+                message = await websocket.receive_json()
+            except Exception:
+                # Handles pong frames and other non-JSON transport frames
+                # that websockets surfaces as exceptions in receive_json —
+                # these are normal keep-alive traffic, not errors.
+                continue
+            agent_registry.touch(agent_id)
+            request_id = message.get("request_id")
+            if request_id is None:
+                continue  # malformed or old-style null-request_id heartbeat — ignore
+            msg_type = message.get("type", "")
+            if msg_type == "HEARTBEAT":
+                # JSON heartbeat with a real request_id — touch already done above,
+                # no further action needed. Don't try to resolve it as a command response.
+                continue
+            resolved = agent_registry.resolve_response(conn, request_id, message)
+            if not resolved:
+                logger.warning(f"[agent] unmatched response from agent_id={agent_id}: request_id={request_id}")
+    except WebSocketDisconnect:
+        logger.info(f"[agent] disconnected: agent_id={agent_id}")
+    except Exception as e:
+        logger.warning(f"[agent] error for agent_id={agent_id}: {e}")
+    finally:
+        agent_registry.unregister(agent_id)
