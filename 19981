@@ -1,50 +1,972 @@
-@echo off
-title AI Test Recorder - Local Agent
-color 3F
-echo.
-echo ================================================
-echo   AI Test Recorder - Local Agent
-echo   State Bank of India - Internal Use Only
-echo ================================================
-echo.
+/*
+Injected via Playwright's page.add_init_script() so it re-attaches on every
+navigation (including SPA route changes that reload the document, and full
+page loads). Captures click + input/change events and builds MULTIPLE
+independent locator strategies per element so the generated tests don't
+depend on a single brittle selector. Actions are queued here and drained
+by the Python side polling window.__flushActions() (see
+recorder/recorder.py) from the single worker thread that owns the page.
+*/
+(function () {
+  if (window.__recorderInstalled) return;
+  window.__recorderInstalled = true;
 
-cd /d "%~dp0"
+  // Actions are also mirrored to sessionStorage (same-origin, survives a
+  // navigation) so a queued action isn't lost if the page navigates/reloads
+  // (e.g. pressing Enter submits the form) before the Python side's next
+  // poll had a chance to flush window.__recordedQueue - that race is why
+  // Enter/submit-triggered actions could intermittently go unrecorded.
+  var STORAGE_KEY = '__recorderQueue';
 
-REM build-venv is inside the project folder (ai-test-recorder-pw\build-venv)
-set VENV_PATH=%~dp0build-venv
+  // id of the right-click capture menu's Shadow DOM host (see
+  // showCaptureMenu below) - every OTHER listener in this file that
+  // records page activity (click/change/keydown/copy/cut/paste) needs to
+  // ignore events that originate from INSIDE this menu, or interacting
+  // with the recorder's own capture UI (choosing a mode, typing a
+  // variable name, clicking Capture) would itself get recorded as bogus
+  // click/type/copy actions targeting an element that won't even exist
+  // during replay. Shadow DOM automatically RETARGETS any such event's
+  // target/activeElement to this host id when observed from a
+  // document-level listener outside the shadow tree, so a single ==
+  // check against this constant is enough everywhere.
+  var CAPTURE_MENU_HOST_ID = '__ai_tr_capture_menu_host__';
 
-if not exist "%VENV_PATH%\Scripts\activate.bat" (
-    echo [ERROR] Virtual environment not found at: %VENV_PATH%
-    echo Expected structure:
-    echo   ai-test-recorder-pw\
-    echo     build-venv\   ^<-- venv should be here
-    echo     local_agent\
-    pause
-    exit /b 1
-)
+  function loadPersistedQueue() {
+    try {
+      var raw = sessionStorage.getItem(STORAGE_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch (e) {
+      return [];
+    }
+  }
 
-REM Check SERVER_URL is set
-if "%SERVER_URL%"=="" (
-    echo [WARNING] SERVER_URL is not set. Using default.
-    set SERVER_URL=http://10.1.161.165:8000
-    echo To set permanently run this once and restart:
-    echo   setx SERVER_URL "http://10.1.161.165:8000"
-    echo.
-)
+  function persistQueue() {
+    try {
+      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(window.__recordedQueue));
+    } catch (e) { /* storage unavailable/full - keep going in-memory only */ }
+  }
 
-echo [1/2] Activating build-venv...
-call "%VENV_PATH%\Scripts\activate.bat"
+  window.__recordedQueue = loadPersistedQueue();
 
-echo [2/2] Starting local agent...
-echo.
-echo  Server URL : %SERVER_URL%
-echo  Press Ctrl+C to stop
-echo.
+  function cssEscape(s) {
+    return (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/([^a-zA-Z0-9_-])/g, '\\$1');
+  }
 
-:retry
-python -m local_agent.main
-echo.
-echo [INFO] Agent stopped. Restarting in 5 seconds...
-echo  Press Ctrl+C to exit
-timeout /t 5 /nobreak >nul
-goto retry
+  function isUnique(selector) {
+    try {
+      return document.querySelectorAll(selector).length === 1;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function cssPath(el) {
+    if (!(el instanceof Element)) return null;
+    var path = [];
+    while (el && el.nodeType === Node.ELEMENT_NODE && el.tagName.toLowerCase() !== 'html') {
+      var selector = el.tagName.toLowerCase();
+      if (el.id) {
+        selector = '#' + cssEscape(el.id);
+        path.unshift(selector);
+        break;
+      } else {
+        var sib = el, nth = 1;
+        while ((sib = sib.previousElementSibling)) {
+          if (sib.tagName === el.tagName) nth++;
+        }
+        selector += ':nth-of-type(' + nth + ')';
+      }
+      path.unshift(selector);
+      el = el.parentElement;
+    }
+    return path.join(' > ');
+  }
+
+  function xpathOf(el) {
+    if (el.id) return '//*[@id="' + el.id + '"]';
+    var parts = [];
+    while (el && el.nodeType === Node.ELEMENT_NODE) {
+      var idx = 1;
+      var sib = el.previousElementSibling;
+      while (sib) {
+        if (sib.tagName === el.tagName) idx++;
+        sib = sib.previousElementSibling;
+      }
+      parts.unshift(el.tagName.toLowerCase() + '[' + idx + ']');
+      el = el.parentElement;
+    }
+    return '/' + parts.join('/');
+  }
+
+  function textXPath(el) {
+    var text = (el.innerText || el.textContent || '').trim();
+    if (!text || text.length > 60) return null;
+    var tag = el.tagName.toLowerCase();
+    return "//" + tag + "[normalize-space(.)=\"" + text.replace(/"/g, '') + "\"]";
+  }
+
+  function isUniqueXPath(xpath) {
+    try {
+      var result = document.evaluate('count(' + xpath + ')', document, null, XPathResult.NUMBER_TYPE, null);
+      return result.numberValue === 1;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function ancestorTextXPath(el) {
+    // Radio/checkbox inputs usually have NO text content of their own - the
+    // visible option label lives on a wrapping component instead (e.g.
+    // Angular Material's <mat-radio-button>/<mat-checkbox>, or a plain
+    // wrapping <label>), so textXPath(el) above returns null for them. That
+    // leaves the input's auto-generated id (e.g. Angular's "mat-radio-9-input")
+    // as the only usable locator - and that id is NOT stable across page
+    // loads, since frameworks like Angular/React generate it from a global
+    // counter that depends on everything else rendered earlier on the page.
+    // Climbing to the nearest wrapper with short, meaningful text and
+    // anchoring an XPath on THAT text (then navigating back down to the
+    // input) gives a locator based on what a real user actually sees - e.g.
+    // //mat-radio-button[normalize-space(.)="Yes"]//input - which stays
+    // correct regardless of what id Angular happens to generate this time.
+    if (!(el.tagName === 'INPUT' && (el.type === 'radio' || el.type === 'checkbox'))) return null;
+    var wrapper = el.closest('mat-radio-button, mat-checkbox, [role="radio"], [role="checkbox"], label') || el.parentElement;
+    var depth = 0;
+    while (wrapper && depth < 4) {
+      var text = (wrapper.innerText || wrapper.textContent || '').trim();
+      if (text && text.length <= 60) {
+        var tag = wrapper.tagName.toLowerCase();
+        var xp = "//" + tag + "[normalize-space(.)=\"" + text.replace(/"/g, '') + "\"]//input[@type=\"" + el.type + "\"]";
+        if (isUniqueXPath(xp)) return xp;
+      }
+      wrapper = wrapper.parentElement;
+      depth++;
+    }
+    return null;
+  }
+
+  function buildLocators(el) {
+    var locs = [];
+
+    if (el.getAttribute('data-testid')) {
+      var v = el.getAttribute('data-testid');
+      var sel = '[data-testid="' + cssEscape(v) + '"]';
+      if (isUnique(sel)) locs.push({ strategy: 'CSS', value: sel, note: 'data-testid' });
+    }
+    if (el.id) {
+      var idSel = '#' + cssEscape(el.id);
+      if (isUnique(idSel)) locs.push({ strategy: 'ID', value: el.id });
+    }
+    if (el.name) {
+      var nameSel = '[name="' + cssEscape(el.name) + '"]';
+      if (isUnique(nameSel)) locs.push({ strategy: 'NAME', value: el.name });
+    }
+    if (el.getAttribute('aria-label')) {
+      var al = el.getAttribute('aria-label');
+      var alSel = '[aria-label="' + cssEscape(al) + '"]';
+      if (isUnique(alSel)) locs.push({ strategy: 'CSS', value: alSel, note: 'aria-label' });
+    }
+    if (el.getAttribute('placeholder')) {
+      var ph = el.getAttribute('placeholder');
+      var phSel = '[placeholder="' + cssEscape(ph) + '"]';
+      if (isUnique(phSel)) locs.push({ strategy: 'CSS', value: phSel, note: 'placeholder' });
+    }
+    var txp = textXPath(el);
+    if (txp) locs.push({ strategy: 'XPATH', value: txp, note: 'text' });
+
+    var atxp = ancestorTextXPath(el);
+    if (atxp) locs.push({ strategy: 'XPATH', value: atxp, note: 'text' });
+
+    var cp = cssPath(el);
+    if (cp) locs.push({ strategy: 'CSS', value: cp, note: 'generated-path' });
+
+    var xp = xpathOf(el);
+    if (xp) locs.push({ strategy: 'XPATH', value: xp, note: 'generated-path' });
+
+    return locs;
+  }
+
+  function describe(el) {
+    return {
+      tag: el.tagName.toLowerCase(),
+      type: el.getAttribute('type') || '',
+      text: (el.innerText || el.textContent || '').trim().slice(0, 60),
+      placeholder: el.getAttribute('placeholder') || '',
+      name: el.name || '',
+      ariaLabel: el.getAttribute('aria-label') || ''
+    };
+  }
+
+  // ── iframe / Shadow DOM context detection ───────────────────────────────
+  // Detects whether the target element lives inside a shadow root or
+  // iframe and captures that context so the generated page object knows
+  // to switch frames before interacting with the element.
+  //
+  // frame_path: array of CSS selectors leading from the top page down to
+  //   the iframe(s) containing this element.
+  //   e.g. ["#main-frame", ".login-widget"] for a nested iframe.
+  //
+  // in_shadow_dom: true if the element is inside any shadow root.
+  //   The generated page object uses page.locator("css=...").shadow_dom()
+  //   or pierces the shadow root via >> notation.
+  function _detectFrameContext(el) {
+    var framePath = [];
+    var inShadow = false;
+
+    // Walk up the DOM checking for shadow roots
+    var node = el;
+    while (node && node !== document.documentElement) {
+      if (node.getRootNode && node.getRootNode() instanceof ShadowRoot) {
+        inShadow = true;
+        break;
+      }
+      node = node.parentElement;
+    }
+
+    // We're injected into a single frame - detect if this IS an iframe
+    // by checking if window !== window.top. If so, walk frames to build
+    // the path from the top page to this frame.
+    if (window !== window.top) {
+      try {
+        var allFrames = window.top.document.querySelectorAll('iframe, frame');
+        for (var fi = 0; fi < allFrames.length; fi++) {
+          var frm = allFrames[fi];
+          try {
+            if (frm.contentWindow === window) {
+              // Found our frame - build selector for it
+              var frmSel = '';
+              if (frm.id) frmSel = '#' + frm.id;
+              else if (frm.name) frmSel = '[name="' + frm.name + '"]';
+              else if (frm.src) frmSel = '[src*="' + frm.src.split('/').pop() + '"]';
+              else frmSel = 'iframe:nth-of-type(' + (fi + 1) + ')';
+              framePath.push(frmSel);
+              break;
+            }
+          } catch (_e) {}
+        }
+      } catch (_e) {}
+    }
+
+    return { frame_path: framePath, in_shadow_dom: inShadow };
+  }
+  // ── End iframe / Shadow DOM detection ───────────────────────────────────
+
+  function record(action, el, value, extra) {
+    var frameCtx = el ? _detectFrameContext(el) : { frame_path: [], in_shadow_dom: false };
+    var item = {
+      ts: Date.now(),
+      action: action,
+      value: value === undefined ? null : value,
+      element: describe(el),
+      locators: buildLocators(el),
+      url: window.location.href,
+      frame_path: frameCtx.frame_path,
+      in_shadow_dom: frameCtx.in_shadow_dom,
+    };
+    // Set B: copy any extra fields (e.g. picker, dateInput, date_source)
+    // onto the recorded item so date_picker.py can use them on the server.
+    if (extra) {
+      var keys = Object.keys(extra);
+      for (var k = 0; k < keys.length; k++) { item[keys[k]] = extra[keys[k]]; }
+    }
+    window.__recordedQueue.push(item);
+    persistQueue();
+  }
+
+  // ── Date fields & calendar pickers (Set B) ─────────────────────────────
+  // A calendar interaction (opening popup, clicking month/year/arrows/day)
+  // is collapsed server-side by recorder/date_picker.py into one "date"
+  // action that types directly into the underlying input. Here in the
+  // injector we:
+  //   1. Tag calendar clicks with picker:true + a dateInput reference so
+  //      the collapse function can drop them.
+  //   2. Detect when a date-like <input> gets a date value (via change or
+  //      the scanner below) and emit a single "date" action instead.
+  var _isTextInput = function(el) {
+    if (!el) return false;
+    var t = (el.type || '').toLowerCase();
+    return el.tagName === 'INPUT' && (t === '' || t === 'text' || t === 'tel' || t === 'date');
+  };
+  var _isDateInput = function(el) {
+    if (!el) return false;
+    var t = (el.type || '').toLowerCase();
+    var ph = (el.placeholder || '').toLowerCase();
+    return el.tagName === 'INPUT' && (
+      t === 'date' ||
+      /dd[\\/\-]mm[\\/\-]yyyy|yyyy[\\/\-]mm[\\/\-]dd|mm[\\/\-]dd[\\/\-]yyyy/.test(ph) ||
+      el.getAttribute('data-date-format')
+    );
+  };
+  var _inPicker = function(el) {
+    // Is `el` inside a calendar popup? Look for common calendar widget roles/classes.
+    var p = el;
+    while (p && p !== document.body) {
+      var role = (p.getAttribute && p.getAttribute('role') || '').toLowerCase();
+      var cls = (p.className && typeof p.className === 'string') ? p.className : '';
+      if (role === 'dialog' || role === 'grid' || role === 'listbox') return true;
+      if (/picker|datepicker|calendar|calender|dp-calendar/i.test(cls)) return true;
+      p = p.parentElement;
+    }
+    return false;
+  };
+  var _nearestDateInput = function(anchor) {
+    // Find the closest date-like input to `anchor` — used to identify the
+    // target field for a calendar popup.
+    if (!anchor) return null;
+    var form = anchor.closest('form') || anchor.parentElement;
+    if (!form) return null;
+    var inputs = form.querySelectorAll('input[type="date"], input[placeholder*="/"], input[placeholder*="-"]');
+    return inputs.length ? inputs[0] : null;
+  };
+  var _lastDateValue = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
+  var _lastPickerClick = null;
+
+  var _snapshotDates = function() {
+    document.querySelectorAll('input[type="date"], input[type="text"]').forEach(function(inp) {
+      if (_lastDateValue) _lastDateValue.set(inp, inp.value);
+    });
+  };
+  var _scanDates = function() {
+    document.querySelectorAll('input[type="date"], input[type="text"]').forEach(function(inp) {
+      if (!_isDateInput(inp)) return;
+      var prev = _lastDateValue ? (_lastDateValue.get(inp) || '') : '';
+      var curr = inp.value || '';
+      if (curr && curr !== prev && /\d/.test(curr)) {
+        if (_lastDateValue) _lastDateValue.set(inp, curr);
+        // Emit a date action; picker=true on the clicks before this will
+        // be used by collapse_date_pickers to drop the calendar clicks.
+        var dateInput = _lastPickerClick ? describe(_lastPickerClick) : describe(inp);
+        var locs = _lastPickerClick ? buildLocators(_lastPickerClick) : buildLocators(inp);
+        window.__recordedQueue.push({
+          ts: Date.now(),
+          action: 'date',
+          value: curr,
+          date_source: 'picker',
+          element: dateInput,
+          locators: locs,
+          url: window.location.href,
+        });
+        persistQueue();
+        _lastPickerClick = null;
+      }
+    });
+  };
+  // ── End date fields block ───────────────────────────────────────────────
+
+  document.addEventListener('click', function (e) {
+    var el = e.target;
+    if (!el || el === document || el === document.body || el.id === CAPTURE_MENU_HOST_ID) return;
+    // walk up to nearest clickable-ish element if the click landed on an inline text node wrapper.
+    // Includes radio/checkbox inputs and <label> so clicks on custom-styled radio/checkbox UIs
+    // (where the visible click target is a label or wrapping span, not the native input) still
+    // resolve to the actual underlying <input>.
+    var clickable = el.closest(
+      'button, a, [role="button"], input[type="submit"], input[type="button"], ' +
+      'input[type="radio"], input[type="checkbox"], label, [onclick]'
+    ) || el;
+
+    if (clickable.tagName && clickable.tagName.toLowerCase() === 'label') {
+      var forId = clickable.getAttribute('for');
+      var resolved = forId ? document.getElementById(forId) : clickable.querySelector('input, select');
+      if (resolved) clickable = resolved;
+    }
+
+    if (clickable.tagName === 'INPUT' && (clickable.type === 'radio' || clickable.type === 'checkbox')) {
+      // The browser applies the click's default action (actually flipping
+      // .checked) AFTER all capture/bubble listeners have run, so reading
+      // clickable.checked synchronously here would still see the OLD value.
+      // Deferring to the next tick lets us record the RESULTING checked
+      // state as this action's value - the generated replay step then uses
+      // that as an explicit target state (Playwright's check()/uncheck())
+      // instead of a blind click, so replay can never double-toggle it.
+      var target = clickable;
+      setTimeout(function () {
+        record('click', target, target.checked);
+      }, 0);
+      return;
+    }
+
+    // Set B: snapshot date input values before the click so scanDates can
+    // detect which field changed after a calendar popup interaction.
+    _snapshotDates();
+    if (_inPicker(clickable)) {
+      // This click is inside a calendar popup — tag it so collapse_date_pickers
+      // can drop it when the date action arrives.
+      _lastPickerClick = _lastPickerClick || _nearestDateInput(clickable) || clickable;
+      record('click', clickable, undefined, { picker: true });
+      // Schedule date scan at 150ms (after popup animates) and 700ms (slow pickers)
+      setTimeout(_scanDates, 150);
+      setTimeout(_scanDates, 700);
+      return;
+    }
+
+    record('click', clickable);
+  }, true);
+
+  document.addEventListener('change', function (e) {
+    var el = e.target;
+    if (!el || el.id === CAPTURE_MENU_HOST_ID) return;
+    var tag = el.tagName.toLowerCase();
+
+    // Set B: date-like input — emit a "date" action instead of "type".
+    if (tag === 'input' && _isDateInput(el) && el.value) {
+      var dateVal = el.value;
+      record('date', el, dateVal, { date_source: 'typed' });
+      if (_lastDateValue) _lastDateValue.set(el, dateVal);
+      return;
+    }
+
+    if (tag === 'select') {
+      var opt = el.options[el.selectedIndex];
+      record('select', el, opt ? opt.text.trim() : el.value);
+      return;
+    }
+    if (tag === 'input' && el.type === 'file') {
+      // el.value is ALWAYS a browser-fabricated "C:\fakepath\<name>" string
+      // for security - never the real absolute disk path, and there's no
+      // way to type/set a file input back to it on replay. BUT the File
+      // API DOES let JS read the chosen file's actual CONTENT (just not
+      // its path) - so instead of requiring a human to manually go find
+      // and copy the same file into a fixtures folder before every
+      // replay, capture the real bytes here, right now, while the file is
+      // actually available, and ship them along with this action.
+      // generator/build.py writes them straight into output/fixtures/<name>
+      // automatically - by the time replay runs, the exact file used at
+      // recording time is already sitting there, whatever its name was.
+      var file = el.files && el.files.length ? el.files[0] : null;
+      var chosenName = file ? file.name : '';
+      var MAX_INLINE_BYTES = 4 * 1024 * 1024; // ~4MB - stays well under the
+      // ~5-10MB per-origin sessionStorage quota this queue is mirrored
+      // into (see persistQueue), leaving room for other queued actions.
+      if (!file || file.size > MAX_INLINE_BYTES) {
+        // Too large to safely inline (or no file object available for some
+        // reason) - fall back to name-only capture; upload_file() at
+        // replay time will still work fine if a file with this name is
+        // placed in fixtures/ manually.
+        record('file_upload', el, chosenName);
+        return;
+      }
+      var reader = new FileReader();
+      reader.onload = function () {
+        // reader.result is a "data:<mime>;base64,<data>" URL - strip the
+        // prefix down to just the base64 payload.
+        var dataUrl = reader.result || '';
+        var comma = dataUrl.indexOf(',');
+        var base64 = comma >= 0 ? dataUrl.slice(comma + 1) : '';
+        window.__recordedQueue.push({
+          ts: Date.now(),
+          action: 'file_upload',
+          value: chosenName,
+          fileDataBase64: base64,
+          element: describe(el),
+          locators: buildLocators(el),
+          url: window.location.href
+        });
+        persistQueue();
+      };
+      reader.onerror = function () {
+        // Reading failed for some reason - still record the name so
+        // upload_file()'s manual-fallback path remains available.
+        record('file_upload', el, chosenName);
+      };
+      reader.readAsDataURL(file);
+      return;
+    }
+    if (tag === 'input' && (el.type === 'radio' || el.type === 'checkbox')) {
+      // handled by the click listener above (clicking IS the interaction for these;
+      // recording it again here would create a duplicate/redundant step)
+      return;
+    }
+    if (tag === 'input' || tag === 'textarea') {
+      record('type', el, el.value);
+    }
+  }, true);
+
+  // ── Hover / mouseover detection (Fix 5-6) ─────────────────────────────
+  // Records hover actions ONLY when hovering causes a DOM change — i.e.
+  // a submenu or dropdown becomes visible. Raw mouseover fires constantly
+  // as the mouse moves so we must debounce and only emit a hover step
+  // when the DOM actually changed within 300ms of the event.
+  //
+  // This is critical for SBI-style navigation menus where the user must:
+  //   hover "Corporate Banking" → submenu expands
+  //   hover "Trade Finance"     → sub-submenu expands
+  //   click "Import Trade Finance"
+  // Without hover recording only the final click is captured, which fails
+  // at replay because the element is still hidden inside a collapsed menu.
+  var _lastHoverEl = null;
+  var _lastHoverSnapshot = 0;
+  var _hoverDebounceMs = 300;
+  var _hoverTimer = null;
+
+  function _domVisibleCount() {
+    // Count visible elements — also checks computed style to catch
+    // pure CSS :hover menus (ca.statebank nav pattern) that never
+    // set aria-expanded or inline display styles.
+    var count = document.querySelectorAll(
+      '[style*="display: block"],[style*="display:block"],' +
+      '[style*="visibility: visible"],[class*="open"],[class*="active"],' +
+      '[class*="expanded"],[class*="show"],[aria-expanded="true"]'
+    ).length;
+    var navItems = document.querySelectorAll(
+      'nav li ul, nav li ol, .dropdown-menu, .sub-menu,' +
+      '[class*="submenu"],[class*="sub-menu"],[class*="dropdown"]'
+    );
+    for (var ni = 0; ni < navItems.length; ni++) {
+      var cs = window.getComputedStyle(navItems[ni]);
+      if (cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0') {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  function _hasVisibleSubmenu(el) {
+    // Detect if a direct child submenu became visible after hovering.
+    // Catches CSS :hover menus where no aria or class change happens.
+    if (!el) return false;
+    var children = el.querySelectorAll(
+      'ul, ol, [class*="sub"], [class*="drop"], [class*="child"], [class*="menu"]'
+    );
+    for (var ci = 0; ci < children.length; ci++) {
+      var cs = window.getComputedStyle(children[ci]);
+      if (cs.display !== 'none' && cs.visibility !== 'hidden' &&
+          parseFloat(cs.opacity || '1') > 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  document.addEventListener('mouseover', function(e) {
+    var el = e.target;
+    if (!el || el === document.body || el === document) return;
+    // Walk up to nearest element with text, id, or aria-label
+    var walked = el;
+    while (walked && walked !== document.body &&
+           !walked.id && !walked.getAttribute('aria-label') &&
+           !(walked.textContent || '').trim() && walked.parentElement) {
+      walked = walked.parentElement;
+    }
+    el = walked;
+    if (!el || el === _lastHoverEl) return;
+    var text = (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 80);
+    if (!text || text.length < 2) return;
+    // Permissive nav check — catches navbar, topnav, main-nav, header etc.
+    var hasMenu = el.getAttribute('aria-haspopup') ||
+                  el.closest(
+                    'nav, header, [role="navigation"], [role="menubar"],' +
+                    '[class*="nav"], [class*="menu"], [class*="header"],' +
+                    '[class*="toolbar"], [class*="topbar"], [class*="navbar"]'
+                  );
+    if (!hasMenu) return;
+
+    _lastHoverEl = el;
+    var baselineCount = _domVisibleCount();
+
+    if (_hoverTimer) clearTimeout(_hoverTimer);
+    _hoverTimer = setTimeout(function() {
+      var newCount = _domVisibleCount();
+      // Record if DOM changed OR child submenu became visible (CSS :hover)
+      if (newCount > baselineCount || _hasVisibleSubmenu(el)) {
+        record('hover', el, text);
+        // Reset so next nav item hover is also captured (cascading menus)
+        _lastHoverEl = null;
+      }
+    }, _hoverDebounceMs);
+  }, true);
+  // ── End hover detection ────────────────────────────────────────────────
+
+  // Capture keyboard-driven actions (Enter to submit, Backspace to clear/edit,
+  // Arrow Up/Down to move through suggestion lists, Ctrl combos, function keys,
+  // etc.) separately from typed text, since these are user-initiated key presses
+  // rather than a change to the field's value.
+  //
+  // CTRL+C / CTRL+V / CTRL+X are deliberately NOT recorded here - they're
+  // captured with richer data (the actual copied/pasted text and the source/
+  // target element) by the dedicated copy/cut/paste listeners below instead,
+  // so recording them again here would just be a redundant, value-less entry.
+  var SIMPLE_KEY_MAP = {
+    'Enter': 'ENTER',
+    'Backspace': 'BACKSPACE',
+    'Escape': 'ESCAPE',
+    'Delete': 'DELETE',
+    ' ': 'SPACE',
+    'Spacebar': 'SPACE',
+    'ArrowUp': 'ARROW_UP',
+    'ArrowDown': 'ARROW_DOWN',
+    'ArrowLeft': 'ARROW_LEFT',
+    'ArrowRight': 'ARROW_RIGHT',
+    'Home': 'HOME',
+    'End': 'END'
+  };
+  for (var _f = 1; _f <= 12; _f++) SIMPLE_KEY_MAP['F' + _f] = 'F' + _f;
+
+  // Ctrl/Cmd combos recorded generically as a single keypress action (so
+  // playback can literally re-press them via Playwright). 'c'/'v'/'x' are
+  // excluded here on purpose - see note above.
+  var CTRL_COMBO_MAP = {
+    'a': 'CTRL+A',
+    'p': 'CTRL+P',
+    's': 'CTRL+S'
+  };
+
+  function keyComboLabel(e) {
+    var key = e.key;
+    var ctrlLike = e.ctrlKey || e.metaKey;
+
+    if (ctrlLike && !e.altKey) {
+      var combo = CTRL_COMBO_MAP[(key || '').toLowerCase()];
+      if (combo) return combo;
+      if (['c', 'v', 'x'].indexOf((key || '').toLowerCase()) !== -1) return null;
+    }
+    if (e.shiftKey && key === 'Tab') return 'SHIFT+TAB';
+    if (!ctrlLike && !e.altKey) {
+      if (key === 'Tab') return 'TAB';
+      return SIMPLE_KEY_MAP[key] || null;
+    }
+    return null;
+  }
+
+  document.addEventListener('keydown', function (e) {
+    var el = e.target;
+    if (!el || el.id === CAPTURE_MENU_HOST_ID) return;
+    var label = keyComboLabel(e);
+    if (label) {
+      record('keypress', el, label);
+    }
+  }, true);
+
+  // Real-time copy/cut/paste capture: records not just THAT a copy/paste
+  // happened, but the actual text value and the source (copy/cut) or target
+  // (paste) element, so the variable Capture -> Store -> Reuse pipeline (see
+  // recorder/variable_capture.py) can later recognize "this pasted value is
+  // the same one copied earlier from that generated-username field" and turn
+  // it into a {{username}}-style placeholder instead of baking in the
+  // literal string.
+  function selectedTextFrom(el) {
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') &&
+        typeof el.selectionStart === 'number' && el.selectionStart !== el.selectionEnd) {
+      return el.value.substring(el.selectionStart, el.selectionEnd);
+    }
+    var sel = window.getSelection();
+    return sel ? sel.toString() : '';
+  }
+
+  function recordCopyLike() {
+    var el = document.activeElement;
+    if (el && el.id === CAPTURE_MENU_HOST_ID) return;
+    var text = selectedTextFrom(el);
+    if (!text) return;
+    record('copy', (el instanceof Element) ? el : document.body, text);
+  }
+
+  document.addEventListener('copy', recordCopyLike, true);
+  document.addEventListener('cut', recordCopyLike, true);
+
+  document.addEventListener('paste', function (e) {
+    var el = e.target;
+    if (el && el.id === CAPTURE_MENU_HOST_ID) return;
+    var text = '';
+    try {
+      text = (e.clipboardData || window.clipboardData).getData('text');
+    } catch (err) { /* clipboard not readable here - resolved at build/runtime instead */ }
+    record('paste', el, text);
+  }, true);
+
+  // --- Right-click capture: two related but distinct mechanisms behind
+  // one gesture -
+  //
+  //   "text" - reads the element's DISPLAYED TEXT DIRECTLY (input value,
+  //   or innerText/textContent for read-only labels/divs/spans) - no
+  //   image processing at all, resolved instantly, entirely in this
+  //   script. This is what most values actually need: a plain-text field
+  //   or label that the person just never happened to Ctrl+C during
+  //   recording (the existing copy/paste listeners above only fire on a
+  //   REAL clipboard event - looking at a value and typing the same thing
+  //   into another field, with no copy gesture at all, leaves nothing for
+  //   them to correlate). Reuses the EXISTING "copy" action type end to
+  //   end (see recorder.py's handling below, which just relabels the
+  //   request rather than reprocessing it) - a value captured this way is
+  //   stored, correlated, and re-read live at replay through the exact
+  //   same {{var}} pipeline a real Ctrl+C copy already uses; nothing
+  //   downstream needs to know or care which gesture produced it.
+  //
+  //   "ocr" - for values rendered as an IMAGE or CANVAS (a scanned
+  //   reference number, a canvas-drawn amount) that have no real
+  //   selectable/readable DOM text at all - see recorder.py's
+  //   "ocr_capture_request" handling, which screenshots the element and
+  //   runs OCR on it instead.
+  //
+  // Uses a custom, IN-PAGE overlay (showCaptureMenu below), rendered
+  // inside a Shadow DOM for style isolation from the target page's own
+  // CSS - NOT window.prompt()/window.confirm(). A previous version of
+  // this used native dialogs instead, but that turned out to be a dead
+  // end: once Playwright (or any CDP-based automation) is attached to a
+  // page, it ALWAYS intercepts native alert/confirm/prompt dialogs -
+  // recorder.py's _on_dialog has to auto-accept EVERY dialog (so the
+  // TARGET application's own alerts/confirms don't hang the recording),
+  // and it has no way to tell "the target app's dialog" apart from "this
+  // recorder's own menu asking a question". A native dialog here was
+  // therefore auto-dismissed (using its own default value) before a
+  // human could ever actually answer it - it would visibly flash and
+  // disappear instantly, and the "ocr" choice was never reachable at all
+  // since the FIRST prompt always auto-resolved to its default ("text")
+  // before the person could type anything.
+  //
+  // An EVEN EARLIER attempt (before native dialogs were tried as a
+  // workaround) already used an in-page menu, and was abandoned for a
+  // different reason: its "click outside the menu closes it" listener
+  // was registered SYNCHRONOUSLY inside the contextmenu handler, so it
+  // could catch a trailing mouse event from the SAME right-click gesture
+  // that opened the menu, closing it before it was ever visible. Fixed
+  // here by deferring that listener's registration to the next
+  // event-loop tick (setTimeout(fn, 0) - see showCaptureMenu) so it can
+  // only ever react to a LATER, separate interaction - combined with
+  // Shadow DOM's automatic event retargeting (a click anywhere INSIDE
+  // the menu reports e.target as the shadow HOST when observed from a
+  // document-level listener, never the page's own elements), so "was
+  // this click inside or outside the menu" needs no manual
+  // stopPropagation() bookkeeping in every button handler either.
+  //
+  // Deliberately intercepts EVERY right-click on the page while recording
+  // (not just on <img>/<canvas>/inputs) and replaces the native context
+  // menu with this - many apps render meaningful text via SVG,
+  // background-image, or other non-<img> elements too, and there's no
+  // reliable way to detect "this element visually contains text" from the
+  // DOM alone. The trade-off: the browser's own right-click menu
+  // (Inspect, "Save image as", etc.) isn't available during recording,
+  // and every right-click now shows this menu (click Cancel, Escape, or
+  // anywhere outside it, for a normal right-click you don't want captured).
+  function recordTextCaptureRequest(el, varName) {
+    var text = '';
+    if ('value' in el && el.value) {
+      text = el.value;
+    } else {
+      text = (el.innerText || el.textContent || '');
+    }
+    text = text.trim();
+    // Reuses the SAME "copy" action shape a real Ctrl+C produces
+    // (recordCopyLike above) - captured_as is the one addition, carrying
+    // the user's explicitly CHOSEN name through instead of leaving it to
+    // be auto-derived from the element the way an incidental real copy
+    // event's name is (see recorder/variable_capture.py's
+    // derive_variable_name) - the person picked this name on purpose here,
+    // so it should win.
+    window.__recordedQueue.push({
+      ts: Date.now(),
+      action: 'copy',
+      value: text,
+      captured_as: varName,
+      element: describe(el),
+      locators: buildLocators(el),
+      url: window.location.href
+    });
+    persistQueue();
+    // Best-effort convenience so the person recording can genuinely Ctrl+V
+    // this into the next field instead of retyping it by hand - done
+    // directly here in JS (unlike the OCR path below, which has to do this
+    // from Python after its screenshot/OCR round trip) since the value is
+    // already known immediately, with no round trip needed at all.
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        // writeText() returns a Promise that can REJECT asynchronously
+        // (e.g. clipboard-write permission denied, common under headless/
+        // automated contexts) - the try/catch here only guards the
+        // synchronous call itself, so the rejection needs its own .catch()
+        // or it surfaces as an unhandled promise rejection.
+        navigator.clipboard.writeText(text).catch(function () { /* non-fatal - the captured value is already stored regardless */ });
+      }
+    } catch (err) { /* non-fatal - the captured value is already stored regardless */ }
+  }
+
+  function recordOcrCaptureRequest(el, varName) {
+    window.__recordedQueue.push({
+      ts: Date.now(),
+      action: 'ocr_capture_request',
+      value: null,
+      requested_var_name: varName,
+      element: describe(el),
+      locators: buildLocators(el),
+      url: window.location.href
+    });
+    persistQueue();
+  }
+
+  // Small transient in-page notification, replacing window.alert() (which
+  // has the exact same native-dialog-interception problem described in
+  // the big comment above) for the "captured as {{name}}" confirmation
+  // after a successful capture. Auto-dismisses; never blocks anything.
+  function showToast(message) {
+    var host = document.createElement('div');
+    host.style.cssText = 'all:initial; position:fixed; left:0; right:0; bottom:24px; ' +
+      'z-index:2147483647; display:flex; justify-content:center; pointer-events:none;';
+    document.documentElement.appendChild(host);
+    var shadow = host.attachShadow({ mode: 'open' });
+    shadow.innerHTML =
+      '<style>' +
+      '.toast { font: 13px/1.4 -apple-system, Segoe UI, Arial, sans-serif; background:#163C8C; ' +
+      'color:#fff; padding:10px 16px; border-radius:6px; box-shadow:0 4px 16px rgba(0,0,0,0.35); ' +
+      'max-width:420px; text-align:center; opacity:0; transform:translateY(8px); ' +
+      'transition:opacity .15s ease, transform .15s ease; }' +
+      '.toast.show { opacity:1; transform:translateY(0); }' +
+      '</style>' +
+      '<div class="toast" id="t"></div>';
+    var toastEl = shadow.getElementById('t');
+    toastEl.textContent = message;  // textContent, not innerHTML - message may contain recorded values verbatim
+    requestAnimationFrame(function () { toastEl.className = 'toast show'; });
+    setTimeout(function () {
+      toastEl.className = 'toast';
+      setTimeout(function () { host.remove(); }, 200);
+    }, 2600);
+  }
+
+  // The in-page replacement for the old window.prompt() chain - see the
+  // big comment above recordTextCaptureRequest for the full "why" behind
+  // both the Shadow DOM isolation and the deferred outside-click listener.
+  function showCaptureMenu(el, x, y) {
+    var existing = document.getElementById(CAPTURE_MENU_HOST_ID);
+    if (existing) existing.remove();
+
+    var host = document.createElement('div');
+    host.id = CAPTURE_MENU_HOST_ID;
+    host.style.cssText = 'all:initial; position:fixed; left:' + x + 'px; top:' + y + 'px; z-index:2147483647;';
+    document.documentElement.appendChild(host);
+
+    var shadow = host.attachShadow({ mode: 'open' });
+    shadow.innerHTML =
+      '<style>' +
+      '.menu { font: 13px/1.4 -apple-system, Segoe UI, Arial, sans-serif; background:#fff; ' +
+      'color:#0B1E3D; border:1px solid #D8E1EF; border-radius:8px; ' +
+      'box-shadow:0 8px 28px rgba(11,30,61,0.25); width:280px; padding:12px; box-sizing:border-box; }' +
+      '.menu h4 { margin:0 0 8px; font-size:13px; font-weight:600; }' +
+      '.menu .modes { display:flex; gap:6px; margin-bottom:8px; }' +
+      '.menu button { font:inherit; cursor:pointer; border-radius:5px; border:1px solid #D8E1EF; ' +
+      'background:#EAF1FA; color:#163C8C; padding:6px 10px; }' +
+      '.menu button:hover { filter:brightness(0.96); }' +
+      '.menu button.chosen { background:#163C8C; color:#fff; border-color:#163C8C; }' +
+      '.menu button.primary { background:#163C8C; color:#fff; border-color:#163C8C; }' +
+      '.menu input { font:inherit; width:100%; box-sizing:border-box; padding:6px 8px; ' +
+      'border:1px solid #D8E1EF; border-radius:5px; margin:8px 0; }' +
+      '.menu .row { display:flex; gap:6px; justify-content:flex-end; }' +
+      '.menu .hint { color:#5B6B85; font-size:11px; margin-top:-4px; margin-bottom:8px; }' +
+      '.hidden { display:none; }' +
+      '</style>' +
+      '<div class="menu">' +
+      '  <h4>Capture a value from this element</h4>' +
+      '  <div class="modes">' +
+      '    <button type="button" id="modeText">Capture Text</button>' +
+      '    <button type="button" id="modeOcr">Capture via OCR</button>' +
+      '  </div>' +
+      '  <div id="nameSection" class="hidden">' +
+      '    <input type="text" id="varName" value="captured_value" placeholder="variable_name" />' +
+      '    <div class="hint">Letters, numbers, underscore only.</div>' +
+      '    <div class="row">' +
+      '      <button type="button" id="cancelBtn">Cancel</button>' +
+      '      <button type="button" id="confirmBtn" class="primary">Capture</button>' +
+      '    </div>' +
+      '  </div>' +
+      '</div>';
+
+    // Keep the menu fully on screen regardless of where the right-click
+    // landed - a click near the right/bottom edge would otherwise render
+    // it partially or fully off-viewport.
+    requestAnimationFrame(function () {
+      var rect = host.getBoundingClientRect();
+      if (rect.right > window.innerWidth) host.style.left = Math.max(8, window.innerWidth - rect.width - 8) + 'px';
+      if (rect.bottom > window.innerHeight) host.style.top = Math.max(8, window.innerHeight - rect.height - 8) + 'px';
+    });
+
+    var modeTextBtn = shadow.getElementById('modeText');
+    var modeOcrBtn = shadow.getElementById('modeOcr');
+    var nameSection = shadow.getElementById('nameSection');
+    var nameInput = shadow.getElementById('varName');
+    var confirmBtn = shadow.getElementById('confirmBtn');
+    var cancelBtn = shadow.getElementById('cancelBtn');
+    var chosenMode = null;
+
+    function selectMode(mode, btn) {
+      chosenMode = mode;
+      modeTextBtn.classList.remove('chosen');
+      modeOcrBtn.classList.remove('chosen');
+      btn.classList.add('chosen');
+      nameSection.classList.remove('hidden');
+      nameInput.focus();
+      nameInput.select();
+    }
+    modeTextBtn.addEventListener('click', function () { selectMode('text', modeTextBtn); });
+    modeOcrBtn.addEventListener('click', function () { selectMode('ocr', modeOcrBtn); });
+
+    function closeMenu() {
+      host.remove();
+      document.removeEventListener('mousedown', onOutsideMouseDown, true);
+      document.removeEventListener('keydown', onKeyDown, true);
+    }
+    cancelBtn.addEventListener('click', closeMenu);
+
+    function confirmCapture() {
+      if (!chosenMode) return;
+      var varName = (nameInput.value || '').trim().replace(/[^a-zA-Z0-9_]/g, '_');
+      if (!varName) { nameInput.focus(); return; }
+      closeMenu();
+      if (chosenMode === 'ocr') {
+        recordOcrCaptureRequest(el, varName);
+        showToast('Marked for OCR capture as {{' + varName + '}} - re-read live every time this test runs.');
+      } else {
+        recordTextCaptureRequest(el, varName);
+        showToast('Marked "{{' + varName + '}}" for live text capture - re-read every time this test runs.');
+      }
+    }
+    confirmBtn.addEventListener('click', confirmCapture);
+    nameInput.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); confirmCapture(); }
+      else if (e.key === 'Escape') { closeMenu(); }
+    });
+
+    // Shadow DOM automatically RETARGETS events that cross the shadow
+    // boundary: from a document-level listener's point of view, ANY click
+    // inside this menu reports e.target as `host` itself (never the real
+    // inner button/input) - so this one check correctly distinguishes
+    // "inside the menu" from "outside it" with no manual
+    // stopPropagation() needed in any of the handlers above.
+    function onOutsideMouseDown(e) {
+      if (e.target !== host) closeMenu();
+    }
+    function onKeyDown(e) {
+      if (e.key === 'Escape') closeMenu();
+    }
+    // Deferred to the next event-loop tick - see the big comment above
+    // recordTextCaptureRequest for exactly why this can't be attached
+    // synchronously here (it would catch the tail of the SAME right-click
+    // gesture that's opening this menu).
+    setTimeout(function () {
+      document.addEventListener('mousedown', onOutsideMouseDown, true);
+      document.addEventListener('keydown', onKeyDown, true);
+    }, 0);
+  }
+
+  document.addEventListener('contextmenu', function (e) {
+    var el = e.target;
+    if (!el || el === document || el === document.body) return;
+    e.preventDefault();
+    if (el.id === CAPTURE_MENU_HOST_ID) return;  // right-clicking the menu itself - not a real capture target
+    showCaptureMenu(el, e.clientX, e.clientY);
+  }, true);
+
+  window.__flushActions = function () {
+    var q = window.__recordedQueue;
+    window.__recordedQueue = [];
+    persistQueue();
+    return q;
+  };
+
+  // Exposed so the Python side (recorder/recorder.py) can compute a stable
+  // CSS path for an <iframe>/<frame> DOM ELEMENT from *inside the PARENT
+  // frame's context* (Playwright's Frame.frame_element() returns that
+  // element handle, but it has to be evaluated against the parent frame,
+  // not the iframe's own document) - this is how mainframe/iframe support
+  // builds a "frame_path" (a chain of selectors from the top page down to
+  // the frame an action happened in) without needing any new JS of its
+  // own; it just reuses the same cssPath() this file already uses for
+  // in-page elements. See Recorder._frame_path_for.
+  window.__recorderCssPathFor = cssPath;
+})();
