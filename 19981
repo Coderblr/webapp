@@ -1,478 +1,191 @@
-# -*- coding: utf-8 -*-
 """
-Auto-generated behave step definitions.
-Regenerating from a new recording will overwrite this file - customize
-downstream (e.g. add real assertions to the Then step) in a copy if needed.
+The agent's single persistent outbound connection to the backend (spec
+section 8) - the agent always connects TO the server; the server never
+needs an inbound connection to the user's PC (works fine through NAT/
+corporate firewalls with no port-forwarding, since it's just an outgoing
+WSS connection like any browser tab makes).
+
+State machine (spec section 8): CONNECTING -> CONNECTED -> (on drop)
+RECONNECTING -> CONNECTING -> ... with exponential backoff, or
+DISCONNECTED once stop() is called deliberately (app shutdown). BUSY is a
+local-agent-level state (see command_handler.py's `busy` flag) surfaced
+separately, not a transport-level state - a busy agent stays CONNECTED,
+it just declines new work.
 """
-import logging
-import os
+from __future__ import annotations
+import asyncio
+import json
+from enum import Enum
+from typing import Awaitable, Callable, Optional
+from urllib.parse import urlencode
 
-from behave import given, when, then
+import websockets
+from websockets.exceptions import ConnectionClosed
 
-logger = logging.getLogger(__name__)
+from local_agent.logger import get_logger
 
-# Set CONTINUE_ON_STEP_FAILURE=false to restore the old behavior (a failed
-# step stops the whole scenario, everything after it shows "Undefined") -
-# default is to continue, logging clearly why each step that failed did,
-# so one flaky/changed field doesn't kill an otherwise-working flow. See
-# _run_step below.
-_CONTINUE_ON_FAILURE = os.getenv("CONTINUE_ON_STEP_FAILURE", "true").lower() != "false"
+logger = get_logger("server_connection")
 
 
-def _run_step(context, description, fn, element_name=None, default=None):
-    """
-    Runs `fn()` (a zero-arg callable wrapping one step's real action/
-    assertion) and returns (ok, value). On success, ok=True and value is
-    whatever fn() returned. On any exception, ok=False, value=`default`,
-    and the failure is recorded on context.step_failures (written out in
-    after_all as output/reports/step_failures.json - see
-    runner/environment.py, local_agent/agent_environment.py) instead of
-    being re-raised.
+class AgentState(str, Enum):
+    CONNECTING = "CONNECTING"
+    CONNECTED = "CONNECTED"
+    RECONNECTING = "RECONNECTING"
+    DISCONNECTED = "DISCONNECTED"
+    ERROR = "ERROR"
 
-    Why not just let it raise: Behave stops a SCENARIO at its first
-    failed step, marking everything after it "Undefined" (never
-    attempted) - there's no supported "continue after failed step" mode
-    in Behave itself. Catching it HERE, before Behave ever sees it, means
-    this step reports "passed" at the framework level and Behave moves on
-    to the next one normally - runner/run_recording.py's _extract_steps()
-    then overrides that back to "Failed" (with the real reason) using
-    context.step_failures, so the report is still accurate even though
-    Behave's own per-step status isn't.
-    """
-    if not _CONTINUE_ON_FAILURE:
-        return True, fn()
-    try:
-        return True, fn()
-    except Exception as e:
-        context.step_failures.append({
-            "step_index": context.step_counter + 1,  # same alignment as context.locator_log - see environment.py's after_step
-            "step_name": description,
-            "element_name": element_name,
-            "error_type": type(e).__name__,
-            "error": str(e),
+
+class ConnectionManager:
+    def __init__(
+        self,
+        ws_url: str,
+        token: str,
+        agent_id: str,
+        hostname: str,
+        version: str,
+        on_command: Callable[[dict], Awaitable[Optional[dict]]],
+        initial_backoff: float = 1.0,
+        max_backoff: float = 30.0,
+    ):
+        self.ws_url = ws_url
+        self.token = token
+        self.agent_id = agent_id
+        self.hostname = hostname
+        self.version = version
+        self.on_command = on_command  # async callable(message) -> response dict (with request_id) or None
+        self.initial_backoff = initial_backoff
+        self.max_backoff = max_backoff
+
+        self.state = AgentState.DISCONNECTED
+        self._stop = False
+
+    def _url(self) -> str:
+        params = urlencode({
+            "token": self.token, "agent_id": self.agent_id,
+            "hostname": self.hostname, "version": self.version,
         })
-        logger.warning(f"Step failed but continuing: {description} - {type(e).__name__}: {e}")
-        return False, default
+        return f"{self.ws_url}/api/agent/ws?{params}"
 
+    async def run_forever(self) -> None:
+        """The agent's main loop for its whole lifetime - connect, serve
+        commands until the connection drops for any reason, then
+        reconnect with exponential backoff, forever, until stop() is
+        called (app shutdown - see client.py)."""
+        backoff = self.initial_backoff
+        while not self._stop:
+            self.state = AgentState.CONNECTING
+            logger.info(f"Connecting to {self.ws_url} (agent_id={self.agent_id})...")
+            try:
+                async with websockets.connect(self._url(), open_timeout=15) as ws:
+                    self.state = AgentState.CONNECTED
+                    logger.info("Connected to central server.")
+                    backoff = self.initial_backoff  # reset only after a successful connection
+                    heartbeat_task = asyncio.ensure_future(self._heartbeat_loop(ws))
+                    try:
+                        await self._receive_loop(ws)
+                    finally:
+                        heartbeat_task.cancel()
+            except ConnectionClosed as e:
+                logger.warning(f"Connection closed by server: code={e.code} reason={e.reason!r}")
+                self.state = AgentState.ERROR
+                if e.code == 4401:
+                    logger.error("Authentication rejected - the stored token may be expired or revoked. "
+                                 "Restart the desktop app to log in again.")
+            except (OSError, asyncio.TimeoutError) as e:
+                logger.warning(f"Could not reach the central server: {e}")
+                self.state = AgentState.ERROR
+            except Exception:
+                logger.exception("Unexpected error in connection loop")
+                self.state = AgentState.ERROR
 
-@given('the user opens "{url}"')
-def step_open(context, url):
-    # Deliberately NOT routed through _run_step - nothing meaningful can
-    # continue without a page having actually loaded, so a navigation
-    # failure should still stop the scenario outright.
-    context.raw_page.goto(url)
+            if self._stop:
+                break
+            self.state = AgentState.RECONNECTING
+            logger.info(f"Reconnecting in {backoff:.1f}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, self.max_backoff)
 
+        self.state = AgentState.DISCONNECTED
+        logger.info("Connection manager stopped.")
 
-def _sync_browser_pages(context, previous_pages=None):
-    """
-    Detect tabs/windows opened by the previous browser action.
+    async def _receive_loop(self, ws) -> None:
+        # Each command is dispatched as a background asyncio task so the
+        # loop IMMEDIATELY reads the next WebSocket message without waiting
+        # for the previous command to finish.
+        #
+        # Without this, START_TEST blocks the loop for the entire test
+        # duration (minutes). STOP_TEST sits in the WebSocket buffer and
+        # is never read until START_TEST finishes — making the stop button
+        # completely ineffective.
+        #
+        # With this change:
+        #   1. START_TEST message received → task created → loop reads next msg
+        #   2. STOP_TEST message received → task created → runs immediately
+        #   3. _stop_test() kills the Behave process inside START_TEST's thread
+        #   4. START_TEST thread exits → its task sends the (interrupted) response
+        async for raw in ws:
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                logger.warning(f"Ignoring malformed (non-JSON) message from server: {raw[:200]!r}")
+                continue
+            asyncio.ensure_future(self._dispatch(ws, message))
 
-    Uses Playwright's BrowserContext.pages rather than Windows focus or the
-    physical mouse cursor. A newly detected page becomes the active page.
-    """
-    try:
-        previous_pages = list(previous_pages or [])
-        current_pages = list(context.browser_session.context.pages)
-
-        for page in current_pages:
-            if page not in context.recorder_pages:
-                try:
-                    page.wait_for_load_state(
-                        "domcontentloaded",
-                        timeout=5000,
-                    )
-                except Exception:
-                    pass
-
-                context.recorder_pages.append(page)
-                context.page.switch_page(page)
-
-                try:
-                    page.bring_to_front()
-                except Exception:
-                    pass
-
-                print(
-                    f"[browser] Detected new tab/window "
-                    f"#{len(context.recorder_pages) - 1}"
-                )
-
-        return current_pages
-
-    except Exception as exc:
-        print(f"[browser] Page synchronization warning: {exc}")
-        return previous_pages
-
-
-{% macro explicit_wait(step) %}
-    # Recording showed this step's target took ~{{ step.wait_seconds }}s to become ready.
-    # No sleep() - wait_ready() polls every known locator strategy and continues
-    # the moment one resolves, up to this measured timeout, so a fast response
-    # doesn't sit around waiting.
-    context.page.wait_ready("{{ step.element_name }}", timeout={{ step.wait_seconds }})
-{%- endmacro %}
-{% macro maybe_switch(step) %}
-{% if step.switch_to_page %}
-    # Recorded on browser tab/window #{{ step.page_index }} - switch to it
-    # first (see generator/build.py's page_index/switch_to_page and
-    # RecordedPage.switch_page). Covers both continuing in a popup/new tab
-    # that just opened and coming back to an earlier tab/window.
-    context.page.switch_page(context.recorder_pages[{{ step.page_index }}])
-{% endif %}
-{%- endmacro %}
-{% macro new_page_wrapper(step) %}
-    # Snapshot the BrowserContext pages before the action. This also handles
-    # UiPath-imported flows where the Excel file does not explicitly contain
-    # a "new_window" event.
-    _pages_before = list(context.browser_session.context.pages)
-{% if step.opens_new_page %}
-    # When the generator KNOWS this action opens a new page, use expect_page()
-    # around the exact triggering action.
-    with context.browser_session.context.expect_page() as _new_page_info:
-{{ caller() | indent(4, true) }}
-    if _ok:
-        _new_pg = _new_page_info.value
+    async def _dispatch(self, ws, message) -> None:
+        """Run one command and send its response as a background task.
+        Errors are logged but never bubble up to crash the receive loop."""
         try:
-            _new_pg.wait_for_load_state("domcontentloaded", timeout=10000)
-        except Exception:
-            pass
-        if _new_pg not in context.recorder_pages:
-            context.recorder_pages.append(_new_pg)
-        context.page.switch_page(_new_pg)
-        _sync_browser_pages(context, _pages_before)
-{% else %}
-{{ caller() }}
-    if _ok:
-        # For imported UiPath actions, detect target="_blank", window.open(),
-        # document viewers and other popup/new-tab behavior automatically.
-        _sync_browser_pages(context, _pages_before)
-{% endif %}
-{%- endmacro %}
-{% for step in steps -%}
-{%- if step.action == "click" %}
-@when('the user clicks "{{ step.element_name }}"')
-def step_click_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{% call new_page_wrapper(step) %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.click("{{ step.element_name }}")
-    _ok, _ = _run_step(context, 'click "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
+            response = await self.on_command(message)
+            if response is not None:
+                await ws.send(json.dumps(response))
+        except Exception as e:
+            logger.warning(f"[agent] Error dispatching command {message.get('type')!r}: {e}")
 
-{% elif step.action == "click_optional" %}
-@when('the user clicks "{{ step.element_name }}" if it appears')
-def step_click_optional_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-    # Optional step (imported from a UiPath CLICK-CONDITIONAL) - clicks
-    # if this appears, otherwise moves on without failing the scenario.
-    # See BasePage.click_if_present. Wrapped in _run_step (not just
-    # relying on click_if_present's own non-throwing design) because
-    # explicit_wait's wait_ready() call - now INSIDE _do(), see below -
-    # would otherwise still raise and stop the scenario if the element
-    # never appears at all, defeating this step's whole "optional" point.
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.click_if_present("{{ step.element_name }}")
-    _run_step(context, 'click "{{ step.element_name }}" if present', _do, element_name="{{ step.element_name }}")
+    async def _heartbeat_loop(self, ws, interval: float = 15.0) -> None:
+        """Keeps the connection alive through corporate proxies and ensures
+        the server's last_seen stays current.
 
-{% elif step.action == "toggle" %}
-{% if step.checked_value %}
-@when('the user checks "{{ step.element_name }}"')
-def step_check_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-    # Idempotent by design (BasePage.set_checked reads the current state
-    # first) - this is what avoids the double-toggle risk a blind click()
-    # has for checkbox/radio inputs.
-{% call new_page_wrapper(step) %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.set_checked("{{ step.element_name }}", True)
-    _ok, _ = _run_step(context, 'check "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
+        Two mechanisms:
+        1. ws.ping() every 15s -- transport-level WebSocket ping frame.
+           Proxies see this at TCP level and keep the connection open.
+        2. JSON HEARTBEAT with a real request_id every 30s (every 2 ticks)
+           -- this is what calls agent_registry.touch() on the server,
+           updating last_seen so the stale reaper doesn't kill the connection.
 
-{% else %}
-@when('the user unchecks "{{ step.element_name }}"')
-def step_uncheck_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{% call new_page_wrapper(step) %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.set_checked("{{ step.element_name }}", False)
-    _ok, _ = _run_step(context, 'uncheck "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
+        Previously: interval=20s, JSON heartbeat every 3 ticks = 60s.
+        The stale timeout was 45s < 60s, so the reaper killed live
+        connections before the JSON heartbeat could update last_seen.
 
-{% endif %}
-{% elif step.action in ("type", "paste") %}
-{% if step.random_spec %}
-@when('the user enters a random "{{ step.random_spec }}" value into "{{ step.element_name }}"')
-def step_random_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-    from generator.random_data import generate as _gen_random
-    _value, _spec_used = _gen_random("{{ step.random_spec }}", "{{ step.saved_as }}")
-    {% if step.saved_as %}
-    context.variables.store("{{ step.saved_as }}", _value)
-    context._random_data = getattr(context, "_random_data", {})
-    context._random_data["{{ step.saved_as }}"] = _value
-    {% endif %}
-{% call new_page_wrapper(step) %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.type_text("{{ step.element_name }}", _value)
-    _ok, _ = _run_step(context, 'enter random value into "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
-
-{% elif step.var_placeholder %}
-@when('the user enters "{{ step.var_placeholder_escaped }}" into "{{ step.element_name }}"')
-def step_type_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-    # Reuse: resolved from the LIVE value captured earlier in THIS run (see
-    # context.variables, seeded by a "captures the value of ..." step below)
-    # instead of the literal value that happened to be recorded originally.
-    value = context.variables.resolve("{{ step.var_placeholder }}")
-{% call new_page_wrapper(step) %}
-{% if step.action == "paste" %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.paste_text("{{ step.element_name }}", value)
-{% else %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.type_text("{{ step.element_name }}", value)
-{% endif %}
-    _ok, _ = _run_step(context, 'enter value into "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
-
-{% else %}
-@when('the user enters "{{ step.value }}" into "{{ step.element_name }}"')
-def step_type_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{% call new_page_wrapper(step) %}
-{% if step.action == "paste" %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.paste_text("{{ step.element_name }}", "{{ step.value }}")
-{% else %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.type_text("{{ step.element_name }}", "{{ step.value }}")
-{% endif %}
-    _ok, _ = _run_step(context, 'enter value into "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
-
-{% endif %}
-{% elif step.action == "file_upload" %}
-@when('the user uploads the file "{{ step.value | pyesc }}" into "{{ step.element_name }}"')
-def step_upload_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{% call new_page_wrapper(step) %}
-    # Only the file NAME was ever recordable - browsers never expose the
-    # real local path of a chosen file to JavaScript (el.value is a
-    # fabricated "C:\fakepath\<name>" string for security). BasePage.
-    # upload_file() resolves this name to a real file for replay - see
-    # its docstring in page.tmpl for where it looks.
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.upload_file("{{ step.element_name }}", "{{ step.value | pyesc }}")
-    _ok, _ = _run_step(context, 'upload file into "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
-
-{% elif step.action == "select" %}
-@when('the user selects "{{ step.value }}" from "{{ step.element_name }}"')
-def step_select_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{% call new_page_wrapper(step) %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.select_option("{{ step.element_name }}", "{{ step.value }}")
-    _ok, _ = _run_step(context, 'select from "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
-
-{% elif step.action == "keypress" %}
-@when('the user presses {{ step.key_label }} on "{{ step.element_name }}"')
-def step_keypress_{{ step.element_name }}_{{ step.key_name|lower|replace("+", "_") }}(context):
-{{ maybe_switch(step) }}
-{% call new_page_wrapper(step) %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.press_key("{{ step.element_name }}", "{{ step.key_name }}")
-    _ok, _ = _run_step(context, 'press {{ step.key_label }} on "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
-
-{% elif step.action == "copy" %}
-@when('the user captures the value of "{{ step.element_name }}" as "{{ step.var_placeholder_escaped }}"')
-def step_capture_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-    # Capture: prefers reading the live DOM value/text via Playwright
-    # (input_value() / text_content()) and only falls back to the browser's
-    # own clipboard (still entirely through Playwright) if the element itself
-    # doesn't expose the value - see BasePage.capture_value in the page object.
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        return context.page.capture_value("{{ step.element_name }}")
-    _ok, value = _run_step(context, 'capture value of "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-    if _ok:
-        context.variables.store("{{ step.var_name }}", value)
-
-{% elif step.action == "ocr_capture" %}
-@when('the user captures the value of "{{ step.element_name }}" via OCR as "{{ step.var_placeholder_escaped }}"')
-def step_ocr_capture_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-    # OCR capture: screenshots this element fresh and re-reads its text via
-    # OCR on EVERY run (never baked in from recording time) - for a value
-    # with no real selectable DOM text at all (an image or canvas-rendered
-    # reference number, a scanned document field, etc.) that a plain
-    # capture_value() can't see. See recorder/ocr_engine.py (the same
-    # module used when this was first captured during recording).
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        return context.page.capture_value_ocr("{{ step.element_name }}")
-    _ok, value = _run_step(context, 'capture value of "{{ step.element_name }}" via OCR', _do, element_name="{{ step.element_name }}")
-    if _ok:
-        context.variables.store("{{ step.var_name }}", value)
-
-{% elif step.action == "window_closed" %}
-@when('the user closes the current browser tab or window (step {{ loop.index }})')
-def step_close_window_{{ loop.index }}(context):
-    # Recorded browser tab/window #{{ step.closed_page_index }} being closed -
-    # switch replay back to whichever tab/window opened it (#{{ step.switch_back_to_index }}).
-    def _do():
-        # Close the ACTUALLY ACTIVE Playwright page. This is important for
-        # UiPath imports because the Excel format does not always encode the
-        # popup/tab index that was opened by a document click.
-        closing_page = context.page.page
-        if not closing_page.is_closed():
-            closing_page.close()
-
-        target_index = {{ step.switch_back_to_index }}
-        if target_index < len(context.recorder_pages):
-            target_page = context.recorder_pages[target_index]
-            if not target_page.is_closed():
-                context.page.switch_page(target_page)
-        else:
-            # Fallback to the first still-open page.
-            for candidate in reversed(context.recorder_pages):
-                if not candidate.is_closed():
-                    context.page.switch_page(candidate)
+        Now: interval=15s, JSON heartbeat every 2 ticks = 30s.
+        Stale timeout is 90s -- well above the 30s heartbeat interval.
+        """
+        import uuid as _uuid
+        tick = 0
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                tick += 1
+                # Transport-level ping -- proxy keep-alive
+                try:
+                    await asyncio.wait_for(ws.ping(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.debug("[heartbeat] ping timed out -- connection likely dead")
                     break
+                except Exception:
+                    break
+                # JSON heartbeat every 30s -- updates server last_seen
+                if tick % 2 == 0:
+                    await ws.send(_uuid.uuid4().hex and json.dumps({
+                        "type": "HEARTBEAT",
+                        "request_id": f"hb-{_uuid.uuid4().hex[:8]}",
+                        "payload": {},
+                    }))
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"Heartbeat loop ending: {e}")
 
-    _run_step(context, "close browser tab/window (step {{ loop.index }})", _do)
-
-{% elif step.action == "dialog" %}
-@when('a "{{ step.dialog_type }}" dialog appears and is accepted (step {{ loop.index }})')
-def step_dialog_{{ loop.index }}(context):
-    # Native alert/confirm/prompt/beforeunload dialogs are auto-accepted
-    # globally for every page/tab/window (see environment.py's page.on(
-    # "dialog", ...) handlers) - this step performs no action of its own and
-    # exists purely so the generated feature/report show that the recording
-    # encountered one. Recorded message: {{ step.dialog_message | comment_safe }}
-    pass
-
-{% elif step.action == "delay" %}
-@when('the flow waits {{ step.delay_seconds }} seconds (step {{ loop.index }})')
-def step_delay_{{ loop.index }}(context):
-    context.page.page.wait_for_timeout({{ (step.delay_seconds * 1000) | int }})
-
-{% elif step.action == "assert_text" %}
-@when('the page shows "{{ step.expected_text | pyesc }}" in "{{ step.element_name }}"')
-def step_assert_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.assert_text_contains("{{ step.element_name }}", "{{ step.expected_text | pyesc }}")
-    _run_step(context, 'verify text in "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-
-{% elif step.action == "assert_ocr_text" %}
-@when('the page visually shows "{{ step.expected_text | pyesc }}" (via OCR) (step {{ loop.index }})')
-def step_assert_ocr_{{ loop.index }}(context):
-{{ maybe_switch(step) }}
-    def _do():
-        context.page.assert_ocr_text_visible("{{ step.expected_text | pyesc }}")
-    _run_step(context, 'verify text visible via OCR (step {{ loop.index }})', _do)
-
-{% elif step.action == "scroll" %}
-@when('the page scrolls {{ step.scroll_direction }} (step {{ loop.index }})')
-def step_scroll_{{ loop.index }}(context):
-    def _do():
-        _dy = {{ step.scroll_amount }} * 400 * (1 if "{{ step.scroll_direction }}" == "down" else -1)
-        context.page.page.mouse.wheel(0, _dy)
-        context.page.page.wait_for_timeout(300)
-    _run_step(context, "scroll {{ step.scroll_direction }} (step {{ loop.index }})", _do)
-
-{% elif step.action == "date" %}
-@when('the user sets the date "{{ step.value }}" in "{{ step.element_name }}"')
-def step_date_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{% call new_page_wrapper(step) %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.set_date("{{ step.element_name }}", "{{ step.value }}", near_anchor={{ "True" if step.get("near_anchor") else "False" }})
-    _ok, _ = _run_step(context, 'set date "{{ step.value }}" in "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
-
-{% elif step.action == "hover" %}
-@when('the user hovers over "{{ step.element_name }}"')
-def step_hover_{{ step.element_name }}(context):
-{{ maybe_switch(step) }}
-{% call new_page_wrapper(step) %}
-    def _do():
-{{ explicit_wait(step) | indent(4, true) }}
-        context.page.hover_element(
-            "{{ step.element_name }}",
-            recorded_cx={{ step.hover_cx | default("None") }},
-            recorded_cy={{ step.hover_cy | default("None") }},
-        )
-    _ok, _ = _run_step(context, 'hover over "{{ step.element_name }}"', _do, element_name="{{ step.element_name }}")
-{% endcall %}
-
-{% elif step.action == "new_window_wait" %}
-@when('a new browser tab or window opens (step {{ loop.index }})')
-def step_new_window_wait_{{ loop.index }}(context):
-    # Fallback path: this recording's very first captured event was a new
-    # tab/window opening (no earlier click/type step to fold expect_page()
-    # onto - e.g. the app pops one immediately on load), so there's nothing
-    # to wrap; just wait for the context to report one directly.
-    def _do():
-        _new_pg = context.browser_session.context.wait_for_event("page", timeout={{ step.wait_seconds * 1000 }})
-        _new_pg.wait_for_load_state()
-        context.recorder_pages.append(_new_pg)
-        context.page.switch_page(_new_pg)
-    _run_step(context, "wait for new browser tab/window (step {{ loop.index }})", _do)
-
-{% endif -%}
-{% if step.opens_new_page %}
-@when('the new browser tab or window is now active (step {{ loop.index }})')
-def step_new_page_now_active_{{ loop.index }}(context):
-    # Purely informational/traceability line for the feature file and exit
-    # report - the actual expect_page()/switch_page() handoff already
-    # happened inside the PREVIOUS step (the click/type/etc. that caused
-    # this tab/window to open - see steps.tmpl's new_page_wrapper macro),
-    # so there's nothing left to do here.
-    pass
-
-{% endif %}
-{% endfor %}
-
-@then('the flow should complete without errors')
-def step_verify_no_errors(context):
-    # Generic post-condition: no unhandled browser alert/JS error banner.
-    # Checks the CURRENTLY ACTIVE tab/window (context.page.page - see
-    # RecordedPage.switch_page), not always the original one, so this still
-    # works for a flow that ends on a popup/new tab/new window.
-    #
-    # A recorded flow can legitimately end by closing its own tab/window
-    # (see the "the user closes the current browser tab or window" step,
-    # generated for a recorded window/tab-close action) - at that point
-    # there is nothing left to check a title on, and that's a successful
-    # end state, not a failure. Checking is_closed() first (a local state
-    # check, safe to call on an already-closed page) avoids ever calling
-    # .title() on a closed page in the first place - .title() talks to the
-    # browser process and raises TargetClosedError there instead of
-    # returning some default value, which would otherwise fail this
-    # deliberately generic, no-op-by-default final check for a flow that
-    # did nothing wrong.
-    if context.page.page.is_closed():
-        return
-    assert context.page.page.title() is not None
-    # Replace with an assertion specific to the target application
-    # (e.g. checking a confirmation message or success banner).
+    def stop(self) -> None:
+        """Deliberate shutdown (app quitting) - distinct from a dropped
+        connection, which reconnects instead of stopping."""
+        self._stop = True
