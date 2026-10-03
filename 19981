@@ -1,76 +1,224 @@
-# -*- coding: utf-8 -*-
 """
-Auto-generated Page Object.
-Locators live in locators.json (not hard-coded here) so the self-healing
-agent can patch a broken selector without touching this file.
+Converts a UiPath-style Excel test-steps sheet into the SAME recording
+JSON schema recorder/recorder.py already produces - so a UiPath-authored
+flow flows through the EXACT same downstream pipeline as a recorded one:
+generator/build.py, the Behave/Playwright templates, "Run Saved
+Recording", the exit report, Regenerate, everything. Nothing downstream
+needs to know or care whether a recording came from a live browser
+session or an imported spreadsheet.
+
+Expected columns (case-insensitive, matched by header text - order
+doesn't matter): Steps, NAME, Action/Method, present element, input.
+"present element" holds UiPath's own selector dump, e.g.:
+
+    <html app='msedge.exe' title='LLMS Lite' />
+    <webctrl id='username' tag='INPUT' />
+
+Only the <webctrl .../> line's attributes matter here - the <html .../>
+line just identifies the target application/window, which this project
+already gets from the recording's own target_url instead.
+
+Action/Method -> internal action mapping:
+    OPENBROWSER  -> sets the recording's target_url (not a step of its own)
+    DELAY        -> "delay" action, "input" column is the number of seconds
+    INPUT-C      -> "type" action, "input" column is the value to type
+    CLICK-C      -> "click" action
+    DROPDOWN-S   -> "select" action, "input" column is the option to select
+    SCROLL       -> "scroll" action, "input" column is "DOWN-4"/"UP-2" style (direction-amount)
+    CLOSETAB     -> "window_closed" action (same one recorder.py itself
+                    produces for a real closed tab/window - see
+                    generator/build.py)
+    ENTER        -> "keypress" action (presses Enter - a UiPath ENTER step
+                    never carries a selector of its own; it acts on
+                    whatever element currently has focus, exactly like a
+                    real Enter keypress does)
+    VERIFICATION -> "assert_text" action - asserts the selector's element
+                    contains the expected text (from "input"). Does NOT
+                    click/type anything - a pure check. See
+                    generator/build.py and the templates for the
+                    corresponding replay step.
+    STOPPER      -> imported as "click" (UiPath's STOPPER marks a step that
+                    needs special handling - most commonly a date-picker
+                    day cell, which behaves like a normal click once
+                    resolved) - logged as a warning since the selector for
+                    these is usually the least reliable in the whole sheet
+                    and worth a human double-checking.
+
+A selector dump with MORE THAN ONE <webctrl .../> line (UiPath emits this
+for a nested/scoped target, e.g. a specific cell inside a specific table)
+uses the LAST (innermost, most specific) <webctrl> line's attributes -
+that's always the one actually closest to the real interactive element;
+the earlier line(s) are just scoping/context UiPath included for its own
+matching, e.g. the containing <table> or <tr>.
+
+A selector dump using UiPath's DESKTOP/native-dialog syntax instead of
+<webctrl> (<wnd .../><ctrl role='dialog' .../>...) - e.g. a native
+"llmslite.uat.sbi says... OK" browser confirm popup - is skipped
+entirely, with an informational note rather than a warning: this
+project's generated tests already auto-accept every native browser
+dialog globally (see runner/environment.py and
+local_agent/agent_environment.py's page.on("dialog", ...) handlers), so
+no explicit step is needed for it at all.
+
+Anything else in the Action/Method column is imported as a "click" by
+default (logged as a warning in the returned `warnings` list) rather than
+silently dropped or failing the whole import - a single unrecognized
+row shouldn't block importing the other 50 rows in a real spreadsheet.
 """
 from __future__ import annotations
-import json
-import time
-from pathlib import Path
+import html
+import re
+from datetime import datetime
+from typing import Optional
 
-from playwright.sync_api import Page, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
+import openpyxl
 
-LOCATORS_PATH = Path(__file__).parent / "locators.json"
-
-# Self-heal writes go back to LOCATORS_PATH by default (same directory as
-# the generated page object). This is the shared locators.json that
-# build_artifacts() writes fresh on every run.
-#
-# Per-run scoping (Fix 1): if the environment sets LOCATORS_OVERRIDE_PATH,
-# the page object reads from that path and writes healed locators there
-# instead of the shared LOCATORS_PATH. run_recording.py sets this env var
-# to a copy inside the run's output dir so healed locators from run N
-# never corrupt run N+1.
-import os as _os
-_LOCATORS_OVERRIDE = _os.environ.get("LOCATORS_OVERRIDE_PATH")
-_EFFECTIVE_LOCATORS_PATH = Path(_LOCATORS_OVERRIDE) if _LOCATORS_OVERRIDE else LOCATORS_PATH
-
-# Where upload_file() looks for a real local file to attach to a recorded
-# file input - see generator/build.py, which materializes any file(s)
-# actually chosen during recording here automatically, under their
-# original name (see recorder/recorder_injector.js's "file_upload" handling).
-FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
-
-# Recorded keypress values (see recorder/recorder_injector.js) mapped to the
-# key name Playwright's Locator.press()/Keyboard.press() expects.
-_KEY_MAP = {
-    "ENTER": "Enter",
-    "BACKSPACE": "Backspace",
-    "ARROW_UP": "ArrowUp",
-    "ARROW_DOWN": "ArrowDown",
-    "ARROW_LEFT": "ArrowLeft",
-    "ARROW_RIGHT": "ArrowRight",
-    "TAB": "Tab",
-    "ESCAPE": "Escape",
-    "DELETE": "Delete",
-    "SPACE": "Space",
-    "HOME": "Home",
-    "END": "End",
-}
-_KEY_MAP.update({f"F{i}": f"F{i}" for i in range(1, 13)})
-
-# Modifier + key combos. Playwright accepts these as a single "Modifier+Key"
-# string directly (no separate keydown/keyup calls needed, unlike Selenium).
-_COMBO_MAP = {
-    "CTRL+A": "Control+A",
-    "CTRL+C": "Control+C",
-    "CTRL+V": "Control+V",
-    "CTRL+X": "Control+X",
-    "CTRL+P": "Control+P",
-    "CTRL+S": "Control+S",
-    "SHIFT+TAB": "Shift+Tab",
+ACTION_MAP = {
+    # Standard click variants
+    "CLICK-C":           "click",
+    "CLICK-S":           "click",
+    "S_CLICK":           "click",   # SBI Seoul format
+    "S-CLICK":           "click",
+    "CLICK_S":           "click",
+    "CLICK":             "click",
+    "CLICK-CONDITIONAL": "click_optional",
+    # Input / type variants
+    "INPUT-C":           "type",
+    "INPUT-S":           "type",
+    "S_INPUT":           "type",
+    "S-INPUT":           "type",
+    "INPUT":             "type",
+    # Dropdown
+    "DROPDOWN-S":        "select",
+    "DROPDOWN-W":        "select",
+    # Verification — VERIFY is the SBI Seoul variant of VERIFICATION
+    "VERIFY":            "assert_text",
+    "VERIFICATION":      "assert_text",
+    "VALIDATE":          "assert_text",
+    "VALIDATION":        "assert_text",
+    # Stopper (treated as click with a warning)
+    "STOPPER":           "click",
 }
 
+# Columns this importer looks for, matched case-insensitively against the
+# header row - the exact wording/casing in real spreadsheets varies
+# ("Action/Method" vs "Action / Method" vs "Method"), so this matches on
+# whichever of these substrings appears first in each header cell. Extra
+# columns some sheets include (a "Test Case No" ID column, a trailing
+# "Proposal" reference column, etc.) are simply ignored - nothing here
+# assumes a fixed column count or order, only that these specific headers
+# exist somewhere in the row.
+COLUMN_ALIASES = {
+    "step":     ["steps", "step"],
+    "name":     ["name", "object name"],
+    "action":   ["action/method", "action / method", "method", "action"],
+    "selector": ["present element", "selector",
+                 "object path", "objectpath", "object_path",  # SBI Seoul / alternate format
+                 "path"],
+    "input":    ["input", "value", "data", "input data"],
+}
 
-def _css_attr_quote(value: str) -> str:
-    """Safely double-quotes a string for use inside a CSS attribute selector."""
+# Matches every <webctrl .../> occurrence in a selector dump, not just the
+# first - a scoped/nested target (a specific cell inside a specific table,
+# a specific button inside a specific dialog) is expressed as MULTIPLE
+# webctrl lines, and the LAST one is always the actual target element
+# (see this module's docstring).
+# Matches UP TO THE LITERAL "/>" closing sequence (not just any "/") -
+# critical because a real attribute VALUE can itself contain a bare "/"
+# (e.g. aaname='Permanent / Correspondence Address ' - a genuine value
+# seen in real data), which the naive "everything except / or >" pattern
+# this used originally would stop at prematurely, failing to match the
+# tag at all. Non-greedy + DOTALL so it matches the FIRST "/>" it finds
+# (the tag's own close) rather than running past it into whatever follows.
+_WEBCTRL_RE = re.compile(r"<webctrl\b(.*?)/>", re.IGNORECASE | re.DOTALL)
+_ATTR_RE = re.compile(r"([a-zA-Z_:][\w:.-]*)\s*=\s*'([^']*)'|([a-zA-Z_:][\w:.-]*)\s*=\s*\"([^\"]*)\"")
+
+# UiPath's DESKTOP/native-dialog selector syntax (a <wnd>/<ctrl> pair,
+# instead of <webctrl>) - identifies a row targeting a native OS/browser
+# dialog (e.g. a plain JS confirm() popup), which this project's replay
+# already auto-accepts globally without needing an explicit step - see
+# this module's docstring.
+_NATIVE_DIALOG_RE = re.compile(r"<wnd\b|<ctrl\b", re.IGNORECASE)
+
+
+def _find_column_indices(header_row: list) -> dict:
+    """Maps each logical column name (see COLUMN_ALIASES) to the header
+    row's cell index it was found at. Missing optional columns (name,
+    input) are fine - only "action" and "selector" are ever required, and
+    only for rows whose action actually needs them."""
+    normalized = [str(c or "").strip().lower() for c in header_row]
+    indices = {}
+    for logical_name, aliases in COLUMN_ALIASES.items():
+        for i, cell in enumerate(normalized):
+            if any(alias in cell for alias in aliases):
+                indices[logical_name] = i
+                break
+    return indices
+
+
+def _normalize_selector_text(selector_text: str) -> str:
+    """Undoes a mangled-selector pattern seen in real data - a literal
+    backslash before every "<" and "<br>" tags standing in for real
+    newlines (e.g. "\\<html .../><br>\\<webctrl .../>" instead of the
+    normal clean, newline-separated form). This happens when the
+    selector text was copy-pasted through something HTML-aware (browser
+    dev tools, a rich-text editor, an HTML export) before landing in the
+    spreadsheet cell - the underlying selector is the same, just escaped.
+    Also HTML-entity-decodes the whole thing (e.g. "&gt;" -> ">") - seen
+    in real data inside a css-selector attribute value
+    ("body&gt;div&gt;div") for the exact same copy-paste-through-HTML
+    reason. Used by both _parse_webctrl_attrs and
+    is_native_dialog_selector, so neither needs to special-case it
+    separately. A plain, unmangled cell passes through unchanged."""
+    if not selector_text:
+        return selector_text
+    selector_text = re.sub(r"<br\s*/?>", "\n", selector_text, flags=re.IGNORECASE)
+    selector_text = selector_text.replace("\\<", "<")
+    selector_text = html.unescape(selector_text)
+    return selector_text
+
+
+def is_native_dialog_selector(selector_text: str) -> bool:
+    """True for a UiPath DESKTOP-style selector (<wnd>/<ctrl>) rather than
+    a <webctrl> one - see this module's docstring for why these rows are
+    skipped entirely at import time."""
+    if not selector_text:
+        return False
+    selector_text = _normalize_selector_text(selector_text)
+    return bool(_NATIVE_DIALOG_RE.search(selector_text)) and "<webctrl" not in selector_text.lower()
+
+
+def _parse_webctrl_attrs(selector_text: str) -> dict:
+    """Extracts every attribute='value' pair from the LAST <webctrl .../>
+    line of a UiPath selector dump (see this module's docstring for why
+    the last one, when there's more than one) - ignores <html .../>/
+    <wnd .../> lines entirely, those just identify the target
+    application/window, which this project already gets from the
+    recording's own target_url instead."""
+    if not selector_text:
+        return {}
+    selector_text = _normalize_selector_text(selector_text)
+    matches = list(_WEBCTRL_RE.finditer(selector_text))
+    if not matches:
+        return {}
+    attrs_text = matches[-1].group(1)
+    attrs = {}
+    for m in _ATTR_RE.finditer(attrs_text):
+        if m.group(1):
+            # Strip UiPath wildcard * from start/end of attribute values
+            # e.g. aaname='*Personal Banking*' -> 'Personal Banking'
+            attrs[m.group(1).lower()] = m.group(2).strip("*").strip()
+        else:
+            attrs[m.group(3).lower()] = m.group(4).strip("*").strip()
+    return attrs
+
+
+def _css_attr(name: str, value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
+    return f'[{name}="{escaped}"]'
 
 
 def _xpath_literal(value: str) -> str:
-    """Safely quotes a string for use inside an XPath expression, even if it contains quotes."""
     if '"' not in value:
         return f'"{value}"'
     if "'" not in value:
@@ -79,1229 +227,608 @@ def _xpath_literal(value: str) -> str:
     return "concat(" + ', \'"\', '.join(f'"{p}"' for p in parts) + ")"
 
 
-def _selector_for(strategy: str, value: str) -> str:
-    """Turns a captured (strategy, value) pair into a Playwright selector string.
-    Supports the full canonical locator taxonomy including TEXT, ROLE, ARIA."""
-    if strategy == "ID":
-        return f"css=[id={_css_attr_quote(value)}]"
-    if strategy == "NAME":
-        return f"css=[name={_css_attr_quote(value)}]"
-    if strategy == "CSS":
-        return f"css={value}"
-    if strategy == "XPATH":
-        return f"xpath={value}"
-    if strategy == "TEXT":
-        return f"text={value}"
-    if strategy == "ROLE":
-        if "[" in value:
-            role, rest = value.split("[", 1)
-            name = rest.rstrip("]")
-            return f'role={role.strip()}[name="{name.strip()}"]'
-        return f"role={value}"
-    if strategy == "ARIA":
-        return f'css=[aria-label={_css_attr_quote(value)}]'
-    raise ValueError(f"Unknown locator strategy '{strategy}'")
+def build_locators_from_uipath_selector(selector_text: str) -> list[dict]:
+    """Translates one UiPath <webctrl .../> selector into a PRIORITY-ORDERED
+    list of {"strategy", "value"} candidates - deliberately produces
+    several fallback tiers (not just one "best" guess), the same way a
+    real browser recording captures multiple locator strategies per
+    element: replay already knows how to try each one in turn until one
+    resolves (see generator/templates/page.tmpl's wait_ready()), so an
+    imperfect translation for one attribute combination doesn't need to
+    be perfect - it just needs to include a reasonable set of candidates."""
+    attrs = _parse_webctrl_attrs(selector_text)
+    tag = (attrs.get("tag") or "").lower()
+    locators: list[dict] = []
 
+    # A literal css-selector attribute (some UiPath selector dumps
+    # capture one directly, rather than - or alongside - id/name/etc.) -
+    # the single most explicit, reliable candidate when present, so it
+    # goes first. _normalize_selector_text already HTML-entity-decoded
+    # the whole selector_text before this ever ran (a real one seen in
+    # practice: "body&gt;div&gt;div" -> "body>div>div"), so this is
+    # already a normal, usable CSS selector string as-is.
+    if attrs.get("css-selector"):
+        locators.append({"strategy": "CSS", "value": attrs["css-selector"]})
 
-# Substrings Playwright's own error messages use when an action gets cut
-# short by the PAGE NAVIGATING AWAY mid-action - e.g. clicking a login/submit
-# button that causes a full page load. This is Playwright's normal (if
-# confusingly-worded) way of reporting that the frame/execution context it
-# was tracking got torn down - it does NOT mean the click failed; it almost
-# always means the click worked and the page had already moved on before
-# Playwright finished its own bookkeeping for that action. Treating this as
-# a real failure and retrying (or worse, re-querying the OLD page's selector
-# on the NEW page) is what causes a working login/submit click to still
-# report an error, or to hang for Playwright's own default action timeout
-# waiting for an element that's gone because the page already navigated.
-_NAVIGATION_INTERRUPTED_HINTS = (
-    "execution context was destroyed",
-    "most likely because of a navigation",
-    "target closed",
-    "frame was detached",
-    "navigating frame was detached",
-)
-
-
-def _navigation_interrupted(exc: Exception) -> bool:
-    return any(hint in str(exc).lower() for hint in _NAVIGATION_INTERRUPTED_HINTS)
-
-
-
-class BasePage:
-    def __init__(self, page: Page, timeout: int = 8, poll_interval: float = 0.25, heal_callback=None, max_wait_seconds: int = 90):
-        self.page = page
-        self.timeout = timeout
-        self.poll_interval = poll_interval
-        self.heal_callback = heal_callback  # optional fn(element_name, page) -> {"strategy":..., "value":...} or None
-        self.locators = json.loads(_EFFECTIVE_LOCATORS_PATH.read_text())
-        # element_name -> visible text/aria-label, recorded for plain
-        # click() targets only (see generator/build.py) - consulted ONLY as
-        # a last resort by _ocr_click_fallback below, after every DOM
-        # locator candidate (including self-heal) has already failed. Not
-        # a real element_name, so it's popped off self.locators here rather
-        # than left in it (which would otherwise appear as a bogus element
-        # in the click_X()/type_X() convenience methods at the bottom of
-        # this file).
-        self.ocr_hints = self.locators.pop("__ocr_hints__", {})
-        # Which candidate locator actually resolved the most recent _find()
-        # call - {"element_name", "strategy", "value", "self_healed"} or None.
-        # Read (and reset) by the environment.py/agent_environment.py
-        # after_step hook to build the execution report's per-step "locator
-        # used" field - see runner/run_recording.py's _extract_steps.
-        self.last_resolution = None
-        self._last_hover_pos = None   # (x, y) of last hover — kept so nav menus stay open
-        self._hover_chain = []        # ordered list of (x,y) for every hover in current nav sequence
-        # Adaptive-wait ceiling for wait_ready() below - see its docstring.
-        # Override e.g. RecordedPage(page, max_wait_seconds=180) if a
-        # particular environment's APIs are known to run especially slow.
-        self.max_wait_seconds = max_wait_seconds
-
-    def switch_page(self, new_page: Page):
-        """
-        Redirects every subsequent element lookup/action to a DIFFERENT
-        Playwright Page - used when a recorded flow interacts with a popup,
-        a new tab/window opened via target="_blank"/window.open(), or
-        switches back to the original window after closing one (see
-        generator/build.py's page_index/opens_new_page handling and
-        steps.tmpl's new_page_wrapper/maybe_switch macros, which call this
-        automatically). All existing methods (click, type_text, etc.)
-        keep working unchanged afterward - they just now resolve elements
-        against `new_page` instead.
-        """
-        self.page = new_page
-
-        # Make the selected Playwright page the foreground browser page.
-        # This is programmatic browser-page switching; the user does not
-        # need to move the physical mouse cursor to the target tab.
-        try:
-            if not new_page.is_closed():
-                new_page.bring_to_front()
-        except Exception:
-            pass
-
-    def _root_for(self, frame_path: list | None):
-        """
-        Resolves the Playwright object (Page, or a nested FrameLocator) that
-        element lookups should actually run against, given the "frame_path"
-        recorded for that element (a list of CSS selectors, outermost ->
-        innermost, locating the chain of <iframe> elements to drill through -
-        see Recorder._frame_path_for). Empty/missing frame_path (the normal
-        case, and every locator recorded before iframe support existed)
-        resolves to `self.page` itself, unchanged.
-        """
-        root = self.page
-        for selector in (frame_path or []):
-            root = root.frame_locator(selector)
-        return root
-
-    def _frame_root(self, element_name: str):
-        """The frame_path is recorded per ACTION, not per element name, but
-        every candidate locator saved for a given element_name came from the
-        same action/frame, so the first candidate's frame_path speaks for
-        all of them."""
-        candidates = self.locators.get(element_name, [])
-        frame_path = candidates[0].get("frame_path") if candidates else None
-        return self._root_for(frame_path)
-
-    def _find(self, element_name: str, require_visible: bool = True):
-        """
-        Polls ALL known locator strategies for this element together within a
-        single shared time budget, instead of waiting the full timeout for
-        each strategy in turn - this is what keeps lookups fast even when the
-        first strategy or two no longer match the page. Returns a Playwright
-        Locator resolved to a single (`.first`) element. If the element was
-        recorded inside an iframe, resolves through the recorded
-        "frame_path" first (see _root_for) instead of searching the page
-        directly - a locator that's perfectly valid INSIDE an iframe's own
-        document will simply never match anything on the parent page.
-        """
-        candidates = self.locators.get(element_name, [])
-        root = self._frame_root(element_name)
-        deadline = time.time() + self.timeout
-
-        while time.time() < deadline:
-            for cand in candidates:
-                try:
-                    sel = _selector_for(cand["strategy"], cand["value"])
-                    # Shadow DOM piercing: if this element was recorded inside
-                    # a shadow root, try both the direct selector and the
-                    # Playwright shadow-piercing >> syntax.
-                    in_shadow = cand.get("in_shadow_dom", False)
-                    selectors_to_try = [sel]
-                    if in_shadow and not sel.startswith("xpath="):
-                        # css= selectors can pierce shadow DOM with >> combinator
-                        raw_val = cand["value"]
-                        selectors_to_try.append(f"css={raw_val}")
-                    for s in selectors_to_try:
-                        try:
-                            loc = root.locator(s)
-                            if loc.count() == 0:
-                                continue
-                            el = loc.first
-                            if not require_visible or el.is_visible():
-                                self.last_resolution = {
-                                    "element_name": element_name, "strategy": cand["strategy"],
-                                    "value": cand["value"], "self_healed": False,
-                                }
-                                return el
-                        except PlaywrightError:
-                            continue
-                except PlaywrightError:
-                    continue
-            time.sleep(self.poll_interval)
-
-        # Every known strategy failed within the time budget requiring
-        # visibility. Before self-healing/giving up, try once more allowing
-        # a NON-visible match: styled checkbox/radio widgets (Bootstrap,
-        # MUI, Ant Design, and plenty of custom CSS) very commonly keep the
-        # real <input type="radio"/"checkbox"> in the DOM but visually
-        # hidden (opacity:0, 1x1px, clip-path, etc.) while a label/span
-        # renders the visible control - the native input is still exactly
-        # what needs to be interacted with, it's just never "visible" by
-        # Playwright's definition. This relaxed pass is what makes those
-        # work instead of just timing out.
-        if require_visible:
-            for cand in candidates:
-                try:
-                    loc = root.locator(_selector_for(cand["strategy"], cand["value"]))
-                    if loc.count() > 0:
-                        self.last_resolution = {
-                            "element_name": element_name, "strategy": cand["strategy"],
-                            "value": cand["value"], "self_healed": False,
-                        }
-                        return loc.first
-                except PlaywrightError:
-                    continue
-
-        # still nothing - try self-healing if available. Note: self-healing
-        # operates against the TOP-LEVEL page (it re-reads page.content()),
-        # not the resolved iframe root - repairing a broken locator that
-        # lives inside an iframe is out of scope for now.
-        # ── 3-Stage Self-Healing Pipeline ────────────────────────────────────
-        # Stage 1: Deterministic Playwright semantic locators (no LLM, no vision)
-        # Stage 2: Non-LLM DOM candidate ranking with configurable scores
-        # Stage 3: Structured LLM reasoning over Stage 2 candidates + vision
-        # Every result validated before execution. Results cached. Metrics tracked.
-        try:
-            from agent.healer import run_healing_pipeline
-            # Build element description from OCR hints and locator metadata
-            ocr_hints = self.locators.get("__ocr_hints__") or {}
-            elem_desc = {
-                "text": ocr_hints.get(element_name, ""),
-                "ariaLabel": "",
-                "tag": "",
-                "name": "",
-                "placeholder": "",
-                "type": "",
-                "role": "",
-                "title": "",
-                "data-testid": "",
-            }
-            orig_sel = ""
-            if candidates:
-                try:
-                    orig_sel = _selector_for(candidates[0]["strategy"], candidates[0]["value"])
-                except Exception:
-                    pass
-            # Extract LLM from heal_callback if available
-            _llm = None
-            if self.heal_callback and hasattr(self.heal_callback, "__self__"):
-                _llm = getattr(self.heal_callback.__self__, "_llm", None)
-            elif hasattr(self, "_llm"):
-                _llm = self._llm
-
-            heal_result = run_healing_pipeline(
-                page=self.page,
-                element_name=element_name,
-                element_description=elem_desc,
-                original_selector=orig_sel,
-                action="click",
-                llm=_llm,
-                iframe_path=candidates[0].get("frame_path") if candidates else [],
-                in_shadow_dom=candidates[0].get("in_shadow_dom", False) if candidates else False,
-            )
-            if heal_result.get("success"):
-                # Vision coordinate result
-                if heal_result.get("coords") and not heal_result.get("selector"):
-                    coords = heal_result["coords"]
-                    self.page.mouse.click(coords[0], coords[1])
-                    self.last_resolution = {
-                        "element_name": element_name,
-                        "strategy": heal_result.get("strategy", "vision"),
-                        "value": str(coords), "self_healed": True,
-                        "stage": heal_result.get("stage"),
-                    }
-                    return None
-                # Selector/locator result
-                if heal_result.get("locator"):
-                    sel = heal_result.get("selector", "")
-                    if sel:
-                        try:
-                            strat = "CSS" if not sel.startswith("xpath=") else "XPATH"
-                            val = sel.removeprefix("css=").removeprefix("xpath=")
-                            fix_entry = {
-                                "strategy": strat, "value": val,
-                                "frame_path": candidates[0].get("frame_path") if candidates else [],
-                                "self_healed": True,
-                                "heal_stage": heal_result.get("stage"),
-                            }
-                            self.locators.setdefault(element_name, []).insert(0, fix_entry)
-                            _EFFECTIVE_LOCATORS_PATH.write_text(json.dumps(self.locators, indent=2))
-                        except Exception:
-                            pass
-                    self.last_resolution = {
-                        "element_name": element_name,
-                        "strategy": heal_result.get("strategy", "healed"),
-                        "value": sel or "", "self_healed": True,
-                        "stage": heal_result.get("stage"),
-                        "confidence": heal_result.get("confidence"),
-                    }
-                    return heal_result["locator"]
-        except Exception as _heal_err:
-            import logging as _log
-            _log.getLogger(__name__).warning(f"[SELF-HEAL] Pipeline error: {_heal_err}")
-
-        raise PlaywrightTimeoutError(
-            f"Could not locate a visible element for '{element_name}' with any known strategy "
-            f"({[c['strategy'] for c in candidates]}) within {self.timeout}s, and self-healing "
-            f"did not resolve it. "
-            f"If this element is inside a hover/dropdown menu, ensure hover steps are recorded "
-            f"before this step so the menu is open when the click runs."
-        )
-
-    def wait_ready(self, element_name: str, timeout: int = None):
-        """
-        Blocks until `element_name` resolves via ANY known strategy (see
-        _find above). Adaptive: starts with the (optionally larger) explicit
-        timeout - normally the wait time measured from the original
-        recording, so a step that recorded slow (e.g. an API-backed lookup)
-        gets a matching wait while a fast one doesn't sit around waiting
-        needlessly - but if that's not actually enough THIS run (real API/
-        network timing varies - a backend that took 5s when this was
-        recorded might take 20s under load later), keeps waiting beyond it,
-        up to self.max_wait_seconds total, instead of failing the step the
-        moment the originally-recorded duration elapses. It's almost always
-        better to wait longer than to fail a step that would have succeeded
-        a few seconds later.
-        """
-        original_timeout = self.timeout
-        target = max(self.timeout, timeout or 0)
-        self.timeout = min(target, self.max_wait_seconds)
-        try:
-            self._find(element_name)
-            return
-        except PlaywrightTimeoutError:
-            if self.timeout >= self.max_wait_seconds:
-                raise
-        finally:
-            self.timeout = original_timeout
-
-        # Didn't show up within the expected/recorded time - give it the
-        # rest of the adaptive budget before actually failing the step.
-        remaining = self.max_wait_seconds - target
-        self.timeout = remaining
-        try:
-            self._find(element_name)
-        finally:
-            self.timeout = original_timeout
-
-    def _looks_visually_hidden(self, el) -> bool:
-        """
-        True for the common 'intentionally hidden but technically visible to
-        Playwright' CSS patterns used by custom checkbox/radio widgets - a
-        near-zero-size box, or one positioned far outside the document (e.g.
-        the `position:absolute; left:-9999px` accessibility-hiding
-        technique). Playwright's own is_visible() considers these VISIBLE
-        (opacity and off-screen positioning don't affect the
-        `visibility`/`display` properties it actually checks) - so without
-        this, click()/set_checked() below would try to actually scroll the
-        page to that off-screen position before clicking, which is exactly
-        what makes the whole page visibly jump/scroll sideways for elements
-        hidden this way.
-        """
-        try:
-            box = el.bounding_box()
-        except PlaywrightError:
-            return True
-        if box is None:
-            return True
-        if box["width"] < 2 or box["height"] < 2:
-            return True
-        if box["x"] < -1000 or box["y"] < -1000:
-            return True
-        return False
-
-    def _safe_scroll(self, el):
-        """
-        Best-effort scroll, bounded by self.timeout instead of Playwright's
-        ~30s default action timeout, and never lets a scroll failure bubble
-        up and abort the whole step. This is what every action method below
-        calls instead of a bare scroll_into_view_if_needed() - a hidden or
-        off-screen element (a date-picker's real <input> behind a styled
-        widget, a field that's disabled/invisible until an earlier field is
-        filled, etc.) would otherwise make Playwright retry the scroll for
-        its full default timeout before finally raising, hanging the entire
-        step for ~30 seconds over something that was never meant to be
-        scrolled to in the first place.
-        """
-        if self._looks_visually_hidden(el):
-            return
-        try:
-            el.scroll_into_view_if_needed(timeout=self.timeout * 1000)
-        except PlaywrightError:
-            pass
-
-    def click(self, element_name: str):
-        # Try normal click first
-        try:
-            el = self._find(element_name)
-        except PlaywrightTimeoutError:
-            # Element not found — may be inside a CSS hover menu that
-            # collapsed. Replay the FULL hover chain (all ancestor hovers
-            # in recorded order) then retry. This handles 1, 2, 3+ levels.
-            import time as _t
-            chain = getattr(self, '_hover_chain', [])
-            if chain:
-                try:
-                    for (hx, hy) in chain:
-                        self.page.mouse.move(hx, hy)
-                        _t.sleep(0.12)
-                    # After replaying chain, give CSS transitions time to settle
-                    _t.sleep(0.3)
-                    el = self._find(element_name)
-                except PlaywrightTimeoutError:
-                    pass
-                else:
-                    # Found it — click with force (element visible only via :hover)
-                    try:
-                        el.click(force=True, timeout=self.timeout * 1000)
-                        self._hover_chain = []   # chain consumed by click
-                        self._last_hover_pos = None
-                        return
-                    except Exception:
-                        pass
-            # Try OCR fallback
-            if self._ocr_click_fallback(element_name):
-                return
-            raise
-        if not self._looks_visually_hidden(el):
-            self._safe_scroll(el)
-            try:
-                el.click(timeout=self.timeout * 1000)
-                self._hover_chain = []   # successful click ends the hover sequence
-                self._last_hover_pos = None
-                return
-            except (PlaywrightTimeoutError, PlaywrightError) as e:
-                if _navigation_interrupted(e):
-                    # the click almost certainly worked - the page just
-                    # navigated away (e.g. a login/submit button) before
-                    # Playwright finished its own post-click bookkeeping.
-                    # Treating this as a failure and retrying below would
-                    # re-query THIS element on the NEW page it just navigated
-                    # to, where it (correctly) no longer exists.
-                    return
-                try:
-                    # element is present but something (overlay, animation,
-                    # off-screen positioning) is blocking a native click -
-                    # force bypasses the actionability checks that just failed.
-                    el.click(force=True, timeout=self.timeout * 1000)
-                    return
-                except (PlaywrightTimeoutError, PlaywrightError) as e2:
-                    if _navigation_interrupted(e2):
-                        return
-        # Either visually-hidden by design (skip straight here - no point
-        # scrolling to reveal something meant to stay hidden), or the normal
-        # path above failed. Dispatch a native click directly on the DOM node
-        # via JS - this never scrolls/moves the page and bypasses Playwright's
-        # actionability checks (including visibility) entirely. Per spec,
-        # calling .click() on a checkbox/radio still triggers the browser's
-        # normal toggle behavior, not just the click event, so this is
-        # equivalent to a real user click. Explicit timeout here (rather than
-        # Playwright's own 30s default) so a GENUINE failure - the element
-        # really is gone, not just navigated past - fails in a reasonable
-        # time instead of hanging.
-        try:
-            el.evaluate("node => node.click()", timeout=self.timeout * 1000)
-        except (PlaywrightTimeoutError, PlaywrightError) as e:
-            if not _navigation_interrupted(e):
-                raise
-
-    def _ocr_click_fallback(self, element_name: str) -> bool:
-        """
-        Last-resort locator strategy for click() ONLY, tried after every
-        DOM candidate (and self-heal, if available) has already failed:
-        if this element was recorded with visible text/aria-label (see
-        generator/build.py's ocr_hints), screenshot the WHOLE page, OCR
-        it, and click the best-matching text region's center by raw
-        pixel coordinates (page.mouse.click) instead of Playwright's
-        selector-based Locator API.
-
-        This is the only way a canvas-rendered or image-based button (no
-        real DOM node to select at all, so no CSS/XPath could ever have
-        worked, and self-heal - which only proposes CSS/XPATH - can't
-        help either) has any chance of being recovered.
-
-        Needs no LLM/API key (unlike self-heal, see agent/self_healer.py),
-        so this works identically whether replay is running server-side
-        or via the desktop local agent (which never has an LLM key - see
-        local_agent/agent_environment.py). It also needs no OCR
-        dependency to be a HARD requirement: if easyocr/torch aren't
-        installed (e.g. a lightweight local-agent build), the import
-        below fails quietly and this just returns False, exactly as if
-        no hint had been recorded at all - never raises its own error,
-        since the ORIGINAL locator failure is always the more useful one
-        to surface if this doesn't pan out.
-
-        Returns True (and has already performed the click) on success,
-        False otherwise.
-        """
-        hint = self.ocr_hints.get(element_name)
-        if not hint:
-            return False
-        try:
-            from recorder.ocr_engine import find_text_regions, best_match
-        except Exception:
-            return False
-        try:
-            png_bytes = self.page.screenshot(full_page=True, timeout=self.timeout * 1000)
-            regions = find_text_regions(png_bytes)
-            region = best_match(regions, hint)
-        except Exception:
-            return False
-        if region is None:
-            return False
-        box = region["bbox"]
-        x = box["x"] + box["width"] / 2
-        y = box["y"] + box["height"] / 2
-        try:
-            self.page.mouse.click(x, y)
-        except PlaywrightError:
-            return False
-        self.last_resolution = {
-            "element_name": element_name, "strategy": "OCR", "value": region["text"],
-            "self_healed": False, "ocr_confidence": region["confidence"],
-        }
-        return True
-
-    def click_vision_fallback(self, element_name: str, label_hint: str = "") -> bool:
-        """
-        Pure Vision AI coordinate click - called when BOTH OCR text
-        matching AND the DOM/self-heal path have failed. Separate from
-        _ocr_click_fallback so it can also be reached directly from
-        non-click actions (type, select) that encountered a locator
-        failure and want to at least try clicking the element first.
-
-        Returns True if Vision AI located the element with high/medium
-        confidence and the click succeeded, False otherwise.
-        """
-        if not label_hint:
-            hint = self.ocr_hints.get(element_name) or element_name
+    if attrs.get("id"):
+        if "*" in attrs["id"]:
+            # A wildcard id (e.g. "combo-box-demo-option*") isn't a
+            # literal id at all - UiPath's own "starts with" match. CSS
+            # attribute selectors support this natively via ^= ("starts
+            # with") - split on the first "*" and use everything before
+            # it, which is the meaningful, stable part of a dynamically-
+            # generated id like this (MUI and similar component
+            # libraries commonly suffix an otherwise-stable id with a
+            # generated index/value).
+            prefix = attrs["id"].split("*")[0]
+            if prefix:
+                locators.append({"strategy": "CSS", "value": f'[id^="{prefix}"]'})
         else:
-            hint = label_hint
+            locators.append({"strategy": "ID", "value": attrs["id"]})
+
+    if attrs.get("name") and not attrs.get("idx"):
+        # A plain NAME locator is only safe when there's exactly one match -
+        # if "idx" is also present, UiPath is telling us this name is
+        # shared by more than one element (a radio/checkbox group, a
+        # repeated field), so a bare NAME locator would non-deterministically
+        # resolve to whichever one Playwright happens to pick first. The
+        # idx-based XPath further below (which fires whenever idx is
+        # present, for ANY tag/type - not just radio/checkbox) is the
+        # correct, disambiguated locator for that case instead.
+        locators.append({"strategy": "NAME", "value": attrs["name"]})
+
+    if attrs.get("aria-label"):
+        locators.append({"strategy": "CSS", "value": _css_attr("aria-label", attrs["aria-label"])})
+
+    if attrs.get("placeholder"):
+        locators.append({"strategy": "CSS", "value": _css_attr("placeholder", attrs["placeholder"])})
+
+    # "aaname" (UiPath's "accessible automation name") and plain
+    # "innertext" (no "visible" prefix - some UiPath selector dumps use
+    # one, some the other, for what's functionally the same thing) are
+    # both treated like visibleinnertext for XPath purposes when there's
+    # no better attribute to key off of.
+    text_value = (attrs.get("visibleinnertext") or attrs.get("innertext") or attrs.get("aaname") or "").strip()
+    if text_value == "*":
+        # A bare wildcard with nothing else to match on carries no real
+        # information at all (UiPath's "any accessible name") - nothing
+        # useful can be built from it, so it's skipped rather than
+        # producing a locator that matches everything (or nothing
+        # meaningfully) on the page.
+        text_value = ""
+    elif "*" in text_value:
+        # A partial wildcard (e.g. "*(Self) Scale*") means "contains this
+        # text", not "the text is literally this, asterisks included" -
+        # strip the wildcard characters and switch from an exact
+        # normalize-space(text())=... match to XPath's contains(), which
+        # is the correct equivalent.
+        contains_value = text_value.replace("*", "").strip()
+        if contains_value:
+            xpath_tag = tag or "*"
+            locators.append({
+                "strategy": "XPATH",
+                "value": f"//{xpath_tag}[contains(normalize-space(text()), {_xpath_literal(contains_value)})]",
+            })
+        text_value = ""  # already handled above - skip the exact-match branch below
+    if text_value and tag:
+        locators.append({
+            "strategy": "XPATH",
+            "value": f"//{tag}[normalize-space(text())={_xpath_literal(text_value)}]",
+        })
+    elif text_value:
+        locators.append({
+            "strategy": "XPATH",
+            "value": f"//*[normalize-space(text())={_xpath_literal(text_value)}]",
+        })
+
+    if attrs.get("parentid") and tag:
+        locators.append({"strategy": "CSS", "value": f'[id="{attrs["parentid"]}"] {tag}'})
+
+    if attrs.get("parentname") and tag:
+        # Same idea as parentid, but the parent is identified by its
+        # "name" attribute instead of "id" - seen in real data for MUI-
+        # style form wrappers (e.g. parentname='ClaimMonth' wrapping a
+        # combobox <input>).
+        locators.append({"strategy": "CSS", "value": f'[name="{attrs["parentname"]}"] {tag}'})
+
+    if attrs.get("class") and tag:
+        # A CSS class - lower priority than id/name/aria-label (classes
+        # are far more likely to be shared by many elements, or to be a
+        # build-generated/versioned name like a CSS-in-JS library
+        # produces - e.g. "MuiButton-label" - so this is a fallback
+        # candidate, not a primary one), but still meaningfully narrower
+        # than tag alone.
+        first_class = attrs["class"].split()[0] if attrs["class"].split() else ""
+        if first_class:
+            locators.append({"strategy": "CSS", "value": f"{tag}.{first_class}"})
+
+    # Position-based disambiguation (UiPath's "idx") - fires for ANY
+    # element with an idx, not just radio/checkbox inputs (a plain text
+    # input can just as easily be the 3rd of several otherwise-identical
+    # fields - e.g. a repeated "Address line" input with only a shared
+    # placeholder to go on). Builds the most specific XPath predicate it
+    # can from whatever OTHER attributes are actually present (name,
+    # type, placeholder), falling back to tag alone if that's all there
+    # is - still meaningfully narrower than the last-resort "//tag" below,
+    # since taking the Nth match at least respects document order.
+    #
+    # Skipped when rowName/colName is ALSO present (see below): in that
+    # combination, the idx is clearly meant to be interpreted WITHIN that
+    # row/column's scope, not against the whole page - the row/col-scoped
+    # locators below already incorporate it correctly, and a global,
+    # unscoped "(//select)[1]" candidate ahead of them would often
+    # resolve to the wrong element (whatever happens to be the first
+    # matching tag anywhere on the page) before replay ever tries the
+    # more specific ones.
+    if attrs.get("idx") and not (attrs.get("rowname") or attrs.get("colname")):
         try:
-            from agent.vision_fallback import vision_click_coordinates
-            png_bytes = self.page.screenshot(full_page=True, timeout=self.timeout * 1000)
-            viewport = self.page.viewport_size or {}
-            coords = vision_click_coordinates(
-                png_bytes,
-                element_description=f"element_name='{element_name}', label='{hint}'",
-                action_type="click",
-                page_width=viewport.get("width"),
-                page_height=viewport.get("height"),
-            )
-            if coords and coords.get("confidence") in ("high", "medium"):
-                self.page.mouse.click(coords["x"], coords["y"])
-                self.last_resolution = {
-                    "element_name": element_name, "strategy": "VISION",
-                    "value": coords.get("reasoning", hint),
-                    "self_healed": False,
-                    "vision_confidence": coords.get("confidence"),
-                }
-                return True
-        except Exception:
-            pass
-        return False
-
-    def click_if_present(self, element_name: str):
-        """
-        Like click() above, but for a step that's genuinely OPTIONAL - a
-        popup, dialog, or \"Skip\"/\"OK\" style button that may or may not
-        appear on a given run (e.g. a post-login interstitial that only
-        shows sometimes). Imported from a UiPath CLICK-CONDITIONAL step
-        (see generator/uipath_importer.py) - unlike a normal click(), NO
-        failure to click is treated as an error here: this returns
-        quietly instead of raising, so the rest of the flow continues
-        normally whether or not this particular click happened. Still
-        performs a REAL click using the exact same logic as click()
-        whenever the element does resolve and IS clickable - the only
-        difference is what happens when it isn't.
-
-        Catches PlaywrightError (the base class), not just
-        PlaywrightTimeoutError - a real failure seen in practice: the
-        element simply never appearing within the timeout does raise
-        TimeoutError (a subclass of Error), but a DIFFERENT failure - the
-        element resolving but then failing to actually click for some
-        other reason (detached from the DOM, a strict-mode violation,
-        etc.) - raises plain Error instead, which a narrower `except
-        PlaywrightTimeoutError` does NOT catch. Since this step is
-        supposed to be a no-op whenever it can't cleanly click, ANY
-        Playwright-level failure here should be swallowed the same way,
-        not just a timeout specifically.
-        """
-        try:
-            self.click(element_name)
-        except PlaywrightError:
-            pass
-
-    def set_checked(self, element_name: str, checked: bool):
-        """
-        Sets a checkbox/radio to an explicit target state - idempotent by
-        design (reads the current state first and does nothing further if
-        it's already correct), which is what makes replay safe from the
-        double-toggle a blind click() risks: if an earlier fallback tier
-        actually succeeded before raising, or this step re-runs, checking
-        the current state first means we never click a second time by
-        mistake. Used instead of click() specifically for recorded
-        radio/checkbox actions (see generator/build.py) - the recorded
-        value is the RESULTING checked state captured right after the
-        original click, not just "click happened".
-        """
-        el = self._find(element_name)
-        if not self._looks_visually_hidden(el):
-            self._safe_scroll(el)
-
-        try:
-            current = el.is_checked()
-        except PlaywrightError:
-            current = None
-        if current == checked:
-            return
-
-        if not self._looks_visually_hidden(el):
-            try:
-                (el.check if checked else el.uncheck)(timeout=self.timeout * 1000)
-                return
-            except (PlaywrightTimeoutError, PlaywrightError) as e:
-                if _navigation_interrupted(e):
-                    return
-                try:
-                    (el.check if checked else el.uncheck)(timeout=self.timeout * 1000, force=True)
-                    return
-                except (PlaywrightTimeoutError, PlaywrightError) as e2:
-                    if _navigation_interrupted(e2):
-                        return
-
-        # Last resort, and the direct path for visually-hidden elements:
-        # re-verify the live state right before acting (in case an earlier
-        # tier above partially succeeded despite raising) so this never
-        # dispatches a click that isn't actually needed.
-        try:
-            already = bool(el.evaluate("node => !!node.checked", timeout=self.timeout * 1000))
-        except PlaywrightError:
-            already = None
-        if already != checked:
-            try:
-                el.evaluate("node => node.click()", timeout=self.timeout * 1000)
-            except (PlaywrightTimeoutError, PlaywrightError) as e:
-                if not _navigation_interrupted(e):
-                    raise
-
-    def type_text(self, element_name: str, value: str):
-        el = self._find(element_name)
-        self._safe_scroll(el)
-        try:
-            el.fill(value, timeout=self.timeout * 1000)
-        except (PlaywrightTimeoutError, PlaywrightError) as e:
-            if _navigation_interrupted(e):
-                return
-            el.evaluate(
-                "(node, val) => {"
-                "  node.value = val;"
-                "  node.dispatchEvent(new Event('input', {bubbles: true}));"
-                "  node.dispatchEvent(new Event('change', {bubbles: true}));"
-                "}",
-                value,
-                timeout=self.timeout * 1000,
-            )
-
-    def paste_text(self, element_name: str, value: str):
-        """
-        Like type_text(), but for a recorded PASTE action specifically:
-        dispatches a real synthetic 'paste' ClipboardEvent instead of just
-        setting the field's value. fill()/direct value-setting alone never
-        fires a 'paste' event, so an app with its own onPaste handling
-        (rich text editors, OTP boxes, format-on-paste fields like phone/
-        currency inputs) wouldn't see anything happen with type_text()
-        alone even though the DOM value looks right. If no listener calls
-        preventDefault() on the synthetic event (i.e. nothing intercepted
-        it), this applies the same default fill behavior itself, matching
-        what a real unhandled paste does.
-        """
-        el = self._find(element_name)
-        self._safe_scroll(el)
-        try:
-            el.evaluate(
-                "(node, val) => {"
-                "  node.focus();"
-                "  const dt = new DataTransfer();"
-                "  dt.setData('text/plain', val);"
-                "  const evt = new ClipboardEvent('paste', {"
-                "    clipboardData: dt, bubbles: true, cancelable: true"
-                "  });"
-                "  const notCancelled = node.dispatchEvent(evt);"
-                "  if (notCancelled) {"
-                "    node.value = val;"
-                "    node.dispatchEvent(new Event('input', {bubbles: true}));"
-                "    node.dispatchEvent(new Event('change', {bubbles: true}));"
-                "  }"
-                "}",
-                value,
-                timeout=self.timeout * 1000,
-            )
-        except (PlaywrightTimeoutError, PlaywrightError) as e:
-            if not _navigation_interrupted(e):
-                self.type_text(element_name, value)
-
-    def press_key(self, element_name: str, key_name: str):
-        """
-        Sends a key or Ctrl/Shift combo (Enter, Backspace, Arrow Up/Down/Left/Right,
-        Tab, Shift+Tab, Escape, Delete, Space, Home, End, F1-F12, Ctrl+A/C/V/X/P/S,
-        etc.) to the element via Playwright's press() - key_name is one of the
-        values the recorder captures (e.g. "ENTER", "BACKSPACE", "ARROW_UP", "CTRL+A").
-        """
-        key_name = (key_name or "").upper()
-        el = self._find(element_name)
-        self._safe_scroll(el)
-
-        key = _COMBO_MAP.get(key_name) or _KEY_MAP.get(key_name)
-        if key is None:
-            raise ValueError(
-                f"Unsupported key '{key_name}'. Known keys: {sorted(list(_KEY_MAP) + list(_COMBO_MAP))}"
-            )
-        try:
-            el.press(key, timeout=self.timeout * 1000)
-        except (PlaywrightTimeoutError, PlaywrightError) as e:
-            if _navigation_interrupted(e):
-                return
-            el.evaluate("node => node.focus()", timeout=self.timeout * 1000)
-            el.press(key, timeout=self.timeout * 1000)
-
-    def press_enter(self, element_name: str):
-        """Kept for backward compatibility - equivalent to press_key(element_name, "ENTER")."""
-        self.press_key(element_name, "ENTER")
-
-    def press_backspace(self, element_name: str):
-        self.press_key(element_name, "BACKSPACE")
-
-    def press_arrow_up(self, element_name: str):
-        self.press_key(element_name, "ARROW_UP")
-
-    def press_arrow_down(self, element_name: str):
-        self.press_key(element_name, "ARROW_DOWN")
-
-    def press_tab(self, element_name: str):
-        self.press_key(element_name, "TAB")
-
-    def press_shift_tab(self, element_name: str):
-        self.press_key(element_name, "SHIFT+TAB")
-
-    def press_escape(self, element_name: str):
-        self.press_key(element_name, "ESCAPE")
-
-    def press_ctrl_a(self, element_name: str):
-        self.press_key(element_name, "CTRL+A")
-
-    def press_ctrl_s(self, element_name: str):
-        self.press_key(element_name, "CTRL+S")
-
-    def press_ctrl_p(self, element_name: str):
-        self.press_key(element_name, "CTRL+P")
-
-    def hover_element(self, element_name: str,
-                      recorded_cx=None, recorded_cy=None) -> None:
-        """Generic multi-level hover execution for CSS :hover navigation menus.
-
-        Root cause this solves
-        ----------------------
-        CSS :hover menus are purely coordinate-driven — the browser shows a
-        submenu only while the mouse pointer is physically over the parent.
-        Playwright's locator.hover() moves the CDP mouse to an element, but
-        as soon as the NEXT _find() call runs (to locate the child menu item)
-        it may call scroll_into_view_if_needed(), refocus the page, or
-        trigger any internal Playwright bookkeeping that repositions the
-        virtual cursor — causing the parent menu to collapse before the child
-        is found.
-
-        Solution
-        --------
-        1. Move the mouse to the element using page.mouse.move() at exact
-           recorded pixel coordinates (or element bounding box centre if no
-           recorded coords).  page.mouse.move() is a raw CDP mouse move — it
-           does NOT trigger any scrolling, focusing, or Playwright
-           bookkeeping.  The mouse stays where we put it.
-
-        2. Poll for child visibility using getComputedStyle (not aria/class
-           attributes) — catches pure CSS :hover menus that change neither.
-
-        3. Store the FULL ordered hover chain in self._hover_chain so any
-           subsequent hover or click step can replay the entire sequence of
-           parent → child → grandchild moves before looking for its own
-           element.  This is what handles 3+ level menus generically.
-
-        4. Before every _find() call inside this method, replay the chain
-           to ensure all ancestors are still hovered.
-
-        Multi-level replay contract
-        ---------------------------
-        Each hover_element() call appends its own position to self._hover_chain.
-        The click() method reads self._hover_chain and replays the full
-        sequence before retrying a failed _find(), restoring the entire
-        hover context regardless of depth.
-        """
-        import time as _time
-
-        # ── Step 1: Locate element without disturbing mouse position ────────
-        # Use _find() with a short timeout first so we don't wait 10s on an
-        # element that's only visible after hovering.  We'll retry after moving
-        # the mouse.
-        el = None
-        try:
-            el = self._find(element_name)
-        except Exception:
-            pass
-
-        # ── Step 2: Replay ancestor hover chain before moving ───────────────
-        # If previous hover steps have been recorded in _hover_chain, move
-        # the mouse through each one in order so their :hover state is
-        # restored.  This is the fix for multi-level menus: each level that
-        # came before MUST be physically hovered again before we can hover
-        # the next level.
-        for (prev_cx, prev_cy) in getattr(self, '_hover_chain', []):
-            try:
-                self.page.mouse.move(prev_cx, prev_cy)
-                _time.sleep(0.08)   # small gap so CSS transitions can fire
-            except Exception:
-                pass
-
-        # ── Step 3: Determine target coordinates ────────────────────────────
-        cx, cy = None, None
-
-        # Prefer recorded coordinates — they are the exact pixel position
-        # the user's mouse was at during recording.
-        if recorded_cx is not None and recorded_cy is not None:
-            cx, cy = float(recorded_cx), float(recorded_cy)
-        elif el is not None:
-            try:
-                box = el.bounding_box()
-                if box:
-                    cx = box["x"] + box["width"] / 2
-                    cy = box["y"] + box["height"] / 2
-            except Exception:
-                pass
-
-        if cx is None:
-            # No coordinates — fall back to Playwright hover which at least
-            # moves the cursor, even if it may cause minor layout shifts.
-            try:
-                if el is None:
-                    el = self._find(element_name)
-                el.hover(timeout=self.timeout * 1000)
-            except Exception as _he:
-                raise _he
-            # Store in chain and return
-            if not hasattr(self, '_hover_chain'):
-                self._hover_chain = []
-            self._hover_chain.append((0, 0))
-            self._last_hover_pos = (0, 0)
-            return
-
-        # ── Step 4: Move mouse to target ────────────────────────────────────
-        # page.mouse.move() is a raw CDP pointer move — no scrolling,
-        # no focus change, no Playwright bookkeeping.  This is what keeps
-        # CSS :hover alive on ancestor elements while we move to the child.
-        self.page.mouse.move(cx, cy)
-
-        # ── Step 5: Wait for child submenu to become visible ────────────────
-        # Poll getComputedStyle — catches CSS :hover menus that change no
-        # aria attributes or class names.
-        deadline = _time.time() + 3.0
-        submenu_visible = False
-        while _time.time() < deadline:
-            # Re-assert mouse position every poll cycle — some applications
-            # scroll the page in response to focus changes and displace the
-            # viewport, which can shift computed element positions.
-            self.page.mouse.move(cx, cy)
-            try:
-                submenu_visible = self.page.evaluate("""
-                    (pos) => {
-                        // Check element at recorded coordinates
-                        var hit = document.elementFromPoint(pos.cx, pos.cy);
-                        if (!hit) return false;
-                        // Walk up from hit element looking for a parent with
-                        // a visible sibling/child submenu
-                        var node = hit;
-                        for (var depth = 0; depth < 8 && node && node !== document.body; depth++) {
-                            var children = node.querySelectorAll(
-                                'ul, ol, [class*="sub"], [class*="drop"],' +
-                                '[class*="child"], [class*="menu"], [class*="flyout"]'
-                            );
-                            for (var i = 0; i < children.length; i++) {
-                                var cs = window.getComputedStyle(children[i]);
-                                if (cs.display !== 'none' &&
-                                    cs.visibility !== 'hidden' &&
-                                    parseFloat(cs.opacity || '1') > 0 &&
-                                    children[i].offsetWidth > 0) {
-                                    return true;
-                                }
-                            }
-                            // Also check aria-expanded anywhere nearby
-                            if (node.getAttribute && node.getAttribute('aria-expanded') === 'true') {
-                                return true;
-                            }
-                            node = node.parentElement;
-                        }
-                        return false;
-                    }
-                """, {"cx": cx, "cy": cy})
-                if submenu_visible:
-                    break
-            except Exception:
-                pass
-            _time.sleep(0.1)
-
-        if not submenu_visible:
-            # CSS transition may just be slow — give it one more fixed wait
-            _time.sleep(0.35)
-            self.page.mouse.move(cx, cy)
-
-        # ── Step 6: Append this position to the hover chain ─────────────────
-        # Every subsequent hover or click step will replay this chain in
-        # order before attempting to locate its own target element.
-        if not hasattr(self, '_hover_chain'):
-            self._hover_chain = []
-        self._hover_chain.append((cx, cy))
-        self._last_hover_pos = (cx, cy)
-
-        self.last_resolution = {
-            "element_name": element_name, "strategy": "HOVER",
-            "coords": (cx, cy), "self_healed": False,
-        }
-
-    def set_date(self, element_name: str, value: str, near_anchor: bool = False):
-        """
-        Set a date field to `value` (ISO format YYYY-MM-DD or the field's
-        own format such as DD/MM/YYYY).  Bypasses the calendar popup
-        entirely -- types directly into the underlying <input type="date">
-        or masked text input, which is far more reliable across browsers.
-
-        Strategy:
-          1. Find the element (or, if near_anchor=True, the nearest date
-             input to the anchor element).
-          2. Determine the field format from its placeholder or type attr.
-          3. Fill with real keystrokes (works for masked inputs).
-          4. Fall back to setting the value directly via JS.
-          5. Blur with Tab.
-          6. Assert the field holds the correct date (raises AssertionError).
-        """
-        import re as _re
-        from datetime import date as _d, datetime as _dt
-
-        # Parse ISO date
-        try:
-            dt = _d.fromisoformat(value[:10])
+            position = int(attrs["idx"])
+            predicates = []
+            if attrs.get("name"):
+                predicates.append(f"@name={_xpath_literal(attrs['name'])}")
+            if attrs.get("type"):
+                predicates.append(f"@type={_xpath_literal(attrs['type'])}")
+            if attrs.get("placeholder") and not predicates:
+                predicates.append(f"@placeholder={_xpath_literal(attrs['placeholder'])}")
+            predicate = f"[{' and '.join(predicates)}]" if predicates else ""
+            locators.append({
+                "strategy": "XPATH",
+                "value": f'(//{tag or "*"}{predicate})[{position}]',
+            })
         except ValueError:
-            try:
-                dt = _dt.strptime(value, "%d/%m/%Y").date()
-            except ValueError:
-                dt = None
-
-        if dt is None:
-            raise ValueError(f"set_date: cannot parse {value!r}")
-
-        # Locate target element
-        try:
-            el = self._find(element_name)
-        except Exception:
-            if near_anchor:
-                # Fall back to first date input on the page
-                el = self.page.locator('input[type="date"], input[placeholder*="/"], input[placeholder*="-"]').first
-            else:
-                raise
-
-        self._safe_scroll(el)
-        input_type = el.evaluate("n => n.type") or ""
-        placeholder = (el.evaluate("n => n.placeholder") or "").upper()
-
-        if input_type == "date":
-            # Native date input -- fill with ISO
-            try:
-                el.fill(dt.isoformat(), timeout=self.timeout * 1000)
-            except Exception:
-                el.evaluate(
-                    "(n, v) => { n.value = v; n.dispatchEvent(new Event('change', {bubbles:true})); }",
-                    dt.isoformat(), timeout=self.timeout * 1000,
-                )
-        else:
-            # Masked / text input: determine display format
-            if "YYYY" in placeholder or "YYYY-MM" in placeholder:
-                fmt = f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}"
-            elif "MM/DD/YYYY" in placeholder:
-                fmt = f"{dt.month:02d}/{dt.day:02d}/{dt.year:04d}"
-            else:  # default DD/MM/YYYY
-                fmt = f"{dt.day:02d}/{dt.month:02d}/{dt.year:04d}"
-
-            digits_only = _re.sub(r"\D", "", fmt)
-            try:
-                el.triple_click(timeout=self.timeout * 1000)
-                el.type(fmt, timeout=self.timeout * 1000)
-            except Exception:
-                # Some masked inputs only accept digit keys
-                try:
-                    el.triple_click(timeout=self.timeout * 1000)
-                    el.type(digits_only, timeout=self.timeout * 1000)
-                except Exception:
-                    el.evaluate(
-                        "(n, v) => { n.value = v; n.dispatchEvent(new Event('input', {bubbles:true})); n.dispatchEvent(new Event('change', {bubbles:true})); }",
-                        fmt, timeout=self.timeout * 1000,
-                    )
-
-            # Blur
-            try:
-                el.press("Tab", timeout=self.timeout * 1000)
-            except Exception:
-                pass
-
-        self.last_resolution = {
-            "element_name": element_name, "strategy": "SET_DATE", "value": value, "self_healed": False,
-        }
-
-    def capture_value(self, element_name: str) -> str:
-        """
-        Reads the CURRENT live value out of an element for the Capture ->
-        Store -> Reuse variable pipeline (see runner/variables.py). Prefers
-        Playwright DOM extraction - input_value() for inputs/textareas/selects,
-        falling back to text_content() for non-input elements/labels - since
-        that's the most reliable, headless-friendly way to read it. Only if
-        the element exposes neither does this fall back to reading the
-        browser's own clipboard, still entirely through Playwright
-        (page.evaluate calling navigator.clipboard.readText() - no external
-        clipboard library involved).
-        """
-        el = self._find(element_name)
-        value = None
-        try:
-            value = el.input_value(timeout=self.timeout * 1000)
-        except PlaywrightError:
             pass
-        if not value:
+
+    # rowName/colName - UiPath's way of targeting "the Nth <tag> in the
+    # table row/column labeled X" (e.g. Step 51-53's "Year-1"/"Year-2"/
+    # "Year-3" dropdowns, or Step 77-78's "First Name"/"Last Name" table
+    # columns). There's no way to know the real table's exact DOM shape
+    # from the spreadsheet alone, so this is a best-effort approximation:
+    # find the nearest ancestor row (a <tr>, or any element - some tables
+    # aren't real <table> markup) containing that label text, then take
+    # the idx'th (or 1st, if no idx given) matching tag within it. Worth a
+    # human double-check if the table turns out to have an unusual
+    # structure - this is exactly the kind of row worth spot-checking
+    # after import.
+    row_or_col_name = attrs.get("rowname") or attrs.get("colname")
+    if row_or_col_name and tag:
+        position = 1
+        if attrs.get("idx"):
             try:
-                value = el.text_content(timeout=self.timeout * 1000)
-            except PlaywrightError:
-                value = None
-        if value:
-            return value
-        try:
-            return self.page.evaluate(
-                "async () => {"
-                "  try {"
-                "    if (navigator.clipboard && navigator.clipboard.readText) {"
-                "      return (await navigator.clipboard.readText()) || '';"
-                "    }"
-                "  } catch (e) {}"
-                "  return '';"
-                "}"
-            ) or ""
-        except Exception:
-            return ""
+                position = int(attrs["idx"])
+            except ValueError:
+                pass
+        label = row_or_col_name.strip()
+        locators.append({
+            "strategy": "XPATH",
+            "value": (
+                f'(//tr[.//*[contains(normalize-space(text()), {_xpath_literal(label)})]]'
+                f'//{tag})[{position}]'
+            ),
+        })
+        # Some "table" layouts aren't real <table>/<tr> markup at all (div-
+        # based grids are common) - a looser fallback that doesn't require
+        # an actual <tr> ancestor, just SOME ancestor containing the label.
+        locators.append({
+            "strategy": "XPATH",
+            "value": (
+                f'(//*[.//*[contains(normalize-space(text()), {_xpath_literal(label)})]]'
+                f'//{tag})[{position}]'
+            ),
+        })
 
-    def capture_value_ocr(self, element_name: str) -> str:
-        """
-        Screenshots this element fresh and runs OCR on it - for a value
-        with no real selectable DOM text (an image or canvas-rendered
-        reference number, a scanned document field, etc.) that
-        capture_value() above can't read at all, since there's no
-        input_value()/text_content() to fall back to.
+    # Table-cell targeting: UiPath's tableCol/tableRow are coordinates
+    # into a specific rendered table whose structure this importer has no
+    # other knowledge of - a text-based match (already added above if
+    # visibleinnertext was present) is far more robust than trying to
+    # compute an nth-child position, so this only adds a plain tag+text
+    # fallback when NOTHING else was found at all.
+    if not locators and tag:
+        locators.append({"strategy": "XPATH", "value": f"//{tag}"})
 
-        Re-run LIVE every single test execution (a fresh screenshot, a
-        fresh OCR pass), never reusing whatever was read at recording
-        time - see recorder/ocr_engine.py's module docstring for why
-        (these are typically values the application generates fresh on
-        each run, the same reason capture_value() above always reads
-        live too). Requires EasyOCR (pip install easyocr Pillow numpy) -
-        imported lazily here so a recording with no OCR captures at all
-        never needs those installed.
-        """
-        from recorder.ocr_engine import extract_text_from_png_bytes
+    return locators
 
-        el = self._find(element_name)
-        png_bytes = el.screenshot(timeout=self.timeout * 1000)
-        return extract_text_from_png_bytes(png_bytes)
 
-    def upload_file(self, element_name: str, file_name: str):
-        """
-        Handles a recorded file upload. Browsers never expose a chosen
-        file's real absolute path to JavaScript (input.value is always a
-        fabricated "C:\\fakepath\\<name>" string, for security) - only the
-        NAME was ever recordable (see recorder_injector.js's 'file_upload'
-        action). That means the actual bytes to upload can't be replayed
-        from the recording alone; this looks for a real local file with
-        that exact name so Playwright's set_input_files() (the only
-        correct API for file inputs - fill()/type() do not work on them)
-        has something real to attach.
+def _parse_scroll_input(value: str) -> tuple[str, int]:
+    """"DOWN-4" -> ("down", 4); tolerates "DOWN", "down-4", stray
+    whitespace, or a bare number (defaults direction to "down")."""
+    value = (value or "down-1").strip()
+    match = re.match(r"([a-zA-Z]+)\s*-?\s*(\d+)?", value)
+    if not match:
+        return "down", 1
+    direction = match.group(1).lower()
+    amount = int(match.group(2)) if match.group(2) else 1
+    if direction not in ("up", "down"):
+        direction = "down"
+    return direction, amount
 
-        Search order for a file named `file_name`:
-          1. FIXTURES_DIR (output/fixtures/) - the file used during
-             recording is placed here automatically (see
-             generator/build.py) whenever it was small enough to capture
-             inline, so this is normally already populated by the time
-             replay runs.
-          2. The output directory itself, in case a file was dropped there
-             directly rather than into fixtures/.
 
-        Raises FileNotFoundError with a clear message if it isn't found
-        anywhere, rather than silently skipping the upload.
-        """
-        search_dirs = [FIXTURES_DIR, Path(__file__).parent.parent]
-        for directory in search_dirs:
-            candidate = directory / file_name
-            if candidate.exists():
-                el = self._find(element_name)
-                el.set_input_files(str(candidate))
-                return
-        raise FileNotFoundError(
-            f"upload_file(\"{element_name}\", \"{file_name}\"): no file named "
-            f"'{file_name}' found in {FIXTURES_DIR} or {search_dirs[1]}. "
-            f"A browser can never report the real path it was uploaded from "
-            f"during recording - place an actual file with this exact name "
-            f"under {FIXTURES_DIR} before replaying this step."
+def list_uipath_sheets(file_path: str) -> list[str]:
+    """Returns every sheet name in the workbook, in their on-disk order -
+    used by the "which sheet(s) do you want to import?" step on the
+    frontend BEFORE anything is actually imported (see
+    backend/api.py's /api/recordings/uipath_sheets), since a real UiPath
+    test suite is very often organized as one sheet per test case/
+    scenario rather than one sheet per file."""
+    wb = openpyxl.load_workbook(file_path, read_only=True)
+    try:
+        return list(wb.sheetnames)
+    finally:
+        wb.close()
+
+
+def import_uipath_excel(file_path: str, recording_name: Optional[str] = None, sheet_name: Optional[str] = None) -> dict:
+    """Reads ONE sheet of a UiPath-style Excel file and returns
+    {"recording": {...}, "warnings": [...]} - `recording` is ready to pass
+    straight to recorder/recorder.py's save_recording_json() or
+    generator/build.py's build_artifacts(), exactly like a live-recorded
+    session would be. `warnings` lists any rows that couldn't be fully
+    understood (an unrecognized Action/Method, a selector with no usable
+    attributes, etc.) - these don't stop the import, but are worth
+    surfacing to whoever's reviewing the result.
+
+    `sheet_name` selects which sheet to read - omit it (or pass None) to
+    use the workbook's active sheet, matching this function's original,
+    single-sheet-file behavior. For a workbook with multiple sheets (one
+    per test case, commonly), see import_uipath_excel_sheets below, which
+    calls this once per sheet and returns one recording per sheet."""
+    wb = openpyxl.load_workbook(file_path, data_only=True)
+    ws = wb[sheet_name] if sheet_name else wb.active
+
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        raise ValueError("The spreadsheet is empty.")
+
+    header_row_idx = 0
+    columns = _find_column_indices(rows[header_row_idx])
+    if "action" not in columns:
+        raise ValueError(
+            "Could not find an 'Action/Method' column in the spreadsheet - "
+            "expected a header row with a column containing that text."
         )
 
-    def assert_text_contains(self, element_name: str, expected_text: str):
-        """
-        Asserts the element's visible text (or, for an input/textarea, its
-        current value) contains `expected_text` - a pure check, no click
-        or type involved. Used for a recorded/imported "VERIFICATION"-style
-        step (e.g. confirming a "Data saved successfully" message actually
-        appeared) - see generator/uipath_importer.py.
+    def cell(row, key):
+        idx = columns.get(key)
+        if idx is None or idx >= len(row):
+            return None
+        value = row[idx]
+        if value is None:
+            return None
+        text = str(value).strip()
+        # A literal two-character '""' (an empty-string placeholder some
+        # UiPath exports write instead of leaving the cell truly blank)
+        # means "no value here" - without this, it would otherwise get
+        # typed/selected literally as the two-character string `""`.
+        if text == '""':
+            return None
+        return text
 
-        Reads the element live, the same way capture_value() does, and
-        raises a plain AssertionError (which behave reports as a normal
-        failed step, with a clear message) rather than letting a
-        Playwright-internal error surface if the text doesn't match.
-        """
-        el = self._find(element_name)
-        try:
-            actual = el.input_value(timeout=self.timeout * 1000)
-        except PlaywrightError:
-            actual = el.text_content(timeout=self.timeout * 1000) or ""
-        actual_normalized = " ".join(actual.split())
-        expected_normalized = " ".join(expected_text.split())
-        if expected_normalized not in actual_normalized:
-            raise AssertionError(
-                f'Expected "{element_name}" to contain "{expected_text}", but its actual text was "{actual}".'
+    target_url = None
+    actions: list[dict] = []
+    warnings: list[str] = []
+    # Tracks the most recent row that had a real, resolvable element/
+    # locators - used by ENTER above, which needs to target "whatever was
+    # last interacted with" rather than a specific selector of its own.
+    last_element: dict = {}
+    last_locators: list = []
+
+    for row_num, row in enumerate(rows[header_row_idx + 1:], start=header_row_idx + 2):
+        if row is None or all(v is None for v in row):
+            continue
+
+        action_method = (cell(row, "action") or "").strip().upper()
+        if not action_method:
+            continue
+
+        name_hint = cell(row, "name") or ""
+        selector_text = cell(row, "selector") or ""
+        input_value = cell(row, "input")
+        step_label = cell(row, "step") or f"row {row_num}"
+
+        if action_method == "OPENBROWSER":
+            target_url = input_value or target_url
+            continue
+
+        if action_method == "DELAY":
+            try:
+                delay_seconds = float(input_value or 1)
+            except ValueError:
+                delay_seconds = 1.0
+                warnings.append(f"{step_label}: DELAY value {input_value!r} isn't a number - defaulted to 1 second.")
+            actions.append({
+                "action": "delay", "value": delay_seconds, "element": {}, "locators": [],
+                "page_index": current_page_index, "frame_path": [],
+            })
+            continue
+
+        if action_method == "SCROLL":
+            direction, amount = _parse_scroll_input(input_value)
+            actions.append({
+                "action": "scroll", "value": None, "element": {}, "locators": [],
+                "page_index": current_page_index, "frame_path": [], "scroll_direction": direction, "scroll_amount": amount,
+            })
+            continue
+
+        if action_method in ("CLOSETAB", "CLOSE_TAB", "CLOSE TAB"):
+            actions.append({
+                "action": "window_closed", "value": None, "element": {}, "locators": [],
+                "page_index": current_page_index, "frame_path": [], "opener_page_index": 0,
+            })
+            continue
+
+        if action_method == "ENTER":
+            # UiPath's ENTER step never carries a selector of its own - in
+            # UiPath itself it presses Enter on whatever element currently
+            # has focus, which in a real flow is essentially always the
+            # field the immediately preceding step just interacted with
+            # (e.g. typing a pincode, then ENTER to trigger a city/state
+            # autofill - a very common pattern in these forms). Unlike a
+            # real browser recording's own "keypress" actions (which always
+            # have a genuine target element, since they're captured AT that
+            # element), this project's press_key() needs an actual element
+            # to resolve - so this reuses the last real element/locators
+            # seen so far in THIS import, rather than generating a step
+            # with an empty, unresolvable locator that would fail
+            # immediately at replay. If no prior element exists at all
+            # (ENTER as the very first meaningful step - unusual), the row
+            # is skipped with a warning rather than generating a step
+            # that's guaranteed to fail.
+            if last_locators:
+                actions.append({
+                    "action": "keypress", "value": "ENTER", "element": last_element, "locators": last_locators,
+                    "page_index": current_page_index, "frame_path": [],
+                })
+            else:
+                warnings.append(f"{step_label}: ENTER has no preceding element to target - row skipped.")
+            continue
+
+        if is_native_dialog_selector(selector_text):
+            # A native OS/browser dialog (e.g. a plain confirm() popup) -
+            # this project's generated tests already auto-accept every
+            # such dialog globally (see runner/environment.py's page.on(
+            # "dialog", ...) handler), so no explicit step is needed for
+            # it at all - see this module's docstring.
+            continue
+
+        if action_method == "CAPTURE":
+            # UiPath's CAPTURE reads a value off the page and stores it as
+            # a variable - maps onto this project's existing "copy" action
+            # (see recorder/variable_capture.py - it's the exact same
+            # "capture -> store -> re-read live at replay" mechanism a
+            # real browser Ctrl+C copy already uses, just triggered here
+            # by an imported row instead of a live gesture).
+            #
+            # The "input" column for a CAPTURE row (e.g. "HRMS-PFIDMAKER")
+            # is a variable NAME/label, not literal page text - there's no
+            # way to know the real text at import time anyway (no live
+            # page to read from during an Excel import). "value" is left
+            # unset here deliberately, since the "copy" action's replay
+            # always re-reads the real, current text live regardless of
+            # what was recorded at capture time (see
+            # generator/templates/page.tmpl's capture_value()) - this row
+            # just tells replay WHERE to read from and WHAT to call the
+            # result.
+            locators = build_locators_from_uipath_selector(selector_text)
+            if not locators:
+                warnings.append(f"{step_label} ({name_hint or 'unnamed'}): CAPTURE has no usable selector in {selector_text!r} - row skipped.")
+                continue
+            var_name = re.sub(r"[^a-zA-Z0-9_]", "_", (input_value or name_hint or "captured_value")).strip("_") or "captured_value"
+            attrs = _parse_webctrl_attrs(selector_text)
+            actions.append({
+                "action": "copy",
+                "value": None,
+                "captured_as": var_name,
+                "element": {
+                    "tag": (attrs.get("tag") or "").lower(), "type": attrs.get("type", ""),
+                    "text": (attrs.get("visibleinnertext") or attrs.get("innertext") or attrs.get("aaname") or "")[:60],
+                    "placeholder": "", "name": attrs.get("name", ""),
+                    "ariaLabel": attrs.get("aria-label", "") or attrs.get("aaname", ""),
+                },
+                "locators": locators, "page_index": current_page_index, "frame_path": [],
+            })
+            last_element, last_locators = actions[-1]["element"], locators
+            continue
+
+        if action_method in ("RANDOMINPUT", "RANDOM", "RANDOMTEXT", "RANDOMDATA", "RANDOMINPUT-C"):
+            # RANDOMINPUT types a randomly generated value.
+            # The input_value (Value column) is the spec e.g. "NUM-9",
+            # "FIRSTNAME", "LN{NUM-6}" - see generator/random_data.py.
+            # Empty Value → spec guessed from NAME column.
+            # The name_hint is stored so [NAME] in a later step resolves
+            # to the generated value at run time.
+            locators = build_locators_from_uipath_selector(selector_text)
+            if not locators:
+                warnings.append(
+                    f"{step_label} ({name_hint or 'unnamed'}): RANDOMINPUT has no usable selector "
+                    f"in {selector_text!r} - row skipped."
+                )
+                continue
+            try:
+                from generator.random_data import check as _check_spec
+                problem = _check_spec(input_value, name_hint)
+                if problem:
+                    warnings.append(f"{step_label} ({name_hint or 'unnamed'}): {problem}")
+            except ImportError:
+                pass
+            attrs = _parse_webctrl_attrs(selector_text)
+            actions.append({
+                "action": "type",
+                "value": input_value or "",          # spec string kept as value
+                "random_spec": input_value or "",    # explicit marker for runner
+                "saved_as": name_hint or "",         # [NAME] key for later resolution
+                "element": {
+                    "tag": (attrs.get("tag") or "").lower(),
+                    "type": attrs.get("type", ""),
+                    "text": (attrs.get("visibleinnertext") or attrs.get("aaname") or name_hint or "").strip()[:60],
+                    "placeholder": "",
+                    "name": attrs.get("name", ""),
+                    "ariaLabel": attrs.get("aria-label", "") or attrs.get("aaname", ""),
+                },
+                "locators": locators, "page_index": current_page_index, "frame_path": [],
+                "raw_selector": selector_text,
+            })
+            continue
+
+        if action_method in ("VERIFICATION", "VERIFY", "VALIDATE", "VALIDATION"):
+            locators = build_locators_from_uipath_selector(selector_text)
+            if not locators:
+                warnings.append(f"{step_label} ({name_hint or 'unnamed'}): VERIFICATION has no usable selector in {selector_text!r} - row skipped.")
+                continue
+            attrs = _parse_webctrl_attrs(selector_text)
+            expected_text = input_value or (attrs.get("visibleinnertext") or attrs.get("innertext") or "").strip()
+            actions.append({
+                "action": "assert_text",
+                "value": expected_text,
+                "element": {
+                    "tag": (attrs.get("tag") or "").lower(), "type": attrs.get("type", ""),
+                    "text": expected_text[:60], "placeholder": "", "name": attrs.get("name", ""),
+                    "ariaLabel": attrs.get("aria-label", "") or attrs.get("aaname", ""),
+                },
+                "locators": locators, "page_index": current_page_index, "frame_path": [], "raw_selector": selector_text,
+            })
+            continue
+
+        # Everything else needs a selector to act on.
+        locators = build_locators_from_uipath_selector(selector_text)
+        if not locators:
+            warnings.append(f"{step_label} ({name_hint or 'unnamed'}): no usable selector found in {selector_text!r} - row skipped.")
+            continue
+
+        attrs = _parse_webctrl_attrs(selector_text)
+        element = {
+            "tag": (attrs.get("tag") or "").lower(),
+            "type": attrs.get("type", ""),
+            "text": (attrs.get("visibleinnertext") or attrs.get("aaname") or name_hint or "").strip()[:60],
+            "placeholder": "",
+            "name": attrs.get("name", ""),
+            "ariaLabel": attrs.get("aria-label", "") or attrs.get("aaname", ""),
+        }
+
+        internal_action = ACTION_MAP.get(action_method)
+        if internal_action is None:
+            warnings.append(f"{step_label} ({name_hint or 'unnamed'}): unrecognized Action/Method {action_method!r} - imported as a click.")
+            internal_action = "click"
+        elif action_method == "STOPPER":
+            warnings.append(
+                f"{step_label} ({name_hint or 'unnamed'}): STOPPER imported as a click - these are usually the "
+                f"least reliable selector in the sheet (often a date-picker day cell) and worth double-checking."
+            )
+        elif internal_action == "select" and element["tag"] != "select":
+            # A real <select> is the only element type Playwright's
+            # select_option() (what a "select" action calls at replay -
+            # see BasePage.select_option in page.tmpl) actually works on.
+            # Several UI component libraries (MUI's Autocomplete/combobox
+            # among them) render a text <input> that LOOKS like a
+            # dropdown but is a completely different widget under the
+            # hood - clicking to open it, then clicking the matching
+            # option by its own text, is what actually works there
+            # instead. This project doesn't yet generate that alternate
+            # interaction automatically, so this is imported as-is
+            # (select_option() will raise a clear Playwright error at
+            # replay if it turns out not to be a real <select>) with an
+            # up-front warning, rather than only discovering the mismatch
+            # after a failed run.
+            warnings.append(
+                f"{step_label} ({name_hint or 'unnamed'}): DROPDOWN-S on a <{element['tag'] or '?'}> element, not a "
+                f"real <select> - if this is a custom dropdown/combobox (MUI, etc.), it likely needs to be "
+                f"recorded as a click-to-open + click-the-option sequence instead; this will probably fail at "
+                f"replay as imported."
             )
 
-    def assert_ocr_text_visible(self, expected_text: str, min_confidence: float = 0.35):
-        """
-        Page-level visual assertion, no DOM element/locator involved at
-        all: screenshots the WHOLE page and confirms `expected_text` is
-        visibly present somewhere on it via OCR. For content with no DOM
-        node to check in the first place - canvas-rendered text,
-        image-based labels/buttons, scanned or embedded content -
-        assert_text_contains above can't help since there's nothing to
-        select; this only needs the text to be genuinely ON SCREEN.
+        action_dict = {
+            "action": internal_action,
+            "value": input_value if internal_action in ("type", "select") else None,
+            "element": element,
+            "locators": locators,
+            "page_index": 0,
+            "frame_path": [],
+            "raw_selector": selector_text,
+            # -- Canonical layer (Phase 2 migration) ----------------------
+            # source: preserves the original UiPath metadata so the
+            # canonical workflow retains its migration provenance.
+            # The execution engine only reads `action` (already canonical);
+            # `source` is for audit, rollback, and migration tooling.
+            "source": {
+                "type": "uipath",
+                "original_action": action_method,   # e.g. "S_CLICK", "VERIFY"
+                "original_selector": selector_text, # verbatim from spreadsheet
+                "original_name": name_hint or "",   # NAME column value
+            },
+        }
+        # Radio/checkbox clicks need the resulting checked state as their
+        # "value" (see recorder_injector.js's own click listener +
+        # generator/build.py's is_toggle handling) - a UiPath CLICK-C on a
+        # radio/checkbox is assumed to be selecting/checking it (UiPath
+        # itself doesn't record an "uncheck" gesture the way this project
+        # does), which covers the overwhelming majority of real flows.
+        if internal_action == "click" and element["type"] in ("radio", "checkbox"):
+            action_dict["value"] = True
 
-        Raises a plain AssertionError (reported by behave as a normal
-        failed step, same as assert_text_contains) including what OCR
-        actually read, so a failure is debuggable without needing to open
-        the step's screenshot separately - though that screenshot IS
-        still captured automatically for every step regardless (see
-        runner/environment.py's after_step hook), providing the same
-        visual evidence a failed DOM assertion already gets.
-        """
-        from recorder.ocr_engine import find_text_regions, best_match
+        actions.append(action_dict)
+        last_element, last_locators = element, locators
 
-        png_bytes = self.page.screenshot(full_page=True, timeout=self.timeout * 1000)
-        regions = find_text_regions(png_bytes)
-        match = best_match(regions, expected_text, min_confidence=min_confidence)
-        if match is None:
-            seen = ", ".join(r["text"] for r in regions if r["text"].strip()) or "(no text detected at all)"
-            raise AssertionError(
-                f'Expected "{expected_text}" to be visible on screen (via OCR), but it was not found. '
-                f"Text OCR actually read on this page: {seen}"
-            )
+    if not actions:
+        warnings.append("No actionable steps were found in this spreadsheet.")
 
-    def select_option(self, element_name: str, option_text: str):
-        """
-        Handles native <select> dropdowns via Playwright's select_option()
-        (the reliable way - clicking/sending keys directly to a <select> is
-        what usually causes "dropdown issues"). Falls back to selecting by
-        value, then to a generic click-open-and-click-option approach for
-        custom (non-native) dropdown widgets that aren't real <select>
-        elements.
-        """
-        el = self._find(element_name)
-        self._safe_scroll(el)
+    recording = {
+        "target_url": target_url or "",
+        "recorded_at": datetime.now().strftime("%Y%m%d_%H%M%S"),
+        "recording_name": recording_name,
+        "actions": actions,
+        "imported_from": "uipath_excel",
+        # -- Canonical layer (Phase 2 migration) --------------------------
+        # migration_status tracks where this workflow is in the UiPath->
+        # native migration lifecycle.  Possible values (from Section 14):
+        #   NOT_MIGRATED  -- freshly imported UiPath script, not yet validated
+        #   MIGRATED      -- imported and basic execution confirmed
+        #   VALIDATING    -- under active validation/QA
+        #   VALIDATED     -- confirmed to match original UiPath behavior
+        #   PRODUCTION    -- approved for production regression use
+        #   DEPRECATED    -- no longer needed
+        "migration_status": "NOT_MIGRATED",
+        # source_type: which input source produced this recording.
+        # Future values: "native_recorder", "manual", "ai_generated".
+        "source_type": "uipath",
+    }
+    if not target_url:
+        warnings.append("No OPENBROWSER row was found - this recording has no target_url set. Add one before running it.")
 
-        tag_name = el.evaluate("node => node.tagName.toLowerCase()", timeout=self.timeout * 1000)
-        if tag_name == "select":
-            try:
-                el.select_option(label=option_text, timeout=self.timeout * 1000)
-                return
-            except (PlaywrightTimeoutError, PlaywrightError) as e:
-                if _navigation_interrupted(e):
-                    return
-            try:
-                el.select_option(value=option_text, timeout=self.timeout * 1000)
-                return
-            except (PlaywrightTimeoutError, PlaywrightError) as e:
-                if _navigation_interrupted(e):
-                    return
+    return {"recording": recording, "warnings": warnings}
 
-        # Not a native <select>, or text/value didn't match an <option> exactly -
-        # treat it as a custom dropdown: open it, then click the option by its text.
+
+def import_uipath_excel_sheets(file_path: str, sheet_names: list[str], recording_name_prefix: Optional[str] = None) -> list[dict]:
+    """Imports several sheets of ONE workbook, one recording per sheet -
+    see backend/api.py's /api/recordings/import_uipath, which lets the
+    person choose a specific sheet, several, or every sheet (via
+    list_uipath_sheets above) rather than always reading just the active
+    one. A real UiPath test suite is very often organized as one sheet
+    per test case/scenario, all bundled into a single .xlsx file - this
+    is what makes importing "all of them at once" meaningful rather than
+    just a convenience for a single-sheet file.
+
+    Returns one entry per sheet, in the SAME order as `sheet_names`:
+      {"sheet_name": str, "recording": {...} | None, "warnings": [...],
+       "error": str | None}
+    A sheet that isn't actually a test-steps sheet at all (e.g. a
+    reference/notes tab with no recognizable "Action/Method" column)
+    gets "error" set and "recording": None rather than aborting the
+    whole batch - the other sheets in the same file still import
+    normally. Each successfully-imported sheet's recording_name is
+    `f"{recording_name_prefix} - {sheet_name}"` (or just the sheet name
+    if no prefix was given), so a batch import of "MCC Flows.xlsx" with
+    sheets "Proposal" and "Sanction" produces two distinctly-named,
+    independently runnable recordings rather than one being silently
+    overwritten by the other."""
+    results = []
+    for sheet_name in sheet_names:
+        recording_name = f"{recording_name_prefix} - {sheet_name}" if recording_name_prefix else sheet_name
         try:
-            el.click(timeout=self.timeout * 1000)
-        except (PlaywrightTimeoutError, PlaywrightError) as e:
-            if not _navigation_interrupted(e):
-                raise
-        # Search within the SAME iframe (if any) the dropdown itself lives
-        # in, not the top page - a custom dropdown's option list almost
-        # always renders inside that same document.
-        root = self._frame_root(element_name)
-        option = root.locator(f"xpath=//*[normalize-space(text())={_xpath_literal(option_text)}]")
-        try:
-            option.first.click(timeout=self.timeout * 1000)
-        except (PlaywrightTimeoutError, PlaywrightError) as e:
-            if not _navigation_interrupted(e):
-                raise
-
-
-class RecordedPage(BasePage):
-    """Convenience wrappers matching the recorded element names."""
-{% for name in element_names %}
-    def click_{{ name }}(self):
-        self.click("{{ name }}")
-
-    def type_{{ name }}(self, value):
-        self.type_text("{{ name }}", value)
-
-    def paste_{{ name }}(self, value):
-        self.paste_text("{{ name }}", value)
-
-    def set_checked_{{ name }}(self, checked):
-        self.set_checked("{{ name }}", checked)
-
-    def press_enter_{{ name }}(self):
-        self.press_enter("{{ name }}")
-
-    def press_key_{{ name }}(self, key_name):
-        self.press_key("{{ name }}", key_name)
-
-    def capture_{{ name }}(self):
-        return self.capture_value("{{ name }}")
-
-    def select_{{ name }}(self, option_text):
-        self.select_option("{{ name }}", option_text)
-{% endfor %}
+            single = import_uipath_excel(file_path, recording_name=recording_name, sheet_name=sheet_name)
+            results.append({
+                "sheet_name": sheet_name, "recording": single["recording"],
+                "warnings": single["warnings"], "error": None,
+            })
+        except Exception as e:
+            results.append({
+                "sheet_name": sheet_name, "recording": None, "warnings": [], "error": str(e),
+            })
+    return results
