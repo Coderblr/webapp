@@ -1,65 +1,2365 @@
-Feature: Recorded flow - {{ scenario_name }}
-  Auto-generated from a recorded browser session on {{ recorded_at }}.
-  Target application: {{ target_url }}
+# -*- coding: utf-8 -*-
+"""
+Auto-generated Page Object.
+Locators live in locators.json (not hard-coded here) so the self-healing
+agent can patch a broken selector without touching this file.
+"""
+from __future__ import annotations
+import json
+import time
+from pathlib import Path
 
-  Scenario: {{ scenario_name }}
-    Given the user opens "{{ target_url }}"
-{% for step in steps %}
-{% if step.action == "click" %}
-    When the user clicks "{{ step.element_name }}"
-{% elif step.action == "click_optional" %}
-    When the user clicks "{{ step.element_name }}" if it appears
-{% elif step.action == "toggle" %}
-{% if step.checked_value %}
-    When the user checks "{{ step.element_name }}"
-{% else %}
-    When the user unchecks "{{ step.element_name }}"
-{% endif %}
-{% elif step.action in ("type", "paste") %}
-{% if step.var_placeholder %}
-    When the user enters "{{ step.var_placeholder }}" into "{{ step.element_name }}"
-{% else %}
-    When the user enters "{{ step.value }}" into "{{ step.element_name }}"
-{% endif %}
-{% elif step.action == "file_upload" %}
-    When the user uploads the file "{{ step.value }}" into "{{ step.element_name }}"
-{% elif step.action == "select" %}
-    When the user selects "{{ step.value }}" from "{{ step.element_name }}"
-{% elif step.action == "keypress" %}
-    When the user presses {{ step.key_label }} on "{{ step.element_name }}"
-{% elif step.action == "copy" %}
-    When the user captures the value of "{{ step.element_name }}" as "{{ step.var_placeholder }}"
-{% elif step.action == "ocr_capture" %}
-    When the user captures the value of "{{ step.element_name }}" via OCR as "{{ step.var_placeholder }}"
-{% elif step.action == "window_closed" %}
-    When the user closes the current browser tab or window (step {{ loop.index }})
-{% elif step.action == "dialog" %}
-    When a "{{ step.dialog_type }}" dialog appears and is accepted (step {{ loop.index }})
-{% elif step.action == "delay" %}
-    When the flow waits {{ step.delay_seconds }} seconds (step {{ loop.index }})
-{% elif step.action == "assert_text" %}
-    When the page shows "{{ step.expected_text }}" in "{{ step.element_name }}"
-{% elif step.action == "assert_ocr_text" %}
-    When the page visually shows "{{ step.expected_text }}" (via OCR) (step {{ loop.index }})
-{% elif step.action == "scroll" %}
-    When the page scrolls {{ step.scroll_direction }} (step {{ loop.index }})
-{% elif step.action == "new_window_wait" %}
-    When a new browser tab or window opens (step {{ loop.index }})
-{% elif step.action == "date" %}
-    When the user sets the date "{{ step.value }}" in "{{ step.element_name }}"
-{% elif step.action == "hover" %}
-    When the user hovers over "{{ step.element_name }}"
-{% elif step.action == "menu_check" %}
-    When every link in the navigation menu is checked (step {{ loop.index }})
-{% elif step.action == "type" and step.random_spec %}
-    When the user enters a random "{{ step.random_spec }}" value into "{{ step.element_name }}"
-{% endif %}
-{% if step.opens_new_page %}
-{% if step.activate_new_page is defined and not step.activate_new_page %}
-    And a new browser tab or window has opened in the background (step {{ loop.index }})
-{% else %}
-    And the new browser tab or window is now active (step {{ loop.index }})
-{% endif %}
-{% endif %}
+from playwright.sync_api import Page, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
+
+LOCATORS_PATH = Path(__file__).parent / "locators.json"
+
+# Self-heal writes go back to LOCATORS_PATH by default (same directory as
+# the generated page object). This is the shared locators.json that
+# build_artifacts() writes fresh on every run.
+#
+# Per-run scoping (Fix 1): if the environment sets LOCATORS_OVERRIDE_PATH,
+# the page object reads from that path and writes healed locators there
+# instead of the shared LOCATORS_PATH. run_recording.py sets this env var
+# to a copy inside the run's output dir so healed locators from run N
+# never corrupt run N+1.
+import os as _os
+_LOCATORS_OVERRIDE = _os.environ.get("LOCATORS_OVERRIDE_PATH")
+_EFFECTIVE_LOCATORS_PATH = Path(_LOCATORS_OVERRIDE) if _LOCATORS_OVERRIDE else LOCATORS_PATH
+
+import logging as _logging
+logger = _logging.getLogger(__name__)
+
+# A recorded link that is hidden inside a closed hover/dropdown menu gets
+# its parent menus opened automatically before it is used (see
+# BasePage._reveal_in_menu). Set AUTO_OPEN_MENUS=false to disable.
+_AUTO_OPEN_MENUS = _os.environ.get("AUTO_OPEN_MENUS", "true").lower().strip() != "false"
+
+# Menus are opened WITHOUT the mouse pointer: the browser is told to treat
+# the parent items as hovered (the same "force :hover" switch DevTools has),
+# so it makes no difference where the real mouse is, or whether anyone
+# touches it during a run. Moving the pointer is kept only as the fallback.
+# Set MENU_OPEN_WITHOUT_MOUSE=false to go back to pointer-only.
+_POINTER_FREE_MENUS = _os.environ.get("MENU_OPEN_WITHOUT_MOUSE", "true").lower().strip() != "false"
+
+# Where upload_file() looks for a real local file to attach to a recorded
+# file input - see generator/build.py, which materializes any file(s)
+# actually chosen during recording here automatically, under their
+# original name (see recorder/recorder_injector.js's "file_upload" handling).
+FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
+
+# Recorded keypress values (see recorder/recorder_injector.js) mapped to the
+# key name Playwright's Locator.press()/Keyboard.press() expects.
+_KEY_MAP = {
+    "ENTER": "Enter",
+    "BACKSPACE": "Backspace",
+    "ARROW_UP": "ArrowUp",
+    "ARROW_DOWN": "ArrowDown",
+    "ARROW_LEFT": "ArrowLeft",
+    "ARROW_RIGHT": "ArrowRight",
+    "TAB": "Tab",
+    "ESCAPE": "Escape",
+    "DELETE": "Delete",
+    "SPACE": "Space",
+    "HOME": "Home",
+    "END": "End",
+}
+_KEY_MAP.update({f"F{i}": f"F{i}" for i in range(1, 13)})
+
+# Modifier + key combos. Playwright accepts these as a single "Modifier+Key"
+# string directly (no separate keydown/keyup calls needed, unlike Selenium).
+_COMBO_MAP = {
+    "CTRL+A": "Control+A",
+    "CTRL+C": "Control+C",
+    "CTRL+V": "Control+V",
+    "CTRL+X": "Control+X",
+    "CTRL+P": "Control+P",
+    "CTRL+S": "Control+S",
+    "SHIFT+TAB": "Shift+Tab",
+}
+
+
+def _css_attr_quote(value: str) -> str:
+    """Safely double-quotes a string for use inside a CSS attribute selector."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _xpath_literal(value: str) -> str:
+    """Safely quotes a string for use inside an XPath expression, even if it contains quotes."""
+    if '"' not in value:
+        return f'"{value}"'
+    if "'" not in value:
+        return f"'{value}'"
+    parts = value.split('"')
+    return "concat(" + ', \'"\', '.join(f'"{p}"' for p in parts) + ")"
+
+
+def _selector_for(strategy: str, value: str) -> str:
+    """Turns a captured (strategy, value) pair into a Playwright selector string.
+    Supports the full canonical locator taxonomy including TEXT, ROLE, ARIA."""
+    if strategy == "ID":
+        return f"css=[id={_css_attr_quote(value)}]"
+    if strategy == "NAME":
+        return f"css=[name={_css_attr_quote(value)}]"
+    if strategy == "CSS":
+        return f"css={value}"
+    if strategy == "XPATH":
+        return f"xpath={value}"
+    if strategy == "TEXT":
+        return f"text={value}"
+    if strategy == "ROLE":
+        if "[" in value:
+            role, rest = value.split("[", 1)
+            name = rest.rstrip("]")
+            return f'role={role.strip()}[name="{name.strip()}"]'
+        return f"role={value}"
+    if strategy == "ARIA":
+        return f'css=[aria-label={_css_attr_quote(value)}]'
+    raise ValueError(f"Unknown locator strategy '{strategy}'")
+
+
+# Substrings Playwright's own error messages use when an action gets cut
+# short by the PAGE NAVIGATING AWAY mid-action - e.g. clicking a login/submit
+# button that causes a full page load. This is Playwright's normal (if
+# confusingly-worded) way of reporting that the frame/execution context it
+# was tracking got torn down - it does NOT mean the click failed; it almost
+# always means the click worked and the page had already moved on before
+# Playwright finished its own bookkeeping for that action. Treating this as
+# a real failure and retrying (or worse, re-querying the OLD page's selector
+# on the NEW page) is what causes a working login/submit click to still
+# report an error, or to hang for Playwright's own default action timeout
+# waiting for an element that's gone because the page already navigated.
+_NAVIGATION_INTERRUPTED_HINTS = (
+    "execution context was destroyed",
+    "most likely because of a navigation",
+    "target closed",
+    "frame was detached",
+    "navigating frame was detached",
+)
+
+
+def _navigation_interrupted(exc: Exception) -> bool:
+    return any(hint in str(exc).lower() for hint in _NAVIGATION_INTERRUPTED_HINTS)
+
+
+
+class BasePage:
+    def __init__(self, page: Page, timeout: int = 8, poll_interval: float = 0.25, heal_callback=None, max_wait_seconds: int = 90):
+        self.page = page
+        self.timeout = timeout
+        self.poll_interval = poll_interval
+        self.heal_callback = heal_callback  # optional fn(element_name, page) -> {"strategy":..., "value":...} or None
+        self.locators = json.loads(_EFFECTIVE_LOCATORS_PATH.read_text())
+        # element_name -> visible text/aria-label, recorded for plain
+        # click() targets only (see generator/build.py) - consulted ONLY as
+        # a last resort by _ocr_click_fallback below, after every DOM
+        # locator candidate (including self-heal) has already failed. Not
+        # a real element_name, so it's popped off self.locators here rather
+        # than left in it (which would otherwise appear as a bogus element
+        # in the click_X()/type_X() convenience methods at the bottom of
+        # this file).
+        self.ocr_hints = self.locators.pop("__ocr_hints__", {})
+        # Which candidate locator actually resolved the most recent _find()
+        # call - {"element_name", "strategy", "value", "self_healed"} or None.
+        # Read (and reset) by the environment.py/agent_environment.py
+        # after_step hook to build the execution report's per-step "locator
+        # used" field - see runner/run_recording.py's _extract_steps.
+        self.last_resolution = None
+        self._last_hover_pos = None   # unused since hovers became locator-driven; kept for compatibility
+        self._hover_chain = []        # element NAMES of the hover steps in the current menu sequence, in order
+        # Adaptive-wait ceiling for wait_ready() below - see its docstring.
+        # Override e.g. RecordedPage(page, max_wait_seconds=180) if a
+        # particular environment's APIs are known to run especially slow.
+        self.max_wait_seconds = max_wait_seconds
+
+    def switch_page(self, new_page: Page):
+        """
+        Redirects every subsequent element lookup/action to a DIFFERENT
+        Playwright Page - used when a recorded flow interacts with a popup,
+        a new tab/window opened via target="_blank"/window.open(), or
+        switches back to the original window after closing one (see
+        generator/build.py's page_index/opens_new_page handling and
+        steps.tmpl's new_page_wrapper/maybe_switch macros, which call this
+        automatically). All existing methods (click, type_text, etc.)
+        keep working unchanged afterward - they just now resolve elements
+        against `new_page` instead.
+        """
+        if new_page is self.page:
+            return  # already on this tab - nothing to switch, nothing to re-focus
+        self._nav_release()  # a menu held open on the tab being left must not stay open
+        self.page = new_page
+
+        # Make the selected Playwright page the foreground browser page.
+        # This is programmatic browser-page switching; the user does not
+        # need to move the physical mouse cursor to the target tab.
+        try:
+            if not new_page.is_closed():
+                new_page.bring_to_front()
+        except Exception:
+            pass
+
+    def _root_for(self, frame_path: list | None):
+        """
+        Resolves the Playwright object (Page, or a nested FrameLocator) that
+        element lookups should actually run against, given the "frame_path"
+        recorded for that element (a list of CSS selectors, outermost ->
+        innermost, locating the chain of <iframe> elements to drill through -
+        see Recorder._frame_path_for). Empty/missing frame_path (the normal
+        case, and every locator recorded before iframe support existed)
+        resolves to `self.page` itself, unchanged.
+        """
+        root = self.page
+        for selector in (frame_path or []):
+            root = root.frame_locator(selector)
+        return root
+
+    def _frame_root(self, element_name: str):
+        """The frame_path is recorded per ACTION, not per element name, but
+        every candidate locator saved for a given element_name came from the
+        same action/frame, so the first candidate's frame_path speaks for
+        all of them."""
+        candidates = self.locators.get(element_name, [])
+        frame_path = candidates[0].get("frame_path") if candidates else None
+        return self._root_for(frame_path)
+
+    def _find(self, element_name: str, require_visible: bool = True):
+        """
+        Polls ALL known locator strategies for this element together within a
+        single shared time budget, instead of waiting the full timeout for
+        each strategy in turn - this is what keeps lookups fast even when the
+        first strategy or two no longer match the page. Returns a Playwright
+        Locator resolved to a single (`.first`) element. If the element was
+        recorded inside an iframe, resolves through the recorded
+        "frame_path" first (see _root_for) instead of searching the page
+        directly - a locator that's perfectly valid INSIDE an iframe's own
+        document will simply never match anything on the parent page.
+        """
+        candidates = self.locators.get(element_name, [])
+        root = self._frame_root(element_name)
+        deadline = time.time() + self.timeout
+        # Auto-open hover/dropdown menus (see _reveal_in_menu): a recorded
+        # link that exists but is hidden inside a closed menu gets the menus
+        # above it opened here, so no recorded hover step is needed. Tried
+        # at most 3 times, a second apart, so a slow page still gets its
+        # chance. Set AUTO_OPEN_MENUS=false to switch this off.
+        reveal_tries = 0
+        next_reveal_at = 0.0
+
+        while time.time() < deadline:
+            for cand in candidates:
+                try:
+                    sel = _selector_for(cand["strategy"], cand["value"])
+                    # Shadow DOM piercing: if this element was recorded inside
+                    # a shadow root, try both the direct selector and the
+                    # Playwright shadow-piercing >> syntax.
+                    in_shadow = cand.get("in_shadow_dom", False)
+                    selectors_to_try = [sel]
+                    if in_shadow and not sel.startswith("xpath="):
+                        # css= selectors can pierce shadow DOM with >> combinator
+                        raw_val = cand["value"]
+                        selectors_to_try.append(f"css={raw_val}")
+                    for s in selectors_to_try:
+                        try:
+                            loc = root.locator(s)
+                            if loc.count() == 0:
+                                continue
+                            el = loc.first
+                            if not require_visible or el.is_visible():
+                                self.last_resolution = {
+                                    "element_name": element_name, "strategy": cand["strategy"],
+                                    "value": cand["value"], "self_healed": False,
+                                }
+                                return el
+                            if (_AUTO_OPEN_MENUS and reveal_tries < 3 and time.time() >= next_reveal_at):
+                                reveal_tries += 1
+                                next_reveal_at = time.time() + 1.0
+                                if self._reveal_in_menu(el):
+                                    self.last_resolution = {
+                                        "element_name": element_name, "strategy": cand["strategy"],
+                                        "value": cand["value"], "self_healed": False,
+                                        "menu_opened": True,
+                                    }
+                                    return el
+                        except PlaywrightError:
+                            continue
+                except PlaywrightError:
+                    continue
+            time.sleep(self.poll_interval)
+
+        # Every known strategy failed within the time budget requiring
+        # visibility. Before self-healing/giving up, try once more allowing
+        # a NON-visible match: styled checkbox/radio widgets (Bootstrap,
+        # MUI, Ant Design, and plenty of custom CSS) very commonly keep the
+        # real <input type="radio"/"checkbox"> in the DOM but visually
+        # hidden (opacity:0, 1x1px, clip-path, etc.) while a label/span
+        # renders the visible control - the native input is still exactly
+        # what needs to be interacted with, it's just never "visible" by
+        # Playwright's definition. This relaxed pass is what makes those
+        # work instead of just timing out.
+        if require_visible:
+            for cand in candidates:
+                try:
+                    loc = root.locator(_selector_for(cand["strategy"], cand["value"]))
+                    if loc.count() > 0:
+                        self.last_resolution = {
+                            "element_name": element_name, "strategy": cand["strategy"],
+                            "value": cand["value"], "self_healed": False,
+                        }
+                        return loc.first
+                except PlaywrightError:
+                    continue
+
+        # still nothing - try self-healing if available. Note: self-healing
+        # operates against the TOP-LEVEL page (it re-reads page.content()),
+        # not the resolved iframe root - repairing a broken locator that
+        # lives inside an iframe is out of scope for now.
+        # ── 3-Stage Self-Healing Pipeline ────────────────────────────────────
+        # Stage 1: Deterministic Playwright semantic locators (no LLM, no vision)
+        # Stage 2: Non-LLM DOM candidate ranking with configurable scores
+        # Stage 3: Structured LLM reasoning over Stage 2 candidates + vision
+        # Every result validated before execution. Results cached. Metrics tracked.
+        try:
+            from agent.healer import run_healing_pipeline
+            # Build element description from OCR hints and locator metadata
+            ocr_hints = self.locators.get("__ocr_hints__") or {}
+            elem_desc = {
+                "text": ocr_hints.get(element_name, ""),
+                "ariaLabel": "",
+                "tag": "",
+                "name": "",
+                "placeholder": "",
+                "type": "",
+                "role": "",
+                "title": "",
+                "data-testid": "",
+            }
+            orig_sel = ""
+            if candidates:
+                try:
+                    orig_sel = _selector_for(candidates[0]["strategy"], candidates[0]["value"])
+                except Exception:
+                    pass
+            # Extract LLM from heal_callback if available
+            _llm = None
+            if self.heal_callback and hasattr(self.heal_callback, "__self__"):
+                _llm = getattr(self.heal_callback.__self__, "_llm", None)
+            elif hasattr(self, "_llm"):
+                _llm = self._llm
+
+            heal_result = run_healing_pipeline(
+                page=self.page,
+                element_name=element_name,
+                element_description=elem_desc,
+                original_selector=orig_sel,
+                action="click",
+                llm=_llm,
+                iframe_path=candidates[0].get("frame_path") if candidates else [],
+                in_shadow_dom=candidates[0].get("in_shadow_dom", False) if candidates else False,
+            )
+            if heal_result.get("success"):
+                # Vision coordinate result
+                if heal_result.get("coords") and not heal_result.get("selector"):
+                    coords = heal_result["coords"]
+                    self.page.mouse.click(coords[0], coords[1])
+                    self.last_resolution = {
+                        "element_name": element_name,
+                        "strategy": heal_result.get("strategy", "vision"),
+                        "value": str(coords), "self_healed": True,
+                        "stage": heal_result.get("stage"),
+                    }
+                    return None
+                # Selector/locator result
+                if heal_result.get("locator"):
+                    sel = heal_result.get("selector", "")
+                    if sel:
+                        try:
+                            strat = "CSS" if not sel.startswith("xpath=") else "XPATH"
+                            val = sel.removeprefix("css=").removeprefix("xpath=")
+                            fix_entry = {
+                                "strategy": strat, "value": val,
+                                "frame_path": candidates[0].get("frame_path") if candidates else [],
+                                "self_healed": True,
+                                "heal_stage": heal_result.get("stage"),
+                            }
+                            self.locators.setdefault(element_name, []).insert(0, fix_entry)
+                            _EFFECTIVE_LOCATORS_PATH.write_text(json.dumps(self.locators, indent=2))
+                        except Exception:
+                            pass
+                    self.last_resolution = {
+                        "element_name": element_name,
+                        "strategy": heal_result.get("strategy", "healed"),
+                        "value": sel or "", "self_healed": True,
+                        "stage": heal_result.get("stage"),
+                        "confidence": heal_result.get("confidence"),
+                    }
+                    return heal_result["locator"]
+        except Exception as _heal_err:
+            import logging as _log
+            _log.getLogger(__name__).warning(f"[SELF-HEAL] Pipeline error: {_heal_err}")
+
+        raise PlaywrightTimeoutError(
+            f"Could not locate a visible element for '{element_name}' with any known strategy "
+            f"({[c['strategy'] for c in candidates]}) within {self.timeout}s, and self-healing "
+            f"did not resolve it. "
+            f"If this element is inside a hover/dropdown menu, ensure hover steps are recorded "
+            f"before this step so the menu is open when the click runs."
+        )
+
+    def wait_ready(self, element_name: str, timeout: int = None):
+        """
+        Blocks until `element_name` resolves via ANY known strategy (see
+        _find above). Adaptive: starts with the (optionally larger) explicit
+        timeout - normally the wait time measured from the original
+        recording, so a step that recorded slow (e.g. an API-backed lookup)
+        gets a matching wait while a fast one doesn't sit around waiting
+        needlessly - but if that's not actually enough THIS run (real API/
+        network timing varies - a backend that took 5s when this was
+        recorded might take 20s under load later), keeps waiting beyond it,
+        up to self.max_wait_seconds total, instead of failing the step the
+        moment the originally-recorded duration elapses. It's almost always
+        better to wait longer than to fail a step that would have succeeded
+        a few seconds later.
+        """
+        original_timeout = self.timeout
+        target = max(self.timeout, timeout or 0)
+        self.timeout = min(target, self.max_wait_seconds)
+        try:
+            self._find(element_name)
+            return
+        except PlaywrightTimeoutError:
+            if self.timeout >= self.max_wait_seconds:
+                raise
+        finally:
+            self.timeout = original_timeout
+
+        # Didn't show up within the expected/recorded time - give it the
+        # rest of the adaptive budget before actually failing the step.
+        remaining = self.max_wait_seconds - target
+        self.timeout = remaining
+        try:
+            self._find(element_name)
+        finally:
+            self.timeout = original_timeout
+
+    def _looks_visually_hidden(self, el) -> bool:
+        """
+        True for the common 'intentionally hidden but technically visible to
+        Playwright' CSS patterns used by custom checkbox/radio widgets - a
+        near-zero-size box, or one positioned far outside the document (e.g.
+        the `position:absolute; left:-9999px` accessibility-hiding
+        technique). Playwright's own is_visible() considers these VISIBLE
+        (opacity and off-screen positioning don't affect the
+        `visibility`/`display` properties it actually checks) - so without
+        this, click()/set_checked() below would try to actually scroll the
+        page to that off-screen position before clicking, which is exactly
+        what makes the whole page visibly jump/scroll sideways for elements
+        hidden this way.
+        """
+        try:
+            box = el.bounding_box()
+        except PlaywrightError:
+            return True
+        if box is None:
+            return True
+        if box["width"] < 2 or box["height"] < 2:
+            return True
+        if box["x"] < -1000 or box["y"] < -1000:
+            return True
+        return False
+
+    def _safe_scroll(self, el):
+        """
+        Best-effort scroll, bounded by self.timeout instead of Playwright's
+        ~30s default action timeout, and never lets a scroll failure bubble
+        up and abort the whole step. This is what every action method below
+        calls instead of a bare scroll_into_view_if_needed() - a hidden or
+        off-screen element (a date-picker's real <input> behind a styled
+        widget, a field that's disabled/invisible until an earlier field is
+        filled, etc.) would otherwise make Playwright retry the scroll for
+        its full default timeout before finally raising, hanging the entire
+        step for ~30 seconds over something that was never meant to be
+        scrolled to in the first place.
+        """
+        if self._looks_visually_hidden(el):
+            return
+        try:
+            el.scroll_into_view_if_needed(timeout=self.timeout * 1000)
+        except PlaywrightError:
+            pass
+
+    def click(self, element_name: str):
+        try:
+            self._click_impl(element_name)
+        finally:
+            # A menu held open for this click (see _nav_force_open) must not
+            # stay open over the page afterwards.
+            self._nav_release()
+
+    def _click_impl(self, element_name: str):
+        # Try normal click first
+        try:
+            el = self._find(element_name)
+        except PlaywrightTimeoutError:
+            # Element not found — may be inside a CSS hover menu that
+            # collapsed. Replay the FULL hover chain (all ancestor hovers
+            # in recorded order) then retry. This handles 1, 2, 3+ levels.
+            import time as _t
+            chain = getattr(self, '_hover_chain', [])
+            if chain:
+                try:
+                    # Re-hover each earlier hover step's ELEMENT (the chain
+                    # holds element names - see hover_element), not a stored
+                    # pixel position.
+                    for hovered_name in chain:
+                        previous = self._peek(hovered_name)
+                        if previous is not None:
+                            self._hover_locator(previous)
+                            _t.sleep(0.12)
+                    # After replaying chain, give CSS transitions time to settle
+                    _t.sleep(0.3)
+                    el = self._find(element_name)
+                except PlaywrightTimeoutError:
+                    pass
+                else:
+                    # Found it — click with force (element visible only via :hover)
+                    try:
+                        el.click(force=True, timeout=self.timeout * 1000)
+                        self._hover_chain = []   # chain consumed by click
+                        self._last_hover_pos = None
+                        return
+                    except Exception:
+                        pass
+            # Try OCR fallback
+            if self._ocr_click_fallback(element_name):
+                return
+            raise
+        if not self._looks_visually_hidden(el):
+            self._safe_scroll(el)
+            try:
+                el.click(timeout=self.timeout * 1000)
+                self._hover_chain = []   # successful click ends the hover sequence
+                self._last_hover_pos = None
+                return
+            except (PlaywrightTimeoutError, PlaywrightError) as e:
+                if _navigation_interrupted(e):
+                    # the click almost certainly worked - the page just
+                    # navigated away (e.g. a login/submit button) before
+                    # Playwright finished its own post-click bookkeeping.
+                    # Treating this as a failure and retrying below would
+                    # re-query THIS element on the NEW page it just navigated
+                    # to, where it (correctly) no longer exists.
+                    return
+                try:
+                    # element is present but something (overlay, animation,
+                    # off-screen positioning) is blocking a native click -
+                    # force bypasses the actionability checks that just failed.
+                    el.click(force=True, timeout=self.timeout * 1000)
+                    return
+                except (PlaywrightTimeoutError, PlaywrightError) as e2:
+                    if _navigation_interrupted(e2):
+                        return
+        # Either visually-hidden by design (skip straight here - no point
+        # scrolling to reveal something meant to stay hidden), or the normal
+        # path above failed. Dispatch a native click directly on the DOM node
+        # via JS - this never scrolls/moves the page and bypasses Playwright's
+        # actionability checks (including visibility) entirely. Per spec,
+        # calling .click() on a checkbox/radio still triggers the browser's
+        # normal toggle behavior, not just the click event, so this is
+        # equivalent to a real user click. Explicit timeout here (rather than
+        # Playwright's own 30s default) so a GENUINE failure - the element
+        # really is gone, not just navigated past - fails in a reasonable
+        # time instead of hanging.
+        try:
+            el.evaluate("node => node.click()", timeout=self.timeout * 1000)
+        except (PlaywrightTimeoutError, PlaywrightError) as e:
+            if not _navigation_interrupted(e):
+                raise
+
+    def _ocr_click_fallback(self, element_name: str) -> bool:
+        """
+        Last-resort locator strategy for click() ONLY, tried after every
+        DOM candidate (and self-heal, if available) has already failed:
+        if this element was recorded with visible text/aria-label (see
+        generator/build.py's ocr_hints), screenshot the WHOLE page, OCR
+        it, and click the best-matching text region's center by raw
+        pixel coordinates (page.mouse.click) instead of Playwright's
+        selector-based Locator API.
+
+        This is the only way a canvas-rendered or image-based button (no
+        real DOM node to select at all, so no CSS/XPath could ever have
+        worked, and self-heal - which only proposes CSS/XPATH - can't
+        help either) has any chance of being recovered.
+
+        Needs no LLM/API key (unlike self-heal, see agent/self_healer.py),
+        so this works identically whether replay is running server-side
+        or via the desktop local agent (which never has an LLM key - see
+        local_agent/agent_environment.py). It also needs no OCR
+        dependency to be a HARD requirement: if easyocr/torch aren't
+        installed (e.g. a lightweight local-agent build), the import
+        below fails quietly and this just returns False, exactly as if
+        no hint had been recorded at all - never raises its own error,
+        since the ORIGINAL locator failure is always the more useful one
+        to surface if this doesn't pan out.
+
+        Returns True (and has already performed the click) on success,
+        False otherwise.
+        """
+        hint = self.ocr_hints.get(element_name)
+        if not hint:
+            return False
+        try:
+            from recorder.ocr_engine import find_text_regions, best_match
+        except Exception:
+            return False
+        try:
+            png_bytes = self.page.screenshot(full_page=True, timeout=self.timeout * 1000)
+            regions = find_text_regions(png_bytes)
+            region = best_match(regions, hint)
+        except Exception:
+            return False
+        if region is None:
+            return False
+        box = region["bbox"]
+        x = box["x"] + box["width"] / 2
+        y = box["y"] + box["height"] / 2
+        try:
+            self.page.mouse.click(x, y)
+        except PlaywrightError:
+            return False
+        self.last_resolution = {
+            "element_name": element_name, "strategy": "OCR", "value": region["text"],
+            "self_healed": False, "ocr_confidence": region["confidence"],
+        }
+        return True
+
+    def click_vision_fallback(self, element_name: str, label_hint: str = "") -> bool:
+        """
+        Pure Vision AI coordinate click - called when BOTH OCR text
+        matching AND the DOM/self-heal path have failed. Separate from
+        _ocr_click_fallback so it can also be reached directly from
+        non-click actions (type, select) that encountered a locator
+        failure and want to at least try clicking the element first.
+
+        Returns True if Vision AI located the element with high/medium
+        confidence and the click succeeded, False otherwise.
+        """
+        if not label_hint:
+            hint = self.ocr_hints.get(element_name) or element_name
+        else:
+            hint = label_hint
+        try:
+            from agent.vision_fallback import vision_click_coordinates
+            png_bytes = self.page.screenshot(full_page=True, timeout=self.timeout * 1000)
+            viewport = self.page.viewport_size or {}
+            coords = vision_click_coordinates(
+                png_bytes,
+                element_description=f"element_name='{element_name}', label='{hint}'",
+                action_type="click",
+                page_width=viewport.get("width"),
+                page_height=viewport.get("height"),
+            )
+            if coords and coords.get("confidence") in ("high", "medium"):
+                self.page.mouse.click(coords["x"], coords["y"])
+                self.last_resolution = {
+                    "element_name": element_name, "strategy": "VISION",
+                    "value": coords.get("reasoning", hint),
+                    "self_healed": False,
+                    "vision_confidence": coords.get("confidence"),
+                }
+                return True
+        except Exception:
+            pass
+        return False
+
+    def click_if_present(self, element_name: str):
+        """
+        Like click() above, but for a step that's genuinely OPTIONAL - a
+        popup, dialog, or \"Skip\"/\"OK\" style button that may or may not
+        appear on a given run (e.g. a post-login interstitial that only
+        shows sometimes). Imported from a UiPath CLICK-CONDITIONAL step
+        (see generator/uipath_importer.py) - unlike a normal click(), NO
+        failure to click is treated as an error here: this returns
+        quietly instead of raising, so the rest of the flow continues
+        normally whether or not this particular click happened. Still
+        performs a REAL click using the exact same logic as click()
+        whenever the element does resolve and IS clickable - the only
+        difference is what happens when it isn't.
+
+        Catches PlaywrightError (the base class), not just
+        PlaywrightTimeoutError - a real failure seen in practice: the
+        element simply never appearing within the timeout does raise
+        TimeoutError (a subclass of Error), but a DIFFERENT failure - the
+        element resolving but then failing to actually click for some
+        other reason (detached from the DOM, a strict-mode violation,
+        etc.) - raises plain Error instead, which a narrower `except
+        PlaywrightTimeoutError` does NOT catch. Since this step is
+        supposed to be a no-op whenever it can't cleanly click, ANY
+        Playwright-level failure here should be swallowed the same way,
+        not just a timeout specifically.
+        """
+        try:
+            self.click(element_name)
+        except PlaywrightError:
+            pass
+
+    def set_checked(self, element_name: str, checked: bool):
+        """
+        Sets a checkbox/radio to an explicit target state - idempotent by
+        design (reads the current state first and does nothing further if
+        it's already correct), which is what makes replay safe from the
+        double-toggle a blind click() risks: if an earlier fallback tier
+        actually succeeded before raising, or this step re-runs, checking
+        the current state first means we never click a second time by
+        mistake. Used instead of click() specifically for recorded
+        radio/checkbox actions (see generator/build.py) - the recorded
+        value is the RESULTING checked state captured right after the
+        original click, not just "click happened".
+        """
+        el = self._find(element_name)
+        if not self._looks_visually_hidden(el):
+            self._safe_scroll(el)
+
+        try:
+            current = el.is_checked()
+        except PlaywrightError:
+            current = None
+        if current == checked:
+            return
+
+        if not self._looks_visually_hidden(el):
+            try:
+                (el.check if checked else el.uncheck)(timeout=self.timeout * 1000)
+                return
+            except (PlaywrightTimeoutError, PlaywrightError) as e:
+                if _navigation_interrupted(e):
+                    return
+                try:
+                    (el.check if checked else el.uncheck)(timeout=self.timeout * 1000, force=True)
+                    return
+                except (PlaywrightTimeoutError, PlaywrightError) as e2:
+                    if _navigation_interrupted(e2):
+                        return
+
+        # Last resort, and the direct path for visually-hidden elements:
+        # re-verify the live state right before acting (in case an earlier
+        # tier above partially succeeded despite raising) so this never
+        # dispatches a click that isn't actually needed.
+        try:
+            already = bool(el.evaluate("node => !!node.checked", timeout=self.timeout * 1000))
+        except PlaywrightError:
+            already = None
+        if already != checked:
+            try:
+                el.evaluate("node => node.click()", timeout=self.timeout * 1000)
+            except (PlaywrightTimeoutError, PlaywrightError) as e:
+                if not _navigation_interrupted(e):
+                    raise
+
+    def type_text(self, element_name: str, value: str):
+        el = self._find(element_name)
+        self._safe_scroll(el)
+        try:
+            el.fill(value, timeout=self.timeout * 1000)
+        except (PlaywrightTimeoutError, PlaywrightError) as e:
+            if _navigation_interrupted(e):
+                return
+            el.evaluate(
+                "(node, val) => {"
+                "  node.value = val;"
+                "  node.dispatchEvent(new Event('input', {bubbles: true}));"
+                "  node.dispatchEvent(new Event('change', {bubbles: true}));"
+                "}",
+                value,
+                timeout=self.timeout * 1000,
+            )
+
+    def paste_text(self, element_name: str, value: str):
+        """
+        Like type_text(), but for a recorded PASTE action specifically:
+        dispatches a real synthetic 'paste' ClipboardEvent instead of just
+        setting the field's value. fill()/direct value-setting alone never
+        fires a 'paste' event, so an app with its own onPaste handling
+        (rich text editors, OTP boxes, format-on-paste fields like phone/
+        currency inputs) wouldn't see anything happen with type_text()
+        alone even though the DOM value looks right. If no listener calls
+        preventDefault() on the synthetic event (i.e. nothing intercepted
+        it), this applies the same default fill behavior itself, matching
+        what a real unhandled paste does.
+        """
+        el = self._find(element_name)
+        self._safe_scroll(el)
+        try:
+            el.evaluate(
+                "(node, val) => {"
+                "  node.focus();"
+                "  const dt = new DataTransfer();"
+                "  dt.setData('text/plain', val);"
+                "  const evt = new ClipboardEvent('paste', {"
+                "    clipboardData: dt, bubbles: true, cancelable: true"
+                "  });"
+                "  const notCancelled = node.dispatchEvent(evt);"
+                "  if (notCancelled) {"
+                "    node.value = val;"
+                "    node.dispatchEvent(new Event('input', {bubbles: true}));"
+                "    node.dispatchEvent(new Event('change', {bubbles: true}));"
+                "  }"
+                "}",
+                value,
+                timeout=self.timeout * 1000,
+            )
+        except (PlaywrightTimeoutError, PlaywrightError) as e:
+            if not _navigation_interrupted(e):
+                self.type_text(element_name, value)
+
+    def press_key(self, element_name: str, key_name: str):
+        """
+        Sends a key or Ctrl/Shift combo (Enter, Backspace, Arrow Up/Down/Left/Right,
+        Tab, Shift+Tab, Escape, Delete, Space, Home, End, F1-F12, Ctrl+A/C/V/X/P/S,
+        etc.) to the element via Playwright's press() - key_name is one of the
+        values the recorder captures (e.g. "ENTER", "BACKSPACE", "ARROW_UP", "CTRL+A").
+        """
+        key_name = (key_name or "").upper()
+        el = self._find(element_name)
+        self._safe_scroll(el)
+
+        key = _COMBO_MAP.get(key_name) or _KEY_MAP.get(key_name)
+        if key is None:
+            raise ValueError(
+                f"Unsupported key '{key_name}'. Known keys: {sorted(list(_KEY_MAP) + list(_COMBO_MAP))}"
+            )
+        try:
+            el.press(key, timeout=self.timeout * 1000)
+        except (PlaywrightTimeoutError, PlaywrightError) as e:
+            if _navigation_interrupted(e):
+                return
+            el.evaluate("node => node.focus()", timeout=self.timeout * 1000)
+            el.press(key, timeout=self.timeout * 1000)
+
+    def press_enter(self, element_name: str):
+        """Kept for backward compatibility - equivalent to press_key(element_name, "ENTER")."""
+        self.press_key(element_name, "ENTER")
+
+    def press_backspace(self, element_name: str):
+        self.press_key(element_name, "BACKSPACE")
+
+    def press_arrow_up(self, element_name: str):
+        self.press_key(element_name, "ARROW_UP")
+
+    def press_arrow_down(self, element_name: str):
+        self.press_key(element_name, "ARROW_DOWN")
+
+    def press_tab(self, element_name: str):
+        self.press_key(element_name, "TAB")
+
+    def press_shift_tab(self, element_name: str):
+        self.press_key(element_name, "SHIFT+TAB")
+
+    def press_escape(self, element_name: str):
+        self.press_key(element_name, "ESCAPE")
+
+    def press_ctrl_a(self, element_name: str):
+        self.press_key(element_name, "CTRL+A")
+
+    def press_ctrl_s(self, element_name: str):
+        self.press_key(element_name, "CTRL+S")
+
+    def press_ctrl_p(self, element_name: str):
+        self.press_key(element_name, "CTRL+P")
+
+    def _peek(self, element_name: str, require_visible: bool = True):
+        """The element's locator if it can be resolved RIGHT NOW from its
+        recorded locator candidates - no waiting, no self-healing, no menu
+        opening (that is _find's job). None otherwise. Used to check
+        "is the next menu item showing yet?" without paying _find's timeout."""
+        try:
+            root = self._frame_root(element_name)
+        except Exception:
+            return None
+        for cand in self.locators.get(element_name, []):
+            try:
+                loc = root.locator(_selector_for(cand["strategy"], cand["value"]))
+                if loc.count() == 0:
+                    continue
+                first = loc.first
+                if not require_visible or first.is_visible():
+                    return first
+            except Exception:
+                continue
+        return None
+
+    def _hover_locator(self, el) -> bool:
+        """Hovers `el` with Playwright's own locator hover: scroll it into
+        view, then locator.hover(), which moves the AUTOMATION pointer to
+        wherever the element is on screen at this moment. No stored X/Y is
+        involved, so window position, window size and screen resolution do
+        not matter. Returns False instead of raising if it cannot hover."""
+        budget_ms = int(min(max(self.timeout, 1), 5) * 1000)
+        try:
+            el.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+        try:
+            el.hover(timeout=budget_ms)
+            return True
+        except Exception:
+            pass
+        try:
+            # Something overlaps the element's centre (a sticky bar, an
+            # animation still running) - hover it anyway.
+            el.hover(timeout=2000, force=True)
+            return True
+        except Exception:
+            return False
+
+    def hover_element(self, element_name: str,
+                      recorded_cx=None, recorded_cy=None, expect_visible=None) -> None:
+        """
+        Replays a RECORDED hover step. Locator-driven:
+
+          1. Resolve the element from its recorded locators - _find() tries
+             every recorded candidate, then the self-healing fallback, the
+             same as a click does.
+          2. scroll_into_view_if_needed() + locator.hover() (_hover_locator).
+          3. Verify the hover did something: wait for the NEXT recorded
+             target (`expect_visible`, the element the following hover/click
+             step uses) to become visible, re-hovering once if it has not.
+
+        This used to be coordinate-driven: page.mouse.move() to the pixel
+        position stored at recording time, then again for every earlier
+        hover in the sequence. That only works when replay has the same
+        window size, position and scroll offset as the recording.
+
+        `recorded_cx` / `recorded_cy` are still accepted, but are used ONLY
+        when the element cannot be located by any locator at all - the
+        coordinate fallback this method always had, now last instead of
+        first.
+
+        Independently of the pointer, the element and its parents are also
+        marked as hovered inside the browser (_nav_force_open). In a visible
+        browser window the person's real mouse can take hover away from the
+        automation pointer; this keeps the menu open no matter where the
+        real mouse is. It is released by the click that follows.
+        """
+        import time as _time
+
+        # -- 1. resolve by locator ----------------------------------------
+        el = None
+        find_error = None
+        try:
+            el = self._find(element_name)
+        except Exception as e:
+            find_error = e
+        resolution = dict(self.last_resolution or {})
+
+        if el is None:
+            if recorded_cx is not None and recorded_cy is not None:
+                # Last resort only: no locator matched anything.
+                logger.warning(
+                    'hover "%s": no locator matched - falling back to the recorded position (%s, %s)',
+                    element_name, recorded_cx, recorded_cy,
+                )
+                self.page.mouse.move(float(recorded_cx), float(recorded_cy))
+                self.last_resolution = {
+                    "element_name": element_name, "strategy": "HOVER_COORDINATES",
+                    "value": "%s,%s" % (recorded_cx, recorded_cy), "self_healed": False,
+                }
+                return
+            raise find_error
+
+        # -- 2. hover it ---------------------------------------------------
+        forced = False
+        if _POINTER_FREE_MENUS:
+            try:
+                forced = self._nav_force_open(el.element_handle(timeout=1000), include_self=True)
+            except Exception:
+                forced = False
+        hovered = self._hover_locator(el)
+        if not hovered and not forced:
+            raise PlaywrightError('Could not hover "%s": the element was found but cannot be hovered.' % element_name)
+
+        # -- 3. verify the menu reacted -----------------------------------
+        opened = None
+        if expect_visible and expect_visible in self.locators:
+            deadline = _time.time() + 5.0
+            rehover_at = _time.time() + 1.5
+            opened = False
+            while _time.time() < deadline:
+                if self._peek(expect_visible) is not None:
+                    opened = True
+                    break
+                if rehover_at and _time.time() >= rehover_at:
+                    rehover_at = None
+                    self._hover_locator(el)  # one more try, e.g. after a slow animation
+                _time.sleep(0.1)
+            if not opened:
+                # Not raised here: the next step locates that element itself
+                # (opening its menu if needed) and reports a precise error.
+                logger.warning('hover "%s": "%s" did not become visible within 5s', element_name, expect_visible)
+        else:
+            # No known next target - give a submenu under this item a short
+            # moment to appear (pure CSS :hover menus change no attribute,
+            # so this looks at computed style).
+            deadline = _time.time() + 1.5
+            while _time.time() < deadline:
+                try:
+                    opened = bool(el.evaluate(_HOVER_SUBMENU_OPEN_JS))
+                except Exception:
+                    opened = None
+                    break
+                if opened:
+                    break
+                _time.sleep(0.1)
+
+        # -- 4. remember the sequence (by NAME, not by position) ----------
+        if not hasattr(self, '_hover_chain'):
+            self._hover_chain = []
+        self._hover_chain.append(element_name)
+        self._last_hover_pos = None
+
+        resolution.update({"element_name": element_name, "hover": "locator", "submenu_visible": opened})
+        resolution.setdefault("strategy", "HOVER")
+        resolution.setdefault("self_healed", False)
+        self.last_resolution = resolution
+
+    def set_date(self, element_name: str, value: str, near_anchor: bool = False):
+        """
+        Set a date field to `value` (ISO format YYYY-MM-DD or the field's
+        own format such as DD/MM/YYYY).  Bypasses the calendar popup
+        entirely -- types directly into the underlying <input type="date">
+        or masked text input, which is far more reliable across browsers.
+
+        Strategy:
+          1. Find the element (or, if near_anchor=True, the nearest date
+             input to the anchor element).
+          2. Determine the field format from its placeholder or type attr.
+          3. Fill with real keystrokes (works for masked inputs).
+          4. Fall back to setting the value directly via JS.
+          5. Blur with Tab.
+          6. Assert the field holds the correct date (raises AssertionError).
+        """
+        import re as _re
+        from datetime import date as _d, datetime as _dt
+
+        # Parse ISO date
+        try:
+            dt = _d.fromisoformat(value[:10])
+        except ValueError:
+            try:
+                dt = _dt.strptime(value, "%d/%m/%Y").date()
+            except ValueError:
+                dt = None
+
+        if dt is None:
+            raise ValueError(f"set_date: cannot parse {value!r}")
+
+        # Locate target element
+        try:
+            el = self._find(element_name)
+        except Exception:
+            if near_anchor:
+                # Fall back to first date input on the page
+                el = self.page.locator('input[type="date"], input[placeholder*="/"], input[placeholder*="-"]').first
+            else:
+                raise
+
+        self._safe_scroll(el)
+        input_type = el.evaluate("n => n.type") or ""
+        placeholder = (el.evaluate("n => n.placeholder") or "").upper()
+
+        if input_type == "date":
+            # Native date input -- fill with ISO
+            try:
+                el.fill(dt.isoformat(), timeout=self.timeout * 1000)
+            except Exception:
+                el.evaluate(
+                    "(n, v) => { n.value = v; n.dispatchEvent(new Event('change', {bubbles:true})); }",
+                    dt.isoformat(), timeout=self.timeout * 1000,
+                )
+        else:
+            # Masked / text input: determine display format
+            if "YYYY" in placeholder or "YYYY-MM" in placeholder:
+                fmt = f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}"
+            elif "MM/DD/YYYY" in placeholder:
+                fmt = f"{dt.month:02d}/{dt.day:02d}/{dt.year:04d}"
+            else:  # default DD/MM/YYYY
+                fmt = f"{dt.day:02d}/{dt.month:02d}/{dt.year:04d}"
+
+            digits_only = _re.sub(r"\D", "", fmt)
+            try:
+                el.triple_click(timeout=self.timeout * 1000)
+                el.type(fmt, timeout=self.timeout * 1000)
+            except Exception:
+                # Some masked inputs only accept digit keys
+                try:
+                    el.triple_click(timeout=self.timeout * 1000)
+                    el.type(digits_only, timeout=self.timeout * 1000)
+                except Exception:
+                    el.evaluate(
+                        "(n, v) => { n.value = v; n.dispatchEvent(new Event('input', {bubbles:true})); n.dispatchEvent(new Event('change', {bubbles:true})); }",
+                        fmt, timeout=self.timeout * 1000,
+                    )
+
+            # Blur
+            try:
+                el.press("Tab", timeout=self.timeout * 1000)
+            except Exception:
+                pass
+
+        self.last_resolution = {
+            "element_name": element_name, "strategy": "SET_DATE", "value": value, "self_healed": False,
+        }
+
+    def capture_value(self, element_name: str) -> str:
+        """
+        Reads the CURRENT live value out of an element for the Capture ->
+        Store -> Reuse variable pipeline (see runner/variables.py). Prefers
+        Playwright DOM extraction - input_value() for inputs/textareas/selects,
+        falling back to text_content() for non-input elements/labels - since
+        that's the most reliable, headless-friendly way to read it. Only if
+        the element exposes neither does this fall back to reading the
+        browser's own clipboard, still entirely through Playwright
+        (page.evaluate calling navigator.clipboard.readText() - no external
+        clipboard library involved).
+        """
+        el = self._find(element_name)
+        value = None
+        try:
+            value = el.input_value(timeout=self.timeout * 1000)
+        except PlaywrightError:
+            pass
+        if not value:
+            try:
+                value = el.text_content(timeout=self.timeout * 1000)
+            except PlaywrightError:
+                value = None
+        if value:
+            return value
+        try:
+            return self.page.evaluate(
+                "async () => {"
+                "  try {"
+                "    if (navigator.clipboard && navigator.clipboard.readText) {"
+                "      return (await navigator.clipboard.readText()) || '';"
+                "    }"
+                "  } catch (e) {}"
+                "  return '';"
+                "}"
+            ) or ""
+        except Exception:
+            return ""
+
+    def capture_value_ocr(self, element_name: str) -> str:
+        """
+        Screenshots this element fresh and runs OCR on it - for a value
+        with no real selectable DOM text (an image or canvas-rendered
+        reference number, a scanned document field, etc.) that
+        capture_value() above can't read at all, since there's no
+        input_value()/text_content() to fall back to.
+
+        Re-run LIVE every single test execution (a fresh screenshot, a
+        fresh OCR pass), never reusing whatever was read at recording
+        time - see recorder/ocr_engine.py's module docstring for why
+        (these are typically values the application generates fresh on
+        each run, the same reason capture_value() above always reads
+        live too). Requires EasyOCR (pip install easyocr Pillow numpy) -
+        imported lazily here so a recording with no OCR captures at all
+        never needs those installed.
+        """
+        from recorder.ocr_engine import extract_text_from_png_bytes
+
+        el = self._find(element_name)
+        png_bytes = el.screenshot(timeout=self.timeout * 1000)
+        return extract_text_from_png_bytes(png_bytes)
+
+    def upload_file(self, element_name: str, file_name: str):
+        """
+        Handles a recorded file upload. Browsers never expose a chosen
+        file's real absolute path to JavaScript (input.value is always a
+        fabricated "C:\\fakepath\\<name>" string, for security) - only the
+        NAME was ever recordable (see recorder_injector.js's 'file_upload'
+        action). That means the actual bytes to upload can't be replayed
+        from the recording alone; this looks for a real local file with
+        that exact name so Playwright's set_input_files() (the only
+        correct API for file inputs - fill()/type() do not work on them)
+        has something real to attach.
+
+        Search order for a file named `file_name`:
+          1. FIXTURES_DIR (output/fixtures/) - the file used during
+             recording is placed here automatically (see
+             generator/build.py) whenever it was small enough to capture
+             inline, so this is normally already populated by the time
+             replay runs.
+          2. The output directory itself, in case a file was dropped there
+             directly rather than into fixtures/.
+
+        Raises FileNotFoundError with a clear message if it isn't found
+        anywhere, rather than silently skipping the upload.
+        """
+        search_dirs = [FIXTURES_DIR, Path(__file__).parent.parent]
+        for directory in search_dirs:
+            candidate = directory / file_name
+            if candidate.exists():
+                el = self._find(element_name)
+                el.set_input_files(str(candidate))
+                return
+        raise FileNotFoundError(
+            f"upload_file(\"{element_name}\", \"{file_name}\"): no file named "
+            f"'{file_name}' found in {FIXTURES_DIR} or {search_dirs[1]}. "
+            f"A browser can never report the real path it was uploaded from "
+            f"during recording - place an actual file with this exact name "
+            f"under {FIXTURES_DIR} before replaying this step."
+        )
+
+    def assert_text_contains(self, element_name: str, expected_text: str):
+        """
+        Asserts the element's visible text (or, for an input/textarea, its
+        current value) contains `expected_text` - a pure check, no click
+        or type involved. Used for a recorded/imported "VERIFICATION"-style
+        step (e.g. confirming a "Data saved successfully" message actually
+        appeared) - see generator/uipath_importer.py.
+
+        Reads the element live, the same way capture_value() does, and
+        raises a plain AssertionError (which behave reports as a normal
+        failed step, with a clear message) rather than letting a
+        Playwright-internal error surface if the text doesn't match.
+        """
+        el = self._find(element_name)
+        try:
+            actual = el.input_value(timeout=self.timeout * 1000)
+        except PlaywrightError:
+            actual = el.text_content(timeout=self.timeout * 1000) or ""
+        actual_normalized = " ".join(actual.split())
+        expected_normalized = " ".join(expected_text.split())
+        if expected_normalized not in actual_normalized:
+            raise AssertionError(
+                f'Expected "{element_name}" to contain "{expected_text}", but its actual text was "{actual}".'
+            )
+
+    def assert_ocr_text_visible(self, expected_text: str, min_confidence: float = 0.35):
+        """
+        Page-level visual assertion, no DOM element/locator involved at
+        all: screenshots the WHOLE page and confirms `expected_text` is
+        visibly present somewhere on it via OCR. For content with no DOM
+        node to check in the first place - canvas-rendered text,
+        image-based labels/buttons, scanned or embedded content -
+        assert_text_contains above can't help since there's nothing to
+        select; this only needs the text to be genuinely ON SCREEN.
+
+        Raises a plain AssertionError (reported by behave as a normal
+        failed step, same as assert_text_contains) including what OCR
+        actually read, so a failure is debuggable without needing to open
+        the step's screenshot separately - though that screenshot IS
+        still captured automatically for every step regardless (see
+        runner/environment.py's after_step hook), providing the same
+        visual evidence a failed DOM assertion already gets.
+        """
+        from recorder.ocr_engine import find_text_regions, best_match
+
+        png_bytes = self.page.screenshot(full_page=True, timeout=self.timeout * 1000)
+        regions = find_text_regions(png_bytes)
+        match = best_match(regions, expected_text, min_confidence=min_confidence)
+        if match is None:
+            seen = ", ".join(r["text"] for r in regions if r["text"].strip()) or "(no text detected at all)"
+            raise AssertionError(
+                f'Expected "{expected_text}" to be visible on screen (via OCR), but it was not found. '
+                f"Text OCR actually read on this page: {seen}"
+            )
+
+    def select_option(self, element_name: str, option_text: str):
+        """
+        Handles native <select> dropdowns via Playwright's select_option()
+        (the reliable way - clicking/sending keys directly to a <select> is
+        what usually causes "dropdown issues"). Falls back to selecting by
+        value, then to a generic click-open-and-click-option approach for
+        custom (non-native) dropdown widgets that aren't real <select>
+        elements.
+        """
+        el = self._find(element_name)
+        self._safe_scroll(el)
+
+        tag_name = el.evaluate("node => node.tagName.toLowerCase()", timeout=self.timeout * 1000)
+        if tag_name == "select":
+            try:
+                el.select_option(label=option_text, timeout=self.timeout * 1000)
+                return
+            except (PlaywrightTimeoutError, PlaywrightError) as e:
+                if _navigation_interrupted(e):
+                    return
+            try:
+                el.select_option(value=option_text, timeout=self.timeout * 1000)
+                return
+            except (PlaywrightTimeoutError, PlaywrightError) as e:
+                if _navigation_interrupted(e):
+                    return
+
+        # Not a native <select>, or text/value didn't match an <option> exactly -
+        # treat it as a custom dropdown: open it, then click the option by its text.
+        try:
+            el.click(timeout=self.timeout * 1000)
+        except (PlaywrightTimeoutError, PlaywrightError) as e:
+            if not _navigation_interrupted(e):
+                raise
+        # Search within the SAME iframe (if any) the dropdown itself lives
+        # in, not the top page - a custom dropdown's option list almost
+        # always renders inside that same document.
+        root = self._frame_root(element_name)
+        option = root.locator(f"xpath=//*[normalize-space(text())={_xpath_literal(option_text)}]")
+        try:
+            option.first.click(timeout=self.timeout * 1000)
+        except (PlaywrightTimeoutError, PlaywrightError) as e:
+            if not _navigation_interrupted(e):
+                raise
+
+{% raw %}
+    # ------------------------------------------------------------------
+    # Hover / dropdown navigation menus
+    #
+    # Two things live here, both built on the same "open the menus above
+    # this link" routine (_reveal_in_menu):
+    #
+    #   1. Auto-open for RECORDED steps. _find() calls _reveal_in_menu()
+    #      whenever a recorded link/button exists in the page but is not
+    #      visible - the normal state of an item inside a closed hover
+    #      menu. The parents are found from the live DOM (not from
+    #      recorded pixel positions), so a recording that only contains
+    #      the final click replays correctly, with no hover steps at all,
+    #      at any window size.
+    #
+    #   2. check_navigation_menu() - the "menu check" step. Finds the
+    #      site's navigation menu at run time, then for every link in it:
+    #      opens the menus above it with the real mouse, clicks it, and
+    #      verifies the page that opened. Nothing is recorded by hand.
+    # ------------------------------------------------------------------
+    def _nav_shown(self, handle) -> bool:
+        """True when `handle` is really on screen and can receive the
+        mouse (laid out, not transparent, not clipped/covered at its
+        centre) - stricter than Playwright's is_visible(), which still
+        reports True for an item clipped by a collapsed (max-height: 0)
+        menu or sitting under an overlay."""
+        try:
+            return bool(handle.evaluate(_NAV_SHOWN_JS))
+        except Exception:
+            return False
+
+    def _nav_wait_shown(self, handle, seconds: float = 1.2) -> bool:
+        end = time.time() + seconds
+        while True:
+            if self._nav_shown(handle):
+                return True
+            if time.time() >= end:
+                return False
+            time.sleep(0.08)
+
+    def _nav_hover(self, handle) -> bool:
+        """Puts the real mouse pointer on the centre of `handle`, using its
+        position on screen right now. Returns False if it has no box."""
+        try:
+            box = handle.bounding_box()
+        except Exception:
+            box = None
+        if not box or box["width"] < 1 or box["height"] < 1:
+            return False
+        cx = box["x"] + box["width"] / 2
+        cy = box["y"] + box["height"] / 2
+        try:
+            # Two moves: the first lands on the element (mouseenter/
+            # mouseover), the second is a real mousemove inside it, which
+            # some script-driven menus wait for before opening.
+            self.page.mouse.move(cx - 1, cy)
+            self.page.mouse.move(cx, cy)
+            return True
+        except Exception:
+            return False
+
+    def _nav_release(self) -> None:
+        """Drops any forced :hover state set by _nav_force_open. Safe to
+        call at any time, including after the page has navigated away."""
+        cdp = getattr(self, "_nav_cdp", None)
+        self._nav_cdp = None
+        if cdp is not None:
+            try:
+                cdp.detach()  # closing the session clears every forced state
+            except Exception:
+                pass
+
+    def _nav_force_open(self, handle, include_self: bool = False) -> bool:
+        """
+        Opens the menus above `handle` without using the mouse pointer.
+
+        Why: in a visible (non-headless) browser the REAL mouse wins. If
+        the person's cursor is anywhere over the window, the browser keeps
+        applying hover to whatever is under it, so a menu opened by an
+        automated pointer move closes again straight away - the run then
+        only moves forward while someone holds the real mouse on the menu.
+
+        Two pointer-free mechanisms, both applied:
+          - CSS menus: the browser is told to treat each parent item as
+            hovered (CDP CSS.forcePseudoState - the "force element state
+            :hover" switch from DevTools). The real cursor cannot undo it.
+          - Script menus: mouseenter/mouseover events are sent directly to
+            each parent.
+
+        The forced state stays until _nav_release() (called after the
+        click, and before the next menu is opened). Returns True if the
+        hover state could be forced; False (e.g. element inside an iframe,
+        or a non-Chromium browser) leaves the caller to fall back to
+        moving the pointer.
+        """
+        self._nav_release()
+        try:
+            marked = handle.evaluate(_NAV_FORCE_TAG_JS, include_self)
+        except Exception:
+            return False
+        if not marked:
+            return False
+        forced = False
+        try:
+            cdp = self.page.context.new_cdp_session(self.page)
+            self._nav_cdp = cdp
+            cdp.send("DOM.enable")
+            cdp.send("CSS.enable")
+            root = cdp.send("DOM.getDocument", {"depth": 0})["root"]["nodeId"]
+            found = cdp.send("DOM.querySelectorAll", {"nodeId": root, "selector": "[data-atr-force]"})
+            for node_id in found.get("nodeIds") or []:
+                cdp.send("CSS.forcePseudoState", {"nodeId": node_id, "forcedPseudoClasses": ["hover", "focus-within"]})
+                forced = True
+        except Exception:
+            self._nav_release()
+        try:
+            handle.evaluate(_NAV_SYNTH_HOVER_JS, include_self)
+        except Exception:
+            pass
+        return forced
+
+    def _reveal_in_menu(self, target, settle: float = 1.2) -> bool:
+        """
+        Makes `target` (a Locator or ElementHandle for a link/button)
+        visible by opening the menus it sits inside, outermost first.
+        Each parent is opened by hovering it; if hovering does nothing it
+        is focused, and - only for a parent that is clearly a dropdown
+        toggle and not a real link - clicked.
+
+        Returns True when the target is on screen afterwards (also when
+        it already was). Never raises.
+        """
+        try:
+            handle = target.element_handle(timeout=2000) if hasattr(target, "element_handle") else target
+        except Exception:
+            return False
+        if handle is None:
+            return False
+        if self._nav_shown(handle):
+            return True
+        try:
+            chain = handle.evaluate_handle(_NAV_CHAIN_JS)
+            props = chain.get_properties()
+            triggers = []
+            for key in sorted(props.keys(), key=lambda k: int(k) if str(k).isdigit() else 10 ** 6):
+                element = props[key].as_element()
+                if element is not None:
+                    triggers.append(element)
+        except Exception:
+            return False
+        if not triggers:
+            return False
+
+        # First choice: no pointer involved at all (see _nav_force_open).
+        if _POINTER_FREE_MENUS:
+            self._nav_force_open(handle)
+            if self._nav_wait_shown(handle, settle):
+                return True
+
+        # Still closed: click-to-open toggles, and - last resort - moving
+        # the pointer onto each parent in turn.
+        for i, trigger in enumerate(triggers):
+            nxt = triggers[i + 1] if i + 1 < len(triggers) else handle
+            if self._nav_shown(nxt):
+                continue  # this level is already open
+            if not self._nav_shown(trigger):
+                continue  # cannot point at something that is not on screen
+            try:
+                trigger.scroll_into_view_if_needed(timeout=1500)
+            except Exception:
+                pass
+            try:
+                info = trigger.evaluate(_NAV_TOGGLE_JS) or {}
+            except Exception:
+                info = {}
+            clickable_toggle = bool((info.get("toggle") or info.get("dead_link")) and not info.get("is_link"))
+            self._nav_hover(trigger)
+            # A parent that is a real link can only open on hover, so give it
+            # the full settle time; a toggle button usually opens on click,
+            # so do not wait as long before trying that.
+            if self._nav_wait_shown(nxt, 0.5 if clickable_toggle else settle):
+                continue
+            try:
+                trigger.focus()
+            except Exception:
+                pass
+            if self._nav_wait_shown(nxt, 0.3):
+                continue
+            if clickable_toggle:
+                try:
+                    trigger.click(timeout=1500)
+                except Exception:
+                    pass
+                self._nav_wait_shown(nxt, settle)
+        return self._nav_shown(handle)
+
+    def _nav_dismiss_overlays(self) -> list:
+        """Best effort: closes cookie banners / welcome pop-ups that sit on
+        top of the page (Accept, Close, X ...). Only clicks buttons inside
+        a floating cookie/consent/modal/pop-up box, never a real link."""
+        try:
+            return self.page.evaluate(_NAV_DISMISS_JS) or []
+        except Exception:
+            return []
+
+    def _nav_discover(self, selector: str = "", retries: int = 4) -> dict:
+        last = {}
+        for _ in range(max(1, retries)):
+            try:
+                last = self.page.evaluate(_NAV_DISCOVER_JS, {"selector": selector or ""}) or {}
+            except Exception as e:
+                last = {"error": str(e), "items": []}
+            if last.get("items") or last.get("error"):
+                return last
+            time.sleep(1.0)  # menu may still be rendering
+        return last
+
+    def check_navigation_menu(self, options: dict | None = None) -> dict:
+        """
+        Checks every link of the navigation menu on the page that is open
+        right now (so it can follow recorded login steps).
+
+        For each menu link: go back to the start page, open the menus
+        above the link with the mouse, click it, and verify what opened -
+        HTTP status, not an error/blank page, and (when a baseline is
+        given) that the link still points where it did before. Links that
+        open a new tab or download a file are handled too.
+
+        options:
+          menu_selector        CSS selector of the menu, if the automatic
+                               pick is wrong (default: detect it)
+          baseline             [{"path": [...], "href": "..."}] from an
+                               earlier run - items that disappeared or
+                               whose link changed are reported as failed
+          strict_hover         fail an item whose menu does not open on
+                               hover (default: check the link anyway and
+                               add a note)
+          max_items            safety cap (default 200)
+          time_budget_seconds  stop starting new items after this long
+          screenshots          "all" (default) | "failed" | "none"
+          dismiss_popups       close cookie banners / pop-ups (default True)
+
+        Returns {"home", "root", "rows", "discovered", "summary"} - one
+        row per menu link. Raises AssertionError only when no menu could
+        be found at all.
+        """
+        opts = dict(options or {})
+        selector = (opts.get("menu_selector") or "").strip()
+        strict_hover = bool(opts.get("strict_hover"))
+        max_items = int(opts.get("max_items") or 200)
+        budget = float(opts.get("time_budget_seconds") or 480)
+        shots = str(opts.get("screenshots") or "all").lower()
+        dismiss = opts.get("dismiss_popups", True)
+        nav_wait = float(opts.get("navigation_wait_seconds") or 10)
+        baseline = opts.get("baseline") or []
+
+        page = self.page
+        ctx = page.context
+        started = time.time()
+
+        try:
+            page.wait_for_load_state("load", timeout=15000)
+        except Exception:
+            pass
+        home = page.url
+        home_host = _nav_host(home)
+
+        dismissed = []
+        if dismiss:
+            time.sleep(0.5)  # pop-ups often appear just after load
+            dismissed = self._nav_dismiss_overlays()
+
+        disc = self._nav_discover(selector)
+        items = disc.get("items") or []
+        if not items:
+            hint = disc.get("error") or (
+                "No navigation menu was found on " + home + ". If the page has one, give its CSS "
+                "selector (for example \"nav\" or \"#main-menu\") in the menu check's settings."
+            )
+            raise AssertionError(hint)
+
+        # ---- what each click leads to (status of the page it opens) ----
+        nav_resp = {}
+        nav_fail = {}
+        downloads = []
+
+        # A brand-new tab's first request is sent before Playwright has a
+        # frame for it, so request.frame raises for exactly the response we
+        # care about. Those go into these two lists instead and are matched
+        # to the new tab that opened after the click.
+        early_resp = []
+        early_fail = []
+
+        def _on_response(resp):
+            try:
+                req = resp.request
+                if not req.is_navigation_request():
+                    return
+                entry = (resp.status, resp.url, (resp.headers or {}).get("content-type", ""))
+                try:
+                    frame = req.frame
+                except Exception:
+                    early_resp.append(entry)
+                    return
+                if frame.parent_frame is None:
+                    nav_resp[frame.page] = entry
+            except Exception:
+                pass
+
+        def _on_failed(req):
+            try:
+                if not req.is_navigation_request():
+                    return
+                reason = req.failure or "request failed"
+                try:
+                    frame = req.frame
+                except Exception:
+                    early_fail.append(reason)
+                    return
+                if frame.parent_frame is None:
+                    nav_fail[frame.page] = reason
+            except Exception:
+                pass
+
+        def _on_download(download):
+            downloads.append(download)
+
+        def _on_page(new_page):
+            try:
+                new_page.on("download", _on_download)
+            except Exception:
+                pass
+
+        ctx.on("response", _on_response)
+        ctx.on("requestfailed", _on_failed)
+        ctx.on("page", _on_page)
+        page.on("download", _on_download)
+
+        shots_dir = Path(__file__).resolve().parent.parent / "screenshots"
+
+        def _lookup(found_items):
+            table = {}
+            for it in found_items:
+                table.setdefault(_nav_key(it.get("path")), it)
+            return table
+
+        def _go_home():
+            try:
+                page.goto(home, wait_until="domcontentloaded", timeout=45000)
+            except Exception as e:
+                if not _navigation_interrupted(e):
+                    raise
+            try:
+                page.wait_for_load_state("load", timeout=8000)
+            except Exception:
+                pass
+            if dismiss:
+                self._nav_dismiss_overlays()
+            return _lookup(self._nav_discover(selector, retries=3).get("items") or [])
+
+        def _park_mouse(on_page):
+            # Move the pointer off the menu so an open dropdown closes (and
+            # does not cover the screenshot of the page that just opened).
+            try:
+                size = on_page.evaluate("() => [window.innerWidth, window.innerHeight]")
+                on_page.mouse.move(max(1, size[0] - 3), max(1, size[1] - 3))
+            except Exception:
+                pass
+
+        base_map = {}
+        for entry in baseline:
+            base_map[_nav_key(entry.get("path"))] = entry.get("href") or ""
+
+        links = [it for it in items if _nav_link_kind(it) == "link"]
+        no_link = len([it for it in items if _nav_link_kind(it) != "link" and not it.get("has_children")])
+        lookup = _lookup(items)
+        on_home = True
+        rows = []
+
+        try:
+            for index, item in enumerate(links):
+                key = _nav_key(item.get("path"))
+                href = item.get("href") or ""
+                row = {
+                    "path": " > ".join(item.get("path") or []), "href": href, "status": "Passed",
+                    "error": "", "note": "", "final_url": "", "http_status": None,
+                    "screenshot": "", "duration": 0.0,
+                }
+                rows.append(row)
+                if index >= max_items:
+                    row["status"] = "Skipped"
+                    row["error"] = "Not checked - the menu has more than %d links (the limit for one run)." % max_items
+                    continue
+                if time.time() - started > budget:
+                    row["status"] = "Skipped"
+                    row["error"] = ("Not checked - the time limit for one run (%d seconds) was reached before this "
+                                    "item. Raise AGENT_TEST_TIMEOUT_SECONDS on the server to allow longer runs." % int(budget))
+                    continue
+
+                t0 = time.time()
+                errors, notes = [], []
+                target = page
+                opened_pages = []
+                try:
+                    if not on_home:
+                        lookup = _go_home()
+                        on_home = True
+                    current = lookup.get(key)
+                    if current is None:
+                        raise AssertionError("The item could not be found in the menu again after returning to the start page.")
+                    href = current.get("href") or href
+                    row["href"] = href
+
+                    if base_map:
+                        old = base_map.get(key)
+                        if old is None:
+                            notes.append("new item - not in the saved baseline")
+                        elif _nav_norm(old) != _nav_norm(href):
+                            errors.append("The link changed: it pointed to %s before and points to %s now." % (old, href))
+
+                    el = page.locator('[data-atr-nav="%s"]' % current["id"]).first
+                    opened = self._reveal_in_menu(el)
+                    if not opened and dismiss and self._nav_dismiss_overlays():
+                        opened = self._reveal_in_menu(el)  # something was covering the menu
+
+                    before = list(ctx.pages)
+                    nav_resp.pop(page, None)
+                    nav_fail.pop(page, None)
+                    del downloads[:]
+                    del early_resp[:]
+                    del early_fail[:]
+                    url_before = page.url
+
+                    if opened:
+                        try:
+                            el.click(timeout=5000)
+                        except Exception as e:
+                            if not _navigation_interrupted(e):
+                                el.evaluate("node => node.click()")
+                                notes.append("a normal click was blocked, so the link was activated directly")
+                    else:
+                        if strict_hover:
+                            errors.append("The menu above this item did not open on hover, so a user could not reach it.")
+                        else:
+                            notes.append("the menu did not open on hover - the link was opened directly")
+                        try:
+                            el.evaluate("node => node.click()")
+                        except Exception as e:
+                            if not _navigation_interrupted(e):
+                                raise
+
+                    # ---- what happened? new tab / download / navigation ----
+                    outcome = None
+                    deadline = time.time() + nav_wait
+                    while time.time() < deadline:
+                        opened_pages = [p for p in ctx.pages if p not in before]
+                        if opened_pages:
+                            outcome, target = "new_tab", opened_pages[-1]
+                            break
+                        if downloads:
+                            outcome = "download"
+                            break
+                        if page in nav_resp or page in nav_fail:
+                            outcome = "navigated"
+                            break
+                        try:
+                            if page.url != url_before:
+                                outcome = "url_changed"
+                                break
+                            page.wait_for_timeout(100)
+                        except Exception:
+                            time.sleep(0.1)
+
+                    if outcome == "new_tab":
+                        end = time.time() + 15
+                        while (time.time() < end and target not in nav_resp and target not in nav_fail
+                               and not early_resp and not early_fail and not downloads):
+                            try:
+                                target.wait_for_timeout(150)
+                            except Exception:
+                                break
+                        if target not in nav_resp and early_resp:
+                            nav_resp[target] = early_resp[-1]
+                        if target not in nav_fail and early_fail:
+                            nav_fail[target] = early_fail[-1]
+                    if outcome in ("new_tab", "navigated", "url_changed"):
+                        try:
+                            target.wait_for_load_state("domcontentloaded", timeout=15000)
+                        except Exception:
+                            pass
+                        try:
+                            target.wait_for_timeout(300)  # lets a late download event arrive
+                        except Exception:
+                            pass
+
+                    if downloads:
+                        name = ""
+                        try:
+                            name = downloads[-1].suggested_filename
+                        except Exception:
+                            pass
+                        notes.append("opens a file download" + (" (%s)" % name if name else ""))
+                        for download in list(downloads):
+                            try:
+                                download.cancel()
+                            except Exception:
+                                pass
+                        if outcome == "new_tab":
+                            notes.append("opens in a new tab")
+                    elif outcome is None:
+                        if _nav_strip_hash(href) == _nav_strip_hash(url_before):
+                            notes.append("the link points to the page that is already open")
+                        else:
+                            errors.append("Clicking this item did nothing - no page opened within %d seconds." % int(nav_wait))
+                    else:
+                        try:
+                            final_url = target.url
+                        except Exception:
+                            final_url = ""
+                        row["final_url"] = final_url
+                        response = nav_resp.get(target)
+                        failure = nav_fail.get(target)
+                        external = bool(final_url) and _nav_host(final_url) != home_host and not final_url.startswith("chrome-error")
+                        check_content = True
+                        if response is None and failure:
+                            errors.append("The page failed to load (%s)." % failure)
+                            check_content = False
+                        elif response is not None:
+                            status, _resp_url, ctype = response
+                            row["http_status"] = status
+                            if status >= 400:
+                                check_content = False
+                                if external and status in (401, 403, 429):
+                                    notes.append("the external site refused the automated visit (HTTP %d) - check it by hand" % status)
+                                else:
+                                    errors.append("The page returned HTTP %d." % status)
+                            elif ctype and "html" not in ctype.lower():
+                                check_content = False
+                                notes.append("opens a %s file" % ctype.split(";")[0].strip())
+                        if check_content:
+                            try:
+                                state = target.evaluate(_NAV_PAGE_STATE_JS) or {}
+                            except Exception:
+                                state = {}
+                            doc_type = (state.get("content_type") or "").lower()
+                            if doc_type and "html" not in doc_type:
+                                notes.append("opens a %s file" % doc_type)
+                            elif state:
+                                headline = ((state.get("title") or "") + " | " + (state.get("h1") or "")).lower()
+                                if _NAV_ERROR_PAGE_RE.search(headline):
+                                    errors.append("The page opened but looks like an error page (title: \"%s\")." % (state.get("title") or state.get("h1") or ""))
+                                elif not state.get("text_len") and not state.get("media"):
+                                    errors.append("The page opened but is blank.")
+                        if outcome == "new_tab":
+                            notes.append("opens in a new tab")
+                        if external:
+                            notes.append("external site")
+                        if final_url and _nav_norm(final_url) != _nav_norm(href) and not final_url.startswith("chrome-error"):
+                            notes.append("redirected to " + final_url)
+                except Exception as e:
+                    message = str(e).strip().splitlines()[0][:300] if str(e).strip() else type(e).__name__
+                    errors.append(message if isinstance(e, AssertionError) else "%s: %s" % (type(e).__name__, message))
+
+                # ---- evidence + clean up, never allowed to fail the row ----
+                if shots == "all" or (shots == "failed" and errors):
+                    try:
+                        _park_mouse(target)
+                        shots_dir.mkdir(parents=True, exist_ok=True)
+                        shot_name = "step_menu_%03d.png" % (index + 1)
+                        target.screenshot(path=str(shots_dir / shot_name), timeout=8000)
+                        row["screenshot"] = shot_name
+                    except Exception:
+                        pass
+                for extra in opened_pages:
+                    try:
+                        extra.close()
+                    except Exception:
+                        pass
+                try:
+                    on_home = page.url == home and page not in nav_resp and page not in nav_fail
+                except Exception:
+                    on_home = False
+                self._nav_release()  # close the menu that was held open for this link
+                if on_home:
+                    _park_mouse(page)
+
+                if errors:
+                    row["status"] = "Failed"
+                    row["error"] = " ".join(errors)
+                row["note"] = "; ".join(notes)
+                row["duration"] = round(time.time() - t0, 2)
+                self.last_resolution = None
+        finally:
+            self._nav_release()
+            for event, handler in (("response", _on_response), ("requestfailed", _on_failed), ("page", _on_page)):
+                try:
+                    ctx.remove_listener(event, handler)
+                except Exception:
+                    pass
+            try:
+                page.remove_listener("download", _on_download)
+            except Exception:
+                pass
+
+        # Items the baseline had that are not in the menu any more.
+        if base_map:
+            present = set(_nav_key(it.get("path")) for it in items)
+            for entry in baseline:
+                if _nav_key(entry.get("path")) not in present:
+                    rows.append({
+                        "path": " > ".join(entry.get("path") or []), "href": entry.get("href") or "",
+                        "status": "Failed", "note": "", "final_url": "", "http_status": None, "screenshot": "",
+                        "duration": 0.0,
+                        "error": "This item was in the menu before (saved baseline) but is not in the menu now.",
+                    })
+
+        passed = len([r for r in rows if r["status"] == "Passed"])
+        return {
+            "home": home,
+            "root": disc.get("root") or "",
+            "rows": rows,
+            "discovered": [{"path": it.get("path") or [], "href": it.get("href") or ""} for it in links],
+            "summary": {
+                "total": len(rows), "passed": passed, "failed": len(rows) - passed,
+                "items_without_link": no_link, "popups_closed": dismissed,
+                "seconds": round(time.time() - started, 1),
+            },
+        }
+
+
+# ----------------------------------------------------------------------
+# Helpers for the navigation-menu code above (module level so the long
+# JavaScript snippets are not re-built on every call).
+# ----------------------------------------------------------------------
+import re as _nav_re
+from urllib.parse import urlsplit as _nav_urlsplit
+
+# Title / main heading of a page that "opened fine" (HTTP 200) but is
+# really an error page.
+_NAV_ERROR_PAGE_RE = _nav_re.compile(
+    r"(^\s*(404|500|502|503)\b"
+    r"|\b(page|file|resource)\s+not\s+found\b"
+    r"|\b404\s+not\s+found\b"
+    r"|\berror\s+(404|500|502|503)\b"
+    r"|\bpage\s+(cannot|can.?t|could\s+not)\s+be\s+found\b"
+    r"|\bpage\s+(does\s+not|doesn.?t)\s+exist\b"
+    r"|\binternal\s+server\s+error\b"
+    r"|\bservice\s+unavailable\b"
+    r"|\bbad\s+gateway\b"
+    r"|\baccess\s+denied\b"
+    r"|\bsomething\s+went\s+wrong\b)"
+)
+
+
+def _nav_key(path) -> str:
+    return " > ".join(str(p).strip().lower() for p in (path or []))
+
+
+def _nav_host(url: str) -> str:
+    try:
+        host = (_nav_urlsplit(url).hostname or "").lower()
+    except Exception:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _nav_strip_hash(url: str) -> str:
+    return (url or "").split("#", 1)[0].rstrip("/")
+
+
+def _nav_norm(url: str) -> str:
+    """Host + path only - ignores http/https, 'www.', a trailing slash,
+    the query string and the #fragment, so harmless differences are not
+    reported as a changed link or a redirect."""
+    try:
+        parts = _nav_urlsplit(url or "")
+    except Exception:
+        return url or ""
+    return _nav_host(url) + (parts.path or "").rstrip("/")
+
+
+def _nav_link_kind(item: dict) -> str:
+    """'link' for a menu entry that leads to a page; 'none' for one that
+    only opens a submenu (no href, '#', javascript:); 'mail' for
+    mailto:/tel: links, which are not opened."""
+    raw = (item.get("raw_href") or "").strip()
+    low = raw.lower()
+    if not raw or raw == "#" or low.startswith("javascript:"):
+        return "none"
+    if low.startswith(("mailto:", "tel:", "sms:")):
+        return "mail"
+    return "link"
+
+
+# True when something that looks like a submenu is visible under the hovered
+# element (or under one of its nearest ancestors).
+_HOVER_SUBMENU_OPEN_JS = r"""
+(el) => {
+  var node = el;
+  for (var depth = 0; depth < 4 && node && node !== document.body; depth++) {
+    if (node.getAttribute && node.getAttribute('aria-expanded') === 'true') return true;
+    var subs = node.querySelectorAll('ul, ol, [role="menu"], [class*="sub"], [class*="drop"], [class*="flyout"]');
+    for (var i = 0; i < subs.length; i++) {
+      if (subs[i].contains(el)) continue;
+      var cs = window.getComputedStyle(subs[i]);
+      if (cs.display !== 'none' && cs.visibility !== 'hidden' && parseFloat(cs.opacity || '1') > 0 && subs[i].offsetWidth > 0) return true;
+    }
+    node = node.parentElement;
+  }
+  return false;
+}
+"""
+
+_NAV_SHOWN_JS = r"""
+(el) => {
+  if (!el || !el.isConnected) return false;
+  var r = el.getBoundingClientRect();
+  if (r.width < 1 || r.height < 1) return false;
+  if (getComputedStyle(el).visibility === 'hidden') return false;
+  var n = el;
+  while (n && n.nodeType === 1) {
+    var cs = getComputedStyle(n);
+    if (cs.display === 'none' || parseFloat(cs.opacity || '1') < 0.05) return false;
+    n = n.parentElement;
+  }
+  if (r.right <= 0 || r.left >= window.innerWidth) return false;
+  var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  if (cx < 0 || cx >= window.innerWidth) return false;
+  if (cy < 0 || cy >= window.innerHeight) return true;  // needs scrolling - cannot hit-test yet
+  var hit = document.elementFromPoint(cx, cy);
+  if (!hit) return false;
+  if (hit === el || el.contains(hit)) return true;
+  var p = el.parentElement;
+  return !!p && (hit === p || hit === p.parentElement);
+}
+"""
+
+# Shared by the three snippets below: navChain(el, anyTag) returns the menu
+# "triggers" above `el`, outermost first - the things a person would point
+# at, one after another, to make `el` appear.
+_NAV_CHAIN_FN = r"""
+  var ITEM = 'li, [role="none"], [role="presentation"], .dropdown, .dropend, .dropstart, .dropup';
+  var TRIG = 'a, button, summary, [role="menuitem"], [role="button"], [aria-haspopup], [data-toggle], [data-bs-toggle]';
+  function triggerOf(item) {
+    var c = item.querySelectorAll(TRIG);
+    for (var i = 0; i < c.length; i++) { if (c[i].closest(ITEM) === item) return c[i]; }
+    return item;
+  }
+  function navChain(el, anyTag) {
+    if (!anyTag && !el.closest('a, button, summary, [role="menuitem"], [role="link"], [role="button"]')) return [];
+    var chain = [];
+    var item = el.closest(ITEM);
+    if (item) {
+      var own = triggerOf(item);
+      if (own !== el && own !== item && !own.contains(el) && !el.contains(own)) chain.unshift(own);
+    }
+    var node = item, guard = 0;
+    while (node && guard++ < 12) {
+      var parent = node.parentElement ? node.parentElement.closest(ITEM) : null;
+      if (!parent) break;
+      var t = triggerOf(parent);
+      if (t !== el && !t.contains(el) && chain[0] !== t) chain.unshift(t);
+      node = parent;
+    }
+    return chain;
+  }
+"""
+
+_NAV_CHAIN_JS = "(el) => {" + _NAV_CHAIN_FN + "  return navChain(el, false);\n}"
+
+# Marks every element whose :hover has to be forced for `el` to appear -
+# each trigger above it and that trigger's menu item (rules are written
+# either way: "li:hover > ul" or "a:hover + ul") - and, with includeSelf,
+# `el` and its own item too (a recorded hover step: open what is under it).
+# Returns how many were marked.
+_NAV_FORCE_TAG_JS = "(el, includeSelf) => {" + _NAV_CHAIN_FN + r"""
+  var old = document.querySelectorAll('[data-atr-force]');
+  for (var o = 0; o < old.length; o++) old[o].removeAttribute('data-atr-force');
+  var nodes = [];
+  function push(n) { if (n && nodes.indexOf(n) < 0) nodes.push(n); }
+  var chain = navChain(el, !!includeSelf);
+  for (var i = 0; i < chain.length; i++) { push(chain[i]); push(chain[i].closest(ITEM)); }
+  if (includeSelf) { push(el); push(el.closest(ITEM)); }
+  for (var k = 0; k < nodes.length; k++) nodes[k].setAttribute('data-atr-force', String(k));
+  return nodes.length;
+}
+"""
+
+# For menus opened by script (mouseenter/mouseover handlers) rather than by
+# a CSS :hover rule: sends those events straight to each trigger, outermost
+# first. Needs no pointer at all.
+_NAV_SYNTH_HOVER_JS = "(el, includeSelf) => {" + _NAV_CHAIN_FN + r"""
+  var chain = navChain(el, !!includeSelf);
+  if (includeSelf) chain.push(el);
+  var kinds = [['pointerover', true], ['pointerenter', false], ['mouseover', true], ['mouseenter', false], ['mousemove', true]];
+  for (var i = 0; i < chain.length; i++) {
+    var t = chain[i], item = t.closest(ITEM);
+    var r = t.getBoundingClientRect();
+    var targets = item && item !== t ? [item, t] : [t];
+    for (var k = 0; k < kinds.length; k++) {
+      var init = { bubbles: kinds[k][1], cancelable: true, view: window,
+                   clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+      for (var n = 0; n < targets.length; n++) {
+        try {
+          targets[n].dispatchEvent(kinds[k][0].indexOf('pointer') === 0 ? new PointerEvent(kinds[k][0], init)
+                                                                         : new MouseEvent(kinds[k][0], init));
+        } catch (e) {}
+      }
+    }
+  }
+  return chain.length;
+}
+"""
+
+_NAV_TOGGLE_JS = r"""
+(t) => {
+  var href = t.getAttribute('href');
+  var dead = t.tagName === 'A' && (!href || href === '#' || href.toLowerCase().indexOf('javascript:') === 0);
+  var tog = (t.getAttribute('data-toggle') || t.getAttribute('data-bs-toggle') || '').toLowerCase();
+  return {
+    toggle: t.hasAttribute('aria-haspopup') || t.hasAttribute('aria-expanded') || tog === 'dropdown' || tog === 'collapse' || t.tagName === 'SUMMARY',
+    dead_link: dead,
+    is_link: t.tagName === 'A' && !dead
+  };
+}
+"""
+
+_NAV_DISCOVER_JS = r"""
+(opts) => {
+  opts = opts || {};
+  var ATTR = 'data-atr-nav';
+  var old = document.querySelectorAll('[' + ATTR + ']');
+  for (var o = 0; o < old.length; o++) old[o].removeAttribute(ATTR);
+
+  var LISTS = 'ul, ol, [role="menubar"], [role="menu"]';
+  var SCOPE = 'nav, header, [role="navigation"], [role="menubar"], [role="banner"], [class*="nav" i], [id*="nav" i], [class*="menu" i], [id*="menu" i], [class*="header" i], [id*="header" i]';
+  var EXCLUDE = 'footer, [role="contentinfo"], [class*="footer" i], [id*="footer" i], [class*="breadcrumb" i], [class*="pagination" i], [class*="sitemap" i], [class*="social" i], [class*="cookie" i], [class*="carousel" i], [class*="slick" i], [class*="swiper" i]';
+
+  function clean(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
+  function rendered(el) {
+    var r = el.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1 || r.right <= 0 || r.left >= window.innerWidth) return false;
+    var cs = getComputedStyle(el);
+    return cs.display !== 'none' && cs.visibility !== 'hidden' && parseFloat(cs.opacity || '1') > 0.05;
+  }
+  function labelOf(el) {
+    var c = el.cloneNode(true);
+    var drop = c.querySelectorAll('ul, ol, [role="menu"], script, style, svg');
+    for (var i = 0; i < drop.length; i++) drop[i].remove();
+    var t = clean(c.textContent);
+    if (!t) t = clean(el.getAttribute('aria-label') || el.getAttribute('title'));
+    if (!t) { var img = el.querySelector('img[alt]'); if (img) t = clean(img.getAttribute('alt')); }
+    return t.slice(0, 80);
+  }
+  function ownerList(n) { return n.parentElement ? n.parentElement.closest(LISTS) : null; }
+  function itemsOf(list) {
+    var all = list.querySelectorAll('li'), out = [];
+    for (var i = 0; i < all.length; i++) if (ownerList(all[i]) === list) out.push(all[i]);
+    return out;
+  }
+  function triggerOf(li) {
+    var c = li.querySelectorAll('a, button, summary, [role="menuitem"], [role="button"]');
+    for (var i = 0; i < c.length; i++) if (c[i].closest('li') === li) return c[i];
+    return null;
+  }
+  function subLists(li) {
+    var all = li.querySelectorAll(LISTS), out = [];
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].parentElement.closest('li') === li && itemsOf(all[i]).length) out.push(all[i]);
+    }
+    return out;
+  }
+  function looseLinks(li, trig) {
+    var all = li.querySelectorAll('a[href]'), out = [];
+    for (var i = 0; i < all.length; i++) if (all[i] !== trig && all[i].closest('li') === li) out.push(all[i]);
+    return out;
+  }
+  function describe(el) {
+    var s = el.tagName.toLowerCase();
+    if (el.id) s += '#' + el.id;
+    var cls = (typeof el.className === 'string' ? el.className : '').trim().split(/\s+/).filter(Boolean).slice(0, 2);
+    if (cls.length) s += '.' + cls.join('.');
+    return s;
+  }
+  function notPage(el) { return el && el !== document.body && el !== document.documentElement; }
+
+  var roots = [];
+  if (opts.selector) {
+    var box = null;
+    try { box = document.querySelector(opts.selector); }
+    catch (e) { return { error: 'The menu selector is not valid CSS: ' + opts.selector, items: [] }; }
+    if (!box) return { items: [], root: '', note: 'selector matched nothing' };
+    if (box.matches(LISTS) && itemsOf(box).length) roots.push(box);
+    else {
+      var inner = box.querySelectorAll(LISTS);
+      for (var b = 0; b < inner.length; b++) {
+        var up = inner[b].parentElement.closest('li');
+        if ((!up || !box.contains(up)) && itemsOf(inner[b]).length) roots.push(inner[b]);
+      }
+    }
+  } else {
+    var all = document.querySelectorAll(LISTS);
+    var strict = [], loose = [];
+    for (var a = 0; a < all.length; a++) {
+      var l = all[a];
+      if (l.parentElement.closest('li')) continue;        // a submenu, not a menu
+      if (notPage(l.closest(EXCLUDE))) continue;
+      if (itemsOf(l).length < 2) continue;
+      if (!l.querySelector('a[href]')) continue;
+      (notPage(l.closest(SCOPE)) ? strict : loose).push(l);
+    }
+    var cands = strict.length ? strict : loose;
+    var best = null, bestScore = -1;
+    for (var c = 0; c < cands.length; c++) {
+      var lis = itemsOf(cands[c]), shownTop = 0, nested = 0;
+      for (var k = 0; k < lis.length; k++) {
+        var t = triggerOf(lis[k]);
+        if (t && rendered(t)) shownTop++;
+        if (subLists(lis[k]).length || looseLinks(lis[k], t).length) nested++;
+      }
+      var top = cands[c].getBoundingClientRect().top + window.scrollY;
+      var score = (shownTop >= 2 ? 10000 : 0) + (nested ? 3000 : 0) + (top < 500 ? 2000 : 0)
+                + Math.min(cands[c].querySelectorAll('a[href]').length, 500);
+      if (score > bestScore) { bestScore = score; best = cands[c]; }
+    }
+    if (best) roots.push(best);
+  }
+
+  var counter = 0, out = [], used = {};
+  function add(el, path, parentId, hasChildren) {
+    var key = path.join(' > ').toLowerCase(), n = 2, label = path[path.length - 1];
+    while (used[key]) {            // two entries with the same name under the same parent
+      path = path.slice(0, -1).concat([label + ' (' + n + ')']);
+      key = path.join(' > ').toLowerCase();
+      n++;
+    }
+    used[key] = true;
+    var id = String(counter++);
+    try { el.setAttribute(ATTR, id); } catch (e) {}
+    var raw = '', href = '';
+    if (el.tagName === 'A') { raw = el.getAttribute('href') || ''; href = el.href || ''; }
+    out.push({ id: id, parent: parentId, path: path, href: href, raw_href: raw,
+               target: el.getAttribute('target') || '', has_children: hasChildren, shown: rendered(el) });
+    return { id: id, path: path };
+  }
+  function walk(list, prefix, parentId, depth) {
+    if (depth > 6) return;
+    var lis = itemsOf(list);
+    for (var i = 0; i < lis.length && counter < 600; i++) {
+      var li = lis[i], trig = triggerOf(li);
+      var subs = subLists(li);
+      var loose = subs.length ? [] : looseLinks(li, trig);
+      var el = trig || li;
+      var label = labelOf(el);
+      if (!label) {
+        if (!subs.length && !loose.length) continue;      // icon-only entry with nothing under it
+        label = 'item ' + (i + 1);
+      }
+      var me = add(el, prefix.concat([label]), parentId, subs.length > 0 || loose.length > 0);
+      for (var s = 0; s < subs.length; s++) walk(subs[s], me.path, me.id, depth + 1);
+      for (var q = 0; q < loose.length; q++) {
+        var l2 = labelOf(loose[q]);
+        if (l2) add(loose[q], me.path.concat([l2]), me.id, false);
+      }
+    }
+  }
+  for (var r = 0; r < roots.length; r++) walk(roots[r], [], '', 0);
+  return { items: out, root: roots.length ? describe(roots[0]) : '' };
+}
+"""
+
+_NAV_PAGE_STATE_JS = r"""
+() => {
+  var h1 = document.querySelector('h1');
+  var body = document.body;
+  return {
+    title: (document.title || '').slice(0, 200),
+    h1: h1 ? (h1.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200) : '',
+    text_len: body ? (body.innerText || '').trim().length : 0,
+    media: body ? body.querySelectorAll('img, svg, canvas, video, iframe, embed, object').length : 0,
+    content_type: document.contentType || ''
+  };
+}
+"""
+
+_NAV_DISMISS_JS = r"""
+() => {
+  var WORDS = /^(accept|accept all|accept all cookies|accept cookies|accept and continue|accept & continue|allow all|allow all cookies|i accept|i agree|agree|got it|ok|okay|close|dismiss|no thanks|x|\u00d7|\u2715|\u2716)$/i;
+  var BOX = '[class*="cookie" i], [id*="cookie" i], [class*="consent" i], [id*="consent" i], [class*="gdpr" i], [class*="modal" i], [class*="popup" i], [id*="popup" i], [class*="overlay" i], [role="dialog"], [role="alertdialog"], [aria-modal="true"]';
+  function floating(el) {
+    var n = el, d = 0;
+    while (n && n.nodeType === 1 && d++ < 14) {
+      var cs = getComputedStyle(n);
+      if (cs.position === 'fixed' || cs.position === 'sticky') return true;
+      if (cs.position === 'absolute' && parseInt(cs.zIndex || '0', 10) >= 10) return true;
+      n = n.parentElement;
+    }
+    return false;
+  }
+  var clicked = [], done = [];
+  var cands = document.querySelectorAll('button, [role="button"], a, input[type="button"], input[type="submit"], span, div');
+  for (var i = 0; i < cands.length && clicked.length < 4; i++) {
+    var el = cands[i];
+    if (el.children.length > 2) continue;
+    var label = ((el.value || el.textContent || '') + '').replace(/\s+/g, ' ').trim();
+    if (!label) label = (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+    if (!label || label.length > 30 || !WORDS.test(label)) continue;
+    if (el.tagName === 'A') {
+      var h = el.getAttribute('href') || '';
+      if (h && h !== '#' && h.toLowerCase().indexOf('javascript:') !== 0) continue;   // a real link - leave it
+    }
+    if (!el.closest(BOX)) continue;
+    var r = el.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1 || getComputedStyle(el).visibility === 'hidden') continue;
+    if (!floating(el)) continue;
+    var dup = false;
+    for (var d = 0; d < done.length; d++) if (done[d].contains(el) || el.contains(done[d])) dup = true;
+    if (dup) continue;
+    try { el.click(); done.push(el); clicked.push(label); } catch (e) {}
+  }
+  return clicked;
+}
+"""
+{% endraw %}
+
+
+class RecordedPage(BasePage):
+    """Convenience wrappers matching the recorded element names."""
+{% for name in element_names %}
+    def click_{{ name }}(self):
+        self.click("{{ name }}")
+
+    def type_{{ name }}(self, value):
+        self.type_text("{{ name }}", value)
+
+    def paste_{{ name }}(self, value):
+        self.paste_text("{{ name }}", value)
+
+    def set_checked_{{ name }}(self, checked):
+        self.set_checked("{{ name }}", checked)
+
+    def press_enter_{{ name }}(self):
+        self.press_enter("{{ name }}")
+
+    def press_key_{{ name }}(self, key_name):
+        self.press_key("{{ name }}", key_name)
+
+    def capture_{{ name }}(self):
+        return self.capture_value("{{ name }}")
+
+    def select_{{ name }}(self, option_text):
+        self.select_option("{{ name }}", option_text)
 {% endfor %}
-    Then the flow should complete without errors
