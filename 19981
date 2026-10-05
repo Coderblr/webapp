@@ -1,468 +1,65 @@
-# AI Test Recorder
-
-Record a session on **any** web application (click, type an amount, etc.),
-and generate a runnable **Behave + Playwright** framework: a `.feature` file,
-a `steps.py`, and a Page Object with multi-strategy locators - then run it
-with one click.
-
-## Why LangGraph + LangChain
-
-- **LangChain** wraps the model calls (Azure OpenAI or DeepSeek - both work
-  through the same `ChatOpenAI`-style interface, see `agent/llm_factory.py`).
-- **LangGraph** orchestrates the workflow as a small state machine, because
-  it isn't a single prompt: `generate artifacts -> run tests -> (if a
-  locator broke) self-heal -> run again`. That retry loop is what
-  `agent/graph.py` implements. LangChain alone can do the individual calls,
-  but the stateful retry loop is naturally a graph, not a linear chain.
-
-The pipeline still works with **zero LLM keys configured** - it falls back
-to heuristic element naming and simply reports failures without
-self-healing. The LLM makes step names/Gherkin phrasing more natural and
-adds the self-healing repair step; it isn't required for the core
-record -> generate -> run loop.
-
-## How locator accuracy is achieved
-
-Recorders are only as good as the selectors they capture. This one never
-relies on a single selector:
-
-1. At record time (`recorder/recorder_injector.js`), every clicked/typed
-   element gets **up to 7 independent locator candidates**: `data-testid`,
-   `id`, `name`, `aria-label`, `placeholder`, text-based XPath, and a
-   generated CSS/XPath path - each validated for uniqueness on the page
-   before being kept.
-2. `recorder/locator_strategy.py` ranks them by robustness.
-3. The generated Page Object (`generator/templates/page.tmpl`) tries them
-   **in order** at runtime, so if the top strategy breaks, it silently
-   falls back to the next one.
-4. Only if *every* stored strategy fails does it call the **self-healing
-   agent** (`agent/self_healer.py`), which reads the live DOM, asks the LLM
-   for a new selector, validates it resolves to exactly one element, and
-   persists it back into `locators.json`.
-
-## Navigation menu check (no recording, no hovering)
-
-Tests every link of a site's menu - Personal Banking > Accounts > Saving
-Account, and so on - without anyone recording or hovering anything.
-
-**Use it:** Run Saved Recording tab -> "Create a navigation menu check" ->
-pick the application (or type the address) -> Create -> Run recording.
-
-**What a run does.** It reads the menu from the live page, then for each
-link: goes back to the start page, opens the parent menus with the real
-mouse, clicks the link and checks the page that opened. A link fails when:
-
-- the page returns an HTTP error (404, 500 ...) or does not load
-- the page loads but is an error page ("Page not found" ...) or blank
-- clicking does nothing
-- (after the first run) the item is gone from the menu, or its link changed
-
-Links that open a new tab, download a file (PDF) or go to another site are
-handled and noted. Cookie banners and welcome pop-ups are closed first.
-The exit report has one row per menu link, each with its own screenshot.
-
-**Baseline.** The first run saves the menu as it is; later runs are compared
-with it. After an intended menu change, click "Reset baseline" and run once.
-
-**Settings** (in the create form):
-
-- *Menu selector* - leave blank; fill in a CSS selector (`nav`,
-  `#main-menu`) only if the wrong list gets picked.
-- *Fail a link if its menu does not open on hover* - off by default: the
-  link is still checked and the row gets a note. Turn on to make a menu that
-  will not open a failure.
-
-**After a login.** The check starts from whatever page is open when its step
-runs. To check a menu behind a login, record the login as usual, then add a
-`MENU-CHECK` row at the end in "Edit steps".
-
-**Limits.** One run stops starting new links ~90 seconds before
-`AGENT_TEST_TIMEOUT_SECONDS` (default 600) - raise that for very large
-menus; unchecked links are reported as "Skipped". Menus are found through
-`ul/li` lists and Bootstrap-style dropdowns in the page header/nav; a menu
-that only appears after tapping a mobile "hamburger" button is not opened.
-
-Code: `generator/templates/page.tmpl` (`check_navigation_menu`),
-`generator/build.py` (`menu_check` action), `runner/run_recording.py`
-(per-link report rows, baseline), `backend/api.py` (`/api/menu_check`).
-
-### Recorded clicks inside hover menus
-
-A recorded click on a menu item no longer needs recorded hover steps. If
-the target exists but is hidden inside a closed menu, replay opens the
-menus above it (found from the page, not from recorded pixel positions)
-and then clicks. Recorded hover steps now also use the element's position
-at replay time. Set `AUTO_OPEN_MENUS=false` to switch the auto-open off.
-
-### Runs do not depend on the mouse pointer
-
-Menus are opened without the pointer: the browser is told to treat the
-parent items as hovered (the DevTools "force :hover" switch, sent over
-CDP), and hover events are sent straight to script-driven menus. In a
-visible browser the person's real cursor otherwise overrides an automated
-pointer move, and the run only advances while someone holds the mouse on
-the menu. Nobody needs to touch the mouse during a run now. Moving the
-pointer is kept as the fallback (elements inside an iframe). Set
-`MENU_OPEN_WITHOUT_MOUSE=false` to go back to pointer-only.
-
-### Recorded hover steps are locator-driven
-
-A recorded hover is replayed through the element's recorded locators:
-find it (all recorded candidates, then self-healing), scroll it into view,
-`locator.hover()`, then wait for the next step's element to become visible.
-The pixel position stored at recording time is used only if no locator
-matches anything. Code: `hover_element()` in `generator/templates/page.tmpl`.
-
-### New tabs during recording
-
-A click that opens a new tab is recorded in the right order, what the user
-does inside the new tab is recorded, and they can close that tab or leave
-it open and carry on in the first one - replay follows the same tabs. The
-recording only ends on Save & Generate (or Stop): closing a tab, even the
-first one, no longer ends it. `recorder/recorder.py` and
-`recorder/recorder_injector.js` run inside the local agent, so the agent
-has to be rebuilt/redeployed for this.
-
-## Authentication, sessions & admin panel
-
-The whole tool now sits behind login (JWT-based). Quick tour:
-
-- **Login** - `POST /api/auth/login` with a username/ADID + password, issued
-  by an admin (see below). Every login gets its own session row in the
-  database (`sessions` table) - sessions are never shared between users.
-- **First login / temp passwords** - accounts are created with a temp
-  password and `must_change_password=true`. The frontend forces a redirect
-  to `/change-password` (current/temp password + new password + confirm)
-  until that's cleared.
-- **5-minute idle auto-logout** - enforced in two places, deliberately:
-  the frontend watches for mouse/keyboard/scroll activity and logs out
-  locally after 5 idle minutes (with a warning banner beforehand), and the
-  *backend* independently rejects any API call once a session has gone
-  5 minutes without an authenticated request (`auth/dependencies.py`) -
-  so this holds even if someone scripts around the frontend.
-- **Admin panel** (`/admin/users`, `/admin/sessions`, `/admin/activity` in
-  the frontend) - an admin can create/edit/deactivate/delete users, reset
-  anyone's password, see who's online right now (and force-log them out),
-  and browse/export every user's activity (recordings started, tests run,
-  logins, profile changes, ...) as CSV.
-- **Everyone's dashboard/profile** - `/dashboard` after login, and
-  `/profile` to update your own name/email and review + export your own
-  activity history.
-- **SSO-ready** - `AUTH_PROVIDER=local` today; wiring up State Bank of
-  India's SSO later is meant to be a single-function change
-  (`auth/providers.py:authenticate_sso`) - see the docstring in
-  `auth/config.py` for the intended integration shape. Session handling,
-  the idle timeout, JWTs, and the admin/activity views don't need to
-  change for that.
-
-The very first admin account is seeded automatically on first run from
-`ADMIN_USERNAME`/`ADMIN_TEMP_PASSWORD` in `.env` (defaults to
-`admin` / `ChangeMe@123` - **change these before running anywhere but your
-own machine**). Log in with it, change the password when prompted, then
-create real accounts from the Users admin page.
-
-**Hosting this for multiple people** (not just running it locally)? See
-[`DEPLOYMENT_WINDOWS.md`](DEPLOYMENT_WINDOWS.md) - it covers running as
-Windows Services, a reverse proxy with TLS, and how concurrent *recording*
-specifically works once several people can be using the tool from their
-own machines at once (short version: recording runs headless on the
-server and is watched/controlled live through the browser - see
-`backend/recording_sessions.py` and `recorder/recorder.py`).
-
-### Just a few people on the same local network (no server needed)
-
-Concurrent recording isn't tied to a real server deployment - it's
-application logic that works the same wherever the backend runs. For a
-small team on one office LAN, a full Windows Server setup is overkill;
-run it on any one machine and point everyone else at it:
-
-```bash
-# on the host machine - bind to the LAN, not just localhost
-uvicorn backend.api:app --host 0.0.0.0 --port 8000
-```
-
-```ini
-# frontend/.env.local on the HOST machine - its own LAN IP, not "localhost"
-NEXT_PUBLIC_API_BASE=http://192.168.1.50:8000
-```
-
-```bash
-cd frontend && npm run build && npm run start
-```
-
-Everyone else on the network then opens `http://192.168.1.50:3000`.
-Windows Firewall will prompt the first time another machine reaches
-it - allow it for your private/domain network profile. This skips TLS,
-a reverse proxy, and auto-restart-on-crash/reboot (all of which
-`DEPLOYMENT_WINDOWS.md` adds) - fine for casual internal use, but the
-tool goes down if that machine's terminal closes, sleeps, or reboots, and
-`MAX_CONCURRENT_RECORDINGS` should be set lower than a real server's
-(a laptop realistically handles maybe 2-4 concurrent live recordings, not
-10-30).
-
-## Setup
-
-```bash
-python -m venv venv
-source venv/bin/activate      # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env
-```
-
-Edit `.env`:
-- Set `LLM_PROVIDER=azure` and fill `AZURE_OPENAI_API_KEY` / `AZURE_OPENAI_ENDPOINT` / `AZURE_OPENAI_DEPLOYMENT`, **or**
-- Set `LLM_PROVIDER=deepseek` and fill `DEEPSEEK_API_KEY`.
-- Set `JWT_SECRET_KEY` to a long random value (not the placeholder) before
-  running this anywhere but your own machine - see the auth section above
-  for the rest of the auth-related `.env` keys.
-
-Then install the Playwright browser driver files once:
-```bash
-playwright install msedge
-```
-
-By default this uses **Microsoft Edge** - you need Edge installed locally,
-and Playwright drives it directly via its `channel="msedge"` option (the
-`playwright install msedge` above just makes sure Playwright's own driver
-files are present; it does not download a separate copy of Edge). To use
-Chrome instead, set `BROWSER=chrome` in `.env` and run `playwright install
-chrome` (Chrome must be installed locally in that case).
-
-There's no more `EDGE_DRIVER_PATH`/`CHROME_DRIVER_PATH` to manage - Playwright
-talks to the browser directly, so no separate driver executable is needed.
-
-## Usage - UI (recommended)
-
-The UI is a FastAPI backend (does the actual work, unchanged) + a **Next.js**
-frontend (`frontend/`, the buttons). Run them in two terminals:
-
-```bash
-# terminal 1 - backend API
-uvicorn backend.api:app --reload --port 8000
-
-# terminal 2 - frontend
-cd frontend
-npm install        # first time only
-cp .env.local.example .env.local   # first time only
-npm run dev
-```
-Open `http://localhost:3000` in your browser - you'll land on `/login`.
-Sign in with the seeded admin (or an account one creates for you), then:
-1. Go to **Record & Run**, enter the target application's URL, click **Start Recording** - a browser window opens (Edge by default).
-2. Interact with the app normally (click things, type an amount, submit, etc.).
-3. Click **Save & Generate** - this stops the recording and writes:
-   - `output/features/recorded.feature`
-   - `output/features/steps/recorded_steps.py`
-   - `output/pages/recorded_page.py` + `output/pages/locators.json`
-4. Click **Run / Check** - runs the generated Behave suite against the same app and shows pass/fail + logs.
-
-### Running a saved recording + exit report
-
-The **"Run Saved Recording"** tab in the UI lets you re-run any
-recording you already have in `recordings/`, without re-recording it,
-always attributed to whoever is currently logged in (no more manual "run
-as" picker - your session is the user):
-
-1. Pick a saved recording from the dropdown (auto-populated from `recordings/*.json`).
-2. Click **Run recording** - this regenerates its feature/steps/page files
-   and executes them, then shows the **exit report**: overall
-   Success/Failed status, a per-step Playwright/Behave log (with error
-   messages for any failed step), the list of files produced, and a
-   downloadable `.txt` report.
-
-Every run is written to `transactions/transaction_<id>.json` (status,
-per-step results, files produced) - see
-[`database/README.md`](database/README.md#transactions--not-in-the-database)
-for the format. The SQLite database in `database/` only ever holds
-auth/session/activity data (who logged in, who ran what and when) - never
-the recordings or their run results; see
-[`database/README.md`](database/README.md) for that schema. The same flow
-is available over the API (all endpoints below need
-`Authorization: Bearer <token>` from `/api/auth/login`):
-
-```bash
-TOKEN=$(curl -s -X POST http://127.0.0.1:8000/api/auth/login -H "Content-Type: application/json" \
-  -d '{"username": "admin", "password": "ChangeMe@123"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
-
-curl http://127.0.0.1:8000/api/recordings -H "Authorization: Bearer $TOKEN"
-
-curl -X POST http://127.0.0.1:8000/api/run_recording -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"recording_file": "recordings/recording_20260814_103200.json", "headless": true}'
-```
-
-The backend also works standalone as a plain JSON API (e.g. for scripting
-or a different frontend later) - remember the `Authorization` header:
-```bash
-curl -X POST http://127.0.0.1:8000/api/start -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"url": "https://www.saucedemo.com/"}'
-curl -X POST http://127.0.0.1:8000/api/stop_and_save -H "Authorization: Bearer $TOKEN"
-curl -X POST http://127.0.0.1:8000/api/run -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"headless": false}'
-```
-
-## Usage - CLI
-
-The CLI (`main.py`) talks to the recorder/generator/runner modules
-directly, bypassing the API and its auth - it's meant for local
-scripting, not the shared multi-user deployment described above.
-
-```bash
-python main.py record --url https://your-app.com
-python main.py generate --recording recordings/recording_20260814_103200.json
-python main.py run
-```
-
-Or generate **and** run through the LangGraph pipeline (with self-healing) in one step:
-
-```bash
-python main.py generate --recording recordings/recording_20260814_103200.json --run
-```
-
-## Generated output structure
-
-```
-output/
-  features/
-    recorded.feature
-    environment.py         # Playwright browser setup/teardown, injected at generation time
-    steps/
-      recorded_steps.py
-  pages/
-    recorded_page.py       # BasePage + RecordedPage, locator-agnostic logic
-    locators.json          # the actual selectors, editable / self-healable
-  recorded_steps.xlsx      # every action + ALL candidate locators, for manual review
-  reports/
-    transaction_<id>_exit_report.txt   # human-readable exit report per run
-
-transactions/
-  transaction_<id>.json    # one file per "run a saved recording" execution -
-                            # status, per-step results, files produced (see
-                            # database/README.md#transactions--not-in-the-database)
-```
-
-### The Excel report (`output/recorded_steps.xlsx`)
-
-Every recording generates a styled spreadsheet listing each step, its element name,
-tag/type, the **primary** locator chosen, and the **full list of fallback locators**
-that were captured (not just the one that got used) - useful for spotting exactly
-why a specific element isn't resolving. Any row with **zero captured locators** is
-highlighted red so it's immediately visible.
-
-By default, values typed into `type="password"` fields are masked (`••••••••`) in
-this report, since typed values are otherwise written to disk in plaintext. If you
-need the real value visible (e.g. dummy/test-only credentials), call
-`build_artifacts(recording, mask_passwords=False)` directly, or edit
-`generator/build.py`'s call to `build_excel_report`.
-
-### Radio buttons, checkboxes, and dropdowns
-
-- **Radio/checkbox**: clicks on the visible label (a common pattern where the
-  native `<input type="radio">` is visually hidden and a styled `<label>` sits on
-  top) are resolved back to the underlying input via its `for` attribute or
-  nested structure, so the locator always points at the real form control, not
-  the label wrapper.
-- **Native `<select>` dropdowns**: captured as a distinct `select` action (not
-  lumped in with plain typing) and replayed using Playwright's
-  `select_option()` (by visible label, falling back to by value) - this is
-  the reliable way to drive a native dropdown; clicking/sending keys directly
-  to a `<select>` is what usually causes "dropdown issues."
-- **Custom (non-native) dropdowns** - div/li-based widgets that aren't a real
-  `<select>` - fall back to: click to open, then click the option by its
-  visible text.
-
-### Keyboard-driven actions
-
-Pressing a non-character key while focused on a field is captured as a
-distinct `keypress` action (separate from typing), so flows that rely on the
-keyboard - submitting with Enter instead of clicking a button, clearing a
-field with Backspace, moving through an autocomplete list with the arrow
-keys, selecting all with Ctrl+A, printing/saving with Ctrl+P/Ctrl+S, etc. -
-are recorded and replayed correctly. Captured keys:
-
-| Key pressed         | Recorded value | Replayed via Playwright's `press()`   |
-|----------------------|----------------|----------------------------------------|
-| Enter                | `ENTER`        | `"Enter"`                              |
-| Backspace            | `BACKSPACE`    | `"Backspace"`                          |
-| Delete               | `DELETE`       | `"Delete"`                             |
-| Space                | `SPACE`        | `"Space"`                              |
-| Tab                  | `TAB`          | `"Tab"`                                |
-| Shift+Tab            | `SHIFT+TAB`    | `"Shift+Tab"`                          |
-| Escape               | `ESCAPE`       | `"Escape"`                             |
-| Arrow Up/Down/Left/Right | `ARROW_UP` / `ARROW_DOWN` / `ARROW_LEFT` / `ARROW_RIGHT` | `"ArrowUp"` / `"ArrowDown"` / `"ArrowLeft"` / `"ArrowRight"` |
-| Home / End           | `HOME` / `END` | `"Home"` / `"End"`                     |
-| F1 - F12             | `F1` ... `F12` | `"F1"` ... `"F12"`                     |
-| Ctrl+A / Ctrl+P / Ctrl+S | `CTRL+A` / `CTRL+P` / `CTRL+S` | `"Control+A"` / `"Control+P"` / `"Control+S"` |
-| Ctrl+C / Ctrl+V / Ctrl+X | *(see Copy/Paste below - not double-recorded as a keypress)* | `"Control+C"` / `"Control+V"` / `"Control+X"` via `press_key()` |
-
-Each generated step calls the Page Object's generic `press_key(element_name,
-key_name)` (e.g. `context.page.press_key("search_box_field", "ARROW_DOWN")`),
-and the Gherkin step text names the actual key, e.g. `When the user presses
-Arrow Down on "search_box_field"`. The original `press_enter(element_name)`
-helper is still available and works the same as before (it's now a thin
-wrapper around `press_key(element_name, "ENTER")`).
-
-### Real-time copy/paste and Capture -> Store -> Reuse variables
-
-Ctrl+C/Ctrl+V (and Ctrl+X) are handled separately from the generic keypress
-capture above: the injected script listens for the browser's own `copy`,
-`cut`, and `paste` events, which fire regardless of whether the user pressed
-the keyboard shortcut or used a right-click menu, and records:
-
-- **`copy`** - the text that was copied, plus the field it was copied *from*
-  (its full locator set, same as any other action).
-- **`paste`** - the text that was pasted, plus the field it was pasted *into*.
-
-After recording stops, `recorder/variable_capture.py` walks the actions in
-order and:
-
-1. Names each `copy` after its source field's label, stripping filler words
-   like "Generated"/"New" - e.g. a field labeled **"Generated Username"**
-   becomes `{{username}}`, **"Generated Application ID"** becomes
-   `{{application_id}}`.
-2. Tags any *later* `paste` (or manually retyped `type`) whose value exactly
-   matches a previously copied value with that same `{{name}}` placeholder.
-
-This turns a flow like:
-
-```
-CTRL+C on the "Generated Username" field   -> {{username}}
-...
-CTRL+V into the "Username" field           -> reuses {{username}}
-CTRL+C on the "Generated Application ID"   -> {{application_id}}
-...
-CTRL+V into the "Application ID" field     -> reuses {{application_id}}
-```
-
-into a generated feature file that reads `{{username}}` / `{{application_id}}`
-instead of the literal strings captured at recording time, and generated
-steps that:
-
-- **Capture**: `context.page.capture_value(element_name)` reads the field's
-  *current* value at playback time - preferring Playwright's
-  `input_value()` / `text_content()` (works headless, no OS dependency), and
-  only falling back to the browser's own clipboard (via
-  `page.evaluate(...navigator.clipboard.readText()...)` - still
-  100% Playwright, no external clipboard library) if the element exposes
-  neither - then stores it in `context.variables`.
-- **Reuse**: `context.variables.resolve("{{username}}")` (see
-  `runner/variables.py`) looks up the value *actually generated during this
-  run*, not the static value baked in when the recording was made, and that
-  live value is what gets typed into the later field.
-
-So if the target app generates a fresh username/application ID every run,
-replay still enters the *current* run's values, not a stale recorded one.
-
-
-
-## Notes / things to customize per real project
-
-- The generated `Then the flow should complete without errors` step is a
-  generic placeholder - replace it with a real assertion (e.g. "a success
-  banner with text X is shown") once you know what a successful transaction
-  looks like in your target app.
-- Recorded typed values (e.g. the amount) are baked into the feature file
-  as literals from the actual recording. Convert to a `Scenario Outline`
-  with an `Examples` table if you want to replay the same flow with
-  different amounts.
-- This was built and packaged in a sandboxed environment without a live
-  Chrome browser to record against, so the record -> replay loop hasn't
-  been exercised against a real target app yet - run it locally and let me
-  know if anything needs adjusting for your specific app's markup.
+Feature: Recorded flow - {{ scenario_name }}
+  Auto-generated from a recorded browser session on {{ recorded_at }}.
+  Target application: {{ target_url }}
+
+  Scenario: {{ scenario_name }}
+    Given the user opens "{{ target_url }}"
+{% for step in steps %}
+{% if step.action == "click" %}
+    When the user clicks "{{ step.element_name }}"
+{% elif step.action == "click_optional" %}
+    When the user clicks "{{ step.element_name }}" if it appears
+{% elif step.action == "toggle" %}
+{% if step.checked_value %}
+    When the user checks "{{ step.element_name }}"
+{% else %}
+    When the user unchecks "{{ step.element_name }}"
+{% endif %}
+{% elif step.action in ("type", "paste") %}
+{% if step.var_placeholder %}
+    When the user enters "{{ step.var_placeholder }}" into "{{ step.element_name }}"
+{% else %}
+    When the user enters "{{ step.value }}" into "{{ step.element_name }}"
+{% endif %}
+{% elif step.action == "file_upload" %}
+    When the user uploads the file "{{ step.value }}" into "{{ step.element_name }}"
+{% elif step.action == "select" %}
+    When the user selects "{{ step.value }}" from "{{ step.element_name }}"
+{% elif step.action == "keypress" %}
+    When the user presses {{ step.key_label }} on "{{ step.element_name }}"
+{% elif step.action == "copy" %}
+    When the user captures the value of "{{ step.element_name }}" as "{{ step.var_placeholder }}"
+{% elif step.action == "ocr_capture" %}
+    When the user captures the value of "{{ step.element_name }}" via OCR as "{{ step.var_placeholder }}"
+{% elif step.action == "window_closed" %}
+    When the user closes the current browser tab or window (step {{ loop.index }})
+{% elif step.action == "dialog" %}
+    When a "{{ step.dialog_type }}" dialog appears and is accepted (step {{ loop.index }})
+{% elif step.action == "delay" %}
+    When the flow waits {{ step.delay_seconds }} seconds (step {{ loop.index }})
+{% elif step.action == "assert_text" %}
+    When the page shows "{{ step.expected_text }}" in "{{ step.element_name }}"
+{% elif step.action == "assert_ocr_text" %}
+    When the page visually shows "{{ step.expected_text }}" (via OCR) (step {{ loop.index }})
+{% elif step.action == "scroll" %}
+    When the page scrolls {{ step.scroll_direction }} (step {{ loop.index }})
+{% elif step.action == "new_window_wait" %}
+    When a new browser tab or window opens (step {{ loop.index }})
+{% elif step.action == "date" %}
+    When the user sets the date "{{ step.value }}" in "{{ step.element_name }}"
+{% elif step.action == "hover" %}
+    When the user hovers over "{{ step.element_name }}"
+{% elif step.action == "menu_check" %}
+    When every link in the navigation menu is checked (step {{ loop.index }})
+{% elif step.action == "type" and step.random_spec %}
+    When the user enters a random "{{ step.random_spec }}" value into "{{ step.element_name }}"
+{% endif %}
+{% if step.opens_new_page %}
+{% if step.activate_new_page is defined and not step.activate_new_page %}
+    And a new browser tab or window has opened in the background (step {{ loop.index }})
+{% else %}
+    And the new browser tab or window is now active (step {{ loop.index }})
+{% endif %}
+{% endif %}
+{% endfor %}
+    Then the flow should complete without errors
