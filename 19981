@@ -1,168 +1,61 @@
 @echo off
 setlocal enableextensions
 rem ====================================================================
-rem  Builds the AI Test Recorder desktop installer, start to finish.
-rem  Run on WINDOWS from the project folder (the one containing "backend"
-rem  and "electron"), inside the Python virtual environment:
+rem  Makes ONE self-extracting setup .exe from the already-built app
+rem  (electron\dist\win-unpacked). No NSIS, no internet needed.
+rem  Needs 7-Zip installed (https://www.7-zip.org/).
 rem
-rem      build_desktop_installer.bat            unsigned installer
-rem      build_desktop_installer.bat branded    unsigned, icon embedded in the .exe
-rem      build_desktop_installer.bat signed     signed (set CSC_LINK / CSC_KEY_PASSWORD)
-rem
-rem  Optional: set SKIP_OCR_CHECK=1 first to skip the slow OCR self-test.
-rem  Needs electron\node_modules to exist already (npm install is NOT run).
+rem  Run from the electron folder:   ..\make_single_exe.bat
+rem  or copy this file into electron\ and run:  make_single_exe.bat
+rem  Result: dist\AI-Test-Recorder-Setup-Single.exe
 rem ====================================================================
 cd /d "%~dp0"
 
-set "MODE=%~1"
-set "NPM_SCRIPT=build"
-if /i "%MODE%"=="branded" set "NPM_SCRIPT=build:branded"
-if /i "%MODE%"=="signed" set "NPM_SCRIPT=build:signed"
-if "%MODE%"=="" goto :mode_ok
-if /i "%MODE%"=="branded" goto :mode_ok
-if /i "%MODE%"=="signed" goto :mode_ok
-echo Unknown option "%MODE%". Use "branded", "signed", or nothing.
-exit /b 1
-:mode_ok
+set "SEVENZ=%ProgramFiles%\7-Zip\7z.exe"
+set "SFX=%ProgramFiles%\7-Zip\7z.sfx"
+if not exist "%SEVENZ%" set "SEVENZ=%ProgramFiles(x86)%\7-Zip\7z.exe"
+if not exist "%SFX%" set "SFX=%ProgramFiles(x86)%\7-Zip\7z.sfx"
+if not exist "%SEVENZ%" goto :no7z
+if not exist "%SFX%" goto :no7z
+if not exist "dist\win-unpacked\AI Test Recorder.exe" goto :noapp
+if not exist "dist\win-unpacked\resources\local_agent\local_agent.exe" goto :noagent
 
-echo.
-echo [1/7] Checking the tools are installed...
-where pyinstaller >nul 2>&1
-if errorlevel 1 goto :no_pyinstaller
-where node >nul 2>&1
-if errorlevel 1 goto :no_node
-where npm >nul 2>&1
-if errorlevel 1 goto :no_node
+echo [1/3] Packing the app (can take several minutes)...
+if exist dist\payload.7z del /q dist\payload.7z
+"%SEVENZ%" a -t7z -mx=3 -mmt=on dist\payload.7z ".\dist\win-unpacked\*" >nul
+if errorlevel 1 goto :fail
 
-echo.
-echo [2/7] Checking the icon and the server address...
-set "ELECTRON_BUILD_SKIP_AGENT_CHECK=1"
-node electron\scripts\prebuild-check.js
-if errorlevel 1 exit /b 1
-set "ELECTRON_BUILD_SKIP_AGENT_CHECK="
-
-echo.
-echo [3/7] Building the agent (local_agent) - this takes several minutes...
-taskkill /F /IM local_agent.exe >nul 2>&1
-taskkill /F /IM behave_worker.exe >nul 2>&1
-if exist dist\local_agent rmdir /s /q dist\local_agent
-if exist dist\behave_worker rmdir /s /q dist\behave_worker
-if exist dist\local_agent goto :dist_locked
-pyinstaller --noconfirm local_agent\local_agent.spec
-if errorlevel 1 goto :build_failed
-
-echo.
-echo [4/7] Building the test runner (behave_worker)...
-pyinstaller --noconfirm local_agent\behave_worker.spec
-if errorlevel 1 goto :build_failed
-
-echo.
-echo [5/7] Putting behave_worker next to local_agent (can take a few minutes)...
-robocopy "dist\behave_worker" "dist\local_agent" /E /NFL /NDL /NJH /NJS /NP >nul
-if errorlevel 8 goto :build_failed
-if not exist "dist\local_agent\local_agent.exe" goto :missing_exe
-if not exist "dist\local_agent\behave_worker.exe" goto :missing_exe
-
-if defined SKIP_OCR_CHECK goto :skip_ocr
-echo.
-echo Checking that OCR works in the built programs. This can take several
-echo minutes the first time (antivirus scan + about 100 MB model download).
-echo A failure here is only a WARNING. To skip: set SKIP_OCR_CHECK=1
-"dist\local_agent\local_agent.exe" --check-ocr
-if errorlevel 1 echo WARNING: the OCR check FAILED in local_agent.exe - see electron\README.md.
-"dist\local_agent\behave_worker.exe" --check-ocr
-if errorlevel 1 echo WARNING: the OCR check FAILED in behave_worker.exe - see electron\README.md.
-goto :ocr_done
-:skip_ocr
-echo.
-echo OCR check skipped (SKIP_OCR_CHECK is set).
-:ocr_done
-
-echo.
-echo [6/7] Using the existing Electron dependencies (npm install is skipped)...
-pushd electron
-if not exist "node_modules\.bin\electron-builder.cmd" (
-    echo ERROR: electron-builder was not found in electron\node_modules.
-    echo        Copy a complete node_modules folder into the electron folder first.
-    popd
-    exit /b 1
+echo [2/3] Writing the installer settings...
+> dist\sfx-config.txt (
+echo ;!@Install@!UTF-8!
+echo Title="AI Test Recorder"
+echo BeginPrompt="Install AI Test Recorder on this PC?"
+echo InstallPath="%%LOCALAPPDATA%%\AITestRecorder"
+echo GUIFlags="8+32+64+256+4096"
+echo OverwriteMode="1"
+echo RunProgram="\"AI Test Recorder.exe\""
+echo ;!@InstallEnd@!
 )
-echo Existing node_modules found.
+
+echo [3/3] Building the single .exe...
+copy /b "%SFX%" + dist\sfx-config.txt + dist\payload.7z dist\AI-Test-Recorder-Setup-Single.exe >nul
+if errorlevel 1 goto :fail
+del /q dist\payload.7z dist\sfx-config.txt
 
 echo.
-echo [7/7] Building the installer (npm run %NPM_SCRIPT%)...
-call npm run %NPM_SCRIPT%
-if errorlevel 1 goto :installer_failed
-popd
-goto :done_installer
-
-:installer_failed
-echo.
-echo The installer step failed. If the message above says "Plugin not found, cannot call nsDialogs::Create",
-echo the installer-maker's download is damaged, or antivirus removed part of it.
-echo Clearing that download and trying once more...
-if exist "%LOCALAPPDATA%\electron-builder\Cache\nsis" rmdir /s /q "%LOCALAPPDATA%\electron-builder\Cache\nsis"
-call npm run %NPM_SCRIPT%
-if errorlevel 1 goto :installer_failed_again
-popd
-goto :done_installer
-
-:installer_failed_again
-echo.
-echo The installer still cannot be built on this PC. Building a ZIP of the app instead:
-echo it needs no installer tool and holds exactly the same app and agent.
-call npm run build:zip
-if errorlevel 1 goto :npm_failed
-popd
-goto :done_zip
-
-:done_installer
-echo.
-echo ====================================================================
-echo  Done. Your installer is in the electron\dist folder:
-dir /b electron\dist\AI-Test-Recorder-Setup-*.exe
-echo.
-echo  NEXT: install it on a clean test PC and check sign-in, recording and a
-echo  saved run before sharing it. See electron\README.md.
-echo ====================================================================
+echo Done: electron\dist\AI-Test-Recorder-Setup-Single.exe
+echo Testers double-click it; it installs to %%LOCALAPPDATA%%\AITestRecorder and starts the app.
 exit /b 0
 
-:done_zip
-echo.
-echo ====================================================================
-echo  Done - as a ZIP, because the installer tool failed on this PC.
-echo  Your file is in the electron\dist folder:
-dir /b electron\dist\AI-Test-Recorder-*-win.zip
-echo.
-echo  Share the ZIP. Users extract the WHOLE zip to a permanent folder, such as
-echo  C:\AITestRecorder\ , and run "AI Test Recorder.exe" from there.
-echo ====================================================================
-exit /b 0
-
-:dist_locked
-echo ERROR: dist\local_agent could not be deleted - something is using it.
-echo        Quit AI Test Recorder (tray icon), close Explorer windows showing dist,
-echo        wait for antivirus to finish, then run this again.
+:no7z
+echo ERROR: 7-Zip not found (needs 7z.exe and 7z.sfx in its install folder). Install it from https://www.7-zip.org/
 exit /b 1
-
-:no_pyinstaller
-echo ERROR: pyinstaller was not found.
-echo        Activate your Python virtual environment, then run:  pip install pyinstaller
+:noapp
+echo ERROR: dist\win-unpacked\AI Test Recorder.exe is missing. Run "npm run build:zip" first.
 exit /b 1
-
-:no_node
-echo ERROR: Node.js / npm was not found. Install Node.js 18 or newer from https://nodejs.org and try again.
+:noagent
+echo ERROR: the agent is missing from dist\win-unpacked\resources\local_agent. Rebuild the agent first.
 exit /b 1
-
-:build_failed
-echo ERROR: building the agent failed. Read the messages above.
-exit /b 1
-
-:missing_exe
-echo ERROR: dist\local_agent is missing local_agent.exe or behave_worker.exe after the build.
-exit /b 1
-
-:npm_failed
-echo ERROR: the desktop installer build failed. Read the messages above.
-popd
+:fail
+echo ERROR: could not create the .exe. Read the messages above.
 exit /b 1
