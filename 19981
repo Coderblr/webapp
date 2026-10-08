@@ -1,513 +1,168 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import Head from "next/head";
-import Link from "next/link";
-import { useRouter } from "next/router";
-import Layout from "@/components/Layout";
-import RequireAuth from "@/components/RequireAuth";
-import { api } from "@/lib/api";
-import { Panel, Callout, Spinner, Button, Field, TextInput, Select, Checkbox } from "@/components/ui";
+@echo off
+setlocal enableextensions
+rem ====================================================================
+rem  Builds the AI Test Recorder desktop installer, start to finish.
+rem  Run on WINDOWS from the project folder (the one containing "backend"
+rem  and "electron"), inside the Python virtual environment:
+rem
+rem      build_desktop_installer.bat            unsigned installer
+rem      build_desktop_installer.bat branded    unsigned, icon embedded in the .exe
+rem      build_desktop_installer.bat signed     signed (set CSC_LINK / CSC_KEY_PASSWORD)
+rem
+rem  Optional: set SKIP_OCR_CHECK=1 first to skip the slow OCR self-test.
+rem  Needs electron\node_modules to exist already (npm install is NOT run).
+rem ====================================================================
+cd /d "%~dp0"
 
-// Record from here: add a change request to an existing recording. Pick the
-// application, the recording and what changes; the browser replays the steps
-// before each change, then you record only the new part. Saved as a new
-// version - the original is kept. Backend: recorder/change_requests/.
+set "MODE=%~1"
+set "NPM_SCRIPT=build"
+if /i "%MODE%"=="branded" set "NPM_SCRIPT=build:branded"
+if /i "%MODE%"=="signed" set "NPM_SCRIPT=build:signed"
+if "%MODE%"=="" goto :mode_ok
+if /i "%MODE%"=="branded" goto :mode_ok
+if /i "%MODE%"=="signed" goto :mode_ok
+echo Unknown option "%MODE%". Use "branded", "signed", or nothing.
+exit /b 1
+:mode_ok
 
-const CHANGE_LABELS = {
-  insert: "Insert after step",
-  replace: "Replace steps",
-  remove: "Remove steps",
-  append: "Add at the end",
-};
+echo.
+echo [1/7] Checking the tools are installed...
+where pyinstaller >nul 2>&1
+if errorlevel 1 goto :no_pyinstaller
+where node >nul 2>&1
+if errorlevel 1 goto :no_node
+where npm >nul 2>&1
+if errorlevel 1 goto :no_node
 
-let nextChangeId = 1;
-const newChange = (type, n, tail) => ({
-  id: nextChangeId++,
-  type,
-  after_step: tail,
-  from_step: Math.min(1, n) || 1,
-  to_step: Math.min(1, n) || 1,
-});
+echo.
+echo [2/7] Checking the icon and the server address...
+set "ELECTRON_BUILD_SKIP_AGENT_CHECK=1"
+node electron\scripts\prebuild-check.js
+if errorlevel 1 exit /b 1
+set "ELECTRON_BUILD_SKIP_AGENT_CHECK="
 
-function changeBody(c) {
-  if (c.type === "insert") return { type: "insert", after_step: Number(c.after_step) };
-  if (c.type === "append") return { type: "append" };
-  return { type: c.type, from_step: Number(c.from_step), to_step: Number(c.to_step) };
-}
+echo.
+echo [3/7] Building the agent (local_agent) - this takes several minutes...
+taskkill /F /IM local_agent.exe >nul 2>&1
+taskkill /F /IM behave_worker.exe >nul 2>&1
+if exist dist\local_agent rmdir /s /q dist\local_agent
+if exist dist\behave_worker rmdir /s /q dist\behave_worker
+if exist dist\local_agent goto :dist_locked
+pyinstaller --noconfirm local_agent\local_agent.spec
+if errorlevel 1 goto :build_failed
 
-function NumberBox({ value, min, max, onChange }) {
-  return (
-    <input
-      type="number" value={value} min={min} max={max}
-      onChange={(e) => onChange(e.target.value === "" ? "" : Number(e.target.value))}
-      className="w-24 rounded-sm border border-line bg-white px-2 py-1.5 text-sm text-ink focus:border-brand-blue focus:outline-none"
-    />
-  );
-}
+echo.
+echo [4/7] Building the test runner (behave_worker)...
+pyinstaller --noconfirm local_agent\behave_worker.spec
+if errorlevel 1 goto :build_failed
 
-export default function CrRecordPage() {
-  const router = useRouter();
-  const [crNumber, setCrNumber] = useState("");
-  const [crTitle, setCrTitle] = useState("");
-  const [apps, setApps] = useState([]);
-  const [selectedApp, setSelectedApp] = useState("");
-  const [recordings, setRecordings] = useState([]);
-  const [selectedFile, setSelectedFile] = useState("");
-  const [info, setInfo] = useState(null);          // GET /api/cr/steps
-  const [edits, setEdits] = useState({});          // step no -> {step?, screen?, data?}
-  const [changes, setChanges] = useState([]);
-  const [preview, setPreview] = useState(null);
-  const [previewError, setPreviewError] = useState(null);
-  const [status, setStatus] = useState(null);      // live session, GET /api/cr/status
-  const [saved, setSaved] = useState(null);
-  const [error, setError] = useState(null);
-  const [busy, setBusy] = useState(false);
-  const [checkHeadless, setCheckHeadless] = useState(true);
-  const [checkResult, setCheckResult] = useState(null);
-  const pollRef = useRef(null);
-  const prefillRef = useRef(null);                 // from the "Find steps" page
+echo.
+echo [5/7] Putting behave_worker next to local_agent (can take a few minutes)...
+robocopy "dist\behave_worker" "dist\local_agent" /E /NFL /NDL /NJH /NJS /NP >nul
+if errorlevel 8 goto :build_failed
+if not exist "dist\local_agent\local_agent.exe" goto :missing_exe
+if not exist "dist\local_agent\behave_worker.exe" goto :missing_exe
 
-  const steps = info?.steps || [];
-  const n = steps.length;
-  const tail = info?.tail_start ?? n;
-  const active = !!(status && (status.active || status.start_error));
+if defined SKIP_OCR_CHECK goto :skip_ocr
+echo.
+echo Checking that OCR works in the built programs. This can take several
+echo minutes the first time (antivirus scan + about 100 MB model download).
+echo A failure here is only a WARNING. To skip: set SKIP_OCR_CHECK=1
+"dist\local_agent\local_agent.exe" --check-ocr
+if errorlevel 1 echo WARNING: the OCR check FAILED in local_agent.exe - see electron\README.md.
+"dist\local_agent\behave_worker.exe" --check-ocr
+if errorlevel 1 echo WARNING: the OCR check FAILED in behave_worker.exe - see electron\README.md.
+goto :ocr_done
+:skip_ocr
+echo.
+echo OCR check skipped (SKIP_OCR_CHECK is set).
+:ocr_done
 
-  // ---- live session polling
-  function stopPolling() { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } }
-  async function refreshStatus() {
-    try {
-      const s = await api.cr.status();
-      setStatus(s);
-      if (!s.active && !s.start_error) stopPolling();
-      return s;
-    } catch { return null; }
-  }
-  function startPolling() { stopPolling(); pollRef.current = setInterval(refreshStatus, 1500); }
+echo.
+echo [6/7] Using the existing Electron dependencies (npm install is skipped)...
+pushd electron
+if not exist "node_modules\.bin\electron-builder.cmd" (
+    echo ERROR: electron-builder was not found in electron\node_modules.
+    echo        Copy a complete node_modules folder into the electron folder first.
+    popd
+    exit /b 1
+)
+echo Existing node_modules found.
 
-  useEffect(() => {
-    refreshStatus().then((s) => { if (s?.active) startPolling(); });   // a session started earlier is still running
-    api.cr.apps().then((r) => setApps(r.applications || [])).catch((e) => setError(e.detail || e.message));
-    return stopPolling;
-  }, []);
+echo.
+echo [7/7] Building the installer (npm run %NPM_SCRIPT%)...
+call npm run %NPM_SCRIPT%
+if errorlevel 1 goto :installer_failed
+popd
+goto :done_installer
 
-  // ---- prefill from /cr-search (?file=&app=&after_step=)
-  useEffect(() => {
-    if (!router.isReady || !router.query.file) return;
-    prefillRef.current = { file: String(router.query.file), app: String(router.query.app || ""), after: Number(router.query.after_step) };
-    if (router.query.app) setSelectedApp(String(router.query.app));
-  }, [router.isReady, router.query.file, router.query.app, router.query.after_step]);
+:installer_failed
+echo.
+echo The installer step failed. If the message above says "Plugin not found, cannot call nsDialogs::Create",
+echo the installer-maker's download is damaged, or antivirus removed part of it.
+echo Clearing that download and trying once more...
+if exist "%LOCALAPPDATA%\electron-builder\Cache\nsis" rmdir /s /q "%LOCALAPPDATA%\electron-builder\Cache\nsis"
+call npm run %NPM_SCRIPT%
+if errorlevel 1 goto :installer_failed_again
+popd
+goto :done_installer
 
-  useEffect(() => {
-    if (!apps.length) return;
-    if (!selectedApp || !apps.some((a) => a.name === selectedApp)) setSelectedApp(apps[0].name);
-  }, [apps]);
+:installer_failed_again
+echo.
+echo The installer still cannot be built on this PC. Building a ZIP of the app instead:
+echo it needs no installer tool and holds exactly the same app and agent.
+call npm run build:zip
+if errorlevel 1 goto :npm_failed
+popd
+goto :done_zip
 
-  useEffect(() => {
-    if (!selectedApp) return;
-    api.cr.recordings(selectedApp).then((r) => {
-      const list = r.recordings || [];
-      setRecordings(list);
-      const wanted = prefillRef.current?.file;
-      setSelectedFile(list.some((x) => x.file === wanted) ? wanted : (list[0]?.file || ""));
-    }).catch((e) => setError(e.detail || e.message));
-  }, [selectedApp]);
+:done_installer
+echo.
+echo ====================================================================
+echo  Done. Your installer is in the electron\dist folder:
+dir /b electron\dist\AI-Test-Recorder-Setup-*.exe
+echo.
+echo  NEXT: install it on a clean test PC and check sign-in, recording and a
+echo  saved run before sharing it. See electron\README.md.
+echo ====================================================================
+exit /b 0
 
-  useEffect(() => {
-    setInfo(null); setEdits({}); setPreview(null); setPreviewError(null);
-    if (!selectedFile) return;
-    api.cr.steps(selectedFile).then((r) => {
-      setInfo(r);
-      const count = (r.steps || []).length;
-      const t = r.tail_start ?? count;
-      const pre = prefillRef.current;
-      const first = newChange("insert", count, t);
-      if (pre && pre.file === r.file && Number.isFinite(pre.after)) { first.after_step = Math.min(Math.max(pre.after, 0), t); prefillRef.current = null; }
-      setChanges([first]);
-    }).catch((e) => setError(e.detail || e.message));
-  }, [selectedFile]);
+:done_zip
+echo.
+echo ====================================================================
+echo  Done - as a ZIP, because the installer tool failed on this PC.
+echo  Your file is in the electron\dist folder:
+dir /b electron\dist\AI-Test-Recorder-*-win.zip
+echo.
+echo  Share the ZIP. Users extract the WHOLE zip to a permanent folder, such as
+echo  C:\AITestRecorder\ , and run "AI Test Recorder.exe" from there.
+echo ====================================================================
+exit /b 0
 
-  const editList = useMemo(
-    () => Object.entries(edits).map(([no, e]) => ({ no: Number(no), ...e })),
-    [edits],
-  );
-  const planBody = useMemo(
-    () => ({ file: selectedFile, changes: changes.map(changeBody), edits: editList }),
-    [selectedFile, changes, editList],
-  );
+:dist_locked
+echo ERROR: dist\local_agent could not be deleted - something is using it.
+echo        Quit AI Test Recorder (tray icon), close Explorer windows showing dist,
+echo        wait for antivirus to finish, then run this again.
+exit /b 1
 
-  // ---- preview follows the form
-  useEffect(() => {
-    if (!selectedFile || !info || active) return;
-    let cancelled = false;
-    const timer = setTimeout(() => {
-      api.cr.preview(planBody)
-        .then((r) => { if (!cancelled) { setPreview(r); setPreviewError(null); } })
-        .catch((e) => { if (!cancelled) { setPreview(null); setPreviewError(e.detail || e.message); } });
-    }, 250);
-    return () => { cancelled = true; clearTimeout(timer); };
-  }, [planBody, info, active]);
+:no_pyinstaller
+echo ERROR: pyinstaller was not found.
+echo        Activate your Python virtual environment, then run:  pip install pyinstaller
+exit /b 1
 
-  // ---- table edits
-  function editCell(row, field, value) {
-    setEdits((prev) => {
-      const next = { ...prev };
-      const current = { ...(next[row.no] || {}) };
-      if (value === row[field]) delete current[field]; else current[field] = value;
-      if (Object.keys(current).length) next[row.no] = current; else delete next[row.no];
-      return next;
-    });
-  }
-  const cellValue = (row, field) => (edits[row.no]?.[field] ?? row[field] ?? "");
+:no_node
+echo ERROR: Node.js / npm was not found. Install Node.js 18 or newer from https://nodejs.org and try again.
+exit /b 1
 
-  // ---- changes list
-  const addChange = (type) => setChanges((prev) => [...prev, newChange(type, n, tail)]);
-  const updateChange = (id, patch) => setChanges((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
-  const removeChange = (id) => setChanges((prev) => prev.filter((c) => c.id !== id));
+:build_failed
+echo ERROR: building the agent failed. Read the messages above.
+exit /b 1
 
-  // ---- actions
-  async function run(fn) {
-    setBusy(true); setError(null);
-    try { return await fn(); } catch (e) { setError(e.detail || e.message); return null; } finally { setBusy(false); }
-  }
-  const fullBody = () => ({ ...planBody, cr_number: crNumber.trim(), cr_title: crTitle.trim(), headless: false });
+:missing_exe
+echo ERROR: dist\local_agent is missing local_agent.exe or behave_worker.exe after the build.
+exit /b 1
 
-  const handleStart = () => run(async () => {
-    setSaved(null); setCheckResult(null);
-    await api.cr.start(fullBody());
-    await refreshStatus();
-    startPolling();
-  });
-  const handleSaveDirect = () => run(async () => {
-    setCheckResult(null);
-    setSaved(await api.cr.saveDirect(fullBody()));
-    setEdits({});
-  });
-  const handleDone = () => run(async () => { await api.cr.next(); await refreshStatus(); });
-  const handleContinue = () => run(async () => { await api.cr.continue_(); await refreshStatus(); });
-  const handleCancel = () => run(async () => { await api.cr.cancel(); stopPolling(); setStatus(null); });
-  const handleStop = () => run(async () => {
-    const r = await api.cr.stopAndSave();
-    stopPolling(); setStatus(null); setSaved(r); setEdits({});
-  });
-  const handleCheck = () => run(async () => { setCheckResult(null); setCheckResult(await api.cr.check(saved.file, checkHeadless)); });
-
-  const needsBrowser = !!preview?.needs_browser;
-  const hasWork = !!preview && (preview.changes?.length > 0 || preview.edit_count > 0);
-  const ready = hasWork && !!crNumber.trim() && !busy;
-
-  const recordingLabel = (r) =>
-    `${r.name} — v${r.version}${r.cr_number ? ` · ${r.cr_number}` : " · original"}${r.recorded_at ? ` · ${r.recorded_at}` : ""}`;
-
-  return (
-    <RequireAuth>
-      <Layout>
-        <Head><title>Record from here — AI Test Recorder</title></Head>
-        <div className="mb-6">
-          <h1 className="text-2xl font-bold tracking-tight text-ink">🧩 Record from here</h1>
-          <p className="mt-1 text-sm text-muted">
-            For a change request: the browser replays an existing recording up to the step you choose, then you record
-            only the new part. It is saved as a <strong>new version</strong> — the original recording is kept unchanged.
-          </p>
-        </div>
-
-        {error && <div className="mb-4"><Callout tone="error">{error}</Callout></div>}
-
-        {/* ------------------------------------------------ live session */}
-        {active && (
-          <Panel>
-            <div className="space-y-4 px-5 py-5">
-              <p className="text-sm text-ink"><strong>{status.cr_number}</strong>{status.summary ? ` — ${status.summary}` : ""}</p>
-
-              {status.start_error && (
-                <>
-                  <Callout tone="error">The browser could not start: {status.start_error}</Callout>
-                  <Button variant="secondary" onClick={handleCancel} disabled={busy}>Dismiss</Button>
-                </>
-              )}
-
-              {!status.start_error && (status.launching || !status.phase || status.phase === "launching") && <Spinner label="Opening the browser…" />}
-
-              {status.phase === "replaying" && (
-                <div>
-                  <p className="text-sm text-ink">
-                    {status.change_total > 1 ? `Change ${status.change_no} of ${status.change_total} — ` : ""}
-                    Replaying step {status.current_step || "…"}{status.replay_to_step ? ` (up to step ${status.replay_to_step})` : ""} automatically…
-                    <span className="text-muted"> a step waits up to 90 s for slow pages</span>
-                  </p>
-                  <div className="mt-2 h-2 w-full overflow-hidden rounded-sm bg-rail">
-                    <div className="h-full bg-brand-blue transition-all" style={{ width: `${status.replay_count ? Math.min(100, Math.round((status.replay_done / status.replay_count) * 100)) : 0}%` }} />
-                  </div>
-                  <p className="mt-1 text-xs text-muted">{status.current_text}</p>
-                  <div className="mt-3"><Button variant="secondary" onClick={handleCancel} disabled={busy}>Cancel (nothing is saved)</Button></div>
-                </div>
-              )}
-
-              {status.phase === "replay_failed" && (
-                <div className="space-y-3">
-                  <Callout tone="error">The replay stopped at <strong>step {status.failed_step}</strong>: {status.error}</Callout>
-                  <p className="text-sm text-muted">
-                    This page may have been changed by the change request. You can <strong>record from step {status.failed_step} yourself</strong>:
-                    do step {status.failed_step} onwards by hand in the browser — the old steps from {status.failed_step} up to this change are then
-                    replaced by what you record, and the steps after the change are kept.
-                  </p>
-                  <div className="flex flex-wrap gap-2">
-                    <Button onClick={handleContinue} disabled={busy}>Record from step {status.failed_step} myself</Button>
-                    <Button variant="secondary" onClick={handleCancel} disabled={busy}>Cancel (nothing is saved)</Button>
-                  </div>
-                </div>
-              )}
-
-              {status.phase === "recording" && (
-                <div className="space-y-3">
-                  <div className="rounded-sm border border-signal-teal/40 bg-[#EAF5F2] p-4">
-                    <p className="font-semibold text-signal-tealDark">
-                      🔴 Recording now{status.change_total > 1 ? ` — change ${status.change_no} of ${status.change_total}` : ""}
-                    </p>
-                    <p className="mt-1 text-sm text-ink">{status.change_summary}</p>
-                    <p className="mt-1 text-sm text-muted">
-                      In the browser, do only this part of the change request, then press{" "}
-                      <strong>{status.is_last_change ? "Stop & Save" : "Done"}</strong>.
-                    </p>
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    {status.is_last_change
-                      ? <Button onClick={handleStop} disabled={busy}>{busy ? "Saving…" : "⏹ Stop & Save"}</Button>
-                      : <Button onClick={handleDone} disabled={busy}>✓ Done — go to the next change</Button>}
-                    <Button variant="secondary" onClick={handleCancel} disabled={busy}>Cancel (nothing is saved)</Button>
-                  </div>
-                </div>
-              )}
-            </div>
-          </Panel>
-        )}
-
-        {/* ------------------------------------------------ last saved version */}
-        {!active && saved && (
-          <Panel className="mb-6">
-            <div className="space-y-3 px-5 py-5">
-              <Callout tone="success">Saved as <strong>{saved.name}</strong>. The previous version is kept.</Callout>
-              <StepTable rows={saved.steps} markNew />
-              <div className="flex flex-wrap items-center gap-3">
-                <p className="text-xs text-muted">
-                  It also appears in <Link href="/tool" className="text-brand-blue underline">Record &amp; Run → Run Saved Recording</Link>.
-                </p>
-                <Checkbox label="headless" checked={checkHeadless} onChange={setCheckHeadless} />
-                <Button variant="secondary" onClick={handleCheck} disabled={busy}>{busy ? "Running…" : "▶ Check this version"}</Button>
-                <Button variant="ghost" onClick={() => { setSaved(null); setCheckResult(null); }}>Start another change request</Button>
-              </div>
-              {checkResult && (
-                <Callout tone={checkResult.ok ? "success" : "error"}>
-                  {checkResult.ok ? "PASSED" : "FAILED"} — {checkResult.transaction?.passed_count ?? 0} of {checkResult.transaction?.step_count ?? 0} steps passed.
-                  The full report is under My Executions.
-                </Callout>
-              )}
-            </div>
-          </Panel>
-        )}
-
-        {/* ------------------------------------------------ setup */}
-        {!active && (
-          <Panel>
-            <div className="space-y-5 px-5 py-5">
-              <div className="grid gap-4 md:grid-cols-3">
-                <Field label="Change request no. *">
-                  <TextInput value={crNumber} onChange={(e) => setCrNumber(e.target.value)} placeholder="e.g. CR-1042" />
-                </Field>
-                <div className="md:col-span-2">
-                  <Field label="Short description">
-                    <TextInput value={crTitle} onChange={(e) => setCrTitle(e.target.value)} placeholder="e.g. Add PAN field on Customer Details" />
-                  </Field>
-                </div>
-              </div>
-
-              {apps.length === 0 ? (
-                <Callout>No applications are configured yet - ask an admin to add one in config/applications.yaml.</Callout>
-              ) : (
-                <>
-                  <Field label="1. Application">
-                    <Select value={selectedApp} onChange={(e) => { prefillRef.current = null; setSelectedApp(e.target.value); }}>
-                      {apps.map((a) => (
-                        <option key={a.name} value={a.name}>
-                          {a.name}  ({a.recordings} recording{a.recordings !== 1 ? "s" : ""}{a.recordings === 0 ? " — none yet" : ""})
-                        </option>
-                      ))}
-                    </Select>
-                  </Field>
-
-                  {recordings.length === 0 ? (
-                    <Callout>
-                      No recordings of yours yet for <strong>{selectedApp}</strong> — either record one first in{" "}
-                      <Link href="/tool" className="text-brand-blue underline">Record &amp; Run → Record &amp; Generate</Link>,
-                      or ask whoever recorded one for this application to share it with you.
-                    </Callout>
-                  ) : (
-                  <>
-                  <Field label="2. Recording">
-                    <Select value={selectedFile} onChange={(e) => setSelectedFile(e.target.value)}>
-                      {recordings.map((r) => <option key={r.file} value={r.file}>{recordingLabel(r)}</option>)}
-                    </Select>
-                  </Field>
-                  {info?.cr && <p className="-mt-3 text-xs text-muted">This version: {info.cr.cr_number} — {info.cr.cr_title || ""}</p>}
-
-                  <div>
-                    <p className="text-sm font-semibold text-ink">3. Steps — change Step, Screen or Data right in the table if the CR needs it</p>
-                    <p className="mb-2 mt-1 text-xs text-muted">
-                      <strong>Data</strong> is what the test types, selects or sets (typing, select and date steps);{" "}
-                      <strong>Step</strong> and <strong>Screen</strong> are the wording shown for the step. Changed rows go into the
-                      new version; the original is kept.
-                    </p>
-                    {!info ? <Spinner label="Loading steps…" /> : (
-                      <StepTable rows={steps} edits={edits} cellValue={cellValue} onEdit={editCell} />
-                    )}
-                    {editList.length > 0 && (
-                      <p className="mt-1 text-xs text-muted">
-                        {editList.length} row{editList.length !== 1 ? "s" : ""} changed.{" "}
-                        <button type="button" className="text-brand-blue underline" onClick={() => setEdits({})}>Undo all</button>
-                      </p>
-                    )}
-                  </div>
-
-                  <div>
-                    <p className="text-sm font-semibold text-ink">4. What does the change request do?</p>
-
-                    <p className="mb-3 mt-1 text-xs text-muted">
-                      Add as many changes as you need. All the parts to record are done in one browser session: it replays up to the
-                      first change, you record it and press <strong>Done</strong>, it replays on to the next change, and so on.
-                    </p>
-
-                    <div className="space-y-2">
-                      {changes.map((c, i) => (
-                        <div key={c.id} className="flex flex-wrap items-end gap-3">
-                          <span className="w-5 pb-2 text-sm font-semibold text-muted">{i + 1}.</span>
-                          <div className="min-w-[14rem] flex-1">
-                            {i === 0 && <span className="mb-1 block text-xs text-muted">Change</span>}
-                            <Select value={c.type} onChange={(e) => updateChange(c.id, { type: e.target.value })}>
-                              {Object.entries(CHANGE_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-                            </Select>
-                          </div>
-                          {c.type === "insert" && (
-                            <label className="block">
-                              <span className="mb-1 block text-xs text-muted" title="0 = right after the application opens">after step</span>
-                              <NumberBox value={c.after_step} min={0} max={tail} onChange={(v) => updateChange(c.id, { after_step: v })} />
-                            </label>
-                          )}
-                          {(c.type === "replace" || c.type === "remove") && (
-                            <>
-                              <label className="block">
-                                <span className="mb-1 block text-xs text-muted">from step</span>
-                                <NumberBox value={c.from_step} min={1} max={Math.max(n, 1)} onChange={(v) => updateChange(c.id, { from_step: v, to_step: Math.max(Number(v) || 1, Number(c.to_step) || 1) })} />
-                              </label>
-                              <label className="block">
-                                <span className="mb-1 block text-xs text-muted">to step</span>
-                                <NumberBox value={c.to_step} min={1} max={Math.max(n, 1)} onChange={(v) => updateChange(c.id, { to_step: v })} />
-                              </label>
-                            </>
-                          )}
-                          <button
-                            type="button" onClick={() => removeChange(c.id)} aria-label={`Remove change ${i + 1}`}
-                            className="mb-0.5 rounded-sm border border-line px-2.5 py-1.5 text-sm text-muted hover:border-signal-rust hover:text-signal-rust"
-                          >✕</button>
-                        </div>
-                      ))}
-                      {changes.length === 0 && <p className="text-xs text-muted">No changes yet — add one below, or just edit rows in the table above.</p>}
-                    </div>
-
-                    <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-                      <Button variant="secondary" onClick={() => addChange("insert")}>+ Add insert</Button>
-                      <Button variant="secondary" onClick={() => addChange("replace")}>+ Add replace</Button>
-                      <Button variant="secondary" onClick={() => addChange("remove")}>+ Add remove</Button>
-                      <Button variant="secondary" onClick={() => addChange("append")}>+ Add at end</Button>
-                    </div>
-
-                    {previewError && <div className="mt-3"><Callout tone="error">{previewError}</Callout></div>}
-                    {preview && hasWork && (
-                      <div className="mt-3 space-y-3 rounded-sm border border-brand-blue/20 bg-[#EEF3FB] px-4 py-3 text-sm text-ink">
-                        {preview.changes.map((c, i) => (
-                          <div key={i}>
-                            <p className="font-semibold">{c.summary}</p>
-                            {c.replayed !== "—" && <p>▶ Replayed automatically: {c.replayed}</p>}
-                            {c.removed !== "none"
-                              ? <p>🗑 Removed (nothing to record): {c.removed}</p>
-                              : <p>✂ Replaced by your new steps: {c.replaced}</p>}
-                            <p>↪ Kept after{c.removed !== "none" ? "" : " your new steps"}: {c.kept_after}</p>
-                          </div>
-                        ))}
-                        {preview.edit_count > 0 && <p>✎ {preview.edit_count} step{preview.edit_count !== 1 ? "s" : ""} edited in the table.</p>}
-                      </div>
-                    )}
-                  </div>
-
-                  <div>
-                    {!crNumber.trim() && <p className="mb-2 text-xs text-muted">Enter the change request number to start.</p>}
-                    {needsBrowser || !hasWork ? (
-                      <Button onClick={handleStart} disabled={!ready || !needsBrowser}>
-                        {busy ? "Starting…" : "⏺ Start: replay, then record"}
-                      </Button>
-                    ) : (
-                      <Button onClick={handleSaveDirect} disabled={!ready}>
-                        {busy ? "Saving…" : "💾 Save new version (nothing to record)"}
-                      </Button>
-                    )}
-                  </div>
-                  </>
-                  )}
-                </>
-              )}
-            </div>
-          </Panel>
-        )}
-      </Layout>
-    </RequireAuth>
-  );
-}
-
-// The step list in plain words. With `onEdit` the Step / Screen / Data cells
-// are editable in place (Data only where the step has a value to type,
-// select or set); with `markNew` the steps added by the change request are
-// flagged.
-function StepTable({ rows, edits = {}, cellValue, onEdit, markNew = false }) {
-  const cell = "w-full bg-transparent px-2 py-1.5 text-sm text-ink focus:bg-white focus:outline-none focus:ring-1 focus:ring-brand-blue";
-  return (
-    <div className="max-h-[26rem] overflow-auto rounded-sm border border-line scroll-thin">
-      <table className="w-full border-collapse text-sm">
-        <thead className="sticky top-0 bg-rail text-left text-xs text-muted">
-          <tr>
-            {markNew && <th className="w-12 border-b border-line px-2 py-2" />}
-            <th className="w-12 border-b border-line px-2 py-2 text-right">#</th>
-            <th className="border-b border-line px-2 py-2">Step</th>
-            <th className="w-1/4 border-b border-line px-2 py-2">Screen</th>
-            <th className="w-1/5 border-b border-line px-2 py-2">Data</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row) => {
-            const changed = !!edits[row.no];
-            return (
-              <tr key={row.no} className={`border-b border-line last:border-b-0 ${changed ? "bg-[#FFF8E6]" : ""} ${markNew && row.new ? "bg-[#EAF5F2]" : ""}`}>
-                {markNew && <td className="px-2 py-1.5 text-center text-xs font-semibold text-signal-tealDark">{row.new ? "NEW" : ""}</td>}
-                <td className="px-2 py-1.5 text-right text-xs text-muted">{row.no}</td>
-                {onEdit ? (
-                  <>
-                    <td className="p-0"><input className={cell} value={cellValue(row, "step")} onChange={(e) => onEdit(row, "step", e.target.value)} aria-label={`Step ${row.no} wording`} /></td>
-                    <td className="p-0"><input className={cell} value={cellValue(row, "screen")} onChange={(e) => onEdit(row, "screen", e.target.value)} aria-label={`Step ${row.no} screen`} /></td>
-                    <td className="p-0">
-                      {row.data_editable
-                        ? <input className={cell} value={cellValue(row, "data")} onChange={(e) => onEdit(row, "data", e.target.value)} aria-label={`Step ${row.no} data`} />
-                        : <span className="block px-2 py-1.5 text-muted">{row.data}</span>}
-                    </td>
-                  </>
-                ) : (
-                  <>
-                    <td className="px-2 py-1.5 text-ink">{row.step}</td>
-                    <td className="px-2 py-1.5 text-muted">{row.screen}</td>
-                    <td className="px-2 py-1.5 text-muted">{row.data}</td>
-                  </>
-                )}
-              </tr>
-            );
-          })}
-          {rows.length === 0 && <tr><td colSpan={markNew ? 5 : 4} className="px-3 py-6 text-center text-sm text-muted">This recording has no steps.</td></tr>}
-        </tbody>
-      </table>
-    </div>
-  );
-}
+:npm_failed
+echo ERROR: the desktop installer build failed. Read the messages above.
+popd
+exit /b 1
