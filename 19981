@@ -1,32 +1,637 @@
-@echo off
-setlocal enableextensions
-rem Installs AI Test Recorder from AI-Test-Recorder.zip (next to this file) - no admin rights needed.
-set "DEST=%LOCALAPPDATA%\AITestRecorder"
-set "ZIP=%~dp0AI-Test-Recorder.zip"
-if not exist "%ZIP%" (
-  echo ERROR: AI-Test-Recorder.zip was not found next to this installer.
-  pause
-  exit /b 1
-)
-echo Installing AI Test Recorder to %DEST%
-echo This can take a few minutes - please wait...
-taskkill /F /IM "AI Test Recorder.exe" >nul 2>&1
-taskkill /F /IM local_agent.exe >nul 2>&1
-taskkill /F /IM behave_worker.exe >nul 2>&1
-if not exist "%DEST%" mkdir "%DEST%"
-tar -xf "%ZIP%" -C "%DEST%"
-if errorlevel 1 (
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath '%ZIP%' -DestinationPath '%DEST%' -Force"
-)
-set "EXE="
-for /r "%DEST%" %%F in ("AI Test Recorder.exe") do if not defined EXE if exist "%%~fF" set "EXE=%%~fF"
-if not defined EXE (
-  echo ERROR: the app was not found after extracting. Ask your admin for help.
-  pause
-  exit /b 1
-)
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\AI Test Recorder.lnk'); $s.TargetPath='%EXE%'; $s.WorkingDirectory=(Split-Path '%EXE%'); $s.Save()" >nul 2>&1
-echo.
-echo Done. A shortcut "AI Test Recorder" was added to your Desktop. Starting the app...
-start "" "%EXE%"
-exit /b 0
+/**
+ * AI Test Recorder - desktop app (Electron main process).
+ *
+ * What this app is for: it shows the web app in its own window, runs the local
+ * agent (the program that opens the browser on THIS PC and does the recording /
+ * test runs for the web app) in the background, and signs the user in to it.
+ *
+ *  - Server address: read from a config file shipped inside the installer
+ *    (app-config.json) - users set nothing. See loadDesktopConfig().
+ *  - Sign-in: the agent has no console when the desktop app runs it, so this
+ *    app shows its own sign-in window (login.html) and hands the credentials to
+ *    the agent once (`--login-stdin`), which saves a long-lived session.
+ *  - Tray: closing the window hides it; the agent keeps running until the user
+ *    chooses Quit. Optionally starts when the user signs in to Windows.
+ *  - One copy only: a second launch just brings the first one forward.
+ */
+const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage } = require("electron");
+const path = require("path");
+const fs = require("fs");
+const { spawn } = require("child_process");
+
+// Exit code local_agent uses to say "I have no valid sign-in" (see local_agent/client.py).
+const EXIT_NEEDS_LOGIN = 3;
+const MAX_AGENT_RESTARTS = 5;
+const LOGIN_TIMEOUT_MS = 45000;
+
+// ---------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------
+function readJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function cleanUrl(value) {
+  if (typeof value !== "string") return null;
+  const v = value.trim().replace(/\/+$/, "");
+  if (!/^https?:\/\/[^\s/]+/i.test(v)) return null;
+  // The placeholder that ships in electron/app-config.json counts as "not set".
+  if (/yourbank\.internal/i.test(v)) return null;
+  return v;
+}
+
+/**
+ * Where the server address comes from, first match wins:
+ *   1. environment variables SERVER_URL / FRONTEND_URL  (developers, IT overrides)
+ *   2. %APPDATA%\AI Test Recorder\config.json            (per-user override, for support)
+ *   3. app-config.json inside the installer              (the normal case)
+ *   4. localhost defaults - ONLY when running from source, never in an installed app
+ * FRONTEND_URL falls back to SERVER_URL when only one address is given.
+ */
+function loadDesktopConfig() {
+  const bundledPath = app.isPackaged
+    ? path.join(process.resourcesPath, "app-config.json")
+    : path.join(__dirname, "app-config.json");
+  const userPath = path.join(app.getPath("userData"), "config.json");
+  const bundled = readJson(bundledPath) || {};
+  const user = readJson(userPath) || {};
+
+  const pick = (envName, key, devDefault) =>
+    cleanUrl(process.env[envName]) ||
+    cleanUrl(user[key]) ||
+    cleanUrl(bundled[key]) ||
+    (app.isPackaged ? null : devDefault);
+
+  const server = pick("SERVER_URL", "serverUrl", "http://localhost:8000");
+  const frontend = pick("FRONTEND_URL", "frontendUrl", "http://localhost:3000") || server;
+  const browserRaw = String(process.env.BROWSER || user.browser || bundled.browser || "edge").toLowerCase().trim();
+  return {
+    serverUrl: server,
+    frontendUrl: frontend,
+    wsUrl: (process.env.WS_URL || user.wsUrl || bundled.wsUrl || "").replace(/\/+$/, ""),
+    logLevel: process.env.LOG_LEVEL || "INFO",
+    // Which browser the agent drives ON THIS PC: edge | chrome (installed system browser)
+    // or chromium (the copy bundled inside the installer, see ms-playwright below).
+    browser: ["edge", "chrome", "chromium"].includes(browserRaw) ? browserRaw : "edge",
+    userConfigPath: userPath,
+  };
+}
+
+function originOf(url) {
+  try { return new URL(url).origin; } catch { return null; }
+}
+
+/** True only for IPC calls coming from our own pages (the configured web app, or the local sign-in file). */
+function isTrustedSender(event) {
+  const url = (event.senderFrame && event.senderFrame.url) || event.sender.getURL();
+  if (url.startsWith("file:")) return true;
+  const allowed = originOf(CONFIG && CONFIG.frontendUrl);
+  return !!allowed && originOf(url) === allowed;
+}
+
+let CONFIG = null; // filled in once the app is ready (app.getPath needs it)
+const AGENT_VERSION = require("./package.json").version;
+
+// ---------------------------------------------------------------------
+// Small persisted state (first-run choices)
+// ---------------------------------------------------------------------
+function statePath() {
+  return path.join(app.getPath("userData"), "state.json");
+}
+function loadState() {
+  return readJson(statePath()) || {};
+}
+function saveState(patch) {
+  try {
+    fs.mkdirSync(path.dirname(statePath()), { recursive: true });
+    fs.writeFileSync(statePath(), JSON.stringify({ ...loadState(), ...patch }, null, 2));
+  } catch (err) {
+    console.error(`Could not save desktop state: ${err.message}`);
+  }
+}
+
+function iconPath() {
+  return path.join(__dirname, "assets", process.platform === "win32" ? "icon.ico" : "icon.png");
+}
+
+// ---------------------------------------------------------------------
+// The local agent process
+// ---------------------------------------------------------------------
+// Dev (run from source): the agent runs straight from the project with a
+// system Python. Packaged: the PyInstaller-built local_agent.exe that the
+// installer puts under resources\local_agent\ - no Python needed on the PC.
+function resolveAgentCommand(extraArgs = []) {
+  if (!app.isPackaged) {
+    return {
+      bin: process.env.AGENT_PYTHON_BIN || "python",
+      args: ["-m", "local_agent.main", ...extraArgs],
+      cwd: process.env.AGENT_PROJECT_ROOT || path.join(__dirname, ".."),
+    };
+  }
+  const exeName = process.platform === "win32" ? "local_agent.exe" : "local_agent";
+  const exePath = path.join(process.resourcesPath, "local_agent", exeName);
+  return { bin: exePath, args: [...extraArgs], cwd: path.dirname(exePath) };
+}
+
+function agentEnv() {
+  const env = {
+    ...process.env,
+    SERVER_URL: CONFIG.serverUrl,
+    WS_URL: CONFIG.wsUrl,
+    AGENT_VERSION,
+    LOG_LEVEL: CONFIG.logLevel,
+    BROWSER: CONFIG.browser,
+    // No console to prompt in: if there is no valid sign-in, exit with
+    // EXIT_NEEDS_LOGIN and let this app show its sign-in window.
+    AGENT_NO_PROMPT: "1",
+  };
+  // Offline runtime files that the installer carries next to local_agent.exe (staged by
+  // build_desktop_installer.bat). Pointing the agent at them means nothing is downloaded on
+  // the tester's PC: OCR models (EasyOCR) and, optionally, Playwright's own Chromium.
+  if (app.isPackaged) {
+    const agentDir = path.join(process.resourcesPath, "local_agent");
+    const ocrModels = path.join(agentDir, "easyocr_models");
+    const browsers = path.join(agentDir, "ms-playwright");
+    if (!env.EASYOCR_MODULE_PATH && fs.existsSync(ocrModels)) env.EASYOCR_MODULE_PATH = ocrModels;
+    if (!env.PLAYWRIGHT_BROWSERS_PATH && fs.existsSync(browsers)) env.PLAYWRIGHT_BROWSERS_PATH = browsers;
+    env.PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
+  }
+  return env;
+}
+
+/** Kills a process AND everything it started (Playwright driver, Edge, behave_worker). */
+function killTree(child) {
+  if (!child || !child.pid) return;
+  if (process.platform === "win32") {
+    try {
+      spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+      return;
+    } catch { /* fall back to a plain kill below */ }
+  }
+  try { child.kill(); } catch { /* already gone */ }
+}
+
+let mainWindow = null;
+let loginWindow = null;
+let tray = null;
+let isQuitting = false;
+
+let agentProcess = null;
+let agentRestartCount = 0;
+// stopped | starting | running | reconnecting | needs_login | crashed
+let agentState = "stopped";
+let needsLoginReason = "none"; // none | expired | switch
+
+function setAgentState(state) {
+  agentState = state;
+  updateTray();
+}
+
+function sendLog(text) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("agent:log", text);
+}
+
+function onAgentOutput(text, tag) {
+  process.stdout.write(`[agent${tag}] ${text}`);
+  sendLog(text);
+  const marker = /AGENT_NEEDS_LOGIN:(\w+)/.exec(text);
+  if (marker) needsLoginReason = marker[1] === "expired" ? "expired" : "none";
+  if (/Connected to central server/.test(text)) {
+    agentRestartCount = 0;
+    setAgentState("running");
+  } else if (/Reconnecting in|Connection closed by server|Could not reach the central server/.test(text)) {
+    if (agentState === "running") setAgentState("reconnecting");
+  }
+}
+
+function startAgent() {
+  if (agentProcess) return;
+
+  if (!CONFIG.serverUrl) {
+    console.error("No server address configured - the local agent cannot start.");
+    return;
+  }
+  const { bin, args, cwd } = resolveAgentCommand();
+  if (app.isPackaged && !fs.existsSync(bin)) {
+    console.error(`Bundled agent executable not found at ${bin}. This build is incomplete.`);
+    sendLog(`ERROR: bundled agent executable not found at ${bin}\n`);
+    setAgentState("crashed");
+    return;
+  }
+
+  console.log(`Starting local agent: ${bin} ${args.join(" ")} (cwd=${cwd})`);
+  setAgentState("starting");
+  // stdin is not used by the long-running agent; windowsHide stops a console window flashing up on Windows.
+  const child = spawn(bin, args, { cwd, env: agentEnv(), windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  agentProcess = child;
+  child.intentional = false;
+
+  child.stdout.on("data", (d) => onAgentOutput(d.toString(), ""));
+  child.stderr.on("data", (d) => onAgentOutput(d.toString(), ":err"));
+
+  child.on("error", (err) => {
+    console.error(`Failed to start local agent: ${err.message}`);
+    sendLog(`Failed to start local agent: ${err.message}\n`);
+    if (agentProcess === child) agentProcess = null;
+    setAgentState("crashed");
+  });
+
+  child.on("exit", (code, signal) => {
+    // Only the CURRENT agent's exit matters. A process we stopped on purpose
+    // (restart, sign-out, quit) must never clear the new one or trigger a restart.
+    if (child.intentional || agentProcess !== child) return;
+    agentProcess = null;
+
+    if (code === EXIT_NEEDS_LOGIN) {
+      agentRestartCount = 0;
+      setAgentState("needs_login");
+      showLoginWindow(needsLoginReason);
+      return;
+    }
+    console.warn(`Local agent exited unexpectedly (code=${code}, signal=${signal}).`);
+    if (agentRestartCount < MAX_AGENT_RESTARTS) {
+      agentRestartCount += 1;
+      const delay = Math.min(1000 * 2 ** agentRestartCount, 30000);
+      console.log(`Restarting local agent in ${delay}ms (attempt ${agentRestartCount}/${MAX_AGENT_RESTARTS})...`);
+      setAgentState("starting");
+      setTimeout(() => {
+        if (!isQuitting && !agentProcess && agentState !== "needs_login") startAgent();
+      }, delay);
+    } else {
+      console.error("Local agent crashed too many times - not restarting automatically. Use Restart agent in the tray menu.");
+      setAgentState("crashed");
+    }
+  });
+}
+
+/** Stops the agent and resolves once it has really exited (or after `ms`). */
+function stopAgent(ms = 5000) {
+  const child = agentProcess;
+  agentProcess = null;
+  if (!child) return Promise.resolve();
+  child.intentional = true;
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    killTree(child);
+  });
+}
+
+async function restartAgent() {
+  if (agentState === "needs_login" && !agentProcess) {
+    showLoginWindow(needsLoginReason);
+    return;
+  }
+  await stopAgent();
+  agentRestartCount = 0;
+  startAgent();
+}
+
+// ---------------------------------------------------------------------
+// Sign-in: run the agent once in --login-stdin mode
+// ---------------------------------------------------------------------
+function runAgentHelper(extraArgs, stdinText, timeoutMs) {
+  return new Promise((resolve) => {
+    const { bin, args, cwd } = resolveAgentCommand(extraArgs);
+    let out = "";
+    let finished = false;
+    const finish = (value) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    let child;
+    try {
+      child = spawn(bin, args, { cwd, env: agentEnv(), windowsHide: true });
+    } catch (err) {
+      return resolve({ out: "", error: err.message });
+    }
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* already gone */ }
+      finish({ out, error: "timeout" });
+    }, timeoutMs);
+    child.stdout.on("data", (d) => { out += d.toString(); });
+    child.stderr.on("data", (d) => process.stdout.write(`[agent-helper:err] ${d}`)); // never contains the password
+    child.on("error", (err) => finish({ out, error: err.message }));
+    child.on("exit", (code) => finish({ out, code }));
+    if (stdinText !== null) {
+      child.stdin.on("error", () => { /* helper already exited */ });
+      child.stdin.write(stdinText + "\n");
+      child.stdin.end();
+    } else {
+      child.stdin.end();
+    }
+  });
+}
+
+async function runLogin(username, password) {
+  const res = await runAgentHelper(["--login-stdin"], JSON.stringify({ username, password }), LOGIN_TIMEOUT_MS);
+  const line = (res.out || "").split(/\r?\n/).reverse().find((l) => l.startsWith("LOGIN_RESULT:"));
+  if (line) {
+    try {
+      const parsed = JSON.parse(line.slice("LOGIN_RESULT:".length));
+      return { ok: !!parsed.ok, code: parsed.code || "error", message: parsed.message || "" };
+    } catch { /* fall through */ }
+  }
+  if (res.error === "timeout") {
+    return { ok: false, code: "network", message: "The server did not answer in time. Check your network connection and try again." };
+  }
+  return {
+    ok: false,
+    code: "error",
+    message: "Sign-in could not be completed. Check the agent log in %APPDATA%\\ai-test-recorder-agent\\logs.",
+  };
+}
+
+// ---------------------------------------------------------------------
+// Windows
+// ---------------------------------------------------------------------
+function showConfigError() {
+  dialog.showErrorBox(
+    "AI Test Recorder - Configuration Required",
+    "This installation does not know which server to connect to.\n\n" +
+      "Ask your administrator to reinstall using the latest installer, or create this file:\n" +
+      `${CONFIG.userConfigPath}\n\n` +
+      'with the content:\n{ "serverUrl": "https://your-server", "frontendUrl": "https://your-server" }'
+  );
+}
+
+function createMainWindow(showNow) {
+  mainWindow = new BrowserWindow({
+    width: 1440,
+    height: 900,
+    show: showNow,
+    title: "AI Test Recorder",
+    icon: iconPath(),
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      // Security baseline - the renderer (the web app) gets NO direct Node.js
+      // access; everything it can do is exposed narrowly through preload.js.
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+  // The window only ever shows the configured internal server; links to anywhere else
+  // open in the PC's normal browser instead of inside this window (which has the desktop bridge).
+  const appOrigin = originOf(CONFIG.frontendUrl);
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (originOf(url) !== appOrigin && /^https?:/i.test(url)) require("electron").shell.openExternal(url);
+    return { action: originOf(url) === appOrigin ? "allow" : "deny" };
+  });
+  mainWindow.webContents.on("will-navigate", (event, url) => {
+    if (originOf(url) !== appOrigin) event.preventDefault();
+  });
+  mainWindow.webContents.on("did-fail-load", (_e, code, desc, _url, isMainFrame) => {
+    if (!isMainFrame || code === -3) return; // -3 = aborted by a newer navigation
+    mainWindow.loadURL(
+      "data:text/html;charset=utf-8," +
+        encodeURIComponent(
+          `<body style="font-family:Segoe UI,sans-serif;padding:48px"><h2>Cannot reach the AI Test Recorder server</h2>` +
+            `<p>${CONFIG.frontendUrl}</p><p>${desc} (${code})</p>` +
+            `<p>Check you are on the corporate network/VPN, then <a href="#" onclick="location.href='${CONFIG.frontendUrl}'">try again</a>.</p></body>`
+        )
+    );
+  });
+  mainWindow.loadURL(CONFIG.frontendUrl);
+  mainWindow.on("close", (event) => {
+    // Closing the window keeps the agent running in the tray; Quit is in the tray menu.
+    if (!isQuitting && tray) {
+      event.preventDefault();
+      mainWindow.hide();
+    }
+  });
+  mainWindow.on("closed", () => {
+    mainWindow = null;
+  });
+}
+
+function showMainWindow() {
+  if (!CONFIG || !CONFIG.frontendUrl) return;
+  if (!mainWindow || mainWindow.isDestroyed()) createMainWindow(true);
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function showLoginWindow(reason = "none") {
+  needsLoginReason = reason;
+  if (loginWindow && !loginWindow.isDestroyed()) {
+    loginWindow.show();
+    loginWindow.focus();
+    return;
+  }
+  loginWindow = new BrowserWindow({
+    width: 460,
+    height: 560,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    title: "AI Test Recorder - Sign in",
+    icon: iconPath(),
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, "login-preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+  loginWindow.setMenu(null);
+  loginWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  loginWindow.webContents.on("will-navigate", (event) => event.preventDefault());
+  loginWindow.loadFile(path.join(__dirname, "login.html"));
+  loginWindow.on("closed", () => {
+    loginWindow = null;
+  });
+}
+
+// ---------------------------------------------------------------------
+// Tray + start-at-login
+// ---------------------------------------------------------------------
+const STATE_LABEL = {
+  stopped: "Agent: stopped",
+  starting: "Agent: starting...",
+  running: "Agent: connected",
+  reconnecting: "Agent: reconnecting...",
+  needs_login: "Agent: sign-in needed",
+  crashed: "Agent: stopped (see logs)",
+};
+
+function loginItemSupported() {
+  return app.isPackaged && (process.platform === "win32" || process.platform === "darwin");
+}
+
+function updateTray() {
+  if (!tray) return;
+  const needsLogin = agentState === "needs_login";
+  const menu = Menu.buildFromTemplate([
+    { label: "Open AI Test Recorder", click: showMainWindow },
+    { type: "separator" },
+    { label: STATE_LABEL[agentState] || agentState, enabled: false },
+    {
+      label: needsLogin ? "Sign in..." : "Sign in as a different user...",
+      click: async () => {
+        if (needsLogin) return showLoginWindow(needsLoginReason);
+        await stopAgent();
+        await runAgentHelper(["--logout"], null, 15000);
+        setAgentState("needs_login");
+        showLoginWindow("switch");
+      },
+    },
+    { label: "Restart agent", enabled: !needsLogin, click: () => restartAgent() },
+    { type: "separator" },
+    {
+      label: "Start when I sign in to Windows",
+      type: "checkbox",
+      visible: loginItemSupported(),
+      checked: loginItemSupported() ? app.getLoginItemSettings().openAtLogin : false,
+      click: (item) => app.setLoginItemSettings({ openAtLogin: item.checked, args: ["--hidden"] }),
+    },
+    {
+      label: "Quit",
+      click: () => {
+        isQuitting = true;
+        app.quit();
+      },
+    },
+  ]);
+  tray.setContextMenu(menu);
+}
+
+function createTray() {
+  try {
+    const image = nativeImage.createFromPath(iconPath());
+    if (image.isEmpty()) return;
+    tray = new Tray(image.resize({ width: 16, height: 16 }));
+    tray.setToolTip("AI Test Recorder");
+    tray.on("click", showMainWindow);
+    tray.on("double-click", showMainWindow);
+    updateTray();
+  } catch (err) {
+    console.error(`Could not create the tray icon: ${err.message}`);
+    tray = null;
+  }
+}
+
+function configureStartAtLogin() {
+  if (!loginItemSupported()) return;
+  const state = loadState();
+  if (state.loginItemConfigured) return; // after the first run it is the user's choice (tray menu)
+  app.setLoginItemSettings({ openAtLogin: true, args: ["--hidden"] });
+  saveState({ loginItemConfigured: true });
+}
+
+// ---------------------------------------------------------------------
+// IPC - the ONLY things the renderers can ask the main process to do.
+// ---------------------------------------------------------------------
+ipcMain.handle("agent:get-process-status", (event) => {
+  if (!isTrustedSender(event)) return { running: false, restartCount: 0, state: "stopped", needsSignIn: false };
+  return {
+    running: agentProcess !== null,
+    restartCount: agentRestartCount,
+    state: agentState,
+    needsSignIn: agentState === "needs_login",
+  };
+});
+
+ipcMain.handle("agent:restart", async (event) => {
+  if (!isTrustedSender(event)) return { ok: false };
+  await restartAgent();
+  return { ok: true };
+});
+
+ipcMain.handle("agent:sign-in", (event) => {
+  if (!isTrustedSender(event)) return { ok: false };
+  showLoginWindow(needsLoginReason);
+  return { ok: true };
+});
+
+function fromLoginWindow(event) {
+  return loginWindow && !loginWindow.isDestroyed() && event.sender === loginWindow.webContents;
+}
+
+ipcMain.handle("login:get-info", (event) => {
+  if (!fromLoginWindow(event)) return { serverHost: "", reason: "none" };
+  let host = CONFIG.serverUrl;
+  try { host = new URL(CONFIG.serverUrl).host; } catch { /* keep the raw value */ }
+  return { serverHost: host, reason: needsLoginReason };
+});
+
+ipcMain.handle("login:submit", async (event, creds) => {
+  if (!fromLoginWindow(event)) return { ok: false, code: "error", message: "Not allowed." };
+  const username = String((creds && creds.username) || "");
+  const password = String((creds && creds.password) || "");
+  const result = await runLogin(username, password);
+  if (result.ok) {
+    needsLoginReason = "none";
+    agentRestartCount = 0;
+    setTimeout(() => {
+      if (loginWindow && !loginWindow.isDestroyed()) loginWindow.close();
+    }, 700);
+    // A fresh start so the agent picks up the new sign-in even if an older one was running.
+    stopAgent().then(() => {
+      agentRestartCount = 0;
+      startAgent();
+    });
+    showMainWindow();
+  }
+  return result;
+});
+
+ipcMain.handle("login:open-web", (event) => {
+  if (!fromLoginWindow(event)) return { ok: false };
+  showMainWindow();
+  return { ok: true };
+});
+
+// ---------------------------------------------------------------------
+// Start-up
+// ---------------------------------------------------------------------
+if (!app.requestSingleInstanceLock()) {
+  // Another copy is already running (and owns the agent) - it will bring itself forward.
+  app.quit();
+} else {
+  app.on("second-instance", (_event, argv) => {
+    if (argv.includes("--hidden")) return; // the start-at-login launch of a copy that is already running
+    if (agentState === "needs_login") showLoginWindow(needsLoginReason);
+    showMainWindow();
+  });
+
+  app.whenReady().then(() => {
+    CONFIG = loadDesktopConfig();
+    if (!CONFIG.serverUrl) {
+      showConfigError();
+      app.quit();
+      return;
+    }
+
+    const startHidden =
+      process.argv.includes("--hidden") || (app.getLoginItemSettings().wasOpenedAtLogin === true);
+    createTray();
+    configureStartAtLogin();
+    createMainWindow(!(startHidden && tray));
+    startAgent();
+
+    app.on("activate", () => showMainWindow());
+  });
+
+  app.on("window-all-closed", () => {
+    // Stay alive in the tray (the agent keeps serving the web app); with no
+    // tray there would be no way to quit, so close the app instead.
+    if (!tray) app.quit();
+  });
+
+  app.on("before-quit", () => {
+    isQuitting = true;
+    stopAgent(1500);
+  });
+}
