@@ -1,637 +1,413 @@
-/**
- * AI Test Recorder - desktop app (Electron main process).
- *
- * What this app is for: it shows the web app in its own window, runs the local
- * agent (the program that opens the browser on THIS PC and does the recording /
- * test runs for the web app) in the background, and signs the user in to it.
- *
- *  - Server address: read from a config file shipped inside the installer
- *    (app-config.json) - users set nothing. See loadDesktopConfig().
- *  - Sign-in: the agent has no console when the desktop app runs it, so this
- *    app shows its own sign-in window (login.html) and hands the credentials to
- *    the agent once (`--login-stdin`), which saves a long-lived session.
- *  - Tray: closing the window hides it; the agent keeps running until the user
- *    chooses Quit. Optionally starts when the user signs in to Windows.
- *  - One copy only: a second launch just brings the first one forward.
- */
-const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage } = require("electron");
-const path = require("path");
-const fs = require("fs");
-const { spawn } = require("child_process");
+"""
+Shared OCR helper, used at BOTH:
+  - RECORD time (recorder/recorder.py, when the user right-clicks an
+    element on the page and chooses "Capture text with OCR" from the
+    custom menu injected by recorder_injector.js)
+  - REPLAY time (generator/templates/page.tmpl's
+    BasePage.capture_value_ocr, called from the generated step - see
+    generator/templates/steps.tmpl's "ocr_capture" branch)
 
-// Exit code local_agent uses to say "I have no valid sign-in" (see local_agent/client.py).
-const EXIT_NEEDS_LOGIN = 3;
-const MAX_AGENT_RESTARTS = 5;
-const LOGIN_TIMEOUT_MS = 45000;
+One implementation, so both always extract text the exact same way - and
+critically, REPLAY re-runs the OCR live every single time the test
+executes (a fresh screenshot, fresh OCR pass) rather than reusing
+whatever text was read during recording, the same way a plain
+copy-captured value is re-read live rather than hard-coded (see
+recorder/variable_capture.py's module docstring) - these are usually
+values the application generates fresh each run (a new application
+number, a new reference ID rendered into an image/canvas rather than
+real DOM text), so baking in the recording-time value would make the
+generated test increasingly wrong over time.
 
-// ---------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------
-function readJson(file) {
-  try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch {
-    return null;
-  }
-}
+Uses EasyOCR - a pure-Python OCR engine (pip install easyocr, nothing
+else to install separately, unlike Tesseract) built on PyTorch. This is a
+genuine trade-off, not a strictly-better choice, worth understanding:
+  - Nothing to install on the target machine beyond `pip install easyocr`
+    (or whatever's bundled into local_agent's frozen build) - no separate
+    binary, no PATH configuration, no corporate-security exclusion needed
+    for a second executable.
+  - But: it's a MUCH heavier dependency (EasyOCR pulls in PyTorch - use
+    the CPU-only build, `pip install torch --index-url
+    https://download.pytorch.org/whl/cpu`, NOT the default GPU build,
+    which is several GB larger for zero benefit on a laptop with no GPU).
+  - And: EasyOCR downloads its detection/recognition model weights
+    (~100MB) from the internet the FIRST time a Reader() is ever created
+    on a given machine, caching them (default: ~/.EasyOCR/model/, or
+    wherever EASYOCR_MODULE_PATH points - see _get_reader below) for
+    every run after that. On a machine with restricted/no internet
+    access, this first-run download needs to be pre-staged (copy an
+    already-populated ~/.EasyOCR/model/ folder over, or point
+    EASYOCR_MODULE_PATH at a pre-staged location bundled with the
+    installer) BEFORE the first OCR capture is ever attempted there.
+  - Reader() initialization itself (loading those model weights into
+    memory) takes a few seconds - too slow to redo on every single
+    capture, so _get_reader() below creates it ONCE per process and
+    reuses it for every subsequent OCR call in that process's lifetime.
+"""
+from __future__ import annotations
+import io
+import os
+import threading
 
-function cleanUrl(value) {
-  if (typeof value !== "string") return null;
-  const v = value.trim().replace(/\/+$/, "");
-  if (!/^https?:\/\/[^\s/]+/i.test(v)) return null;
-  // The placeholder that ships in electron/app-config.json counts as "not set".
-  if (/yourbank\.internal/i.test(v)) return null;
-  return v;
-}
+_reader = None
+_reader_lock = threading.Lock()
 
-/**
- * Where the server address comes from, first match wins:
- *   1. environment variables SERVER_URL / FRONTEND_URL  (developers, IT overrides)
- *   2. %APPDATA%\AI Test Recorder\config.json            (per-user override, for support)
- *   3. app-config.json inside the installer              (the normal case)
- *   4. localhost defaults - ONLY when running from source, never in an installed app
- * FRONTEND_URL falls back to SERVER_URL when only one address is given.
- */
-function loadDesktopConfig() {
-  const bundledPath = app.isPackaged
-    ? path.join(process.resourcesPath, "app-config.json")
-    : path.join(__dirname, "app-config.json");
-  const userPath = path.join(app.getPath("userData"), "config.json");
-  const bundled = readJson(bundledPath) || {};
-  const user = readJson(userPath) || {};
 
-  const pick = (envName, key, devDefault) =>
-    cleanUrl(process.env[envName]) ||
-    cleanUrl(user[key]) ||
-    cleanUrl(bundled[key]) ||
-    (app.isPackaged ? null : devDefault);
+def _staged_model_dir():
+    """Folder of pre-staged EasyOCR weights, for PCs with no internet.
+    Order: EASYOCR_MODULE_PATH, then an `easyocr_models` folder next to the
+    packaged .exe (what build_desktop_installer.bat / the build instructions
+    put there), then None (EasyOCR's own default + download)."""
+    env = os.environ.get("EASYOCR_MODULE_PATH")
+    if env:
+        return env
+    try:
+        import sys
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        for cand in (os.path.join(exe_dir, "easyocr_models"),
+                     os.path.join(exe_dir, "_internal", "easyocr_models")):
+            if os.path.isdir(cand) and any(f.endswith(".pth") for f in os.listdir(cand)):
+                return cand
+    except Exception:
+        pass
+    return None
 
-  const server = pick("SERVER_URL", "serverUrl", "http://localhost:8000");
-  const frontend = pick("FRONTEND_URL", "frontendUrl", "http://localhost:3000") || server;
-  const browserRaw = String(process.env.BROWSER || user.browser || bundled.browser || "edge").toLowerCase().trim();
-  return {
-    serverUrl: server,
-    frontendUrl: frontend,
-    wsUrl: (process.env.WS_URL || user.wsUrl || bundled.wsUrl || "").replace(/\/+$/, ""),
-    logLevel: process.env.LOG_LEVEL || "INFO",
-    // Which browser the agent drives ON THIS PC: edge | chrome (installed system browser)
-    // or chromium (the copy bundled inside the installer, see ms-playwright below).
-    browser: ["edge", "chrome", "chromium"].includes(browserRaw) ? browserRaw : "edge",
-    userConfigPath: userPath,
-  };
-}
 
-function originOf(url) {
-  try { return new URL(url).origin; } catch { return null; }
-}
+def _get_reader():
+    """Lazily creates ONE EasyOCR Reader for this process's whole
+    lifetime (thread-safe) - Reader() itself is slow (loads model
+    weights), so this must never be called fresh per-capture. English
+    only by default; add languages via OCR_LANGUAGES (comma-separated
+    EasyOCR language codes, e.g. "en,hi") if this ever needs to read
+    non-English text."""
+    global _reader
+    if _reader is None:
+        with _reader_lock:
+            if _reader is None:
+                import easyocr
+                languages = os.environ.get("OCR_LANGUAGES", "en").split(",")
+                model_dir = _staged_model_dir()  # pre-staged model weights, for a machine with no internet access
+                _reader = easyocr.Reader(
+                    [lang.strip() for lang in languages if lang.strip()],
+                    gpu=False,  # laptops running this agent have no GPU worth using - forcing this off also skips a slow, pointless CUDA availability probe
+                    model_storage_directory=model_dir,
+                    download_enabled=model_dir is None or not os.path.isdir(model_dir),
+                )
+    return _reader
 
-/** True only for IPC calls coming from our own pages (the configured web app, or the local sign-in file). */
-function isTrustedSender(event) {
-  const url = (event.senderFrame && event.senderFrame.url) || event.sender.getURL();
-  if (url.startsWith("file:")) return true;
-  const allowed = originOf(CONFIG && CONFIG.frontendUrl);
-  return !!allowed && originOf(url) === allowed;
-}
 
-let CONFIG = null; // filled in once the app is ready (app.getPath needs it)
-const AGENT_VERSION = require("./package.json").version;
+def ocr_available() -> bool:
+    """Best-effort check - used by recorder.py to fail an OCR capture
+    request clearly and immediately (rather than partway through) if
+    EasyOCR genuinely can't run here (not installed, or model weights
+    can't be obtained/found and there's no internet access to fetch
+    them)."""
+    try:
+        _get_reader()
+        return True
+    except Exception:
+        return False
 
-// ---------------------------------------------------------------------
-// Small persisted state (first-run choices)
-// ---------------------------------------------------------------------
-function statePath() {
-  return path.join(app.getPath("userData"), "state.json");
-}
-function loadState() {
-  return readJson(statePath()) || {};
-}
-function saveState(patch) {
-  try {
-    fs.mkdirSync(path.dirname(statePath()), { recursive: true });
-    fs.writeFileSync(statePath(), JSON.stringify({ ...loadState(), ...patch }, null, 2));
-  } catch (err) {
-    console.error(`Could not save desktop state: ${err.message}`);
-  }
-}
 
-function iconPath() {
-  return path.join(__dirname, "assets", process.platform === "win32" ? "icon.ico" : "icon.png");
-}
+def extract_text_from_png_bytes(png_bytes: bytes) -> str:
+    """Runs OCR on a screenshot (PNG bytes, exactly what Playwright's
+    `element.screenshot()` returns) and returns the extracted text.
+    Multiple detected text regions (EasyOCR reports each line/word
+    separately, with its own bounding box) are joined with a single space
+    in top-to-bottom, left-to-right reading order - e.g. a reference
+    number rendered as two visually-separate pieces ("REF" and "998877")
+    comes back as one "REF 998877" string, not a list. Raises a clear,
+    actionable RuntimeError - not a raw EasyOCR/PyTorch traceback - if OCR
+    genuinely can't run here, since that's a different, more urgent
+    problem than "OCR ran but the image had no readable text"."""
+    try:
+        from PIL import Image
+        import numpy as np
+    except ImportError as e:
+        raise RuntimeError(
+            "OCR support isn't fully installed on this machine - "
+            "pip install easyocr Pillow numpy "
+            "(see local_agent/requirements-agent.txt)."
+        ) from e
 
-// ---------------------------------------------------------------------
-// The local agent process
-// ---------------------------------------------------------------------
-// Dev (run from source): the agent runs straight from the project with a
-// system Python. Packaged: the PyInstaller-built local_agent.exe that the
-// installer puts under resources\local_agent\ - no Python needed on the PC.
-function resolveAgentCommand(extraArgs = []) {
-  if (!app.isPackaged) {
-    return {
-      bin: process.env.AGENT_PYTHON_BIN || "python",
-      args: ["-m", "local_agent.main", ...extraArgs],
-      cwd: process.env.AGENT_PROJECT_ROOT || path.join(__dirname, ".."),
-    };
-  }
-  const exeName = process.platform === "win32" ? "local_agent.exe" : "local_agent";
-  const exePath = path.join(process.resourcesPath, "local_agent", exeName);
-  return { bin: exePath, args: [...extraArgs], cwd: path.dirname(exePath) };
-}
+    try:
+        reader = _get_reader()
+    except Exception as e:
+        raise RuntimeError(explain_init_failure(e)) from e
 
-function agentEnv() {
-  const env = {
-    ...process.env,
-    SERVER_URL: CONFIG.serverUrl,
-    WS_URL: CONFIG.wsUrl,
-    AGENT_VERSION,
-    LOG_LEVEL: CONFIG.logLevel,
-    BROWSER: CONFIG.browser,
-    // No console to prompt in: if there is no valid sign-in, exit with
-    // EXIT_NEEDS_LOGIN and let this app show its sign-in window.
-    AGENT_NO_PROMPT: "1",
-  };
-  // Offline runtime files that the installer carries next to local_agent.exe (staged by
-  // build_desktop_installer.bat). Pointing the agent at them means nothing is downloaded on
-  // the tester's PC: OCR models (EasyOCR) and, optionally, Playwright's own Chromium.
-  if (app.isPackaged) {
-    const agentDir = path.join(process.resourcesPath, "local_agent");
-    const ocrModels = path.join(agentDir, "easyocr_models");
-    const browsers = path.join(agentDir, "ms-playwright");
-    if (!env.EASYOCR_MODULE_PATH && fs.existsSync(ocrModels)) env.EASYOCR_MODULE_PATH = ocrModels;
-    if (!env.PLAYWRIGHT_BROWSERS_PATH && fs.existsSync(browsers)) env.PLAYWRIGHT_BROWSERS_PATH = browsers;
-    env.PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
-  }
-  return env;
-}
+    image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    image_array = np.array(image)
 
-/** Kills a process AND everything it started (Playwright driver, Edge, behave_worker). */
-function killTree(child) {
-  if (!child || !child.pid) return;
-  if (process.platform === "win32") {
-    try {
-      spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-      return;
-    } catch { /* fall back to a plain kill below */ }
-  }
-  try { child.kill(); } catch { /* already gone */ }
-}
+    try:
+        # detail=0 returns just the recognized strings, already in EasyOCR's
+        # own natural (top-to-bottom, left-to-right) reading order - no
+        # manual bounding-box sorting needed.
+        results = reader.readtext(image_array, detail=0)
+    except Exception as e:
+        raise RuntimeError(f"OCR failed while reading the captured image: {type(e).__name__}: {e}") from e
 
-let mainWindow = null;
-let loginWindow = null;
-let tray = null;
-let isQuitting = false;
+    return " ".join(results).strip()
 
-let agentProcess = null;
-let agentRestartCount = 0;
-// stopped | starting | running | reconnecting | needs_login | crashed
-let agentState = "stopped";
-let needsLoginReason = "none"; // none | expired | switch
 
-function setAgentState(state) {
-  agentState = state;
-  updateTray();
-}
 
-function sendLog(text) {
-  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("agent:log", text);
-}
+def find_text_regions(png_bytes: bytes) -> list:
+    """
+    Runs OCR on a full-page screenshot and returns every detected text
+    region with its bounding box and confidence score.
 
-function onAgentOutput(text, tag) {
-  process.stdout.write(`[agent${tag}] ${text}`);
-  sendLog(text);
-  const marker = /AGENT_NEEDS_LOGIN:(\w+)/.exec(text);
-  if (marker) needsLoginReason = marker[1] === "expired" ? "expired" : "none";
-  if (/Connected to central server/.test(text)) {
-    agentRestartCount = 0;
-    setAgentState("running");
-  } else if (/Reconnecting in|Connection closed by server|Could not reach the central server/.test(text)) {
-    if (agentState === "running") setAgentState("reconnecting");
-  }
-}
+    Each returned dict:
+        {
+            "text":       str,
+            "bbox":       {"x": int, "y": int, "width": int, "height": int},
+            "confidence": float,   # 0.0-1.0 EasyOCR confidence
+        }
 
-function startAgent() {
-  if (agentProcess) return;
+    Returns [] silently if OCR is unavailable - never raises, because
+    _ocr_click_fallback treats an empty list as "nothing found" and
+    falls through to the next strategy cleanly.
+    """
+    try:
+        from PIL import Image
+        import numpy as np
+    except ImportError:
+        return []
 
-  if (!CONFIG.serverUrl) {
-    console.error("No server address configured - the local agent cannot start.");
-    return;
-  }
-  const { bin, args, cwd } = resolveAgentCommand();
-  if (app.isPackaged && !fs.existsSync(bin)) {
-    console.error(`Bundled agent executable not found at ${bin}. This build is incomplete.`);
-    sendLog(`ERROR: bundled agent executable not found at ${bin}\n`);
-    setAgentState("crashed");
-    return;
-  }
+    try:
+        reader = _get_reader()
+        image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+        image_array = np.array(image)
+        # detail=1 returns (corners, text, confidence) per region
+        raw_results = reader.readtext(image_array, detail=1)
+    except Exception:
+        return []
 
-  console.log(`Starting local agent: ${bin} ${args.join(" ")} (cwd=${cwd})`);
-  setAgentState("starting");
-  // stdin is not used by the long-running agent; windowsHide stops a console window flashing up on Windows.
-  const child = spawn(bin, args, { cwd, env: agentEnv(), windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
-  agentProcess = child;
-  child.intentional = false;
+    regions = []
+    for corners, text, confidence in raw_results:
+        if not text or not text.strip():
+            continue
+        # corners: [[x1,y1],[x2,y1],[x2,y2],[x1,y2]] clockwise from top-left
+        xs = [int(c[0]) for c in corners]
+        ys = [int(c[1]) for c in corners]
+        x, y = min(xs), min(ys)
+        w, h = max(xs) - x, max(ys) - y
+        regions.append({
+            "text": text.strip(),
+            "bbox": {"x": x, "y": y, "width": max(w, 1), "height": max(h, 1)},
+            "confidence": float(confidence),
+        })
+    return regions
 
-  child.stdout.on("data", (d) => onAgentOutput(d.toString(), ""));
-  child.stderr.on("data", (d) => onAgentOutput(d.toString(), ":err"));
 
-  child.on("error", (err) => {
-    console.error(`Failed to start local agent: ${err.message}`);
-    sendLog(`Failed to start local agent: ${err.message}\n`);
-    if (agentProcess === child) agentProcess = null;
-    setAgentState("crashed");
-  });
+def best_match(regions: list, hint: str, min_confidence: float = 0.3):
+    """
+    Finds the text region best matching `hint` (the recorded element
+    text/aria-label) from find_text_regions() output.
 
-  child.on("exit", (code, signal) => {
-    // Only the CURRENT agent's exit matters. A process we stopped on purpose
-    // (restart, sign-out, quit) must never clear the new one or trigger a restart.
-    if (child.intentional || agentProcess !== child) return;
-    agentProcess = null;
+    Matching tiers (highest to lowest priority):
+    1. Exact case-insensitive match
+    2. Hint is a substring of region text
+    3. Region text is a substring of hint
+    4. Word-level overlap ratio
 
-    if (code === EXIT_NEEDS_LOGIN) {
-      agentRestartCount = 0;
-      setAgentState("needs_login");
-      showLoginWindow(needsLoginReason);
-      return;
-    }
-    console.warn(`Local agent exited unexpectedly (code=${code}, signal=${signal}).`);
-    if (agentRestartCount < MAX_AGENT_RESTARTS) {
-      agentRestartCount += 1;
-      const delay = Math.min(1000 * 2 ** agentRestartCount, 30000);
-      console.log(`Restarting local agent in ${delay}ms (attempt ${agentRestartCount}/${MAX_AGENT_RESTARTS})...`);
-      setAgentState("starting");
-      setTimeout(() => {
-        if (!isQuitting && !agentProcess && agentState !== "needs_login") startAgent();
-      }, delay);
-    } else {
-      console.error("Local agent crashed too many times - not restarting automatically. Use Restart agent in the tray menu.");
-      setAgentState("crashed");
-    }
-  });
-}
+    Regions below min_confidence are ignored. Returns the best
+    matching region dict or None if nothing is confident enough.
+    Deliberately conservative: returns None rather than a weak match
+    so Vision AI gets a chance instead of clicking the wrong element.
+    """
+    if not hint or not regions:
+        return None
 
-/** Stops the agent and resolves once it has really exited (or after `ms`). */
-function stopAgent(ms = 5000) {
-  const child = agentProcess;
-  agentProcess = null;
-  if (!child) return Promise.resolve();
-  child.intentional = true;
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    child.once("exit", () => {
-      clearTimeout(timer);
-      resolve();
-    });
-    killTree(child);
-  });
-}
+    hint_lower = hint.strip().lower()
+    hint_words = set(hint_lower.split())
+    candidates = []
 
-async function restartAgent() {
-  if (agentState === "needs_login" && !agentProcess) {
-    showLoginWindow(needsLoginReason);
-    return;
-  }
-  await stopAgent();
-  agentRestartCount = 0;
-  startAgent();
-}
+    for region in regions:
+        if region["confidence"] < min_confidence:
+            continue
+        text = region["text"].strip().lower()
+        if not text:
+            continue
 
-// ---------------------------------------------------------------------
-// Sign-in: run the agent once in --login-stdin mode
-// ---------------------------------------------------------------------
-function runAgentHelper(extraArgs, stdinText, timeoutMs) {
-  return new Promise((resolve) => {
-    const { bin, args, cwd } = resolveAgentCommand(extraArgs);
-    let out = "";
-    let finished = false;
-    const finish = (value) => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      resolve(value);
-    };
-    let child;
-    try {
-      child = spawn(bin, args, { cwd, env: agentEnv(), windowsHide: true });
-    } catch (err) {
-      return resolve({ out: "", error: err.message });
-    }
-    const timer = setTimeout(() => {
-      try { child.kill(); } catch { /* already gone */ }
-      finish({ out, error: "timeout" });
-    }, timeoutMs);
-    child.stdout.on("data", (d) => { out += d.toString(); });
-    child.stderr.on("data", (d) => process.stdout.write(`[agent-helper:err] ${d}`)); // never contains the password
-    child.on("error", (err) => finish({ out, error: err.message }));
-    child.on("exit", (code) => finish({ out, code }));
-    if (stdinText !== null) {
-      child.stdin.on("error", () => { /* helper already exited */ });
-      child.stdin.write(stdinText + "\n");
-      child.stdin.end();
-    } else {
-      child.stdin.end();
-    }
-  });
-}
+        if text == hint_lower:
+            score = 1.0                                   # tier 1 exact
+        elif hint_lower in text:
+            score = 0.9 - (len(text) - len(hint_lower)) / max(len(text), 1) * 0.1
+        elif text in hint_lower:
+            score = 0.8 - (len(hint_lower) - len(text)) / max(len(hint_lower), 1) * 0.1
+        else:
+            text_words = set(text.split())
+            overlap = len(hint_words & text_words) / max(len(hint_words), 1)
+            if overlap == 0:
+                continue
+            score = overlap * 0.7
 
-async function runLogin(username, password) {
-  const res = await runAgentHelper(["--login-stdin"], JSON.stringify({ username, password }), LOGIN_TIMEOUT_MS);
-  const line = (res.out || "").split(/\r?\n/).reverse().find((l) => l.startsWith("LOGIN_RESULT:"));
-  if (line) {
-    try {
-      const parsed = JSON.parse(line.slice("LOGIN_RESULT:".length));
-      return { ok: !!parsed.ok, code: parsed.code || "error", message: parsed.message || "" };
-    } catch { /* fall through */ }
-  }
-  if (res.error === "timeout") {
-    return { ok: false, code: "network", message: "The server did not answer in time. Check your network connection and try again." };
-  }
-  return {
-    ok: false,
-    code: "error",
-    message: "Sign-in could not be completed. Check the agent log in %APPDATA%\\ai-test-recorder-agent\\logs.",
-  };
-}
+        # Blend match score with OCR confidence for final ranking
+        blended = score * 0.85 + region["confidence"] * 0.15
+        candidates.append((blended, region))
 
-// ---------------------------------------------------------------------
-// Windows
-// ---------------------------------------------------------------------
-function showConfigError() {
-  dialog.showErrorBox(
-    "AI Test Recorder - Configuration Required",
-    "This installation does not know which server to connect to.\n\n" +
-      "Ask your administrator to reinstall using the latest installer, or create this file:\n" +
-      `${CONFIG.userConfigPath}\n\n` +
-      'with the content:\n{ "serverUrl": "https://your-server", "frontendUrl": "https://your-server" }'
-  );
-}
+    if not candidates:
+        return None
 
-function createMainWindow(showNow) {
-  mainWindow = new BrowserWindow({
-    width: 1440,
-    height: 900,
-    show: showNow,
-    title: "AI Test Recorder",
-    icon: iconPath(),
-    webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
-      // Security baseline - the renderer (the web app) gets NO direct Node.js
-      // access; everything it can do is exposed narrowly through preload.js.
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-    },
-  });
-  // The window only ever shows the configured internal server; links to anywhere else
-  // open in the PC's normal browser instead of inside this window (which has the desktop bridge).
-  const appOrigin = originOf(CONFIG.frontendUrl);
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (originOf(url) !== appOrigin && /^https?:/i.test(url)) require("electron").shell.openExternal(url);
-    return { action: originOf(url) === appOrigin ? "allow" : "deny" };
-  });
-  mainWindow.webContents.on("will-navigate", (event, url) => {
-    if (originOf(url) !== appOrigin) event.preventDefault();
-  });
-  mainWindow.webContents.on("did-fail-load", (_e, code, desc, _url, isMainFrame) => {
-    if (!isMainFrame || code === -3) return; // -3 = aborted by a newer navigation
-    mainWindow.loadURL(
-      "data:text/html;charset=utf-8," +
-        encodeURIComponent(
-          `<body style="font-family:Segoe UI,sans-serif;padding:48px"><h2>Cannot reach the AI Test Recorder server</h2>` +
-            `<p>${CONFIG.frontendUrl}</p><p>${desc} (${code})</p>` +
-            `<p>Check you are on the corporate network/VPN, then <a href="#" onclick="location.href='${CONFIG.frontendUrl}'">try again</a>.</p></body>`
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_region = candidates[0]
+
+    # Reject suspiciously low matches - better to fall through to Vision AI
+    if best_score < 0.35:
+        return None
+
+    return best_region
+
+
+# ---------------------------------------------------------------------------
+# Diagnosing "OCR will not start" - and a one-command self-check
+# ---------------------------------------------------------------------------
+# EasyOCR fails to start for four unrelated reasons that used to all get the
+# same message ("check your internet / model weights"), which sent people down
+# the wrong path - most often a PyTorch / torchvision mismatch ("operator
+# torchvision::nms does not exist"), which has nothing to do with the network.
+# explain_init_failure() tells them apart; run_self_check() lets an administrator
+# prove OCR works on a build or a PC before anyone depends on it:
+#     local_agent.exe --check-ocr          behave_worker.exe --check-ocr
+
+CPU_INDEX = "https://download.pytorch.org/whl/cpu"
+
+
+def _installed_versions() -> dict:
+    """Package versions read from metadata only - never by importing them,
+    because importing a broken torchvision is exactly what fails."""
+    from importlib import metadata
+    out = {}
+    for name in ("torch", "torchvision", "easyocr", "numpy", "opencv-python-headless", "Pillow"):
+        try:
+            out[name] = metadata.version(name)
+        except Exception:  # noqa: BLE001
+            out[name] = None
+    return out
+
+
+def _split_version(v):
+    """'2.4.1+cpu' -> ('2.4.1', 'cpu'); '0.19.1' -> ('0.19.1', '')."""
+    base, _, tag = (v or "").partition("+")
+    return base, tag
+
+
+def expected_torchvision(torch_version):
+    """The torchvision release that is built for a given torch release:
+    torch 2.N.P pairs with torchvision 0.(N+15).P (2.4.1 -> 0.19.1, 2.5.1 -> 0.20.1,
+    2.6.0 -> 0.21.0). None if the version can't be read."""
+    base, _ = _split_version(torch_version)
+    try:
+        major, minor, patch = (int(x) for x in (base.split(".") + ["0", "0"])[:3])
+    except ValueError:
+        return None
+    return f"0.{minor + 15}.{patch}" if major == 2 else None
+
+
+def _mismatch_detail(versions: dict):
+    """Why the installed torch and torchvision cannot work together, or None if they look consistent."""
+    tv, tvv = versions.get("torch"), versions.get("torchvision")
+    if not tv or not tvv:
+        return None
+    want = expected_torchvision(tv)
+    (tv_base, tv_tag), (tvv_base, tvv_tag) = _split_version(tv), _split_version(tvv)
+    if want and tvv_base != want:
+        return f"torch {tv} is built to work with torchvision {want}, but torchvision {tvv} is installed"
+    if tv_tag != tvv_tag:
+        return (f"torch is the '{tv_tag or 'standard'}' build ({tv}) but torchvision is the "
+                f"'{tvv_tag or 'standard'}' build ({tvv}) - they came from different places")
+    return None
+
+
+def explain_init_failure(exc: BaseException) -> str:
+    """A plain-English, actionable message for 'EasyOCR could not start', based on what
+    actually went wrong. Always ends with the original error so nothing is hidden."""
+    text = f"{type(exc).__name__}: {exc}"
+    low = text.lower()
+    v = _installed_versions()
+    versions = ", ".join(f"{k} {val}" for k, val in v.items() if val and k in ("torch", "torchvision", "easyocr", "numpy"))
+    versions = f" (installed: {versions})" if versions else ""
+    original = f" Original error: {text}"
+
+    if "torchvision" in low and any(k in low for k in ("does not exist", "undefined symbol", "could not load this library", "nms", "torchvision._c")) \
+            or "operator torchvision" in low:
+        detail = _mismatch_detail(v)
+        want = expected_torchvision(v.get("torch"))
+        pair = (f"torch=={_split_version(v['torch'])[0]} torchvision=={want}" if want and v.get("torch")
+                else "torch==2.4.1 torchvision==0.19.1")
+        fix = f"pip uninstall -y torch torchvision, then pip install {pair} --index-url {CPU_INDEX}"
+        return (
+            "OCR cannot start because PyTorch and torchvision do not match each other"
+            + (f": {detail}" if detail else "") + f"{versions}. This is a setup problem on the machine that built or runs "
+            "the agent - it is NOT a network or model-file problem. Fix: install the two TOGETHER, from the same source, "
+            f"in the Python environment that builds the agent ({fix}), then rebuild local_agent.exe and behave_worker.exe. "
+            "Check it with: local_agent.exe --check-ocr." + original
         )
-    );
-  });
-  mainWindow.loadURL(CONFIG.frontendUrl);
-  mainWindow.on("close", (event) => {
-    // Closing the window keeps the agent running in the tray; Quit is in the tray menu.
-    if (!isQuitting && tray) {
-      event.preventDefault();
-      mainWindow.hide();
-    }
-  });
-  mainWindow.on("closed", () => {
-    mainWindow = null;
-  });
-}
+    if "numpy" in low and any(k in low for k in ("compiled using numpy", "multiarray failed", "_array_api", "numpy 1.x", "numpy 2")):
+        return ("OCR cannot start because the installed NumPy is too new or too old for the installed PyTorch"
+                f"{versions}. Install a NumPy that matches your PyTorch (for torch before 2.3 use numpy<2), "
+                "then rebuild the agent. Check with: local_agent.exe --check-ocr." + original)
+    if isinstance(exc, ImportError) and not isinstance(exc, OSError) and any(
+            k in low for k in ("easyocr", "torch", "cv2", "no module named")):
+        return ("OCR support is not part of this installation (a required package is missing)"
+                f"{versions}. The agent must be built with EasyOCR, PyTorch and torchvision installed "
+                "(see local_agent/requirements-agent.txt)." + original)
+    if "winerror 126" in low or "winerror 127" in low or "winerror 1114" in low or "dll load failed" in low:
+        return ("OCR cannot start because a Windows system library could not be loaded"
+                f"{versions}. Install the 'Microsoft Visual C++ Redistributable (x64)' on this PC, "
+                "or ask your administrator to rebuild the agent." + original)
+    if any(k in low for k in ("urlopen", "max retries", "connection", "timed out", "getaddrinfo", "ssl", "name resolution", "unreachable")):
+        return ("OCR cannot start because EasyOCR could not download its model files and there is no internet "
+                "access. Copy an already-populated ~/.EasyOCR/model/ folder from a PC where OCR has worked, or set "
+                "EASYOCR_MODULE_PATH to a pre-staged model folder shipped with the installer." + original)
+    return (f"EasyOCR could not initialize{versions}. Run local_agent.exe --check-ocr for a full report. "
+            "If this PC has no internet access, EasyOCR's model files must be pre-staged (copy ~/.EasyOCR/model/ "
+            "from a PC where OCR has worked, or set EASYOCR_MODULE_PATH)." + original)
 
-function showMainWindow() {
-  if (!CONFIG || !CONFIG.frontendUrl) return;
-  if (!mainWindow || mainWindow.isDestroyed()) createMainWindow(true);
-  if (mainWindow.isMinimized()) mainWindow.restore();
-  mainWindow.show();
-  mainWindow.focus();
-}
 
-function showLoginWindow(reason = "none") {
-  needsLoginReason = reason;
-  if (loginWindow && !loginWindow.isDestroyed()) {
-    loginWindow.show();
-    loginWindow.focus();
-    return;
-  }
-  loginWindow = new BrowserWindow({
-    width: 460,
-    height: 560,
-    resizable: false,
-    minimizable: false,
-    maximizable: false,
-    title: "AI Test Recorder - Sign in",
-    icon: iconPath(),
-    autoHideMenuBar: true,
-    webPreferences: {
-      preload: path.join(__dirname, "login-preload.js"),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-    },
-  });
-  loginWindow.setMenu(null);
-  loginWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-  loginWindow.webContents.on("will-navigate", (event) => event.preventDefault());
-  loginWindow.loadFile(path.join(__dirname, "login.html"));
-  loginWindow.on("closed", () => {
-    loginWindow = null;
-  });
-}
+def _selfcheck_png() -> bytes:
+    from PIL import Image, ImageDraw, ImageFont
+    img = Image.new("RGB", (560, 150), "white")
+    font = None
+    for name in ("arial.ttf", "DejaVuSans.ttf", "LiberationSans-Regular.ttf"):
+        try:
+            font = ImageFont.truetype(name, 64)
+            break
+        except Exception:  # noqa: BLE001
+            continue
+    if font is None:
+        try:
+            font = ImageFont.load_default(size=64)
+        except TypeError:
+            font = ImageFont.load_default()
+    ImageDraw.Draw(img).text((24, 36), "OCR OK 4821", fill="black", font=font)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
-// ---------------------------------------------------------------------
-// Tray + start-at-login
-// ---------------------------------------------------------------------
-const STATE_LABEL = {
-  stopped: "Agent: stopped",
-  starting: "Agent: starting...",
-  running: "Agent: connected",
-  reconnecting: "Agent: reconnecting...",
-  needs_login: "Agent: sign-in needed",
-  crashed: "Agent: stopped (see logs)",
-};
 
-function loginItemSupported() {
-  return app.isPackaged && (process.platform === "win32" || process.platform === "darwin");
-}
-
-function updateTray() {
-  if (!tray) return;
-  const needsLogin = agentState === "needs_login";
-  const menu = Menu.buildFromTemplate([
-    { label: "Open AI Test Recorder", click: showMainWindow },
-    { type: "separator" },
-    { label: STATE_LABEL[agentState] || agentState, enabled: false },
-    {
-      label: needsLogin ? "Sign in..." : "Sign in as a different user...",
-      click: async () => {
-        if (needsLogin) return showLoginWindow(needsLoginReason);
-        await stopAgent();
-        await runAgentHelper(["--logout"], null, 15000);
-        setAgentState("needs_login");
-        showLoginWindow("switch");
-      },
-    },
-    { label: "Restart agent", enabled: !needsLogin, click: () => restartAgent() },
-    { type: "separator" },
-    {
-      label: "Start when I sign in to Windows",
-      type: "checkbox",
-      visible: loginItemSupported(),
-      checked: loginItemSupported() ? app.getLoginItemSettings().openAtLogin : false,
-      click: (item) => app.setLoginItemSettings({ openAtLogin: item.checked, args: ["--hidden"] }),
-    },
-    {
-      label: "Quit",
-      click: () => {
-        isQuitting = true;
-        app.quit();
-      },
-    },
-  ]);
-  tray.setContextMenu(menu);
-}
-
-function createTray() {
-  try {
-    const image = nativeImage.createFromPath(iconPath());
-    if (image.isEmpty()) return;
-    tray = new Tray(image.resize({ width: 16, height: 16 }));
-    tray.setToolTip("AI Test Recorder");
-    tray.on("click", showMainWindow);
-    tray.on("double-click", showMainWindow);
-    updateTray();
-  } catch (err) {
-    console.error(`Could not create the tray icon: ${err.message}`);
-    tray = null;
-  }
-}
-
-function configureStartAtLogin() {
-  if (!loginItemSupported()) return;
-  const state = loadState();
-  if (state.loginItemConfigured) return; // after the first run it is the user's choice (tray menu)
-  app.setLoginItemSettings({ openAtLogin: true, args: ["--hidden"] });
-  saveState({ loginItemConfigured: true });
-}
-
-// ---------------------------------------------------------------------
-// IPC - the ONLY things the renderers can ask the main process to do.
-// ---------------------------------------------------------------------
-ipcMain.handle("agent:get-process-status", (event) => {
-  if (!isTrustedSender(event)) return { running: false, restartCount: 0, state: "stopped", needsSignIn: false };
-  return {
-    running: agentProcess !== null,
-    restartCount: agentRestartCount,
-    state: agentState,
-    needsSignIn: agentState === "needs_login",
-  };
-});
-
-ipcMain.handle("agent:restart", async (event) => {
-  if (!isTrustedSender(event)) return { ok: false };
-  await restartAgent();
-  return { ok: true };
-});
-
-ipcMain.handle("agent:sign-in", (event) => {
-  if (!isTrustedSender(event)) return { ok: false };
-  showLoginWindow(needsLoginReason);
-  return { ok: true };
-});
-
-function fromLoginWindow(event) {
-  return loginWindow && !loginWindow.isDestroyed() && event.sender === loginWindow.webContents;
-}
-
-ipcMain.handle("login:get-info", (event) => {
-  if (!fromLoginWindow(event)) return { serverHost: "", reason: "none" };
-  let host = CONFIG.serverUrl;
-  try { host = new URL(CONFIG.serverUrl).host; } catch { /* keep the raw value */ }
-  return { serverHost: host, reason: needsLoginReason };
-});
-
-ipcMain.handle("login:submit", async (event, creds) => {
-  if (!fromLoginWindow(event)) return { ok: false, code: "error", message: "Not allowed." };
-  const username = String((creds && creds.username) || "");
-  const password = String((creds && creds.password) || "");
-  const result = await runLogin(username, password);
-  if (result.ok) {
-    needsLoginReason = "none";
-    agentRestartCount = 0;
-    setTimeout(() => {
-      if (loginWindow && !loginWindow.isDestroyed()) loginWindow.close();
-    }, 700);
-    // A fresh start so the agent picks up the new sign-in even if an older one was running.
-    stopAgent().then(() => {
-      agentRestartCount = 0;
-      startAgent();
-    });
-    showMainWindow();
-  }
-  return result;
-});
-
-ipcMain.handle("login:open-web", (event) => {
-  if (!fromLoginWindow(event)) return { ok: false };
-  showMainWindow();
-  return { ok: true };
-});
-
-// ---------------------------------------------------------------------
-// Start-up
-// ---------------------------------------------------------------------
-if (!app.requestSingleInstanceLock()) {
-  // Another copy is already running (and owns the agent) - it will bring itself forward.
-  app.quit();
-} else {
-  app.on("second-instance", (_event, argv) => {
-    if (argv.includes("--hidden")) return; // the start-at-login launch of a copy that is already running
-    if (agentState === "needs_login") showLoginWindow(needsLoginReason);
-    showMainWindow();
-  });
-
-  app.whenReady().then(() => {
-    CONFIG = loadDesktopConfig();
-    if (!CONFIG.serverUrl) {
-      showConfigError();
-      app.quit();
-      return;
-    }
-
-    const startHidden =
-      process.argv.includes("--hidden") || (app.getLoginItemSettings().wasOpenedAtLogin === true);
-    createTray();
-    configureStartAtLogin();
-    createMainWindow(!(startHidden && tray));
-    startAgent();
-
-    app.on("activate", () => showMainWindow());
-  });
-
-  app.on("window-all-closed", () => {
-    // Stay alive in the tray (the agent keeps serving the web app); with no
-    // tray there would be no way to quit, so close the app instead.
-    if (!tray) app.quit();
-  });
-
-  app.on("before-quit", () => {
-    isQuitting = true;
-    stopAgent(1500);
-  });
-}
+def run_self_check() -> int:
+    """`local_agent.exe --check-ocr` / `behave_worker.exe --check-ocr`: prints what is installed,
+    reads a generated test image, and says PASS or FAIL with the reason. Exit code 0 = OCR works."""
+    import sys
+    import time
+    v = _installed_versions()
+    print("AI Test Recorder - OCR self-check")
+    print(f"  Python {sys.version.split()[0]}  ({'packaged build' if getattr(sys, 'frozen', False) else 'running from source'})")
+    for name in ("torch", "torchvision", "easyocr", "numpy", "opencv-python-headless", "Pillow"):
+        print(f"  {name:<24}{v.get(name) or 'NOT INSTALLED'}")
+    detail = _mismatch_detail(v)
+    if detail:
+        print(f"  !! torch/torchvision mismatch: {detail}")
+    model_dir = _staged_model_dir() or os.path.join(os.path.expanduser("~"), ".EasyOCR", "model")
+    n = len([f for f in os.listdir(model_dir) if f.endswith(".pth")]) if os.path.isdir(model_dir) else 0
+    print(f"  model files            {n} found in {model_dir}" + ("" if n else "  (will be downloaded on first use - needs internet)"))
+    print("Reading a test image (the first run can take a minute while models load)...")
+    started = time.time()
+    try:
+        text = extract_text_from_png_bytes(_selfcheck_png())
+    except Exception as e:  # noqa: BLE001
+        print(f"\nRESULT: FAIL\n{e}")
+        return 1
+    ok = "4821" in text.replace(" ", "")
+    print(f"\nRESULT: {'PASS' if ok else 'FAIL'} - read \"{text}\" in {time.time() - started:.1f}s"
+          + ("" if ok else " (expected it to contain 4821)"))
+    return 0 if ok else 1
