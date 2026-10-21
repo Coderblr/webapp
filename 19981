@@ -1,413 +1,775 @@
-"""
-Shared OCR helper, used at BOTH:
-  - RECORD time (recorder/recorder.py, when the user right-clicks an
-    element on the page and chooses "Capture text with OCR" from the
-    custom menu injected by recorder_injector.js)
-  - REPLAY time (generator/templates/page.tmpl's
-    BasePage.capture_value_ocr, called from the generated step - see
-    generator/templates/steps.tmpl's "ocr_capture" branch)
+import { useEffect, useRef, useState } from "react";
+import { api } from "@/lib/api";
+import { recordingsApi, executionsApi, transactionsApi } from "@/lib/api";
+import ExecutionProgress from "@/components/ExecutionProgress";
+import ExecutionDetails from "@/components/ExecutionDetails";
+import ValidationReport from "@/components/ValidationReport";
+import { errorDetail, validateApi } from "@/lib/platformApi";
+import ReportView from "@/components/ReportView";
+import StepEditor from "@/components/StepEditor";
+import ShareDialog from "@/components/ShareDialog";
+import VersionHistory from "@/components/VersionHistory";
+import Link from "next/link";
+import { useAuth } from "@/context/AuthContext";
+import {
+  Button,
+  Callout,
+  Checkbox,
+  DataTable,
+  Disclosure,
+  Field,
+  Panel,
+  Select,
+  Spinner,
+  TextInput,
+} from "@/components/ui";
 
-One implementation, so both always extract text the exact same way - and
-critically, REPLAY re-runs the OCR live every single time the test
-executes (a fresh screenshot, fresh OCR pass) rather than reusing
-whatever text was read during recording, the same way a plain
-copy-captured value is re-read live rather than hard-coded (see
-recorder/variable_capture.py's module docstring) - these are usually
-values the application generates fresh each run (a new application
-number, a new reference ID rendered into an image/canvas rather than
-real DOM text), so baking in the recording-time value would make the
-generated test increasingly wrong over time.
+function PanelHeader({ title, description }) {
+  return (
+    <div className="border-b border-line px-5 py-4">
+      <h2 className="text-sm font-semibold text-ink">{title}</h2>
+      {description && <p className="mt-0.5 text-xs text-muted">{description}</p>}
+    </div>
+  );
+}
 
-Uses EasyOCR - a pure-Python OCR engine (pip install easyocr, nothing
-else to install separately, unlike Tesseract) built on PyTorch. This is a
-genuine trade-off, not a strictly-better choice, worth understanding:
-  - Nothing to install on the target machine beyond `pip install easyocr`
-    (or whatever's bundled into local_agent's frozen build) - no separate
-    binary, no PATH configuration, no corporate-security exclusion needed
-    for a second executable.
-  - But: it's a MUCH heavier dependency (EasyOCR pulls in PyTorch - use
-    the CPU-only build, `pip install torch --index-url
-    https://download.pytorch.org/whl/cpu`, NOT the default GPU build,
-    which is several GB larger for zero benefit on a laptop with no GPU).
-  - And: EasyOCR downloads its detection/recognition model weights
-    (~100MB) from the internet the FIRST time a Reader() is ever created
-    on a given machine, caching them (default: ~/.EasyOCR/model/, or
-    wherever EASYOCR_MODULE_PATH points - see _get_reader below) for
-    every run after that. On a machine with restricted/no internet
-    access, this first-run download needs to be pre-staged (copy an
-    already-populated ~/.EasyOCR/model/ folder over, or point
-    EASYOCR_MODULE_PATH at a pre-staged location bundled with the
-    installer) BEFORE the first OCR capture is ever attempted there.
-  - Reader() initialization itself (loading those model weights into
-    memory) takes a few seconds - too slow to redo on every single
-    capture, so _get_reader() below creates it ONCE per process and
-    reuses it for every subsequent OCR call in that process's lifetime.
-"""
-from __future__ import annotations
-import io
-import os
-import threading
+export default function RunSavedTab() {
+  const { user } = useAuth();
+  const [recordings, setRecordings] = useState([]);
+  const [recordingsError, setRecordingsError] = useState(null);
+  const [selectedRecFile, setSelectedRecFile] = useState("");
+  const [applicationNames, setApplicationNames] = useState([]);
+  const [runHeadless, setRunHeadless] = useState(false);
+  const [testData, setTestData] = useState([]);
+  const [testDataLoading, setTestDataLoading] = useState(false);
+  const [testDataError, setTestDataError] = useState(null);
+  const [editValues, setEditValues] = useState({});
+  const [savingData, setSavingData] = useState(false);
+  const [saveDataNotice, setSaveDataNotice] = useState(null);
+  const [saveDataError, setSaveDataError] = useState(null);
+  const [runBusy, setRunBusy] = useState(false);
+  const [runError, setRunError] = useState(null);
+  const [report, setReport] = useState(null);
+  const [job, setJob] = useState(null);                 // the background execution being watched
+  const [connectionLost, setConnectionLost] = useState(false);
+  const [controlBusy, setControlBusy] = useState(null);
+  const pollToken = useRef(0);                          // bumping this stops an older polling loop
+  const [validation, setValidation] = useState(null);       // the pre-run readiness report
+  const [validating, setValidating] = useState(false);
+  const [regenBusy, setRegenBusy] = useState(false);
+  const [regenNotice, setRegenNotice] = useState(null);
+  const [regenFiles, setRegenFiles] = useState(null);
+  const [downloadingRegen, setDownloadingRegen] = useState(null);
+  const [importBusy, setImportBusy] = useState(false);
+  const [importNotice, setImportNotice] = useState(null);
+  const [importFile, setImportFile] = useState(null);
+  const [importName, setImportName] = useState("");
+  const [importAppName, setImportAppName] = useState("");
+  const [importSheets, setImportSheets] = useState(null);
+  const [importSheetsLoading, setImportSheetsLoading] = useState(false);
+  const [selectedSheets, setSelectedSheets] = useState([]);
+  const [shareDialogOpen, setShareDialogOpen] = useState(false);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [pkgImportFile, setPkgImportFile] = useState(null);
+  const [pkgImportBusy, setPkgImportBusy] = useState(false);
+  const [pkgImportNotice, setPkgImportNotice] = useState(null);
+  // "Create a navigation menu check" form + the selected check's baseline.
+  const [menuApp, setMenuApp] = useState("Others");
+  const [menuUrl, setMenuUrl] = useState("");
+  const [menuName, setMenuName] = useState("");
+  const [menuSelector, setMenuSelector] = useState("");
+  const [menuStrict, setMenuStrict] = useState(false);
+  const [menuBusy, setMenuBusy] = useState(false);
+  const [menuNotice, setMenuNotice] = useState(null);
+  const [baselineBusy, setBaselineBusy] = useState(false);
+  // "Delete recordings" panel
+  const [delApp, setDelApp] = useState("All");
+  const [delFilter, setDelFilter] = useState("");
+  const [delPicked, setDelPicked] = useState({});      // file -> true
+  const [delBusy, setDelBusy] = useState(false);
+  const [delNotice, setDelNotice] = useState(null);
+  const [baselineNotice, setBaselineNotice] = useState(null);
 
-_reader = None
-_reader_lock = threading.Lock()
+  const selectedRecording = recordings.find((r) => r.file === selectedRecFile) || null;
 
+  async function loadRecordings() {
+    try {
+      const r = await api.getRecordings();
+      setRecordings(r);
+      setRecordingsError(null);
+      if (r.length && !selectedRecFile) setSelectedRecFile(r[0].file);
+    } catch (e) {
+      setRecordingsError(e.detail || e.message);
+    }
+  }
 
-def _staged_model_dir():
-    """Folder of pre-staged EasyOCR weights, for PCs with no internet.
-    Order: EASYOCR_MODULE_PATH, then an `easyocr_models` folder next to the
-    packaged .exe (what build_desktop_installer.bat / the build instructions
-    put there), then None (EasyOCR's own default + download)."""
-    env = os.environ.get("EASYOCR_MODULE_PATH")
-    if env:
-        return env
-    try:
-        import sys
-        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-        for cand in (os.path.join(exe_dir, "easyocr_models"),
-                     os.path.join(exe_dir, "_internal", "easyocr_models")):
-            if os.path.isdir(cand) and any(f.endswith(".pth") for f in os.listdir(cand)):
-                return cand
-    except Exception:
-        pass
-    return None
+  useEffect(() => {
+    loadRecordings();
+    api.getApplications().then((r) => setApplicationNames(r.applications || [])).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
+  async function loadTestData(file) {
+    setTestDataLoading(true);
+    setTestDataError(null);
+    setSaveDataNotice(null);
+    setSaveDataError(null);
+    try {
+      const data = await api.getRecordingTestData(file);
+      setTestData(data.fields);
+      setEditValues(Object.fromEntries(data.fields.map((f) => [f.index, f.value])));
+    } catch (e) {
+      setTestData([]);
+      setEditValues({});
+      setTestDataError(e.detail || e.message);
+    } finally {
+      setTestDataLoading(false);
+    }
+  }
 
-def _get_reader():
-    """Lazily creates ONE EasyOCR Reader for this process's whole
-    lifetime (thread-safe) - Reader() itself is slow (loads model
-    weights), so this must never be called fresh per-capture. English
-    only by default; add languages via OCR_LANGUAGES (comma-separated
-    EasyOCR language codes, e.g. "en,hi") if this ever needs to read
-    non-English text."""
-    global _reader
-    if _reader is None:
-        with _reader_lock:
-            if _reader is None:
-                import easyocr
-                languages = os.environ.get("OCR_LANGUAGES", "en").split(",")
-                model_dir = _staged_model_dir()  # pre-staged model weights, for a machine with no internet access
-                _reader = easyocr.Reader(
-                    [lang.strip() for lang in languages if lang.strip()],
-                    gpu=False,  # laptops running this agent have no GPU worth using - forcing this off also skips a slow, pointless CUDA availability probe
-                    model_storage_directory=model_dir,
-                    download_enabled=model_dir is None or not os.path.isdir(model_dir),
-                )
-    return _reader
+  useEffect(() => {
+    setReport(null);
+    setRegenNotice(null);
+    setRegenFiles(null);
+    setBaselineNotice(null);
+    if (selectedRecFile) loadTestData(selectedRecFile);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedRecFile]);
 
+  function updateValue(index, value) {
+    setEditValues((prev) => ({ ...prev, [index]: value }));
+    setSaveDataNotice(null);
+  }
 
-def ocr_available() -> bool:
-    """Best-effort check - used by recorder.py to fail an OCR capture
-    request clearly and immediately (rather than partway through) if
-    EasyOCR genuinely can't run here (not installed, or model weights
-    can't be obtained/found and there's no internet access to fetch
-    them)."""
-    try:
-        _get_reader()
-        return True
-    except Exception:
-        return False
+  async function saveTestDataOnly() {
+    setSavingData(true);
+    setSaveDataError(null);
+    setSaveDataNotice(null);
+    try {
+      const data = await api.updateRecordingTestData(selectedRecFile, editValues);
+      setTestData(data.fields);
+      setSaveDataNotice("Test data saved - future runs of this recording will use these values too.");
+    } catch (e) {
+      setSaveDataError(e.detail || e.message);
+    } finally {
+      setSavingData(false);
+    }
+  }
 
-
-def extract_text_from_png_bytes(png_bytes: bytes) -> str:
-    """Runs OCR on a screenshot (PNG bytes, exactly what Playwright's
-    `element.screenshot()` returns) and returns the extracted text.
-    Multiple detected text regions (EasyOCR reports each line/word
-    separately, with its own bounding box) are joined with a single space
-    in top-to-bottom, left-to-right reading order - e.g. a reference
-    number rendered as two visually-separate pieces ("REF" and "998877")
-    comes back as one "REF 998877" string, not a list. Raises a clear,
-    actionable RuntimeError - not a raw EasyOCR/PyTorch traceback - if OCR
-    genuinely can't run here, since that's a different, more urgent
-    problem than "OCR ran but the image had no readable text"."""
-    try:
-        from PIL import Image
-        import numpy as np
-    except ImportError as e:
-        raise RuntimeError(
-            "OCR support isn't fully installed on this machine - "
-            "pip install easyocr Pillow numpy "
-            "(see local_agent/requirements-agent.txt)."
-        ) from e
-
-    try:
-        reader = _get_reader()
-    except Exception as e:
-        raise RuntimeError(explain_init_failure(e)) from e
-
-    image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-    image_array = np.array(image)
-
-    try:
-        # detail=0 returns just the recognized strings, already in EasyOCR's
-        # own natural (top-to-bottom, left-to-right) reading order - no
-        # manual bounding-box sorting needed.
-        results = reader.readtext(image_array, detail=0)
-    except Exception as e:
-        raise RuntimeError(f"OCR failed while reading the captured image: {type(e).__name__}: {e}") from e
-
-    return " ".join(results).strip()
-
-
-
-def find_text_regions(png_bytes: bytes) -> list:
-    """
-    Runs OCR on a full-page screenshot and returns every detected text
-    region with its bounding box and confidence score.
-
-    Each returned dict:
-        {
-            "text":       str,
-            "bbox":       {"x": int, "y": int, "width": int, "height": int},
-            "confidence": float,   # 0.0-1.0 EasyOCR confidence
+  // Polls a background execution until it ends. A failed poll (server restart,
+  // network blip) never ends the run - it only shows "lost contact" and retries
+  // with a growing delay, because the test itself lives on the agent.
+  async function watchJob(jobId) {
+    const token = ++pollToken.current;
+    let delay = 1500;
+    let failures = 0;
+    for (;;) {
+      if (token !== pollToken.current) return;
+      try {
+        const j = await executionsApi.get(jobId);
+        if (token !== pollToken.current) return;
+        setJob(j);
+        setConnectionLost(false);
+        failures = 0;
+        delay = 1500;
+        if (["completed", "cancelled", "failed", "interrupted", "requires_investigation"].includes(j.status)) {
+          if (j.transaction_id) {
+            try {
+              setReport(await transactionsApi.get(j.transaction_id));
+            } catch (e) {
+              setRunError(`The run ended but its report could not be loaded: ${e?.detail || e?.message}`);
+            }
+          } else if (j.message) {
+            setRunError(j.message);
+          }
+          setRunBusy(false);
+          if (selectedRecording?.has_menu_check) loadRecordings();
+          return;
         }
+      } catch (e) {
+        if (e?.status === 404) {                        // the job is gone (cleaned up) - stop watching
+          setRunError("This execution is no longer available.");
+          setRunBusy(false);
+          return;
+        }
+        failures += 1;
+        if (failures >= 2) setConnectionLost(true);
+        delay = Math.min(delay * 1.5, 10000);
+      }
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
 
-    Returns [] silently if OCR is unavailable - never raises, because
-    _ocr_click_fallback treats an empty list as "nothing found" and
-    falls through to the next strategy cleanly.
-    """
-    try:
-        from PIL import Image
-        import numpy as np
-    except ImportError:
-        return []
+  useEffect(() => { setValidation(null); }, [selectedRecFile]);
 
-    try:
-        reader = _get_reader()
-        image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-        image_array = np.array(image)
-        # detail=1 returns (corners, text, confidence) per region
-        raw_results = reader.readtext(image_array, detail=1)
-    except Exception:
-        return []
+  async function handleFix(item) {
+    setValidating(true);
+    try {
+      await validateApi.fix(selectedRecFile, item.fix);
+      await loadRecordings();
+      setValidation(await validateApi.run(selectedRecFile, { check_environment: validation?.coverage?.environment }));
+    } catch (e) {
+      setRunError(e?.detail || e?.message || "That fix could not be applied.");
+    } finally {
+      setValidating(false);
+    }
+  }
 
-    regions = []
-    for corners, text, confidence in raw_results:
-        if not text or not text.strip():
-            continue
-        # corners: [[x1,y1],[x2,y1],[x2,y2],[x1,y2]] clockwise from top-left
-        xs = [int(c[0]) for c in corners]
-        ys = [int(c[1]) for c in corners]
-        x, y = min(xs), min(ys)
-        w, h = max(xs) - x, max(ys) - y
-        regions.append({
-            "text": text.strip(),
-            "bbox": {"x": x, "y": y, "width": max(w, 1), "height": max(h, 1)},
-            "confidence": float(confidence),
-        })
-    return regions
+  // Re-attach to a run that is still going after a page reload / navigation.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await executionsApi.list({ limit: 5 });
+        const active = (r.items || []).find((j) =>
+          ["queued", "generating", "starting", "running", "pausing", "paused", "collecting", "reporting"].includes(j.status));
+        if (active && !cancelled) {
+          setRunBusy(true);
+          setJob(active);
+          watchJob(active.job_id);
+        }
+      } catch (e) { /* not fatal - the user can still start a run */ }
+    })();
+    return () => { cancelled = true; pollToken.current += 1; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
+  async function handleRun() {
+    if (!selectedRecFile) return;
+    setRunError(null);
+    setReport(null);
+    setJob(null);
+    setRunBusy(true);
+    try {
+      if (testData.length > 0) await api.updateRecordingTestData(selectedRecFile, editValues);
+      const started = await executionsApi.start(selectedRecFile, runHeadless, "auto");
+      setJob({ job_id: started.job_id, status: started.status, progress: {}, metrics: {} });
+      watchJob(started.job_id);
+    } catch (e) {
+      const d = errorDetail(e);
+      if (d && d.code === "validation_failed" && d.validation) {
+        // The server refused to start: show the same report the Validate button shows.
+        setValidation({ can_run: false, counts: d.validation.counts, items: d.validation.items, notice: d.validation.notice,
+                        coverage: { static: true, environment: false, application_flow: false } });
+      }
+      setRunError(e?.detail || e?.message || "Execution failed.");
+      setRunBusy(false);
+    }
+  }
 
-def best_match(regions: list, hint: str, min_confidence: float = 0.3):
-    """
-    Finds the text region best matching `hint` (the recorded element
-    text/aria-label) from find_text_regions() output.
+  async function controlJob(action) {
+    if (!job) return;
+    setControlBusy(action);
+    try {
+      await executionsApi[action](job.job_id);
+    } catch (e) {
+      setRunError(e?.detail || e?.message || `Unable to ${action} the execution.`);
+    } finally {
+      setControlBusy(null);
+    }
+  }
 
-    Matching tiers (highest to lowest priority):
-    1. Exact case-insensitive match
-    2. Hint is a substring of region text
-    3. Region text is a substring of hint
-    4. Word-level overlap ratio
+  async function handleRegenerate() {
+    if (!selectedRecFile) return;
+    setRegenNotice(null);
+    setRegenFiles(null);
+    setRegenBusy(true);
+    try {
+      const r = await recordingsApi.regenerate(selectedRecFile);
+      setRegenNotice({
+        tone: "success",
+        text: `Regenerated (${r.build_result.step_count} steps) - download the scripts below, or just run this recording, which already uses the current code either way.`,
+      });
+      setRegenFiles({
+        feature_file: r.build_result.feature_file,
+        steps_file: r.build_result.steps_file,
+        page_file: r.build_result.page_file,
+        locators_file: r.build_result.locators_file,
+      });
+    } catch (e) {
+      setRegenNotice({ tone: "error", text: e.detail || e.message });
+    } finally {
+      setRegenBusy(false);
+    }
+  }
 
-    Regions below min_confidence are ignored. Returns the best
-    matching region dict or None if nothing is confident enough.
-    Deliberately conservative: returns None rather than a weak match
-    so Vision AI gets a chance instead of clicking the wrong element.
-    """
-    if not hint or not regions:
-        return None
+  async function handleDownloadRegenFile(path, label) {
+    setDownloadingRegen(path);
+    try {
+      await recordingsApi.downloadRegeneratedFile(path);
+    } catch (e) {
+      setRegenNotice({ tone: "error", text: `Could not download ${label}: ${e.detail || e.message}` });
+    } finally {
+      setDownloadingRegen(null);
+    }
+  }
 
-    hint_lower = hint.strip().lower()
-    hint_words = set(hint_lower.split())
-    candidates = []
+  async function handleImportFileChosen(file) {
+    setImportFile(file);
+    setImportNotice(null);
+    setImportSheets(null);
+    setSelectedSheets([]);
+    if (!file) return;
+    setImportSheetsLoading(true);
+    try {
+      const r = await recordingsApi.listUipathSheets(file);
+      if (r.sheets.length > 1) { setImportSheets(r.sheets); setSelectedSheets(r.sheets); }
+      else setImportSheets([]);
+    } catch (e) {
+      setImportNotice({ tone: "error", text: e.detail || e.message });
+      setImportFile(null);
+    } finally {
+      setImportSheetsLoading(false);
+    }
+  }
 
-    for region in regions:
-        if region["confidence"] < min_confidence:
-            continue
-        text = region["text"].strip().lower()
-        if not text:
-            continue
+  function toggleSheetSelection(sheetName) {
+    setSelectedSheets((prev) => prev.includes(sheetName) ? prev.filter((s) => s !== sheetName) : [...prev, sheetName]);
+  }
 
-        if text == hint_lower:
-            score = 1.0                                   # tier 1 exact
-        elif hint_lower in text:
-            score = 0.9 - (len(text) - len(hint_lower)) / max(len(text), 1) * 0.1
-        elif text in hint_lower:
-            score = 0.8 - (len(hint_lower) - len(text)) / max(len(hint_lower), 1) * 0.1
-        else:
-            text_words = set(text.split())
-            overlap = len(hint_words & text_words) / max(len(hint_words), 1)
-            if overlap == 0:
-                continue
-            score = overlap * 0.7
+  async function handleImportUipath() {
+    if (!importFile) return;
+    if (importSheets && importSheets.length > 0 && selectedSheets.length === 0) {
+      setImportNotice({ tone: "error", text: 'Select at least one sheet to import, or use "Select all".' });
+      return;
+    }
+    setImportNotice(null);
+    setImportBusy(true);
+    try {
+      const r = await recordingsApi.importUipathExcel(importFile, importName, selectedSheets.length ? selectedSheets : undefined, importAppName);
+      const succeeded = r.results.filter((res) => !res.error);
+      const failed = r.results.filter((res) => res.error);
+      const totalWarnings = succeeded.reduce((n, res) => n + res.warnings.length, 0);
+      const parts = [];
+      if (succeeded.length) {
+        const label = succeeded.length === 1 ? "1 recording" : `${succeeded.length} recordings`;
+        parts.push(`Imported ${label} from ${importFile.name}${totalWarnings ? ` (${totalWarnings} warning${totalWarnings > 1 ? "s" : ""} - check each recording's steps)` : ""}.`);
+      }
+      if (failed.length) parts.push(`${failed.length} sheet${failed.length > 1 ? "s" : ""} could not be imported: ` + failed.map((f) => `${f.sheet_name || "sheet"} (${f.error})`).join("; ") + ".");
+      setImportNotice({ tone: failed.length && !succeeded.length ? "error" : failed.length || totalWarnings ? "warning" : "success", text: parts.join(" ") });
+      setImportFile(null); setImportName(""); setImportSheets(null); setSelectedSheets([]); setImportAppName("");
+      await loadRecordings();
+      if (succeeded.length) setSelectedRecFile(succeeded[0].recording_file);
+    } catch (e) {
+      setImportNotice({ tone: "error", text: e.detail || e.message });
+    } finally {
+      setImportBusy(false);
+    }
+  }
 
-        # Blend match score with OCR confidence for final ranking
-        blended = score * 0.85 + region["confidence"] * 0.15
-        candidates.append((blended, region))
+  // ---- delete recordings -------------------------------------------------
+  const deletable = recordings.filter((r) => r.can_delete);
+  const delApps = ["All", ...Array.from(new Set(deletable.map((r) => r.application || "Others"))).sort()];
+  const delShown = deletable.filter(
+    (r) =>
+      (delApp === "All" || (r.application || "Others") === delApp) &&
+      `${r.name} ${r.target_url || ""}`.toLowerCase().includes(delFilter.trim().toLowerCase()),
+  );
+  const delPickedFiles = Object.keys(delPicked).filter((f) => delPicked[f]);
+  const allShownPicked = delShown.length > 0 && delShown.every((r) => delPicked[r.file]);
 
-    if not candidates:
-        return None
+  function toggleShown(on) {
+    setDelPicked((prev) => {
+      const next = { ...prev };
+      delShown.forEach((r) => { if (on) next[r.file] = true; else delete next[r.file]; });
+      return next;
+    });
+  }
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_region = candidates[0]
+  async function handleDeleteRecordings() {
+    if (!delPickedFiles.length) return;
+    const names = deletable.filter((r) => delPicked[r.file]).map((r) => `  • ${r.name}`).slice(0, 12);
+    const more = delPickedFiles.length > names.length ? `\n  …and ${delPickedFiles.length - names.length} more` : "";
+    if (!window.confirm(
+      `Permanently delete ${delPickedFiles.length} recording(s)?\n\n${names.join("\n")}${more}\n\n` +
+      "This cannot be undone. Past execution reports are kept.",
+    )) return;
+    setDelBusy(true);
+    setDelNotice(null);
+    try {
+      const r = await recordingsApi.deleteRecordings(delPickedFiles);
+      const gone = new Set(r.deleted.map((d) => d.file));
+      setDelPicked({});
+      if (gone.has(selectedRecFile)) setSelectedRecFile("");
+      setReport(null);
+      const list = await api.getRecordings();
+      setRecordings(list);
+      if (gone.has(selectedRecFile)) setSelectedRecFile(list[0]?.file || "");
+      setDelNotice({
+        tone: r.failed.length ? "error" : "success",
+        text:
+          `Deleted ${r.deleted.length} recording(s).` +
+          (r.failed.length ? ` ${r.failed.length} could not be deleted: ` + r.failed.map((f) => f.reason).join("; ") : ""),
+      });
+    } catch (e) {
+      setDelNotice({ tone: "error", text: e.detail || e.message });
+    } finally {
+      setDelBusy(false);
+    }
+  }
 
-    # Reject suspiciously low matches - better to fall through to Vision AI
-    if best_score < 0.35:
-        return None
+  async function handleCreateMenuCheck() {
+    setMenuNotice(null);
+    if (menuApp === "Others" && !menuUrl.trim()) {
+      setMenuNotice({ tone: "error", text: "Enter the website address first." });
+      return;
+    }
+    setMenuBusy(true);
+    try {
+      const r = await recordingsApi.createMenuCheck({
+        app_name: menuApp === "Others" ? "" : menuApp,
+        url: menuUrl,
+        recording_name: menuName,
+        menu_selector: menuSelector,
+        strict_hover: menuStrict,
+      });
+      setMenuNotice({ tone: "success", text: `Created "${r.name}" for ${r.target_url} - it is selected below. Click "Run recording" to check the menu.` });
+      setMenuUrl(""); setMenuName(""); setMenuSelector("");
+      await loadRecordings();
+      setSelectedRecFile(r.recording_file);
+    } catch (e) {
+      setMenuNotice({ tone: "error", text: e.detail || e.message });
+    } finally {
+      setMenuBusy(false);
+    }
+  }
 
-    return best_region
+  async function handleResetBaseline() {
+    if (!selectedRecFile) return;
+    if (!window.confirm("Forget the saved menu? The next run will save the menu as it is then, and compare later runs against that.")) return;
+    setBaselineBusy(true);
+    setBaselineNotice(null);
+    try {
+      await recordingsApi.resetMenuBaseline(selectedRecFile);
+      setBaselineNotice({ tone: "success", text: "Baseline cleared - the next run saves a new one." });
+      await loadRecordings();
+    } catch (e) {
+      setBaselineNotice({ tone: "error", text: e.detail || e.message });
+    } finally {
+      setBaselineBusy(false);
+    }
+  }
 
+  async function handleExport() {
+    if (!selectedRecording?.recording_id) return;
+    setExportBusy(true);
+    try { await recordingsApi.exportRecording(selectedRecording.recording_id); }
+    catch (e) { setRunError(e.detail || e.message); }
+    finally { setExportBusy(false); }
+  }
 
-# ---------------------------------------------------------------------------
-# Diagnosing "OCR will not start" - and a one-command self-check
-# ---------------------------------------------------------------------------
-# EasyOCR fails to start for four unrelated reasons that used to all get the
-# same message ("check your internet / model weights"), which sent people down
-# the wrong path - most often a PyTorch / torchvision mismatch ("operator
-# torchvision::nms does not exist"), which has nothing to do with the network.
-# explain_init_failure() tells them apart; run_self_check() lets an administrator
-# prove OCR works on a build or a PC before anyone depends on it:
-#     local_agent.exe --check-ocr          behave_worker.exe --check-ocr
+  async function handleImportPackage() {
+    if (!pkgImportFile) return;
+    setPkgImportBusy(true);
+    setPkgImportNotice(null);
+    try {
+      const r = await recordingsApi.importPackage(pkgImportFile);
+      setPkgImportNotice({ tone: "success", text: r.message || "Package imported successfully." });
+      setPkgImportFile(null);
+      await loadRecordings();
+    } catch (e) {
+      setPkgImportNotice({ tone: "error", text: e.detail || e.message });
+    } finally {
+      setPkgImportBusy(false);
+    }
+  }
 
-CPU_INDEX = "https://download.pytorch.org/whl/cpu"
+  return (
+    <div className="grid min-w-0 gap-4 lg:grid-cols-2">
+      <Panel>
+        <PanelHeader title="Run Saved Recording" description="Run, regenerate, import and manage saved recordings." />
+        <div className="space-y-4 px-5 py-5">
 
+          <Disclosure title="Delete recordings">
+            <div className="space-y-3">
+              <p className="text-xs text-muted">
+                Tick the recordings you no longer need and delete them. You can only delete recordings you created
+                (admins can delete any). Past execution reports are kept.
+              </p>
+              {deletable.length === 0 ? (
+                <Callout>You have no recordings you can delete.</Callout>
+              ) : (
+                <>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <Field label="Application">
+                      <Select value={delApp} onChange={(e) => setDelApp(e.target.value)}>
+                        {delApps.map((a) => <option key={a} value={a}>{a}</option>)}
+                      </Select>
+                    </Field>
+                    <Field label="Search by name or address">
+                      <TextInput value={delFilter} onChange={(e) => setDelFilter(e.target.value)} placeholder="e.g. test123" />
+                    </Field>
+                  </div>
+                  <Checkbox
+                    label={`Select all shown (${delShown.length})`}
+                    checked={allShownPicked}
+                    onChange={toggleShown}
+                  />
+                  <div className="max-h-64 overflow-auto rounded-sm border border-line">
+                    {delShown.length === 0 && <p className="px-3 py-4 text-center text-sm text-muted">Nothing matches.</p>}
+                    {delShown.map((r) => (
+                      <label key={r.file} className="flex cursor-pointer items-start gap-2 border-b border-line px-3 py-2 text-sm last:border-b-0 hover:bg-rail">
+                        <input
+                          type="checkbox" className="mt-1" checked={!!delPicked[r.file]}
+                          onChange={(e) => setDelPicked((prev) => {
+                            const next = { ...prev };
+                            if (e.target.checked) next[r.file] = true; else delete next[r.file];
+                            return next;
+                          })}
+                        />
+                        <span className="min-w-0">
+                          <span className="block break-words text-ink">{r.name}</span>
+                          <span className="block break-all text-xs text-muted">
+                            {r.application || "Others"} · {r.target_url} · {r.action_count} actions
+                          </span>
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                  <Button variant="secondary" onClick={handleDeleteRecordings} disabled={delBusy || !delPickedFiles.length} className="w-full">
+                    {delBusy ? "Deleting…" : `🗑 Delete selected (${delPickedFiles.length})`}
+                  </Button>
+                </>
+              )}
+              {delNotice && <Callout tone={delNotice.tone}>{delNotice.text}</Callout>}
+            </div>
+          </Disclosure>
 
-def _installed_versions() -> dict:
-    """Package versions read from metadata only - never by importing them,
-    because importing a broken torchvision is exactly what fails."""
-    from importlib import metadata
-    out = {}
-    for name in ("torch", "torchvision", "easyocr", "numpy", "opencv-python-headless", "Pillow"):
-        try:
-            out[name] = metadata.version(name)
-        except Exception:  # noqa: BLE001
-            out[name] = None
-    return out
+          <Disclosure title="Create a navigation menu check (no recording needed)">
+            <div className="space-y-3">
+              <p className="text-xs text-muted">
+                Checks every link in the site&apos;s menu - Personal Banking &gt; Accounts &gt; Saving Account and so on. On each
+                run it opens the menus with the mouse, clicks every link and verifies the page that opens. Nobody has
+                to hover or record anything.
+              </p>
+              <Field label="Application">
+                <Select value={menuApp} onChange={(e) => setMenuApp(e.target.value)}>
+                  {applicationNames.map((name) => (
+                    <option key={name} value={name}>{name}</option>
+                  ))}
+                  <option value="Others">Others</option>
+                </Select>
+              </Field>
+              {menuApp === "Others" && (
+                <Field label="Website address">
+                  <TextInput value={menuUrl} onChange={(e) => setMenuUrl(e.target.value)} placeholder="https://ca.statebank" />
+                </Field>
+              )}
+              <Field label="Name">
+                <TextInput value={menuName} onChange={(e) => setMenuName(e.target.value)} placeholder="Optional, e.g. Navbar regression" />
+              </Field>
+              <Field label="Menu selector" hint="Leave blank - the menu is found automatically. Fill in a CSS selector (e.g. nav or #main-menu) only if the wrong menu gets picked.">
+                <TextInput value={menuSelector} onChange={(e) => setMenuSelector(e.target.value)} placeholder="Optional" />
+              </Field>
+              <Checkbox label="Fail a link if its menu does not open on hover" checked={menuStrict} onChange={setMenuStrict} />
+              <Button variant="secondary" onClick={handleCreateMenuCheck} disabled={menuBusy} className="w-full">
+                {menuBusy ? "Creating..." : "Create menu check"}
+              </Button>
+              {menuNotice && <Callout tone={menuNotice.tone}>{menuNotice.text}</Callout>}
+            </div>
+          </Disclosure>
 
+          <Disclosure title="Import from a UiPath Excel sheet">
+            <div className="space-y-3">
+              <Field label="UiPath Excel file">
+                <input type="file" accept=".xlsx,.xls" onChange={(e) => handleImportFileChosen(e.target.files?.[0] || null)} className="block w-full text-sm text-ink" />
+              </Field>
+              {importSheetsLoading && <Spinner label="Reading Excel sheets..." />}
+              {importSheets && importSheets.length > 1 && (
+                <div className="space-y-2">
+                  <div className="text-sm font-medium text-ink">Sheets</div>
+                  {importSheets.map((sheet) => (
+                    <label key={sheet} className="flex items-center gap-2 text-sm">
+                      <input type="checkbox" checked={selectedSheets.includes(sheet)} onChange={() => toggleSheetSelection(sheet)} />
+                      {sheet}
+                    </label>
+                  ))}
+                </div>
+              )}
+              <Field label="Recording name">
+                <TextInput value={importName} onChange={(e) => setImportName(e.target.value)} placeholder="Optional recording name" />
+              </Field>
+              <Field label="Application">
+                <TextInput value={importAppName} onChange={(e) => setImportAppName(e.target.value)} placeholder="Optional application name" />
+              </Field>
+              <Button variant="secondary" onClick={handleImportUipath} disabled={!importFile || importBusy || importSheetsLoading} className="w-full">
+                {importBusy ? "Importing..." : "Import UiPath Excel"}
+              </Button>
+              {importNotice && <Callout tone={importNotice.tone}>{importNotice.text}</Callout>}
+            </div>
+          </Disclosure>
 
-def _split_version(v):
-    """'2.4.1+cpu' -> ('2.4.1', 'cpu'); '0.19.1' -> ('0.19.1', '')."""
-    base, _, tag = (v or "").partition("+")
-    return base, tag
+          <Disclosure title="Import recording package">
+            <div className="space-y-3">
+              <Field label="Recording package">
+                <input type="file" accept=".zip" onChange={(e) => setPkgImportFile(e.target.files?.[0] || null)} className="block w-full text-sm text-ink" />
+              </Field>
+              <Button variant="secondary" onClick={handleImportPackage} disabled={!pkgImportFile || pkgImportBusy} className="w-full">
+                {pkgImportBusy ? "Importing..." : "Import package"}
+              </Button>
+              {pkgImportNotice && <Callout tone={pkgImportNotice.tone}>{pkgImportNotice.text}</Callout>}
+            </div>
+          </Disclosure>
 
+          {recordingsError && <Callout tone="error">Could not load recordings: {recordingsError}</Callout>}
 
-def expected_torchvision(torch_version):
-    """The torchvision release that is built for a given torch release:
-    torch 2.N.P pairs with torchvision 0.(N+15).P (2.4.1 -> 0.19.1, 2.5.1 -> 0.20.1,
-    2.6.0 -> 0.21.0). None if the version can't be read."""
-    base, _ = _split_version(torch_version)
-    try:
-        major, minor, patch = (int(x) for x in (base.split(".") + ["0", "0"])[:3])
-    except ValueError:
-        return None
-    return f"0.{minor + 15}.{patch}" if major == 2 else None
+          {recordings.length === 0 ? (
+            <Callout>No saved recordings found yet. Record one in the "Record &amp; Generate" tab first.</Callout>
+          ) : (
+            <>
+              <Field label="Saved recording">
+                <Select value={selectedRecFile} onChange={(e) => setSelectedRecFile(e.target.value)}>
+                  {Object.entries(recordings.reduce((groups, r) => { const app = r.application || "Others"; groups[app] = groups[app] || []; groups[app].push(r); return groups; }, {}))
+                    .sort(([a], [b]) => a.localeCompare(b))
+                    .map(([app, recs]) => (
+                      <optgroup key={app} label={app}>
+                        {recs.map((r) => (
+                          <option key={r.file} value={r.file}>
+                            {r.name} — {r.target_url} ({r.action_count} actions)
+                            {r.migration_status && r.migration_status !== "NATIVE" && r.migration_status !== "UNKNOWN" ? ` [${r.migration_status}]` : ""}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                </Select>
+              </Field>
 
+              {selectedRecording && (
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs text-muted">
+                    {selectedRecording.is_owner ? "You own this recording." : selectedRecording.is_shared ? "Shared with you." : "Open to everyone (legacy recording)."}
+                  </span>
+                  <div className="ml-auto flex gap-2">
+                    {selectedRecording.recording_id && (
+                      <Link href={`/recordings/${selectedRecording.recording_id}`} className="inline-flex items-center px-4 py-2 text-sm font-medium text-signal-slate underline decoration-line underline-offset-4 hover:text-ink">
+                        View details →
+                      </Link>
+                    )}
+                    {selectedRecording.is_owner && <Button variant="ghost" onClick={() => setShareDialogOpen(true)}>Share</Button>}
+                    <Button variant="ghost" onClick={handleExport} disabled={exportBusy}>{exportBusy ? "Exporting..." : "Export"}</Button>
+                  </div>
+                </div>
+              )}
 
-def _mismatch_detail(versions: dict):
-    """Why the installed torch and torchvision cannot work together, or None if they look consistent."""
-    tv, tvv = versions.get("torch"), versions.get("torchvision")
-    if not tv or not tvv:
-        return None
-    want = expected_torchvision(tv)
-    (tv_base, tv_tag), (tvv_base, tvv_tag) = _split_version(tv), _split_version(tvv)
-    if want and tvv_base != want:
-        return f"torch {tv} is built to work with torchvision {want}, but torchvision {tvv} is installed"
-    if tv_tag != tvv_tag:
-        return (f"torch is the '{tv_tag or 'standard'}' build ({tv}) but torchvision is the "
-                f"'{tvv_tag or 'standard'}' build ({tvv}) - they came from different places")
-    return None
+              {shareDialogOpen && selectedRecording && (
+                <ShareDialog recordingId={selectedRecording.recording_id} recordingName={selectedRecording.name} onClose={() => setShareDialogOpen(false)} />
+              )}
 
+              {selectedRecording?.has_menu_check && (
+                <div className="space-y-2">
+                  <Callout>
+                    This is a navigation menu check.{" "}
+                    {selectedRecording.menu_baseline_count > 0
+                      ? `Baseline saved: ${selectedRecording.menu_baseline_count} menu links${selectedRecording.menu_baseline_saved_at ? ` (${selectedRecording.menu_baseline_saved_at} UTC)` : ""}. A link that disappears or points somewhere else is reported as failed.`
+                      : "No baseline yet - the first run saves the menu as it is, and later runs are compared against it."}
+                  </Callout>
+                  {selectedRecording.menu_baseline_count > 0 && (
+                    <Button variant="ghost" onClick={handleResetBaseline} disabled={baselineBusy}>
+                      {baselineBusy ? "Clearing..." : "Menu changed on purpose? Reset baseline"}
+                    </Button>
+                  )}
+                  {baselineNotice && <Callout tone={baselineNotice.tone}>{baselineNotice.text}</Callout>}
+                </div>
+              )}
 
-def explain_init_failure(exc: BaseException) -> str:
-    """A plain-English, actionable message for 'EasyOCR could not start', based on what
-    actually went wrong. Always ends with the original error so nothing is hidden."""
-    text = f"{type(exc).__name__}: {exc}"
-    low = text.lower()
-    v = _installed_versions()
-    versions = ", ".join(f"{k} {val}" for k, val in v.items() if val and k in ("torch", "torchvision", "easyocr", "numpy"))
-    versions = f" (installed: {versions})" if versions else ""
-    original = f" Original error: {text}"
+              <Checkbox label="headless" checked={runHeadless} onChange={setRunHeadless} />
 
-    if "torchvision" in low and any(k in low for k in ("does not exist", "undefined symbol", "could not load this library", "nms", "torchvision._c")) \
-            or "operator torchvision" in low:
-        detail = _mismatch_detail(v)
-        want = expected_torchvision(v.get("torch"))
-        pair = (f"torch=={_split_version(v['torch'])[0]} torchvision=={want}" if want and v.get("torch")
-                else "torch==2.4.1 torchvision==0.19.1")
-        fix = f"pip uninstall -y torch torchvision, then pip install {pair} --index-url {CPU_INDEX}"
-        return (
-            "OCR cannot start because PyTorch and torchvision do not match each other"
-            + (f": {detail}" if detail else "") + f"{versions}. This is a setup problem on the machine that built or runs "
-            "the agent - it is NOT a network or model-file problem. Fix: install the two TOGETHER, from the same source, "
-            f"in the Python environment that builds the agent ({fix}), then rebuild local_agent.exe and behave_worker.exe. "
-            "Check it with: local_agent.exe --check-ocr." + original
-        )
-    if "numpy" in low and any(k in low for k in ("compiled using numpy", "multiarray failed", "_array_api", "numpy 1.x", "numpy 2")):
-        return ("OCR cannot start because the installed NumPy is too new or too old for the installed PyTorch"
-                f"{versions}. Install a NumPy that matches your PyTorch (for torch before 2.3 use numpy<2), "
-                "then rebuild the agent. Check with: local_agent.exe --check-ocr." + original)
-    if isinstance(exc, ImportError) and not isinstance(exc, OSError) and any(
-            k in low for k in ("easyocr", "torch", "cv2", "no module named")):
-        return ("OCR support is not part of this installation (a required package is missing)"
-                f"{versions}. The agent must be built with EasyOCR, PyTorch and torchvision installed "
-                "(see local_agent/requirements-agent.txt)." + original)
-    if "winerror 126" in low or "winerror 127" in low or "winerror 1114" in low or "dll load failed" in low:
-        return ("OCR cannot start because a Windows system library could not be loaded"
-                f"{versions}. Install the 'Microsoft Visual C++ Redistributable (x64)' on this PC, "
-                "or ask your administrator to rebuild the agent." + original)
-    if any(k in low for k in ("urlopen", "max retries", "connection", "timed out", "getaddrinfo", "ssl", "name resolution", "unreachable")):
-        return ("OCR cannot start because EasyOCR could not download its model files and there is no internet "
-                "access. Copy an already-populated ~/.EasyOCR/model/ folder from a PC where OCR has worked, or set "
-                "EASYOCR_MODULE_PATH to a pre-staged model folder shipped with the installer." + original)
-    return (f"EasyOCR could not initialize{versions}. Run local_agent.exe --check-ocr for a full report. "
-            "If this PC has no internet access, EasyOCR's model files must be pre-staged (copy ~/.EasyOCR/model/ "
-            "from a PC where OCR has worked, or set EASYOCR_MODULE_PATH)." + original)
+              <Button onClick={handleRun} disabled={runBusy} className="w-full">
+                {runBusy ? "Running..." : "Run recording"}
+              </Button>
 
+              {validation && <ValidationReport report={validation} onFix={handleFix} busy={validating} />}
+              {job && (
+                <ExecutionProgress
+                  job={job}
+                  connectionLost={connectionLost}
+                  busyAction={controlBusy}
+                  onPause={() => controlJob("pause")}
+                  onResume={() => controlJob("resume")}
+                  onCancel={() => controlJob("cancel")}
+                />
+              )}
+              {runBusy && !job && <Spinner label="Starting..." />}
+              {job && job.job_id && (
+                <ExecutionDetails job={job} hideAssertions hideRerunExport />
+              )}
+              {runError && <Callout tone="error">Run failed: {runError}</Callout>}
 
-def _selfcheck_png() -> bytes:
-    from PIL import Image, ImageDraw, ImageFont
-    img = Image.new("RGB", (560, 150), "white")
-    font = None
-    for name in ("arial.ttf", "DejaVuSans.ttf", "LiberationSans-Regular.ttf"):
-        try:
-            font = ImageFont.truetype(name, 64)
-            break
-        except Exception:  # noqa: BLE001
-            continue
-    if font is None:
-        try:
-            font = ImageFont.load_default(size=64)
-        except TypeError:
-            font = ImageFont.load_default()
-    ImageDraw.Draw(img).text((24, 36), "OCR OK 4821", fill="black", font=font)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+              <div className="border-t border-line pt-4">
+                <Button variant="secondary" onClick={handleRegenerate} disabled={regenBusy} className="w-full">
+                  {regenBusy ? "Regenerating..." : "Regenerate (no run)"}
+                </Button>
+                <p className="mt-1.5 text-xs text-muted">
+                  Refreshes this recording's generated feature/steps/page files from the latest generator code - without re-recording or running anything. Useful right after a code/template fix.
+                </p>
+                {regenNotice && <div className="mt-2"><Callout tone={regenNotice.tone}>{regenNotice.text}</Callout></div>}
+                {regenFiles && (
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {[
+                      { path: regenFiles.feature_file, label: "Feature file" },
+                      { path: regenFiles.steps_file, label: "Steps (.py)" },
+                      { path: regenFiles.page_file, label: "Page object (.py)" },
+                      { path: regenFiles.locators_file, label: "Locators (.json)" },
+                    ].map(({ path, label }) =>
+                      path && (
+                        <button key={path} type="button"
+                          className="rounded-sm border border-line bg-panel px-2.5 py-1 text-xs font-medium text-brand-blue hover:border-brand-blue/40 disabled:opacity-40"
+                          disabled={downloadingRegen === path}
+                          onClick={() => handleDownloadRegenFile(path, label)}>
+                          {downloadingRegen === path ? "Downloading..." : `⬇ ${label}`}
+                        </button>
+                      )
+                    )}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      </Panel>
 
+      <div className="min-w-0 space-y-4">
+        {selectedRecFile && (
+          <Panel>
+            <div className="flex items-center justify-between border-b border-line px-5 py-4">
+              <div>
+                <h2 className="text-sm font-semibold text-ink">Test data</h2>
+                <p className="mt-0.5 text-xs text-muted">The values this recording types/selects when it runs. Edit anything below, then hit <strong>Run recording</strong>.</p>
+              </div>
+              {testData.length > 0 && (
+                <Button variant="secondary" onClick={saveTestDataOnly} disabled={savingData}>
+                  {savingData ? "Saving..." : "Save without running"}
+                </Button>
+              )}
+            </div>
+            <div className="px-5 py-4">
+              {testDataLoading && <Spinner label="Loading test data..." />}
+              {testDataError && <Callout tone="error">{testDataError}</Callout>}
+              {saveDataError && <Callout tone="error">{saveDataError}</Callout>}
+              {saveDataNotice && <Callout tone="success">{saveDataNotice}</Callout>}
+              {!testDataLoading && !testDataError && testData.length === 0 && (
+                <p className="text-sm text-muted">This recording has no typed or selected values to edit.</p>
+              )}
+              {testData.length > 0 && (
+                <DataTable
+                  columns={[{ key: "label", label: "Field" }, { key: "action", label: "Type", mono: true }, { key: "value", label: "Value" }]}
+                  rows={testData.map((f) => ({
+                    label: f.label, action: f.action,
+                    value: <TextInput value={editValues[f.index] ?? ""} onChange={(e) => updateValue(f.index, e.target.value)} />,
+                  }))}
+                />
+              )}
+            </div>
+          </Panel>
+        )}
 
-def run_self_check() -> int:
-    """`local_agent.exe --check-ocr` / `behave_worker.exe --check-ocr`: prints what is installed,
-    reads a generated test image, and says PASS or FAIL with the reason. Exit code 0 = OCR works."""
-    import sys
-    import time
-    v = _installed_versions()
-    print("AI Test Recorder - OCR self-check")
-    print(f"  Python {sys.version.split()[0]}  ({'packaged build' if getattr(sys, 'frozen', False) else 'running from source'})")
-    for name in ("torch", "torchvision", "easyocr", "numpy", "opencv-python-headless", "Pillow"):
-        print(f"  {name:<24}{v.get(name) or 'NOT INSTALLED'}")
-    detail = _mismatch_detail(v)
-    if detail:
-        print(f"  !! torch/torchvision mismatch: {detail}")
-    model_dir = _staged_model_dir() or os.path.join(os.path.expanduser("~"), ".EasyOCR", "model")
-    n = len([f for f in os.listdir(model_dir) if f.endswith(".pth")]) if os.path.isdir(model_dir) else 0
-    print(f"  model files            {n} found in {model_dir}" + ("" if n else "  (will be downloaded on first use - needs internet)"))
-    print("Reading a test image (the first run can take a minute while models load)...")
-    started = time.time()
-    try:
-        text = extract_text_from_png_bytes(_selfcheck_png())
-    except Exception as e:  # noqa: BLE001
-        print(f"\nRESULT: FAIL\n{e}")
-        return 1
-    ok = "4821" in text.replace(" ", "")
-    print(f"\nRESULT: {'PASS' if ok else 'FAIL'} - read \"{text}\" in {time.time() - started:.1f}s"
-          + ("" if ok else " (expected it to contain 4821)"))
-    return 0 if ok else 1
+        {selectedRecFile && <StepEditor recordingFile={selectedRecFile} onSaved={() => loadTestData(selectedRecFile)} />}
+        {selectedRecording?.recording_id && <VersionHistory recordingId={selectedRecording.recording_id} />}
+        {report && <ReportView key={report.transaction_id} report={report} />}
+        {!selectedRecFile && (
+          <Panel><div className="px-5 py-10 text-center text-sm text-muted">Pick a saved recording to review its test data and run it.</div></Panel>
+        )}
+      </div>
+    </div>
+  );
+}
