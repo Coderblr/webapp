@@ -1,775 +1,209 @@
-import { useEffect, useRef, useState } from "react";
-import { api } from "@/lib/api";
-import { recordingsApi, executionsApi, transactionsApi } from "@/lib/api";
-import ExecutionProgress from "@/components/ExecutionProgress";
-import ExecutionDetails from "@/components/ExecutionDetails";
-import ValidationReport from "@/components/ValidationReport";
-import { errorDetail, validateApi } from "@/lib/platformApi";
-import ReportView from "@/components/ReportView";
-import StepEditor from "@/components/StepEditor";
-import ShareDialog from "@/components/ShareDialog";
-import VersionHistory from "@/components/VersionHistory";
-import Link from "next/link";
-import { useAuth } from "@/context/AuthContext";
-import {
-  Button,
-  Callout,
-  Checkbox,
-  DataTable,
-  Disclosure,
-  Field,
-  Panel,
-  Select,
-  Spinner,
-  TextInput,
-} from "@/components/ui";
+import { useCallback, useEffect, useState } from "react";
+import { transactionsApi } from "@/lib/api";
+import { errorDetail, insightApi } from "@/lib/platformApi";
+import { Tabs } from "@/components/Tabs";
+import LiveTextPanel from "@/components/LiveTextPanel";
+import { Button, Callout, Spinner, TextInput } from "@/components/ui";
 
-function PanelHeader({ title, description }) {
+const ACTIVE = ["queued", "generating", "starting", "running", "pausing", "paused", "collecting", "reporting"];
+const FILTERS = [["all", "All"], ["failures", "Failures"], ["warnings", "Warnings"], ["slow", "Slow"], ["retried", "Retried"]];
+
+function Screenshot({ job, name }) {
+  const [state, setState] = useState({});
+  async function open() {
+    setState({ loading: true });
+    try {
+      const txn = await transactionsApi.get(job.transaction_id);
+      const url = await transactionsApi.fetchImageDataUrl(txn.transaction_id, name, txn.screenshots_folder);
+      setState({ url });
+    } catch (e) { setState({ error: e.detail || e.message }); }
+  }
+  if (state.url) return <img src={state.url} alt={`Screenshot ${name}`} className="max-h-72 rounded-sm border border-line" />;
+  return <span><button className="text-xs underline" disabled={state.loading || !job.transaction_id} onClick={open}>{state.loading ? "Loading..." : "Show screenshot"}</button>
+    {state.error && <span className="ml-2 text-xs text-signal-rust">{state.error}</span>}</span>;
+}
+
+function Timeline({ job }) {
+  const [filter, setFilter] = useState("all");
+  const [data, setData] = useState(null);
+  const [open, setOpen] = useState({});
+  const [evidence, setEvidence] = useState({});
+  const [error, setError] = useState(null);
+  const active = ACTIVE.includes(job.status);
+
+  const load = useCallback(() => {
+    insightApi.timeline(job.job_id, { filter, limit: 300 }).then((d) => { setData(d); setError(null); }).catch((e) => setError(e.detail || e.message));
+  }, [job.job_id, filter]);
+  useEffect(() => { load(); if (!active) return undefined; const t = setInterval(load, 3000); return () => clearInterval(t); }, [load, active]);
+  useEffect(() => {
+    if (!Object.values(open).some(Boolean) || evidence.loaded) return;
+    insightApi.evidence(job.job_id).then((r) => setEvidence({ loaded: true, by: Object.fromEntries(r.evidence.map((e) => [e.step_index, e])) })).catch(() => {});
+  }, [open, job.job_id, evidence.loaded]);
+
+  if (error) return <Callout tone="error">{error}</Callout>;
+  if (!data) return <Spinner label="Loading timeline..." />;
   return (
-    <div className="border-b border-line px-5 py-4">
-      <h2 className="text-sm font-semibold text-ink">{title}</h2>
-      {description && <p className="mt-0.5 text-xs text-muted">{description}</p>}
+    <div className="space-y-3">
+      <div className="flex flex-wrap gap-1 text-xs">
+        {FILTERS.map(([k, label]) => (
+          <button key={k} onClick={() => setFilter(k)} className={`rounded-sm border px-2 py-0.5 ${filter === k ? "border-brand-blue bg-brand-blueLight text-ink" : "border-line text-muted hover:text-ink"}`}>{label}</button>
+        ))}
+        <span className="ml-auto text-muted">{data.total} step(s)</span>
+      </div>
+      {data.rows.length === 0 && <p className="text-sm text-muted">No steps match this filter.</p>}
+      <ol className="divide-y divide-line rounded-sm border border-line bg-panel">
+        {data.rows.map((r) => {
+          const ev = evidence.by && evidence.by[r.step];
+          return (
+            <li key={r.step}>
+              <button onClick={() => setOpen({ ...open, [r.step]: !open[r.step] })} className="flex w-full items-center gap-3 px-3 py-2 text-left hover:bg-rail">
+                <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${r.status === "failed" ? "bg-signal-rust" : r.slow || r.retries ? "bg-signal-amber" : "bg-signal-teal"}`} />
+                <span className="w-8 shrink-0 font-mono text-xs text-muted">{r.step}</span>
+                <span className="min-w-0 flex-1 truncate text-sm text-ink">
+                  {r.workflow_path.length > 0 && <span className="mr-1 text-xs text-muted">[{r.workflow_path.join(" › ")}]</span>}
+                  {r.label || r.name}
+                </span>
+                {r.retries > 0 && <span className="text-xs text-signal-amber">retried {r.retries}×</span>}
+                {r.slow && <span className="text-xs text-signal-amber">slow</span>}
+                {r.side_effect && <span className="text-[10px] uppercase text-muted" title="This step can change data">changes data</span>}
+                <span className="w-16 shrink-0 text-right font-mono text-xs text-muted">{r.duration == null ? "" : `${r.duration.toFixed(2)}s`}</span>
+              </button>
+              {open[r.step] && (
+                <div className="space-y-2 border-t border-line bg-rail px-4 py-3 text-sm">
+                  <div className="text-xs text-muted">{r.name}</div>
+                  {r.error && <pre className="whitespace-pre-wrap rounded-sm bg-[#FBEEEA] p-2 text-xs text-signal-rust">{r.error}</pre>}
+                  {r.assertion && r.assertion.status === "fail" && (
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      <div><div className="text-[11px] font-semibold uppercase text-muted">Expected</div><pre className="whitespace-pre-wrap rounded-sm bg-white p-2 text-xs">{String(r.assertion.expected)}</pre></div>
+                      <div><div className="text-[11px] font-semibold uppercase text-muted">Actual</div><pre className="whitespace-pre-wrap rounded-sm bg-white p-2 text-xs">{String(r.assertion.actual)}</pre></div>
+                      {r.assertion.diff && <pre className="whitespace-pre-wrap rounded-sm bg-white p-2 text-xs sm:col-span-2">{r.assertion.diff}</pre>}
+                    </div>
+                  )}
+                  {r.retry_log.length > 0 && (
+                    <div><div className="text-[11px] font-semibold uppercase text-muted">Retries</div>
+                      <ul className="text-xs text-muted">{r.retry_log.map((x, i) => <li key={i}>attempt {x.attempt}: {x.error_type} - {x.error}</li>)}</ul></div>
+                  )}
+                  {r.screenshot && <Screenshot job={job} name={r.screenshot} />}
+                  {ev && (
+                    <div className="space-y-1 text-xs">
+                      <div className="text-[11px] font-semibold uppercase text-muted">Evidence</div>
+                      <div>Page: {ev.url}</div>
+                      {ev.console.length > 0 && <pre className="whitespace-pre-wrap rounded-sm bg-white p-2">{ev.console.map((c) => `${c.type}: ${c.text}`).join("\n")}</pre>}
+                      {[...ev.failed_requests, ...ev.http_errors].length > 0 && <pre className="whitespace-pre-wrap rounded-sm bg-white p-2">{[...ev.failed_requests, ...ev.http_errors].map((x) => `${x.method} ${x.url} ${x.status || x.failure || ""}`).join("\n")}</pre>}
+                      {ev.dom && <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded-sm bg-white p-2">{ev.dom}</pre>}
+                    </div>
+                  )}
+                  {r.action_id && <div className="text-[10px] text-muted">step id {r.action_id}</div>}
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ol>
     </div>
   );
 }
 
-export default function RunSavedTab() {
-  const { user } = useAuth();
-  const [recordings, setRecordings] = useState([]);
-  const [recordingsError, setRecordingsError] = useState(null);
-  const [selectedRecFile, setSelectedRecFile] = useState("");
-  const [applicationNames, setApplicationNames] = useState([]);
-  const [runHeadless, setRunHeadless] = useState(false);
-  const [testData, setTestData] = useState([]);
-  const [testDataLoading, setTestDataLoading] = useState(false);
-  const [testDataError, setTestDataError] = useState(null);
-  const [editValues, setEditValues] = useState({});
-  const [savingData, setSavingData] = useState(false);
-  const [saveDataNotice, setSaveDataNotice] = useState(null);
-  const [saveDataError, setSaveDataError] = useState(null);
-  const [runBusy, setRunBusy] = useState(false);
-  const [runError, setRunError] = useState(null);
-  const [report, setReport] = useState(null);
-  const [job, setJob] = useState(null);                 // the background execution being watched
-  const [connectionLost, setConnectionLost] = useState(false);
-  const [controlBusy, setControlBusy] = useState(null);
-  const pollToken = useRef(0);                          // bumping this stops an older polling loop
-  const [validation, setValidation] = useState(null);       // the pre-run readiness report
-  const [validating, setValidating] = useState(false);
-  const [regenBusy, setRegenBusy] = useState(false);
-  const [regenNotice, setRegenNotice] = useState(null);
-  const [regenFiles, setRegenFiles] = useState(null);
-  const [downloadingRegen, setDownloadingRegen] = useState(null);
-  const [importBusy, setImportBusy] = useState(false);
-  const [importNotice, setImportNotice] = useState(null);
-  const [importFile, setImportFile] = useState(null);
-  const [importName, setImportName] = useState("");
-  const [importAppName, setImportAppName] = useState("");
-  const [importSheets, setImportSheets] = useState(null);
-  const [importSheetsLoading, setImportSheetsLoading] = useState(false);
-  const [selectedSheets, setSelectedSheets] = useState([]);
-  const [shareDialogOpen, setShareDialogOpen] = useState(false);
-  const [exportBusy, setExportBusy] = useState(false);
-  const [pkgImportFile, setPkgImportFile] = useState(null);
-  const [pkgImportBusy, setPkgImportBusy] = useState(false);
-  const [pkgImportNotice, setPkgImportNotice] = useState(null);
-  // "Create a navigation menu check" form + the selected check's baseline.
-  const [menuApp, setMenuApp] = useState("Others");
-  const [menuUrl, setMenuUrl] = useState("");
-  const [menuName, setMenuName] = useState("");
-  const [menuSelector, setMenuSelector] = useState("");
-  const [menuStrict, setMenuStrict] = useState(false);
-  const [menuBusy, setMenuBusy] = useState(false);
-  const [menuNotice, setMenuNotice] = useState(null);
-  const [baselineBusy, setBaselineBusy] = useState(false);
-  // "Delete recordings" panel
-  const [delApp, setDelApp] = useState("All");
-  const [delFilter, setDelFilter] = useState("");
-  const [delPicked, setDelPicked] = useState({});      // file -> true
-  const [delBusy, setDelBusy] = useState(false);
-  const [delNotice, setDelNotice] = useState(null);
-  const [baselineNotice, setBaselineNotice] = useState(null);
+function Assertions({ job }) {
+  const [rows, setRows] = useState(null);
+  useEffect(() => { insightApi.assertions(job.job_id).then((r) => setRows(r.assertions)).catch(() => setRows([])); }, [job.job_id, job.status]);
+  if (!rows) return <Spinner label="Loading..." />;
+  if (!rows.length) return <p className="text-sm text-muted">This run has no assertions. Add one in the recording editor to check what the application shows.</p>;
+  return (
+    <table className="w-full text-sm">
+      <thead><tr className="border-b border-line text-left text-xs uppercase text-muted"><th className="py-2 pr-3">Check</th><th className="pr-3">Result</th><th className="pr-3">Expected</th><th>Actual</th></tr></thead>
+      <tbody>{rows.map((a, i) => (
+        <tr key={i} className="border-b border-line align-top last:border-0">
+          <td className="py-2 pr-3"><div className="font-medium">{a.name}</div><div className="text-xs text-muted">{a.assertion_type} · step {a.step_index}</div></td>
+          <td className={`pr-3 font-semibold ${a.status === "pass" ? "text-signal-tealDark" : "text-signal-rust"}`}>{a.status}{a.reason ? <div className="text-xs font-normal text-muted">{a.reason}</div> : null}</td>
+          <td className="pr-3"><pre className="max-w-xs whitespace-pre-wrap text-xs">{String(a.expected)}</pre></td>
+          <td><pre className="max-w-xs whitespace-pre-wrap text-xs">{String(a.actual)}</pre>{a.diff && <pre className="mt-1 whitespace-pre-wrap rounded-sm bg-rail p-1 text-[11px]">{a.diff}</pre>}</td>
+        </tr>))}</tbody>
+    </table>
+  );
+}
 
-  const selectedRecording = recordings.find((r) => r.file === selectedRecFile) || null;
+function RerunExport({ job, onRerun }) {
+  const [analysis, setAnalysis] = useState(null);
+  const [error, setError] = useState(null);
+  const [ack, setAck] = useState("");
+  const [busy, setBusy] = useState(false);
+  const active = ACTIVE.includes(job.status);
 
-  async function loadRecordings() {
+  async function check() {
+    setBusy(true); setError(null);
+    try { setAnalysis(await insightApi.rerunAnalysis(job.job_id)); } catch (e) { setError(e.detail || e.message); } finally { setBusy(false); }
+  }
+  async function go(mode) {
+    setBusy(true); setError(null);
     try {
-      const r = await api.getRecordings();
-      setRecordings(r);
-      setRecordingsError(null);
-      if (r.length && !selectedRecFile) setSelectedRecFile(r[0].file);
-    } catch (e) {
-      setRecordingsError(e.detail || e.message);
-    }
-  }
-
-  useEffect(() => {
-    loadRecordings();
-    api.getApplications().then((r) => setApplicationNames(r.applications || [])).catch(() => {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  async function loadTestData(file) {
-    setTestDataLoading(true);
-    setTestDataError(null);
-    setSaveDataNotice(null);
-    setSaveDataError(null);
-    try {
-      const data = await api.getRecordingTestData(file);
-      setTestData(data.fields);
-      setEditValues(Object.fromEntries(data.fields.map((f) => [f.index, f.value])));
-    } catch (e) {
-      setTestData([]);
-      setEditValues({});
-      setTestDataError(e.detail || e.message);
-    } finally {
-      setTestDataLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    setReport(null);
-    setRegenNotice(null);
-    setRegenFiles(null);
-    setBaselineNotice(null);
-    if (selectedRecFile) loadTestData(selectedRecFile);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedRecFile]);
-
-  function updateValue(index, value) {
-    setEditValues((prev) => ({ ...prev, [index]: value }));
-    setSaveDataNotice(null);
-  }
-
-  async function saveTestDataOnly() {
-    setSavingData(true);
-    setSaveDataError(null);
-    setSaveDataNotice(null);
-    try {
-      const data = await api.updateRecordingTestData(selectedRecFile, editValues);
-      setTestData(data.fields);
-      setSaveDataNotice("Test data saved - future runs of this recording will use these values too.");
-    } catch (e) {
-      setSaveDataError(e.detail || e.message);
-    } finally {
-      setSavingData(false);
-    }
-  }
-
-  // Polls a background execution until it ends. A failed poll (server restart,
-  // network blip) never ends the run - it only shows "lost contact" and retries
-  // with a growing delay, because the test itself lives on the agent.
-  async function watchJob(jobId) {
-    const token = ++pollToken.current;
-    let delay = 1500;
-    let failures = 0;
-    for (;;) {
-      if (token !== pollToken.current) return;
-      try {
-        const j = await executionsApi.get(jobId);
-        if (token !== pollToken.current) return;
-        setJob(j);
-        setConnectionLost(false);
-        failures = 0;
-        delay = 1500;
-        if (["completed", "cancelled", "failed", "interrupted", "requires_investigation"].includes(j.status)) {
-          if (j.transaction_id) {
-            try {
-              setReport(await transactionsApi.get(j.transaction_id));
-            } catch (e) {
-              setRunError(`The run ended but its report could not be loaded: ${e?.detail || e?.message}`);
-            }
-          } else if (j.message) {
-            setRunError(j.message);
-          }
-          setRunBusy(false);
-          if (selectedRecording?.has_menu_check) loadRecordings();
-          return;
-        }
-      } catch (e) {
-        if (e?.status === 404) {                        // the job is gone (cleaned up) - stop watching
-          setRunError("This execution is no longer available.");
-          setRunBusy(false);
-          return;
-        }
-        failures += 1;
-        if (failures >= 2) setConnectionLost(true);
-        delay = Math.min(delay * 1.5, 10000);
-      }
-      await new Promise((r) => setTimeout(r, delay));
-    }
-  }
-
-  useEffect(() => { setValidation(null); }, [selectedRecFile]);
-
-  async function handleFix(item) {
-    setValidating(true);
-    try {
-      await validateApi.fix(selectedRecFile, item.fix);
-      await loadRecordings();
-      setValidation(await validateApi.run(selectedRecFile, { check_environment: validation?.coverage?.environment }));
-    } catch (e) {
-      setRunError(e?.detail || e?.message || "That fix could not be applied.");
-    } finally {
-      setValidating(false);
-    }
-  }
-
-  // Re-attach to a run that is still going after a page reload / navigation.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const r = await executionsApi.list({ limit: 5 });
-        const active = (r.items || []).find((j) =>
-          ["queued", "generating", "starting", "running", "pausing", "paused", "collecting", "reporting"].includes(j.status));
-        if (active && !cancelled) {
-          setRunBusy(true);
-          setJob(active);
-          watchJob(active.job_id);
-        }
-      } catch (e) { /* not fatal - the user can still start a run */ }
-    })();
-    return () => { cancelled = true; pollToken.current += 1; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  async function handleRun() {
-    if (!selectedRecFile) return;
-    setRunError(null);
-    setReport(null);
-    setJob(null);
-    setRunBusy(true);
-    try {
-      if (testData.length > 0) await api.updateRecordingTestData(selectedRecFile, editValues);
-      const started = await executionsApi.start(selectedRecFile, runHeadless, "auto");
-      setJob({ job_id: started.job_id, status: started.status, progress: {}, metrics: {} });
-      watchJob(started.job_id);
+      const r = await insightApi.rerun(job.job_id, { mode, acknowledge: ack });
+      onRerun && onRerun(r.job_id);
     } catch (e) {
       const d = errorDetail(e);
-      if (d && d.code === "validation_failed" && d.validation) {
-        // The server refused to start: show the same report the Validate button shows.
-        setValidation({ can_run: false, counts: d.validation.counts, items: d.validation.items, notice: d.validation.notice,
-                        coverage: { static: true, environment: false, application_flow: false } });
-      }
-      setRunError(e?.detail || e?.message || "Execution failed.");
-      setRunBusy(false);
-    }
+      setError(d && d.code === "manual_verification_required" ? "Type the confirmation sentence exactly to run this again." : e.detail || e.message);
+    } finally { setBusy(false); }
   }
-
-  async function controlJob(action) {
-    if (!job) return;
-    setControlBusy(action);
-    try {
-      await executionsApi[action](job.job_id);
-    } catch (e) {
-      setRunError(e?.detail || e?.message || `Unable to ${action} the execution.`);
-    } finally {
-      setControlBusy(null);
-    }
-  }
-
-  async function handleRegenerate() {
-    if (!selectedRecFile) return;
-    setRegenNotice(null);
-    setRegenFiles(null);
-    setRegenBusy(true);
-    try {
-      const r = await recordingsApi.regenerate(selectedRecFile);
-      setRegenNotice({
-        tone: "success",
-        text: `Regenerated (${r.build_result.step_count} steps) - download the scripts below, or just run this recording, which already uses the current code either way.`,
-      });
-      setRegenFiles({
-        feature_file: r.build_result.feature_file,
-        steps_file: r.build_result.steps_file,
-        page_file: r.build_result.page_file,
-        locators_file: r.build_result.locators_file,
-      });
-    } catch (e) {
-      setRegenNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setRegenBusy(false);
-    }
-  }
-
-  async function handleDownloadRegenFile(path, label) {
-    setDownloadingRegen(path);
-    try {
-      await recordingsApi.downloadRegeneratedFile(path);
-    } catch (e) {
-      setRegenNotice({ tone: "error", text: `Could not download ${label}: ${e.detail || e.message}` });
-    } finally {
-      setDownloadingRegen(null);
-    }
-  }
-
-  async function handleImportFileChosen(file) {
-    setImportFile(file);
-    setImportNotice(null);
-    setImportSheets(null);
-    setSelectedSheets([]);
-    if (!file) return;
-    setImportSheetsLoading(true);
-    try {
-      const r = await recordingsApi.listUipathSheets(file);
-      if (r.sheets.length > 1) { setImportSheets(r.sheets); setSelectedSheets(r.sheets); }
-      else setImportSheets([]);
-    } catch (e) {
-      setImportNotice({ tone: "error", text: e.detail || e.message });
-      setImportFile(null);
-    } finally {
-      setImportSheetsLoading(false);
-    }
-  }
-
-  function toggleSheetSelection(sheetName) {
-    setSelectedSheets((prev) => prev.includes(sheetName) ? prev.filter((s) => s !== sheetName) : [...prev, sheetName]);
-  }
-
-  async function handleImportUipath() {
-    if (!importFile) return;
-    if (importSheets && importSheets.length > 0 && selectedSheets.length === 0) {
-      setImportNotice({ tone: "error", text: 'Select at least one sheet to import, or use "Select all".' });
-      return;
-    }
-    setImportNotice(null);
-    setImportBusy(true);
-    try {
-      const r = await recordingsApi.importUipathExcel(importFile, importName, selectedSheets.length ? selectedSheets : undefined, importAppName);
-      const succeeded = r.results.filter((res) => !res.error);
-      const failed = r.results.filter((res) => res.error);
-      const totalWarnings = succeeded.reduce((n, res) => n + res.warnings.length, 0);
-      const parts = [];
-      if (succeeded.length) {
-        const label = succeeded.length === 1 ? "1 recording" : `${succeeded.length} recordings`;
-        parts.push(`Imported ${label} from ${importFile.name}${totalWarnings ? ` (${totalWarnings} warning${totalWarnings > 1 ? "s" : ""} - check each recording's steps)` : ""}.`);
-      }
-      if (failed.length) parts.push(`${failed.length} sheet${failed.length > 1 ? "s" : ""} could not be imported: ` + failed.map((f) => `${f.sheet_name || "sheet"} (${f.error})`).join("; ") + ".");
-      setImportNotice({ tone: failed.length && !succeeded.length ? "error" : failed.length || totalWarnings ? "warning" : "success", text: parts.join(" ") });
-      setImportFile(null); setImportName(""); setImportSheets(null); setSelectedSheets([]); setImportAppName("");
-      await loadRecordings();
-      if (succeeded.length) setSelectedRecFile(succeeded[0].recording_file);
-    } catch (e) {
-      setImportNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setImportBusy(false);
-    }
-  }
-
-  // ---- delete recordings -------------------------------------------------
-  const deletable = recordings.filter((r) => r.can_delete);
-  const delApps = ["All", ...Array.from(new Set(deletable.map((r) => r.application || "Others"))).sort()];
-  const delShown = deletable.filter(
-    (r) =>
-      (delApp === "All" || (r.application || "Others") === delApp) &&
-      `${r.name} ${r.target_url || ""}`.toLowerCase().includes(delFilter.trim().toLowerCase()),
-  );
-  const delPickedFiles = Object.keys(delPicked).filter((f) => delPicked[f]);
-  const allShownPicked = delShown.length > 0 && delShown.every((r) => delPicked[r.file]);
-
-  function toggleShown(on) {
-    setDelPicked((prev) => {
-      const next = { ...prev };
-      delShown.forEach((r) => { if (on) next[r.file] = true; else delete next[r.file]; });
-      return next;
-    });
-  }
-
-  async function handleDeleteRecordings() {
-    if (!delPickedFiles.length) return;
-    const names = deletable.filter((r) => delPicked[r.file]).map((r) => `  • ${r.name}`).slice(0, 12);
-    const more = delPickedFiles.length > names.length ? `\n  …and ${delPickedFiles.length - names.length} more` : "";
-    if (!window.confirm(
-      `Permanently delete ${delPickedFiles.length} recording(s)?\n\n${names.join("\n")}${more}\n\n` +
-      "This cannot be undone. Past execution reports are kept.",
-    )) return;
-    setDelBusy(true);
-    setDelNotice(null);
-    try {
-      const r = await recordingsApi.deleteRecordings(delPickedFiles);
-      const gone = new Set(r.deleted.map((d) => d.file));
-      setDelPicked({});
-      if (gone.has(selectedRecFile)) setSelectedRecFile("");
-      setReport(null);
-      const list = await api.getRecordings();
-      setRecordings(list);
-      if (gone.has(selectedRecFile)) setSelectedRecFile(list[0]?.file || "");
-      setDelNotice({
-        tone: r.failed.length ? "error" : "success",
-        text:
-          `Deleted ${r.deleted.length} recording(s).` +
-          (r.failed.length ? ` ${r.failed.length} could not be deleted: ` + r.failed.map((f) => f.reason).join("; ") : ""),
-      });
-    } catch (e) {
-      setDelNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setDelBusy(false);
-    }
-  }
-
-  async function handleCreateMenuCheck() {
-    setMenuNotice(null);
-    if (menuApp === "Others" && !menuUrl.trim()) {
-      setMenuNotice({ tone: "error", text: "Enter the website address first." });
-      return;
-    }
-    setMenuBusy(true);
-    try {
-      const r = await recordingsApi.createMenuCheck({
-        app_name: menuApp === "Others" ? "" : menuApp,
-        url: menuUrl,
-        recording_name: menuName,
-        menu_selector: menuSelector,
-        strict_hover: menuStrict,
-      });
-      setMenuNotice({ tone: "success", text: `Created "${r.name}" for ${r.target_url} - it is selected below. Click "Run recording" to check the menu.` });
-      setMenuUrl(""); setMenuName(""); setMenuSelector("");
-      await loadRecordings();
-      setSelectedRecFile(r.recording_file);
-    } catch (e) {
-      setMenuNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setMenuBusy(false);
-    }
-  }
-
-  async function handleResetBaseline() {
-    if (!selectedRecFile) return;
-    if (!window.confirm("Forget the saved menu? The next run will save the menu as it is then, and compare later runs against that.")) return;
-    setBaselineBusy(true);
-    setBaselineNotice(null);
-    try {
-      await recordingsApi.resetMenuBaseline(selectedRecFile);
-      setBaselineNotice({ tone: "success", text: "Baseline cleared - the next run saves a new one." });
-      await loadRecordings();
-    } catch (e) {
-      setBaselineNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setBaselineBusy(false);
-    }
-  }
-
-  async function handleExport() {
-    if (!selectedRecording?.recording_id) return;
-    setExportBusy(true);
-    try { await recordingsApi.exportRecording(selectedRecording.recording_id); }
-    catch (e) { setRunError(e.detail || e.message); }
-    finally { setExportBusy(false); }
-  }
-
-  async function handleImportPackage() {
-    if (!pkgImportFile) return;
-    setPkgImportBusy(true);
-    setPkgImportNotice(null);
-    try {
-      const r = await recordingsApi.importPackage(pkgImportFile);
-      setPkgImportNotice({ tone: "success", text: r.message || "Package imported successfully." });
-      setPkgImportFile(null);
-      await loadRecordings();
-    } catch (e) {
-      setPkgImportNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setPkgImportBusy(false);
-    }
-  }
-
+  const safeFull = analysis && analysis.safe_full_rerun;
+  const resume = analysis && analysis.resume;
+  const needsAck = analysis && ((!safeFull) || (resume && resume.available && !resume.safe));
   return (
-    <div className="grid min-w-0 gap-4 lg:grid-cols-2">
-      <Panel>
-        <PanelHeader title="Run Saved Recording" description="Run, regenerate, import and manage saved recordings." />
-        <div className="space-y-4 px-5 py-5">
-
-          <Disclosure title="Delete recordings">
-            <div className="space-y-3">
-              <p className="text-xs text-muted">
-                Tick the recordings you no longer need and delete them. You can only delete recordings you created
-                (admins can delete any). Past execution reports are kept.
-              </p>
-              {deletable.length === 0 ? (
-                <Callout>You have no recordings you can delete.</Callout>
-              ) : (
-                <>
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    <Field label="Application">
-                      <Select value={delApp} onChange={(e) => setDelApp(e.target.value)}>
-                        {delApps.map((a) => <option key={a} value={a}>{a}</option>)}
-                      </Select>
-                    </Field>
-                    <Field label="Search by name or address">
-                      <TextInput value={delFilter} onChange={(e) => setDelFilter(e.target.value)} placeholder="e.g. test123" />
-                    </Field>
-                  </div>
-                  <Checkbox
-                    label={`Select all shown (${delShown.length})`}
-                    checked={allShownPicked}
-                    onChange={toggleShown}
-                  />
-                  <div className="max-h-64 overflow-auto rounded-sm border border-line">
-                    {delShown.length === 0 && <p className="px-3 py-4 text-center text-sm text-muted">Nothing matches.</p>}
-                    {delShown.map((r) => (
-                      <label key={r.file} className="flex cursor-pointer items-start gap-2 border-b border-line px-3 py-2 text-sm last:border-b-0 hover:bg-rail">
-                        <input
-                          type="checkbox" className="mt-1" checked={!!delPicked[r.file]}
-                          onChange={(e) => setDelPicked((prev) => {
-                            const next = { ...prev };
-                            if (e.target.checked) next[r.file] = true; else delete next[r.file];
-                            return next;
-                          })}
-                        />
-                        <span className="min-w-0">
-                          <span className="block break-words text-ink">{r.name}</span>
-                          <span className="block break-all text-xs text-muted">
-                            {r.application || "Others"} · {r.target_url} · {r.action_count} actions
-                          </span>
-                        </span>
-                      </label>
-                    ))}
-                  </div>
-                  <Button variant="secondary" onClick={handleDeleteRecordings} disabled={delBusy || !delPickedFiles.length} className="w-full">
-                    {delBusy ? "Deleting…" : `🗑 Delete selected (${delPickedFiles.length})`}
-                  </Button>
-                </>
-              )}
-              {delNotice && <Callout tone={delNotice.tone}>{delNotice.text}</Callout>}
-            </div>
-          </Disclosure>
-
-          <Disclosure title="Create a navigation menu check (no recording needed)">
-            <div className="space-y-3">
-              <p className="text-xs text-muted">
-                Checks every link in the site&apos;s menu - Personal Banking &gt; Accounts &gt; Saving Account and so on. On each
-                run it opens the menus with the mouse, clicks every link and verifies the page that opens. Nobody has
-                to hover or record anything.
-              </p>
-              <Field label="Application">
-                <Select value={menuApp} onChange={(e) => setMenuApp(e.target.value)}>
-                  {applicationNames.map((name) => (
-                    <option key={name} value={name}>{name}</option>
-                  ))}
-                  <option value="Others">Others</option>
-                </Select>
-              </Field>
-              {menuApp === "Others" && (
-                <Field label="Website address">
-                  <TextInput value={menuUrl} onChange={(e) => setMenuUrl(e.target.value)} placeholder="https://ca.statebank" />
-                </Field>
-              )}
-              <Field label="Name">
-                <TextInput value={menuName} onChange={(e) => setMenuName(e.target.value)} placeholder="Optional, e.g. Navbar regression" />
-              </Field>
-              <Field label="Menu selector" hint="Leave blank - the menu is found automatically. Fill in a CSS selector (e.g. nav or #main-menu) only if the wrong menu gets picked.">
-                <TextInput value={menuSelector} onChange={(e) => setMenuSelector(e.target.value)} placeholder="Optional" />
-              </Field>
-              <Checkbox label="Fail a link if its menu does not open on hover" checked={menuStrict} onChange={setMenuStrict} />
-              <Button variant="secondary" onClick={handleCreateMenuCheck} disabled={menuBusy} className="w-full">
-                {menuBusy ? "Creating..." : "Create menu check"}
-              </Button>
-              {menuNotice && <Callout tone={menuNotice.tone}>{menuNotice.text}</Callout>}
-            </div>
-          </Disclosure>
-
-          <Disclosure title="Import from a UiPath Excel sheet">
-            <div className="space-y-3">
-              <Field label="UiPath Excel file">
-                <input type="file" accept=".xlsx,.xls" onChange={(e) => handleImportFileChosen(e.target.files?.[0] || null)} className="block w-full text-sm text-ink" />
-              </Field>
-              {importSheetsLoading && <Spinner label="Reading Excel sheets..." />}
-              {importSheets && importSheets.length > 1 && (
-                <div className="space-y-2">
-                  <div className="text-sm font-medium text-ink">Sheets</div>
-                  {importSheets.map((sheet) => (
-                    <label key={sheet} className="flex items-center gap-2 text-sm">
-                      <input type="checkbox" checked={selectedSheets.includes(sheet)} onChange={() => toggleSheetSelection(sheet)} />
-                      {sheet}
-                    </label>
-                  ))}
-                </div>
-              )}
-              <Field label="Recording name">
-                <TextInput value={importName} onChange={(e) => setImportName(e.target.value)} placeholder="Optional recording name" />
-              </Field>
-              <Field label="Application">
-                <TextInput value={importAppName} onChange={(e) => setImportAppName(e.target.value)} placeholder="Optional application name" />
-              </Field>
-              <Button variant="secondary" onClick={handleImportUipath} disabled={!importFile || importBusy || importSheetsLoading} className="w-full">
-                {importBusy ? "Importing..." : "Import UiPath Excel"}
-              </Button>
-              {importNotice && <Callout tone={importNotice.tone}>{importNotice.text}</Callout>}
-            </div>
-          </Disclosure>
-
-          <Disclosure title="Import recording package">
-            <div className="space-y-3">
-              <Field label="Recording package">
-                <input type="file" accept=".zip" onChange={(e) => setPkgImportFile(e.target.files?.[0] || null)} className="block w-full text-sm text-ink" />
-              </Field>
-              <Button variant="secondary" onClick={handleImportPackage} disabled={!pkgImportFile || pkgImportBusy} className="w-full">
-                {pkgImportBusy ? "Importing..." : "Import package"}
-              </Button>
-              {pkgImportNotice && <Callout tone={pkgImportNotice.tone}>{pkgImportNotice.text}</Callout>}
-            </div>
-          </Disclosure>
-
-          {recordingsError && <Callout tone="error">Could not load recordings: {recordingsError}</Callout>}
-
-          {recordings.length === 0 ? (
-            <Callout>No saved recordings found yet. Record one in the "Record &amp; Generate" tab first.</Callout>
-          ) : (
-            <>
-              <Field label="Saved recording">
-                <Select value={selectedRecFile} onChange={(e) => setSelectedRecFile(e.target.value)}>
-                  {Object.entries(recordings.reduce((groups, r) => { const app = r.application || "Others"; groups[app] = groups[app] || []; groups[app].push(r); return groups; }, {}))
-                    .sort(([a], [b]) => a.localeCompare(b))
-                    .map(([app, recs]) => (
-                      <optgroup key={app} label={app}>
-                        {recs.map((r) => (
-                          <option key={r.file} value={r.file}>
-                            {r.name} — {r.target_url} ({r.action_count} actions)
-                            {r.migration_status && r.migration_status !== "NATIVE" && r.migration_status !== "UNKNOWN" ? ` [${r.migration_status}]` : ""}
-                          </option>
-                        ))}
-                      </optgroup>
-                    ))}
-                </Select>
-              </Field>
-
-              {selectedRecording && (
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-xs text-muted">
-                    {selectedRecording.is_owner ? "You own this recording." : selectedRecording.is_shared ? "Shared with you." : "Open to everyone (legacy recording)."}
-                  </span>
-                  <div className="ml-auto flex gap-2">
-                    {selectedRecording.recording_id && (
-                      <Link href={`/recordings/${selectedRecording.recording_id}`} className="inline-flex items-center px-4 py-2 text-sm font-medium text-signal-slate underline decoration-line underline-offset-4 hover:text-ink">
-                        View details →
-                      </Link>
-                    )}
-                    {selectedRecording.is_owner && <Button variant="ghost" onClick={() => setShareDialogOpen(true)}>Share</Button>}
-                    <Button variant="ghost" onClick={handleExport} disabled={exportBusy}>{exportBusy ? "Exporting..." : "Export"}</Button>
-                  </div>
-                </div>
-              )}
-
-              {shareDialogOpen && selectedRecording && (
-                <ShareDialog recordingId={selectedRecording.recording_id} recordingName={selectedRecording.name} onClose={() => setShareDialogOpen(false)} />
-              )}
-
-              {selectedRecording?.has_menu_check && (
-                <div className="space-y-2">
-                  <Callout>
-                    This is a navigation menu check.{" "}
-                    {selectedRecording.menu_baseline_count > 0
-                      ? `Baseline saved: ${selectedRecording.menu_baseline_count} menu links${selectedRecording.menu_baseline_saved_at ? ` (${selectedRecording.menu_baseline_saved_at} UTC)` : ""}. A link that disappears or points somewhere else is reported as failed.`
-                      : "No baseline yet - the first run saves the menu as it is, and later runs are compared against it."}
-                  </Callout>
-                  {selectedRecording.menu_baseline_count > 0 && (
-                    <Button variant="ghost" onClick={handleResetBaseline} disabled={baselineBusy}>
-                      {baselineBusy ? "Clearing..." : "Menu changed on purpose? Reset baseline"}
-                    </Button>
-                  )}
-                  {baselineNotice && <Callout tone={baselineNotice.tone}>{baselineNotice.text}</Callout>}
-                </div>
-              )}
-
-              <Checkbox label="headless" checked={runHeadless} onChange={setRunHeadless} />
-
-              <Button onClick={handleRun} disabled={runBusy} className="w-full">
-                {runBusy ? "Running..." : "Run recording"}
-              </Button>
-
-              {validation && <ValidationReport report={validation} onFix={handleFix} busy={validating} />}
-              {job && (
-                <ExecutionProgress
-                  job={job}
-                  connectionLost={connectionLost}
-                  busyAction={controlBusy}
-                  onPause={() => controlJob("pause")}
-                  onResume={() => controlJob("resume")}
-                  onCancel={() => controlJob("cancel")}
-                />
-              )}
-              {runBusy && !job && <Spinner label="Starting..." />}
-              {job && job.job_id && (
-                <ExecutionDetails job={job} hideAssertions hideRerunExport />
-              )}
-              {runError && <Callout tone="error">Run failed: {runError}</Callout>}
-
-              <div className="border-t border-line pt-4">
-                <Button variant="secondary" onClick={handleRegenerate} disabled={regenBusy} className="w-full">
-                  {regenBusy ? "Regenerating..." : "Regenerate (no run)"}
-                </Button>
-                <p className="mt-1.5 text-xs text-muted">
-                  Refreshes this recording's generated feature/steps/page files from the latest generator code - without re-recording or running anything. Useful right after a code/template fix.
-                </p>
-                {regenNotice && <div className="mt-2"><Callout tone={regenNotice.tone}>{regenNotice.text}</Callout></div>}
-                {regenFiles && (
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    {[
-                      { path: regenFiles.feature_file, label: "Feature file" },
-                      { path: regenFiles.steps_file, label: "Steps (.py)" },
-                      { path: regenFiles.page_file, label: "Page object (.py)" },
-                      { path: regenFiles.locators_file, label: "Locators (.json)" },
-                    ].map(({ path, label }) =>
-                      path && (
-                        <button key={path} type="button"
-                          className="rounded-sm border border-line bg-panel px-2.5 py-1 text-xs font-medium text-brand-blue hover:border-brand-blue/40 disabled:opacity-40"
-                          disabled={downloadingRegen === path}
-                          onClick={() => handleDownloadRegenFile(path, label)}>
-                          {downloadingRegen === path ? "Downloading..." : `⬇ ${label}`}
-                        </button>
-                      )
-                    )}
-                  </div>
-                )}
-              </div>
-            </>
-          )}
+    <div className="space-y-5">
+      <div>
+        <h3 className="text-sm font-semibold text-ink">Export this report</h3>
+        <p className="text-xs text-muted">The report contains the timeline, assertions, captured text and failure evidence. Request/response bodies are never collected, query strings are removed and secrets are hidden.</p>
+        <div className="mt-2 flex gap-2">
+          <Button variant="secondary" onClick={() => insightApi.report(job.job_id, "html").catch((e) => setError(e.detail || e.message))}>Download HTML</Button>
+          <Button variant="secondary" onClick={() => insightApi.report(job.job_id, "json").catch((e) => setError(e.detail || e.message))}>Download JSON</Button>
         </div>
-      </Panel>
-
-      <div className="min-w-0 space-y-4">
-        {selectedRecFile && (
-          <Panel>
-            <div className="flex items-center justify-between border-b border-line px-5 py-4">
-              <div>
-                <h2 className="text-sm font-semibold text-ink">Test data</h2>
-                <p className="mt-0.5 text-xs text-muted">The values this recording types/selects when it runs. Edit anything below, then hit <strong>Run recording</strong>.</p>
+      </div>
+      <div className="border-t border-line pt-4">
+        <h3 className="text-sm font-semibold text-ink">Run again safely</h3>
+        <p className="text-xs text-muted">Before anything is repeated we check whether steps that can change data (a payment, an upload, a submit) already ran. Nothing is replayed automatically.</p>
+        {error && <div className="mt-2"><Callout tone="error">{error}</Callout></div>}
+        <Button className="mt-2" variant="secondary" disabled={busy || active} onClick={check}>{active ? "Wait for the run to finish" : "Check what is safe"}</Button>
+        {analysis && (
+          <div className="mt-3 space-y-3">
+            <Callout tone={safeFull ? "success" : "warning"}>{analysis.advice}</Callout>
+            {analysis.reasons.map((r, i) => <p key={i} className="text-sm text-slate-700">• {r}</p>)}
+            {analysis.side_effect_steps.length > 0 && (
+              <div><div className="text-xs font-semibold uppercase text-muted">Steps that can change data and already ran</div>
+                <ul className="text-sm">{analysis.side_effect_steps.map((s) => <li key={s.step}>Step {s.step}: {s.label || s.name} ({s.status})</li>)}</ul></div>
+            )}
+            {needsAck && (
+              <div className="space-y-1">
+                <p className="text-xs text-muted">Check the application for the result of those steps first. To run anyway, type: <b>{analysis.confirm_text}</b></p>
+                <TextInput value={ack} onChange={(e) => setAck(e.target.value)} placeholder={analysis.confirm_text} />
               </div>
-              {testData.length > 0 && (
-                <Button variant="secondary" onClick={saveTestDataOnly} disabled={savingData}>
-                  {savingData ? "Saving..." : "Save without running"}
-                </Button>
-              )}
+            )}
+            <div className="flex flex-wrap gap-2">
+              <Button disabled={busy || (needsAck && ack !== analysis.confirm_text)} onClick={() => go("full")}>Run from the start</Button>
+              <Button variant="secondary" disabled={busy || !resume.available || (resume.available && !resume.safe && ack !== analysis.confirm_text)} onClick={() => go("resume")}>
+                {resume.available ? `Resume from checkpoint "${resume.checkpoint.name}"` : "Resume from a checkpoint"}
+              </Button>
             </div>
-            <div className="px-5 py-4">
-              {testDataLoading && <Spinner label="Loading test data..." />}
-              {testDataError && <Callout tone="error">{testDataError}</Callout>}
-              {saveDataError && <Callout tone="error">{saveDataError}</Callout>}
-              {saveDataNotice && <Callout tone="success">{saveDataNotice}</Callout>}
-              {!testDataLoading && !testDataError && testData.length === 0 && (
-                <p className="text-sm text-muted">This recording has no typed or selected values to edit.</p>
-              )}
-              {testData.length > 0 && (
-                <DataTable
-                  columns={[{ key: "label", label: "Field" }, { key: "action", label: "Type", mono: true }, { key: "value", label: "Value" }]}
-                  rows={testData.map((f) => ({
-                    label: f.label, action: f.action,
-                    value: <TextInput value={editValues[f.index] ?? ""} onChange={(e) => updateValue(f.index, e.target.value)} />,
-                  }))}
-                />
-              )}
-            </div>
-          </Panel>
-        )}
-
-        {selectedRecFile && <StepEditor recordingFile={selectedRecFile} onSaved={() => loadTestData(selectedRecFile)} />}
-        {selectedRecording?.recording_id && <VersionHistory recordingId={selectedRecording.recording_id} />}
-        {report && <ReportView key={report.transaction_id} report={report} />}
-        {!selectedRecFile && (
-          <Panel><div className="px-5 py-10 text-center text-sm text-muted">Pick a saved recording to review its test data and run it.</div></Panel>
+            {!resume.available && <p className="text-xs text-muted">Resume: {resume.reason}</p>}
+            {resume.available && <p className="text-xs text-muted">A resumed run starts a NEW browser: it replays only your setup steps (e.g. login), re-checks the checkpoint against the live application, and stops if it does not hold.
+              {!resume.safe ? ` ${resume.reason}` : ""}</p>}
+          </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/** Everything about one execution beyond the progress bar: live text, timeline, assertions, export / rerun. */
+export default function ExecutionDetails({ job, onRerun, hideAssertions = false, hideRerunExport = false }) {
+  if (!job || !job.job_id) return null;
+  const active = ACTIVE.includes(job.status);
+  return (
+    <div className="rounded-sm border border-line bg-panel p-4">
+      <Tabs tabs={[
+        { label: "Live text", content: <LiveTextPanel jobId={job.job_id} active={active} /> },
+        { label: "Timeline", content: <Timeline job={job} /> },
+        ...(hideAssertions ? [] : [{ label: "Assertions", content: <Assertions job={job} /> }]),
+        ...(hideRerunExport ? [] : [{ label: "Rerun & export", content: <RerunExport job={job} onRerun={onRerun} /> }]),
+      ]} />
     </div>
   );
 }
