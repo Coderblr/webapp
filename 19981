@@ -1,227 +1,349 @@
-import { useEffect, useMemo, useState } from "react";
-import { adminApi } from "@/lib/api";
-import { Button, Callout, Panel, PanelHeader, Select } from "@/components/ui";
+# -*- mode: python ; coding: utf-8 -*-
+#
+# PyInstaller spec for freezing local_agent into a standalone
+# local_agent.exe, so an end user's PC needs no Python installation at all
+# (see docs/electron-local-agent-architecture.md's "Packaging" section).
+#
+# IMPORTANT: this spec has NOT been built or tested here - doing so
+# requires an actual Windows machine (PyInstaller's Windows target must
+# run on Windows, or under Wine with real limitations). Treat this as a
+# verified-on-your-machine starting point once you build it, not an
+# artifact that's already been confirmed working.
+#
+# Usage (on a Windows machine, from the project root, inside a venv with
+# local_agent/requirements-agent.txt + pyinstaller installed):
+#
+#   pip install -r local_agent\requirements-agent.txt
+#   pip install pyinstaller
+#   pyinstaller local_agent\local_agent.spec
+#
+# Produces dist\local_agent\local_agent.exe (one-folder build, not
+# one-file - Playwright's own browser binaries are large enough that a
+# one-folder build is the more practical choice; electron-builder's
+# extraResources then bundles that whole dist\local_agent\ folder instead
+# of raw .py files + a system Python - see electron/package.json).
 
-// Same names/order as backend/app_access.py PERMISSIONS. "delete" is never granted by default.
-const PERMS = [
-  ["view", "View"],
-  ["record", "Record"],
-  ["edit", "Edit"],
-  ["execute", "Execute"],
-  ["upload", "Upload/import"],
-  ["export", "Export/report"],
-  ["delete", "Delete"],
-];
-const DEFAULT_PERMS = ["view", "record", "edit", "execute", "upload", "export"];
+from pathlib import Path
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
-/**
- * Admin > Users > "Application Access" for ONE user. UI only: every change is validated and authorised again by
- * the server (/api/admin/users/{id}/applications). Admin accounts can use every application regardless.
- */
-export default function ApplicationAccessPanel({ user, onClose }) {
-  const [registry, setRegistry] = useState([]);
-  const [saved, setSaved] = useState({}); // application_id -> [permissions] (what the server has)
-  const [draft, setDraft] = useState({}); // application_id -> [permissions] (what is ticked now)
-  const [pick, setPick] = useState(""); // application chosen in the dropdown, not yet added
-  const [busy, setBusy] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [loadFailed, setLoadFailed] = useState(false);
-  const [notice, setNotice] = useState(null);
+# ---------------------------------------------------------
+# Project paths
+# ---------------------------------------------------------
+#
+# PyInstaller provides SPECPATH while executing the .spec file.
+#
+# SPECPATH:
+#   C:\...\ai-test-recorder-pw\local_agent
+#
+# Therefore:
+#   PROJECT_ROOT = C:\...\ai-test-recorder-pw
+#   AGENT_ROOT   = C:\...\ai-test-recorder-pw\local_agent
+#
+SPEC_DIR = Path(SPECPATH).resolve()
+PROJECT_ROOT = SPEC_DIR.parent
+AGENT_ROOT = SPEC_DIR
 
-  async function load() {
-    setLoading(true);
-    setLoadFailed(false);
-    try {
-      // Pick up applications newly added to config/applications.yaml (idempotent; assigns nothing to anyone).
-      try { await adminApi.syncApplicationRegistry(); } catch (_) { /* older server / transient: still load the list */ }
-      const [reg, mine] = await Promise.all([adminApi.listApplicationRegistry(), adminApi.getUserApplications(user.user_id)]);
-      const map = {};
-      (mine.applications || []).forEach((a) => (map[a.application_id] = a.permissions));
-      setRegistry(reg.filter((a) => a.status === "Active"));
-      setSaved(map);
-      setDraft(map);
-    } catch (e) {
-      setLoadFailed(true);
-      const notFound = /not found/i.test(e.detail || e.message || "");
-      setNotice({
-        tone: "error",
-        text: notFound
-          ? "The server does not have the application-access API (404). Restart the backend with the updated code, then reopen this panel."
-          : e.detail || e.message,
-      });
-    } finally {
-      setLoading(false);
-    }
-  }
+# ---------------------------------------------------------
+# Validate important files before building - fail fast with a clear
+# message instead of a confusing mid-build PyInstaller error if this spec
+# is ever run from the wrong location or against a stale checkout.
+# ---------------------------------------------------------
+MAIN_PY = AGENT_ROOT / "_pyinstaller_entry.py"
+INJECTOR_JS = PROJECT_ROOT / "recorder" / "recorder_injector.js"
+AGENT_ENVIRONMENT = AGENT_ROOT / "agent_environment.py"
 
-  useEffect(() => {
-    setNotice(null);
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user.user_id]);
+if not MAIN_PY.exists():
+    raise FileNotFoundError(f"local_agent PyInstaller entry point not found: {MAIN_PY}")
+if not INJECTOR_JS.exists():
+    raise FileNotFoundError(f"recorder_injector.js not found: {INJECTOR_JS}")
+if not AGENT_ENVIRONMENT.exists():
+    raise FileNotFoundError(f"agent_environment.py not found: {AGENT_ENVIRONMENT}")
 
-  const available = useMemo(() => registry.filter((a) => !draft[a.application_id]), [registry, draft]);
-  const assigned = useMemo(() => registry.filter((a) => draft[a.application_id]), [registry, draft]);
-  const dirty = JSON.stringify(normalize(saved)) !== JSON.stringify(normalize(draft));
+# ---------------------------------------------------------
+# Hidden imports
+# ---------------------------------------------------------
+# Playwright does some dynamic importing (its driver-process bridge, the
+# generated sync API wrappers) that PyInstaller's static analysis can
+# miss - collect_submodules pulls in everything under the package rather
+# than hoping the single explicit entry below is sufficient.
+hiddenimports = (
+    collect_submodules("playwright")
+    + ["playwright.sync_api"]
+    # Behave is now invoked via its own programmatic entry point
+    # (behave.__main__.main) rather than as an external `python -m behave`
+    # subprocess when running from this frozen exe - see
+    # runner/run_tests.py's run_behave_cli for why (sys.executable inside a
+    # frozen build points at this exe, not a real Python interpreter, so
+    # shelling out to "behave" never worked from a packaged build). That
+    # means behave's own submodules need to be statically bundled here too,
+    # not just importable at dev-time.
+    + collect_submodules("behave")
+    + [
+        # Uses EasyOCR (pure-Python OCR, no separate engine binary to
+        # install - see recorder/ocr_engine.py's docstring for the
+        # trade-off vs. Tesseract) - which pulls in PyTorch as a real
+        # dependency. collect_submodules("torch") is NOT used here
+        # deliberately: PyTorch's full module tree includes CUDA/GPU-
+        # specific code paths that pull in nvidia-* packages if present in
+        # the build environment - this build must use the CPU-only torch
+        # wheel BEFORE running this spec, so there's nothing CUDA-related
+        # for a blanket collect to find in the first place. Install torch
+        # AND torchvision together as a matching pair from the CPU index
+        # (pip install torch==2.4.1 torchvision==0.19.1 --index-url
+        # https://download.pytorch.org/whl/cpu) - torch alone leaves pip to
+        # fetch a mismatched torchvision, and OCR then fails at run time with
+        # "operator torchvision::nms does not exist". Verify the build with
+        # `local_agent.exe --check-ocr` (and `behave_worker.exe --check-ocr`). If a "hidden import not found" warning appears
+        # for a specific torch/easyocr submodule when actually building
+        # this, add that ONE module here explicitly rather than switching
+        # to a blanket collect_submodules("torch") - the CPU-only-wheel
+        # discipline is easy to silently lose that way.
+        "easyocr",
+        "torch",
+        "torchvision",
+        "PIL",
+        "PIL.Image",
+        "numpy",
+        "cv2",
+        # Used by recorder/change_requests/replay_runtime.py (step-pattern
+        # matching for "Record from here" - see local_agent/cr_manager.py).
+        # That file lives under recorder/, which is excluded from this
+        # spec's own static analysis (see the long comment below), so an
+        # import made from inside it is invisible to PyInstaller's
+        # automatic detection even though `parse` is already installed
+        # (behave depends on it) - list it explicitly rather than rely on
+        # it being found incidentally via some other analyzed module.
+        "parse",
+    ]
+)
 
-  function toggleApp(id) {
-    setDraft((d) => {
-      const n = { ...d };
-      if (n[id]) delete n[id];
-      else n[id] = [...DEFAULT_PERMS];
-      return n;
-    });
-  }
-  function addPicked() {
-    if (!pick) return;
-    setDraft((d) => ({ ...d, [pick]: [...DEFAULT_PERMS] }));
-    setPick("");
-  }
-  function togglePerm(id, perm) {
-    setDraft((d) => {
-      const cur = new Set(d[id] || []);
-      if (cur.has(perm)) cur.delete(perm);
-      else cur.add(perm);
-      if (cur.size) cur.add("view"); // any permission implies view
-      if (perm === "view") cur.clear(); // un-ticking view removes the assignment's other rights too
-      return { ...d, [id]: PERMS.map(([p]) => p).filter((p) => cur.has(p)) };
-    });
-  }
+# ---------------------------------------------------------
+# recorder/ and runner/ are bundled as RAW DATA FILES, not analyzed as
+# modules - deliberately.
+# ---------------------------------------------------------
+# History: recorder.browser_factory (and, transitively, the rest of
+# recorder/ and runner/) went through several rounds of being added to
+# hiddenimports (see git history / prior versions of this file) after
+# repeatedly hitting "ModuleNotFoundError: No module named 'agent'", then
+# "...'runner.variables'" on earlier builds. Those fixes worked. But on at
+# least one real build (same project, same spec, a clean rebuild with
+# cleared __pycache__, no shadowing "recorder" package on the venv's
+# PYTHONPATH, no duplicate/stray browser_factory.py anywhere in the
+# project tree, and file content verified byte-for-byte identical) -
+# PyInstaller's own analysis log showed:
+#
+#   invalid module named recorder.browser_factory - imported by
+#   local_agent.browser_manager (top-level), recorder.recorder
+#   (optional), local_agent\_pyinstaller_entry.py (top-level)
+#
+# "invalid module" (not "missing module") means PyInstaller's modulegraph
+# genuinely found and traced the real, correct import statement in
+# local_agent/browser_manager.py, but its own dependency analysis
+# misclassified the result - on that machine, for reasons that were not
+# fully root-caused (namespace-package edge cases and cross-version
+# PyInstaller/Python 3.13 interactions are the leading suspects, but this
+# was not conclusively proven). Rather than keep chasing PyInstaller's
+# internal module-graph classification, this sidesteps it entirely for
+# recorder/ and runner/: their .py files are copied in as plain DATA
+# (see `datas` below, using PROJECT_ROOT / "recorder" and
+# PROJECT_ROOT / "runner" as whole-directory copies), and
+# PYTHONPATH_ADDITIONS below adds their PARENT directory
+# (sys._MEIPASS, where PyInstaller's bootloader already extracts/points
+# datas to) onto sys.path via a small runtime hook. At that point these
+# are just ordinary files on disk, imported by the STANDARD CPython
+# import system exactly as if this were an unfrozen script - nothing
+# about PyInstaller's own module bundling/analysis touches them at all,
+# so whatever caused the "invalid module" misclassification cannot recur.
+#
+# generator/, database/, backend/, and agent/ (the central-server-only
+# packages - see excludes below) are NOT part of this datas copy, even
+# though they physically live under runner/run_recording.py's import
+# statements - only the specific files actually needed client-side are
+# copied (see the explicit file list below), not the whole directories
+# wholesale, to avoid shipping server code to the end user's PC.
+RECORDER_ROOT = PROJECT_ROOT / "recorder"
+RUNNER_ROOT = PROJECT_ROOT / "runner"
 
-  async function save() {
-    const assignments = Object.entries(draft)
-      .filter(([, perms]) => perms.length)
-      .map(([id, permissions]) => ({ application_id: Number(id), permissions }));
-    if (!assignments.length && Object.keys(saved).length) {
-      if (!window.confirm(`This removes ALL application access from ${user.username}. Continue?`)) return;
-    }
-    setBusy(true);
-    setNotice(null);
-    try {
-      const res = await adminApi.replaceUserApplications(user.user_id, assignments, assignments.length === 0);
-      const map = {};
-      (res.applications || []).forEach((a) => (map[a.application_id] = a.permissions));
-      setSaved(map);
-      setDraft(map);
-      setNotice({ tone: "success", text: `Saved. ${user.username} now has ${assignments.length} application(s).` });
-    } catch (e) {
-      setNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setBusy(false);
-    }
-  }
+RECORDER_FILES_NEEDED = [
+    "__init__.py",
+    "browser_factory.py",
+    "recorder.py",
+    "locator_strategy.py",
+    "variable_capture.py",
+    "ocr_engine.py",
+    # Imported by the generated page object at run time (page.tmpl) - missing = ModuleNotFoundError mid-run.
+    "capture_extract.py",
+    "date_filler.py",
+]
+RUNNER_FILES_NEEDED = [
+    "__init__.py",
+    "variables.py",
+    "run_tests.py",
+    # Platform runtime (live progress, pause, screenshots policy, text capture, assertions, evidence).
+    # Imported by agent_environment.py, local_agent/job_manager.py, the generated steps and extra_steps.py;
+    # a module missing here breaks every run on the packaged agent, so tests/test_packaging.py checks this list.
+    "progress.py",
+    "redaction.py",
+    "step_runtime.py",
+    "targets.py",
+    "assertions.py",
+    "text_capture.py",
+    "evidence.py",
+    "extra_steps.py",
+]
+# "Record from here" (see local_agent/cr_manager.py) - copied into
+# recorder/change_requests/ (note the nested dest path, unlike the flat
+# files above). Deliberately NOT included: generator/ (needs jinja2 - see
+# the "central-server-only packages" comment above) and
+# recorder/date_picker.py (only steps.py's logical_steps() uses it, and
+# the agent never calls that - the agent only ever runs
+# replay_runtime.run_replay() against files the SERVER already built).
+CHANGE_REQUESTS_ROOT = RECORDER_ROOT / "change_requests"
+CHANGE_REQUESTS_FILES_NEEDED = [
+    "__init__.py",
+    "steps.py",
+    "session.py",
+    "replay_runtime.py",
+]
 
-  async function revokeAll() {
-    if (!window.confirm(`Revoke ALL application access from ${user.username}? Their running tests on those applications will be cancelled.`)) return;
-    setBusy(true);
-    setNotice(null);
-    try {
-      const res = await adminApi.revokeAllUserApplications(user.user_id);
-      setNotice({ tone: "success", text: `Revoked ${res.revoked} application(s).` });
-      await load();
-    } catch (e) {
-      setNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setBusy(false);
-    }
-  }
+datas_for_recorder_and_runner = [
+    (str(RECORDER_ROOT / fname), "recorder") for fname in RECORDER_FILES_NEEDED
+] + [
+    (str(RUNNER_ROOT / fname), "runner") for fname in RUNNER_FILES_NEEDED
+] + [
+    (str(CHANGE_REQUESTS_ROOT / fname), "recorder/change_requests") for fname in CHANGE_REQUESTS_FILES_NEEDED
+]
 
-  return (
-    <Panel>
-      <PanelHeader
-        title={`Application access - ${user.username}`}
-        caption={
-          user.role === "admin"
-            ? "Administrators can use every application regardless of these assignments."
-            : "A user can only see and use the applications ticked here. Nothing is granted by default."
-        }
-      />
-      <div className="space-y-3 px-5 py-5">
-        {notice && <Callout tone={notice.tone}>{notice.text}</Callout>}
-        {loading ? (
-          <p className="text-sm text-muted">Loading...</p>
-        ) : (
-          <>
-            <div className="flex gap-2">
-              <Select value={pick} onChange={(e) => setPick(e.target.value)} disabled={busy || loadFailed || available.length === 0}>
-                <option value="">
-                  {loadFailed
-                    ? "Could not load applications"
-                    : available.length === 0
-                    ? "All registered applications are assigned"
-                    : "Select an application to add..."}
-                </option>
-                {available.map((a) => (
-                  <option key={a.application_id} value={a.application_id}>
-                    {a.display_name || a.name}
-                  </option>
-                ))}
-              </Select>
-              <Button type="button" onClick={addPicked} disabled={busy || !pick}>
-                Add
-              </Button>
-            </div>
-            <p className="text-xs text-muted">
-              The list comes from config/applications.yaml (plus applications found in your recordings). Add a new
-              application there and reopen this panel - it appears here.
-            </p>
-            {assigned.length === 0 ? (
-              <p className="text-sm text-muted">No applications assigned to this user.</p>
-            ) : (
-              <ul className="max-h-96 divide-y divide-line overflow-auto rounded-sm border border-line">
-                {assigned.map((a) => (
-                  <li key={a.application_id} className="px-3 py-2">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-sm font-medium text-ink">{a.display_name || a.name}</span>
-                      <button
-                        type="button"
-                        className="text-xs font-medium text-signal-rust hover:underline disabled:opacity-40"
-                        disabled={busy}
-                        onClick={() => toggleApp(a.application_id)}
-                      >
-                        Remove
-                      </button>
-                    </div>
-                    <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1">
-                      {PERMS.map(([p, label]) => (
-                        <label key={p} className="flex items-center gap-1 text-xs text-ink">
-                          <input
-                            type="checkbox"
-                            checked={draft[a.application_id].includes(p)}
-                            onChange={() => togglePerm(a.application_id, p)}
-                            disabled={busy}
-                          />
-                          {label}
-                        </label>
-                      ))}
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </>
-        )}
-        <div className="flex flex-wrap gap-2">
-          <Button type="button" onClick={save} disabled={busy || !dirty}>
-            {busy ? "Saving..." : "Save access"}
-          </Button>
-          <Button type="button" variant="secondary" onClick={() => setDraft(saved)} disabled={busy || !dirty}>
-            Reset
-          </Button>
-          <Button type="button" variant="secondary" onClick={revokeAll} disabled={busy || Object.keys(saved).length === 0}>
-            Revoke all
-          </Button>
-          <Button type="button" variant="secondary" onClick={onClose}>
-            Close
-          </Button>
-        </div>
-      </div>
-    </Panel>
-  );
-}
+for fname in RECORDER_FILES_NEEDED:
+    if not (RECORDER_ROOT / fname).exists():
+        raise FileNotFoundError(f"Expected recorder file not found: {RECORDER_ROOT / fname}")
+for fname in RUNNER_FILES_NEEDED:
+    if not (RUNNER_ROOT / fname).exists():
+        raise FileNotFoundError(f"Expected runner file not found: {RUNNER_ROOT / fname}")
+for fname in CHANGE_REQUESTS_FILES_NEEDED:
+    if not (CHANGE_REQUESTS_ROOT / fname).exists():
+        raise FileNotFoundError(f"Expected recorder/change_requests file not found: {CHANGE_REQUESTS_ROOT / fname}")
 
-function normalize(m) {
-  return Object.keys(m)
-    .sort()
-    .map((k) => [k, [...m[k]].sort()]);
-}
+# ---------------------------------------------------------
+# Analysis
+# ---------------------------------------------------------
+a = Analysis(
+    [str(MAIN_PY)],
+    pathex=[
+        str(PROJECT_ROOT),
+        str(AGENT_ROOT),
+    ],
+    # torchvision's compiled library and EasyOCR's character/dictionary files are not Python modules,
+    # so naming them in hiddenimports does not bring them along - collect them explicitly. Without
+    # them a frozen build can fail OCR even when the pip install is correct.
+    binaries=collect_dynamic_libs("torchvision"),
+    datas=collect_data_files("easyocr") + [
+        # Recorder injector used by the local agent (read as a text file
+        # at runtime - see recorder/recorder.py's INJECTOR_PATH; not a
+        # .py module PyInstaller would bundle automatically).
+        (
+            str(INJECTOR_JS),
+            "recorder",
+        ),
+        # Agent environment module/data
+        (
+            str(AGENT_ENVIRONMENT),
+            "local_agent",
+        ),
+    ] + datas_for_recorder_and_runner,
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        # Central-server-only packages that must NOT be shipped to an end
+        # user's PC (see local_agent/agent_environment.py's docstring for
+        # why "agent" - the AI/self-healing package - specifically is
+        # excluded: local execution deliberately runs without self-healing
+        # so no LLM key/dependency needs to exist client-side). If any of
+        # these accidentally get pulled in by a stray import, this list is
+        # what catches it at build time as a missing-module error instead
+        # of silently shipping backend code to end users.
+        "fastapi",
+        "sqlalchemy",
+        "jwt",
+        "bcrypt",
+        "jinja2",
+        "pandas",
+        "openpyxl",
+        "backend",
+        "database",
+        "agent",
+        "generator",
+        # "recorder" and "runner" are excluded from PyInstaller's own
+        # module-graph analysis DELIBERATELY - see the long comment above
+        # datas_for_recorder_and_runner for why. This does not remove
+        # them from the running program: their actual source files are
+        # copied in via `datas` above instead, landing under
+        # sys._MEIPASS (which PyInstaller's bootloader already puts on
+        # sys.path automatically), where Python's normal, un-frozen
+        # import system finds and imports them exactly as it would for
+        # any ordinary script - completely bypassing whatever caused
+        # PyInstaller's analysis to misclassify them as "invalid module"
+        # on at least one real build.
+        "recorder",
+        "runner",
+    ],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=None,
+    noarchive=False,
+)
+
+# ---------------------------------------------------------
+# PYZ
+# ---------------------------------------------------------
+pyz = PYZ(
+    a.pure,
+    a.zipped_data,
+    cipher=None,
+)
+
+# ---------------------------------------------------------
+# EXE
+# ---------------------------------------------------------
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name="local_agent",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=True,  # keep a console window for now so connection/errors are visible - revisit once the Electron UI surfaces agent logs well enough to hide it
+    disable_windowed_traceback=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
+
+# ---------------------------------------------------------
+# COLLECT
+# ---------------------------------------------------------
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name="local_agent",
+)
+
+# ---------------------------------------------------------
+# NOT HANDLED BY THIS SPEC (see docs/electron-local-agent-architecture.md)
+# ---------------------------------------------------------
+#   - Playwright's own browser binaries (`playwright install msedge`) are
+#     NOT bundled by PyInstaller - they need a separate install step,
+#     either bundled as additional `datas`/`binaries` entries (large - a
+#     full Chromium-based browser download) or run once at application
+#     first-launch with a visible progress indicator. Decide which before
+#     relying on this spec for a real installer.
