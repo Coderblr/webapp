@@ -1,209 +1,214 @@
-import { useCallback, useEffect, useState } from "react";
-import { transactionsApi } from "@/lib/api";
-import { errorDetail, insightApi } from "@/lib/platformApi";
-import { Tabs } from "@/components/Tabs";
-import LiveTextPanel from "@/components/LiveTextPanel";
-import { Button, Callout, Spinner, TextInput } from "@/components/ui";
+import { useEffect, useMemo, useState } from "react";
+import { adminApi } from "@/lib/api";
+import { Button, Callout, Panel, PanelHeader, Select } from "@/components/ui";
 
-const ACTIVE = ["queued", "generating", "starting", "running", "pausing", "paused", "collecting", "reporting"];
-const FILTERS = [["all", "All"], ["failures", "Failures"], ["warnings", "Warnings"], ["slow", "Slow"], ["retried", "Retried"]];
+// Same names/order as backend/app_access.py PERMISSIONS. "delete" is never granted by default.
+const PERMS = [
+  ["view", "View"],
+  ["record", "Record"],
+  ["edit", "Edit"],
+  ["execute", "Execute"],
+  ["upload", "Upload/import"],
+  ["export", "Export/report"],
+  ["delete", "Delete"],
+];
+const DEFAULT_PERMS = ["view", "record", "edit", "execute", "upload", "export"];
 
-function Screenshot({ job, name }) {
-  const [state, setState] = useState({});
-  async function open() {
-    setState({ loading: true });
-    try {
-      const txn = await transactionsApi.get(job.transaction_id);
-      const url = await transactionsApi.fetchImageDataUrl(txn.transaction_id, name, txn.screenshots_folder);
-      setState({ url });
-    } catch (e) { setState({ error: e.detail || e.message }); }
-  }
-  if (state.url) return <img src={state.url} alt={`Screenshot ${name}`} className="max-h-72 rounded-sm border border-line" />;
-  return <span><button className="text-xs underline" disabled={state.loading || !job.transaction_id} onClick={open}>{state.loading ? "Loading..." : "Show screenshot"}</button>
-    {state.error && <span className="ml-2 text-xs text-signal-rust">{state.error}</span>}</span>;
-}
-
-function Timeline({ job }) {
-  const [filter, setFilter] = useState("all");
-  const [data, setData] = useState(null);
-  const [open, setOpen] = useState({});
-  const [evidence, setEvidence] = useState({});
-  const [error, setError] = useState(null);
-  const active = ACTIVE.includes(job.status);
-
-  const load = useCallback(() => {
-    insightApi.timeline(job.job_id, { filter, limit: 300 }).then((d) => { setData(d); setError(null); }).catch((e) => setError(e.detail || e.message));
-  }, [job.job_id, filter]);
-  useEffect(() => { load(); if (!active) return undefined; const t = setInterval(load, 3000); return () => clearInterval(t); }, [load, active]);
-  useEffect(() => {
-    if (!Object.values(open).some(Boolean) || evidence.loaded) return;
-    insightApi.evidence(job.job_id).then((r) => setEvidence({ loaded: true, by: Object.fromEntries(r.evidence.map((e) => [e.step_index, e])) })).catch(() => {});
-  }, [open, job.job_id, evidence.loaded]);
-
-  if (error) return <Callout tone="error">{error}</Callout>;
-  if (!data) return <Spinner label="Loading timeline..." />;
-  return (
-    <div className="space-y-3">
-      <div className="flex flex-wrap gap-1 text-xs">
-        {FILTERS.map(([k, label]) => (
-          <button key={k} onClick={() => setFilter(k)} className={`rounded-sm border px-2 py-0.5 ${filter === k ? "border-brand-blue bg-brand-blueLight text-ink" : "border-line text-muted hover:text-ink"}`}>{label}</button>
-        ))}
-        <span className="ml-auto text-muted">{data.total} step(s)</span>
-      </div>
-      {data.rows.length === 0 && <p className="text-sm text-muted">No steps match this filter.</p>}
-      <ol className="divide-y divide-line rounded-sm border border-line bg-panel">
-        {data.rows.map((r) => {
-          const ev = evidence.by && evidence.by[r.step];
-          return (
-            <li key={r.step}>
-              <button onClick={() => setOpen({ ...open, [r.step]: !open[r.step] })} className="flex w-full items-center gap-3 px-3 py-2 text-left hover:bg-rail">
-                <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${r.status === "failed" ? "bg-signal-rust" : r.slow || r.retries ? "bg-signal-amber" : "bg-signal-teal"}`} />
-                <span className="w-8 shrink-0 font-mono text-xs text-muted">{r.step}</span>
-                <span className="min-w-0 flex-1 truncate text-sm text-ink">
-                  {r.workflow_path.length > 0 && <span className="mr-1 text-xs text-muted">[{r.workflow_path.join(" › ")}]</span>}
-                  {r.label || r.name}
-                </span>
-                {r.retries > 0 && <span className="text-xs text-signal-amber">retried {r.retries}×</span>}
-                {r.slow && <span className="text-xs text-signal-amber">slow</span>}
-                {r.side_effect && <span className="text-[10px] uppercase text-muted" title="This step can change data">changes data</span>}
-                <span className="w-16 shrink-0 text-right font-mono text-xs text-muted">{r.duration == null ? "" : `${r.duration.toFixed(2)}s`}</span>
-              </button>
-              {open[r.step] && (
-                <div className="space-y-2 border-t border-line bg-rail px-4 py-3 text-sm">
-                  <div className="text-xs text-muted">{r.name}</div>
-                  {r.error && <pre className="whitespace-pre-wrap rounded-sm bg-[#FBEEEA] p-2 text-xs text-signal-rust">{r.error}</pre>}
-                  {r.assertion && r.assertion.status === "fail" && (
-                    <div className="grid gap-2 sm:grid-cols-2">
-                      <div><div className="text-[11px] font-semibold uppercase text-muted">Expected</div><pre className="whitespace-pre-wrap rounded-sm bg-white p-2 text-xs">{String(r.assertion.expected)}</pre></div>
-                      <div><div className="text-[11px] font-semibold uppercase text-muted">Actual</div><pre className="whitespace-pre-wrap rounded-sm bg-white p-2 text-xs">{String(r.assertion.actual)}</pre></div>
-                      {r.assertion.diff && <pre className="whitespace-pre-wrap rounded-sm bg-white p-2 text-xs sm:col-span-2">{r.assertion.diff}</pre>}
-                    </div>
-                  )}
-                  {r.retry_log.length > 0 && (
-                    <div><div className="text-[11px] font-semibold uppercase text-muted">Retries</div>
-                      <ul className="text-xs text-muted">{r.retry_log.map((x, i) => <li key={i}>attempt {x.attempt}: {x.error_type} - {x.error}</li>)}</ul></div>
-                  )}
-                  {r.screenshot && <Screenshot job={job} name={r.screenshot} />}
-                  {ev && (
-                    <div className="space-y-1 text-xs">
-                      <div className="text-[11px] font-semibold uppercase text-muted">Evidence</div>
-                      <div>Page: {ev.url}</div>
-                      {ev.console.length > 0 && <pre className="whitespace-pre-wrap rounded-sm bg-white p-2">{ev.console.map((c) => `${c.type}: ${c.text}`).join("\n")}</pre>}
-                      {[...ev.failed_requests, ...ev.http_errors].length > 0 && <pre className="whitespace-pre-wrap rounded-sm bg-white p-2">{[...ev.failed_requests, ...ev.http_errors].map((x) => `${x.method} ${x.url} ${x.status || x.failure || ""}`).join("\n")}</pre>}
-                      {ev.dom && <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded-sm bg-white p-2">{ev.dom}</pre>}
-                    </div>
-                  )}
-                  {r.action_id && <div className="text-[10px] text-muted">step id {r.action_id}</div>}
-                </div>
-              )}
-            </li>
-          );
-        })}
-      </ol>
-    </div>
-  );
-}
-
-function Assertions({ job }) {
-  const [rows, setRows] = useState(null);
-  useEffect(() => { insightApi.assertions(job.job_id).then((r) => setRows(r.assertions)).catch(() => setRows([])); }, [job.job_id, job.status]);
-  if (!rows) return <Spinner label="Loading..." />;
-  if (!rows.length) return <p className="text-sm text-muted">This run has no assertions. Add one in the recording editor to check what the application shows.</p>;
-  return (
-    <table className="w-full text-sm">
-      <thead><tr className="border-b border-line text-left text-xs uppercase text-muted"><th className="py-2 pr-3">Check</th><th className="pr-3">Result</th><th className="pr-3">Expected</th><th>Actual</th></tr></thead>
-      <tbody>{rows.map((a, i) => (
-        <tr key={i} className="border-b border-line align-top last:border-0">
-          <td className="py-2 pr-3"><div className="font-medium">{a.name}</div><div className="text-xs text-muted">{a.assertion_type} · step {a.step_index}</div></td>
-          <td className={`pr-3 font-semibold ${a.status === "pass" ? "text-signal-tealDark" : "text-signal-rust"}`}>{a.status}{a.reason ? <div className="text-xs font-normal text-muted">{a.reason}</div> : null}</td>
-          <td className="pr-3"><pre className="max-w-xs whitespace-pre-wrap text-xs">{String(a.expected)}</pre></td>
-          <td><pre className="max-w-xs whitespace-pre-wrap text-xs">{String(a.actual)}</pre>{a.diff && <pre className="mt-1 whitespace-pre-wrap rounded-sm bg-rail p-1 text-[11px]">{a.diff}</pre>}</td>
-        </tr>))}</tbody>
-    </table>
-  );
-}
-
-function RerunExport({ job, onRerun }) {
-  const [analysis, setAnalysis] = useState(null);
-  const [error, setError] = useState(null);
-  const [ack, setAck] = useState("");
+/**
+ * Admin > Users > "Application Access" for ONE user. UI only: every change is validated and authorised again by
+ * the server (/api/admin/users/{id}/applications). Admin accounts can use every application regardless.
+ */
+export default function ApplicationAccessPanel({ user, onClose }) {
+  const [registry, setRegistry] = useState([]);
+  const [saved, setSaved] = useState({}); // application_id -> [permissions] (what the server has)
+  const [draft, setDraft] = useState({}); // application_id -> [permissions] (what is ticked now)
+  const [pick, setPick] = useState(""); // application chosen in the dropdown, not yet added
   const [busy, setBusy] = useState(false);
-  const active = ACTIVE.includes(job.status);
+  const [loading, setLoading] = useState(true);
+  const [notice, setNotice] = useState(null);
 
-  async function check() {
-    setBusy(true); setError(null);
-    try { setAnalysis(await insightApi.rerunAnalysis(job.job_id)); } catch (e) { setError(e.detail || e.message); } finally { setBusy(false); }
-  }
-  async function go(mode) {
-    setBusy(true); setError(null);
+  async function load() {
+    setLoading(true);
     try {
-      const r = await insightApi.rerun(job.job_id, { mode, acknowledge: ack });
-      onRerun && onRerun(r.job_id);
+      // Pick up applications newly added to config/applications.yaml (idempotent; assigns nothing to anyone).
+      try { await adminApi.syncApplicationRegistry(); } catch (_) { /* older server / transient: still load the list */ }
+      const [reg, mine] = await Promise.all([adminApi.listApplicationRegistry(), adminApi.getUserApplications(user.user_id)]);
+      const map = {};
+      (mine.applications || []).forEach((a) => (map[a.application_id] = a.permissions));
+      setRegistry(reg.filter((a) => a.status === "Active"));
+      setSaved(map);
+      setDraft(map);
     } catch (e) {
-      const d = errorDetail(e);
-      setError(d && d.code === "manual_verification_required" ? "Type the confirmation sentence exactly to run this again." : e.detail || e.message);
-    } finally { setBusy(false); }
+      setNotice({ tone: "error", text: e.detail || e.message });
+    } finally {
+      setLoading(false);
+    }
   }
-  const safeFull = analysis && analysis.safe_full_rerun;
-  const resume = analysis && analysis.resume;
-  const needsAck = analysis && ((!safeFull) || (resume && resume.available && !resume.safe));
+
+  useEffect(() => {
+    setNotice(null);
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user.user_id]);
+
+  const available = useMemo(() => registry.filter((a) => !draft[a.application_id]), [registry, draft]);
+  const assigned = useMemo(() => registry.filter((a) => draft[a.application_id]), [registry, draft]);
+  const dirty = JSON.stringify(normalize(saved)) !== JSON.stringify(normalize(draft));
+
+  function toggleApp(id) {
+    setDraft((d) => {
+      const n = { ...d };
+      if (n[id]) delete n[id];
+      else n[id] = [...DEFAULT_PERMS];
+      return n;
+    });
+  }
+  function addPicked() {
+    if (!pick) return;
+    setDraft((d) => ({ ...d, [pick]: [...DEFAULT_PERMS] }));
+    setPick("");
+  }
+  function togglePerm(id, perm) {
+    setDraft((d) => {
+      const cur = new Set(d[id] || []);
+      if (cur.has(perm)) cur.delete(perm);
+      else cur.add(perm);
+      if (cur.size) cur.add("view"); // any permission implies view
+      if (perm === "view") cur.clear(); // un-ticking view removes the assignment's other rights too
+      return { ...d, [id]: PERMS.map(([p]) => p).filter((p) => cur.has(p)) };
+    });
+  }
+
+  async function save() {
+    const assignments = Object.entries(draft)
+      .filter(([, perms]) => perms.length)
+      .map(([id, permissions]) => ({ application_id: Number(id), permissions }));
+    if (!assignments.length && Object.keys(saved).length) {
+      if (!window.confirm(`This removes ALL application access from ${user.username}. Continue?`)) return;
+    }
+    setBusy(true);
+    setNotice(null);
+    try {
+      const res = await adminApi.replaceUserApplications(user.user_id, assignments, assignments.length === 0);
+      const map = {};
+      (res.applications || []).forEach((a) => (map[a.application_id] = a.permissions));
+      setSaved(map);
+      setDraft(map);
+      setNotice({ tone: "success", text: `Saved. ${user.username} now has ${assignments.length} application(s).` });
+    } catch (e) {
+      setNotice({ tone: "error", text: e.detail || e.message });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revokeAll() {
+    if (!window.confirm(`Revoke ALL application access from ${user.username}? Their running tests on those applications will be cancelled.`)) return;
+    setBusy(true);
+    setNotice(null);
+    try {
+      const res = await adminApi.revokeAllUserApplications(user.user_id);
+      setNotice({ tone: "success", text: `Revoked ${res.revoked} application(s).` });
+      await load();
+    } catch (e) {
+      setNotice({ tone: "error", text: e.detail || e.message });
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
-    <div className="space-y-5">
-      <div>
-        <h3 className="text-sm font-semibold text-ink">Export this report</h3>
-        <p className="text-xs text-muted">The report contains the timeline, assertions, captured text and failure evidence. Request/response bodies are never collected, query strings are removed and secrets are hidden.</p>
-        <div className="mt-2 flex gap-2">
-          <Button variant="secondary" onClick={() => insightApi.report(job.job_id, "html").catch((e) => setError(e.detail || e.message))}>Download HTML</Button>
-          <Button variant="secondary" onClick={() => insightApi.report(job.job_id, "json").catch((e) => setError(e.detail || e.message))}>Download JSON</Button>
-        </div>
-      </div>
-      <div className="border-t border-line pt-4">
-        <h3 className="text-sm font-semibold text-ink">Run again safely</h3>
-        <p className="text-xs text-muted">Before anything is repeated we check whether steps that can change data (a payment, an upload, a submit) already ran. Nothing is replayed automatically.</p>
-        {error && <div className="mt-2"><Callout tone="error">{error}</Callout></div>}
-        <Button className="mt-2" variant="secondary" disabled={busy || active} onClick={check}>{active ? "Wait for the run to finish" : "Check what is safe"}</Button>
-        {analysis && (
-          <div className="mt-3 space-y-3">
-            <Callout tone={safeFull ? "success" : "warning"}>{analysis.advice}</Callout>
-            {analysis.reasons.map((r, i) => <p key={i} className="text-sm text-slate-700">• {r}</p>)}
-            {analysis.side_effect_steps.length > 0 && (
-              <div><div className="text-xs font-semibold uppercase text-muted">Steps that can change data and already ran</div>
-                <ul className="text-sm">{analysis.side_effect_steps.map((s) => <li key={s.step}>Step {s.step}: {s.label || s.name} ({s.status})</li>)}</ul></div>
-            )}
-            {needsAck && (
-              <div className="space-y-1">
-                <p className="text-xs text-muted">Check the application for the result of those steps first. To run anyway, type: <b>{analysis.confirm_text}</b></p>
-                <TextInput value={ack} onChange={(e) => setAck(e.target.value)} placeholder={analysis.confirm_text} />
-              </div>
-            )}
-            <div className="flex flex-wrap gap-2">
-              <Button disabled={busy || (needsAck && ack !== analysis.confirm_text)} onClick={() => go("full")}>Run from the start</Button>
-              <Button variant="secondary" disabled={busy || !resume.available || (resume.available && !resume.safe && ack !== analysis.confirm_text)} onClick={() => go("resume")}>
-                {resume.available ? `Resume from checkpoint "${resume.checkpoint.name}"` : "Resume from a checkpoint"}
+    <Panel>
+      <PanelHeader
+        title={`Application access - ${user.username}`}
+        caption={
+          user.role === "admin"
+            ? "Administrators can use every application regardless of these assignments."
+            : "A user can only see and use the applications ticked here. Nothing is granted by default."
+        }
+      />
+      <div className="space-y-3 px-5 py-5">
+        {notice && <Callout tone={notice.tone}>{notice.text}</Callout>}
+        {loading ? (
+          <p className="text-sm text-muted">Loading...</p>
+        ) : (
+          <>
+            <div className="flex gap-2">
+              <Select value={pick} onChange={(e) => setPick(e.target.value)} disabled={busy || available.length === 0}>
+                <option value="">
+                  {available.length === 0 ? "All registered applications are assigned" : "Select an application to add..."}
+                </option>
+                {available.map((a) => (
+                  <option key={a.application_id} value={a.application_id}>
+                    {a.display_name || a.name}
+                  </option>
+                ))}
+              </Select>
+              <Button type="button" onClick={addPicked} disabled={busy || !pick}>
+                Add
               </Button>
             </div>
-            {!resume.available && <p className="text-xs text-muted">Resume: {resume.reason}</p>}
-            {resume.available && <p className="text-xs text-muted">A resumed run starts a NEW browser: it replays only your setup steps (e.g. login), re-checks the checkpoint against the live application, and stops if it does not hold.
-              {!resume.safe ? ` ${resume.reason}` : ""}</p>}
-          </div>
+            <p className="text-xs text-muted">
+              The list comes from config/applications.yaml (plus applications found in your recordings). Add a new
+              application there and reopen this panel - it appears here.
+            </p>
+            {assigned.length === 0 ? (
+              <p className="text-sm text-muted">No applications assigned to this user.</p>
+            ) : (
+              <ul className="max-h-96 divide-y divide-line overflow-auto rounded-sm border border-line">
+                {assigned.map((a) => (
+                  <li key={a.application_id} className="px-3 py-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-sm font-medium text-ink">{a.display_name || a.name}</span>
+                      <button
+                        type="button"
+                        className="text-xs font-medium text-signal-rust hover:underline disabled:opacity-40"
+                        disabled={busy}
+                        onClick={() => toggleApp(a.application_id)}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                    <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1">
+                      {PERMS.map(([p, label]) => (
+                        <label key={p} className="flex items-center gap-1 text-xs text-ink">
+                          <input
+                            type="checkbox"
+                            checked={draft[a.application_id].includes(p)}
+                            onChange={() => togglePerm(a.application_id, p)}
+                            disabled={busy}
+                          />
+                          {label}
+                        </label>
+                      ))}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </>
         )}
+        <div className="flex flex-wrap gap-2">
+          <Button type="button" onClick={save} disabled={busy || !dirty}>
+            {busy ? "Saving..." : "Save access"}
+          </Button>
+          <Button type="button" variant="secondary" onClick={() => setDraft(saved)} disabled={busy || !dirty}>
+            Reset
+          </Button>
+          <Button type="button" variant="secondary" onClick={revokeAll} disabled={busy || Object.keys(saved).length === 0}>
+            Revoke all
+          </Button>
+          <Button type="button" variant="secondary" onClick={onClose}>
+            Close
+          </Button>
+        </div>
       </div>
-    </div>
+    </Panel>
   );
 }
 
-/** Everything about one execution beyond the progress bar: live text, timeline, assertions, export / rerun. */
-export default function ExecutionDetails({ job, onRerun, hideAssertions = false, hideRerunExport = false }) {
-  if (!job || !job.job_id) return null;
-  const active = ACTIVE.includes(job.status);
-  return (
-    <div className="rounded-sm border border-line bg-panel p-4">
-      <Tabs tabs={[
-        { label: "Live text", content: <LiveTextPanel jobId={job.job_id} active={active} /> },
-        { label: "Timeline", content: <Timeline job={job} /> },
-        ...(hideAssertions ? [] : [{ label: "Assertions", content: <Assertions job={job} /> }]),
-        ...(hideRerunExport ? [] : [{ label: "Rerun & export", content: <RerunExport job={job} onRerun={onRerun} /> }]),
-      ]} />
-    </div>
-  );
+function normalize(m) {
+  return Object.keys(m)
+    .sort()
+    .map((k) => [k, [...m[k]].sort()]);
 }
