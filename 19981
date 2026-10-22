@@ -1,214 +1,97 @@
-import { useEffect, useMemo, useState } from "react";
-import { adminApi } from "@/lib/api";
-import { Button, Callout, Panel, PanelHeader, Select } from "@/components/ui";
+"""
+Application registry bootstrap / reconciliation (idempotent - safe on every start, safe to run repeatedly).
 
-// Same names/order as backend/app_access.py PERMISSIONS. "delete" is never granted by default.
-const PERMS = [
-  ["view", "View"],
-  ["record", "Record"],
-  ["edit", "Edit"],
-  ["execute", "Execute"],
-  ["upload", "Upload/import"],
-  ["export", "Export/report"],
-  ["delete", "Delete"],
-];
-const DEFAULT_PERMS = ["view", "record", "edit", "execute", "upload", "export"];
+What it does
+  * Creates the `applications` / `user_application_access` tables (db.init_db does that via create_all - this
+    module only fills the registry).
+  * Registers: every application in config/applications.yaml, the built-in "Others", and every application that
+    already EXISTS in the data - a recordings/<folder>/ directory or a recording JSON "application" field.
+  * Names are reconciled case-insensitively (and "DIGI GOV" == "DIGI_GOV" == "digi-gov", see app_names.app_key)
+    so legacy data never creates a second row for the same application; genuinely different names stay separate.
+    The canonical spelling is the first one found, preferring config/applications.yaml.
+  * Never creates a row because a request touched a folder, and never deletes or changes existing rows' names.
 
-/**
- * Admin > Users > "Application Access" for ONE user. UI only: every change is validated and authorised again by
- * the server (/api/admin/users/{id}/applications). Admin accounts can use every application regardless.
- */
-export default function ApplicationAccessPanel({ user, onClose }) {
-  const [registry, setRegistry] = useState([]);
-  const [saved, setSaved] = useState({}); // application_id -> [permissions] (what the server has)
-  const [draft, setDraft] = useState({}); // application_id -> [permissions] (what is ticked now)
-  const [pick, setPick] = useState(""); // application chosen in the dropdown, not yet added
-  const [busy, setBusy] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [notice, setNotice] = useState(null);
+What it deliberately does NOT do
+  * It does NOT assign any application to any user. Existing non-admin users have no application access until an
+    administrator grants it (Admin > Users > Application Access, or tools/grant_application_access.py).
+    That is the explicit, administrator-controlled migration policy - see docs/APPLICATION-ACCESS.md.
+"""
+from __future__ import annotations
 
-  async function load() {
-    setLoading(true);
-    try {
-      // Pick up applications newly added to config/applications.yaml (idempotent; assigns nothing to anyone).
-      try { await adminApi.syncApplicationRegistry(); } catch (_) { /* older server / transient: still load the list */ }
-      const [reg, mine] = await Promise.all([adminApi.listApplicationRegistry(), adminApi.getUserApplications(user.user_id)]);
-      const map = {};
-      (mine.applications || []).forEach((a) => (map[a.application_id] = a.permissions));
-      setRegistry(reg.filter((a) => a.status === "Active"));
-      setSaved(map);
-      setDraft(map);
-    } catch (e) {
-      setNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setLoading(false);
-    }
-  }
+import json
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
-  useEffect(() => {
-    setNotice(null);
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user.user_id]);
+from sqlalchemy.orm import Session
 
-  const available = useMemo(() => registry.filter((a) => !draft[a.application_id]), [registry, draft]);
-  const assigned = useMemo(() => registry.filter((a) => draft[a.application_id]), [registry, draft]);
-  const dirty = JSON.stringify(normalize(saved)) !== JSON.stringify(normalize(draft));
+from database.app_names import OTHERS, app_key, clean_name
+from database.models import Application
 
-  function toggleApp(id) {
-    setDraft((d) => {
-      const n = { ...d };
-      if (n[id]) delete n[id];
-      else n[id] = [...DEFAULT_PERMS];
-      return n;
-    });
-  }
-  function addPicked() {
-    if (!pick) return;
-    setDraft((d) => ({ ...d, [pick]: [...DEFAULT_PERMS] }));
-    setPick("");
-  }
-  function togglePerm(id, perm) {
-    setDraft((d) => {
-      const cur = new Set(d[id] || []);
-      if (cur.has(perm)) cur.delete(perm);
-      else cur.add(perm);
-      if (cur.size) cur.add("view"); // any permission implies view
-      if (perm === "view") cur.clear(); // un-ticking view removes the assignment's other rights too
-      return { ...d, [id]: PERMS.map(([p]) => p).filter((p) => cur.has(p)) };
-    });
-  }
+log = logging.getLogger("app_access")
+ROOT = Path(__file__).resolve().parents[1]
+RECORDINGS_DIR = ROOT / "recordings"
+APPLICATIONS_YAML = ROOT / "config" / "applications.yaml"
+_SKIP_DIRS = {"versions", "imports", "solution_documents", "change_analysis", "fixtures", "__pycache__"}
 
-  async function save() {
-    const assignments = Object.entries(draft)
-      .filter(([, perms]) => perms.length)
-      .map(([id, permissions]) => ({ application_id: Number(id), permissions }));
-    if (!assignments.length && Object.keys(saved).length) {
-      if (!window.confirm(`This removes ALL application access from ${user.username}. Continue?`)) return;
-    }
-    setBusy(true);
-    setNotice(null);
-    try {
-      const res = await adminApi.replaceUserApplications(user.user_id, assignments, assignments.length === 0);
-      const map = {};
-      (res.applications || []).forEach((a) => (map[a.application_id] = a.permissions));
-      setSaved(map);
-      setDraft(map);
-      setNotice({ tone: "success", text: `Saved. ${user.username} now has ${assignments.length} application(s).` });
-    } catch (e) {
-      setNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setBusy(false);
-    }
-  }
 
-  async function revokeAll() {
-    if (!window.confirm(`Revoke ALL application access from ${user.username}? Their running tests on those applications will be cancelled.`)) return;
-    setBusy(true);
-    setNotice(null);
-    try {
-      const res = await adminApi.revokeAllUserApplications(user.user_id);
-      setNotice({ tone: "success", text: `Revoked ${res.revoked} application(s).` });
-      await load();
-    } catch (e) {
-      setNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setBusy(false);
-    }
-  }
+def _yaml_apps() -> dict[str, str]:
+    try:
+        import yaml
+        if APPLICATIONS_YAML.exists():
+            data = yaml.safe_load(APPLICATIONS_YAML.read_text(encoding="utf-8")) or {}
+            return {str(k): (str(v).strip() if v else "") for k, v in (data.get("applications") or {}).items()}
+    except Exception:  # noqa: BLE001 - a bad config file must not stop the server starting
+        log.exception("Could not read config/applications.yaml for the application registry")
+    return {}
 
-  return (
-    <Panel>
-      <PanelHeader
-        title={`Application access - ${user.username}`}
-        caption={
-          user.role === "admin"
-            ? "Administrators can use every application regardless of these assignments."
-            : "A user can only see and use the applications ticked here. Nothing is granted by default."
-        }
-      />
-      <div className="space-y-3 px-5 py-5">
-        {notice && <Callout tone={notice.tone}>{notice.text}</Callout>}
-        {loading ? (
-          <p className="text-sm text-muted">Loading...</p>
-        ) : (
-          <>
-            <div className="flex gap-2">
-              <Select value={pick} onChange={(e) => setPick(e.target.value)} disabled={busy || available.length === 0}>
-                <option value="">
-                  {available.length === 0 ? "All registered applications are assigned" : "Select an application to add..."}
-                </option>
-                {available.map((a) => (
-                  <option key={a.application_id} value={a.application_id}>
-                    {a.display_name || a.name}
-                  </option>
-                ))}
-              </Select>
-              <Button type="button" onClick={addPicked} disabled={busy || !pick}>
-                Add
-              </Button>
-            </div>
-            <p className="text-xs text-muted">
-              The list comes from config/applications.yaml (plus applications found in your recordings). Add a new
-              application there and reopen this panel - it appears here.
-            </p>
-            {assigned.length === 0 ? (
-              <p className="text-sm text-muted">No applications assigned to this user.</p>
-            ) : (
-              <ul className="max-h-96 divide-y divide-line overflow-auto rounded-sm border border-line">
-                {assigned.map((a) => (
-                  <li key={a.application_id} className="px-3 py-2">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-sm font-medium text-ink">{a.display_name || a.name}</span>
-                      <button
-                        type="button"
-                        className="text-xs font-medium text-signal-rust hover:underline disabled:opacity-40"
-                        disabled={busy}
-                        onClick={() => toggleApp(a.application_id)}
-                      >
-                        Remove
-                      </button>
-                    </div>
-                    <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1">
-                      {PERMS.map(([p, label]) => (
-                        <label key={p} className="flex items-center gap-1 text-xs text-ink">
-                          <input
-                            type="checkbox"
-                            checked={draft[a.application_id].includes(p)}
-                            onChange={() => togglePerm(a.application_id, p)}
-                            disabled={busy}
-                          />
-                          {label}
-                        </label>
-                      ))}
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </>
-        )}
-        <div className="flex flex-wrap gap-2">
-          <Button type="button" onClick={save} disabled={busy || !dirty}>
-            {busy ? "Saving..." : "Save access"}
-          </Button>
-          <Button type="button" variant="secondary" onClick={() => setDraft(saved)} disabled={busy || !dirty}>
-            Reset
-          </Button>
-          <Button type="button" variant="secondary" onClick={revokeAll} disabled={busy || Object.keys(saved).length === 0}>
-            Revoke all
-          </Button>
-          <Button type="button" variant="secondary" onClick={onClose}>
-            Close
-          </Button>
-        </div>
-      </div>
-    </Panel>
-  );
-}
 
-function normalize(m) {
-  return Object.keys(m)
-    .sort()
-    .map((k) => [k, [...m[k]].sort()]);
-}
+def discover_names() -> list[tuple[str, Optional[str], str]]:
+    """(name, base_url, source) in priority order: yaml, Others, recording folders, recording JSON fields."""
+    found: list[tuple[str, Optional[str], str]] = []
+    for name, url in _yaml_apps().items():
+        found.append((clean_name(name), url or None, "config"))
+    found.append((OTHERS, None, "builtin"))
+    if RECORDINGS_DIR.is_dir():
+        for d in sorted(RECORDINGS_DIR.iterdir()):
+            if d.is_dir() and d.name not in _SKIP_DIRS:
+                found.append((clean_name(d.name.replace("_", " ") if " " not in d.name else d.name), None, "folder"))
+        for f in RECORDINGS_DIR.rglob("*.json"):
+            if any(part in _SKIP_DIRS for part in f.parts):
+                continue
+            try:
+                app = (json.loads(f.read_text(encoding="utf-8")) or {}).get("application")
+            except (OSError, ValueError, AttributeError):
+                continue
+            if app and str(app).strip():
+                found.append((clean_name(str(app)), None, "recording"))
+    return found
+
+
+def reconcile_applications(session: Session) -> dict:
+    """Insert registry rows that do not exist yet (matched by app_key). Returns counts."""
+    existing = {a.name_key: a for a in session.query(Application).all()}
+    created, updated = 0, 0
+    for name, url, source in discover_names():
+        key = app_key(name)
+        row = existing.get(key)
+        if row is None:
+            # A folder name like "DIGI_GOV" is only used if nothing better (yaml / JSON spelling) registered first.
+            row = Application(name=name, name_key=key, display_name=name, base_url=url, status="Active")
+            session.add(row)
+            session.flush()
+            existing[key] = row
+            created += 1
+        elif url and row.base_url != url and (source == "config" or not row.base_url):  # yaml is the source of truth for URLs
+            row.base_url = url
+            row.updated_at = datetime.utcnow()
+            updated += 1
+    return {"created": created, "updated": updated, "total": len(existing)}
+
+
+def run(session: Session) -> dict:
+    out = reconcile_applications(session)
+    if out["created"]:
+        log.info("[app-access] registered %d new application(s); %d total", out["created"], out["total"])
+    return out
