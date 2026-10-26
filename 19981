@@ -1,31 +1,445 @@
+"""
+Record from here - HTTP API, mounted under /api/cr by backend/api.py.
 
-import ctypes
-import time
+For a change request: pick an existing recording and say what changes
+(insert after a step, replace steps, remove steps, add at the end - any
+number of them). The browser replays the existing steps up to each change,
+the user records only the new part, and the result is saved as a NEW
+version next to the original. The original recording is never modified.
 
-# Windows execution state flags
-ES_CONTINUOUS = 0x80000000
-ES_SYSTEM_REQUIRED = 0x00000001
-ES_DISPLAY_REQUIRED = 0x00000002
+The browser for a session is opened by THIS process (the backend), the same
+way this module always worked - it does not go through the local agent.
+"""
+from __future__ import annotations
 
-def keep_pc_awake():
-    # Prevent system sleep and display timeout
-    ctypes.windll.kernel32.SetThreadExecutionState(
-        ES_CONTINUOUS |
-        ES_SYSTEM_REQUIRED |
-        ES_DISPLAY_REQUIRED
-    )
+import json
+import logging
+from pathlib import Path
+from typing import Optional
 
-    print("PC is now kept awake. Press Ctrl+C to stop.")
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
+
+from auth.dependencies import CurrentUser, get_current_user
+from recorder.change_requests import agent_bridge as AB
+from recorder.change_requests import session as SS
+from recorder.change_requests import steps as S
+
+router = APIRouter(prefix="/api/cr", tags=["change_requests"])
+logger = logging.getLogger("change_requests")
+
+
+# ------------------------------------------------------------------ access
+def _canonical_names() -> dict[str, str]:
+    """app_key -> the application's name as configured, so a recording in recordings/DIGI_GOV/ (or one that
+    stored "nbc") is listed under the configured "DIGI GOV" / "NBC" tile instead of a separate one."""
+    from backend.api import _load_applications
+    from backend.app_access import OTHERS, app_key
+    names = {app_key(n): n for n in _load_applications().keys()}
+    names.setdefault(app_key(OTHERS), OTHERS)
+    return names
+
+
+def _visible_rows(current_user) -> list[dict]:
+    """Recordings the user may at least view - same rule as GET /api/recordings. Each row's "application"
+    is the configured name of its application (see _canonical_names)."""
+    from backend import app_access, recording_access
+    from database.db import get_session
+    access = app_access.for_user(current_user)        # one query for the whole list
+    names = _canonical_names()
+    rows = []
+    with get_session() as session:
+        for row in S.all_recording_rows():
+            if not app_access.recording_allowed(current_user, Path(row["file"]), "view", row["application"], access):
+                continue
+            rec = recording_access.get_or_create_recording(session, Path(row["file"]))
+            if recording_access.check_access(rec, current_user, "view", application_access=access,
+                                             json_app=row["application"]):
+                row["application"] = names.get(app_access.app_key(row["application"]), row["application"])
+                rows.append(row)
+    return rows
+
+
+def _check_file(file: str, current_user) -> str:
+    if not file or not S.is_inside_recordings(file) or not Path(file).is_file():
+        raise HTTPException(404, "Recording not found.")
+    from backend import recording_access
+    from database.db import get_session
+    with get_session() as session:
+        recording_access.require_access(session, Path(file).resolve(), current_user, "view")
+    return str(Path(file).resolve())
+
+
+def _normal_recording_busy(current_user) -> bool:
+    """True while this user has a normal recording open in a browser started
+    by the backend (one backend browser recording at a time per user)."""
+    try:
+        import backend.api as rec_api
+        state = rec_api.recording_sessions.get_state(current_user.session_id, current_user.user_id)
+        return state.get("recorder") is not None or bool(state.get("launching"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _server_session_active() -> bool:
+    """The dev-only server-mode session (ALLOW_SERVER_FALLBACK) lives in this
+    process and there is only one of it. Agent-mode sessions are per user and
+    are tracked in agent_bridge.STATES."""
+    return SS.SESSION["rec"] is not None or SS.SESSION["launching"]
+
+
+def _server_session_owner():
+    return SS.SESSION.get("user_id")
+
+
+def _owns_server_session(current_user) -> bool:
+    owner = _server_session_owner()
+    return owner is None or owner == current_user.user_id or current_user.is_admin
+
+
+def _require_server_session_owner(current_user) -> None:
+    """Nobody but the person who started a server-mode session (or an admin)
+    may look at it, move it on, stop it or cancel it."""
+    if _server_session_active() and not _owns_server_session(current_user):
+        raise HTTPException(403, "This 'Record from here' session belongs to another user.")
+
+
+# ------------------------------------------------------------------ browse
+@router.get("/apps")
+def cr_apps(current_user: CurrentUser = Depends(get_current_user)):
+    """Every application the user can start a change request for: every
+    configured application (config/applications.yaml - same list
+    Record & Generate uses, so an app shows here even before its first
+    recording), plus any application name actually used by a recording but
+    not in that file (e.g. "Others", or an older/removed entry). The count
+    is how many of ITS recordings this user can see (0 is shown rather
+    than hiding the application, since a 0 explains why nothing picks)."""
+    from backend import app_access
+    # Only the applications this user may use (the same list the Record tab shows; admins: all of them).
+    counts: dict[str, int] = {a["name"]: 0 for a in app_access.get_accessible_applications(current_user)}
+    for row in _visible_rows(current_user):
+        counts[row["application"]] = counts.get(row["application"], 0) + 1
+    return {"applications": [{"name": name, "recordings": counts[name]} for name in sorted(counts, key=str.lower)]}
+
+
+@router.get("/recordings")
+def cr_recordings(app: str, current_user: CurrentUser = Depends(get_current_user)):
+    from backend.app_access import app_key
+    want = app_key(app)
+    return {"recordings": [r for r in _visible_rows(current_user) if app_key(r["application"]) == want]}
+
+
+@router.get("/steps")
+def cr_steps(file: str, current_user: CurrentUser = Depends(get_current_user)):
+    file = _check_file(file, current_user)
+    data = S.load(file)
+    steps = S.logical_steps(data.get("actions") or [])
+    return {"file": file, "name": S.base_name(data, file), "application": S.application_of(file, data),
+            "cr": data.get("cr"), "target_url": data.get("target_url"),
+            "steps": S.step_rows(steps), "step_count": len(steps), "tail_start": S.tail_start(steps)}
+
+
+@router.get("/search")
+def cr_search(q: str, current_user: CurrentUser = Depends(get_current_user)):
+    results = S.search(q, files=[r["file"] for r in _visible_rows(current_user)])
+    return {"query": q, "results": results, "count": len(results)}
+
+
+# ------------------------------------------------------------------ plan
+class Change(BaseModel):
+    type: str = Field(pattern="^(insert|replace|remove|append)$")
+    after_step: Optional[int] = None
+    from_step: Optional[int] = None
+    to_step: Optional[int] = None
+
+
+class Edit(BaseModel):
+    no: int
+    step: Optional[str] = None
+    screen: Optional[str] = None
+    data: Optional[str] = None
+
+
+class PlanRequest(BaseModel):
+    file: str
+    changes: list[Change] = []
+    edits: list[Edit] = []
+    # Every original step number once, in the order the user dragged the rows
+    # to in the table (empty = unchanged). See session.make_plan.
+    order: list[int] = []
+    # one-change form the first version of this page sent - still accepted
+    mode: Optional[str] = None
+    after_step: Optional[int] = None
+    from_step: Optional[int] = None
+    to_step: Optional[int] = None
+
+
+class StartRequest(PlanRequest):
+    cr_number: str = Field(min_length=1, max_length=40)
+    cr_title: str = ""
+    headless: bool = False
+
+
+def _plan(req: PlanRequest, current_user) -> dict:
+    changes = [c.model_dump() for c in req.changes]
+    if not changes and req.mode:
+        changes = [{"type": req.mode, "after_step": req.after_step, "from_step": req.from_step, "to_step": req.to_step}]
+    try:
+        return SS.make_plan(_check_file(req.file, current_user), changes, [e.model_dump() for e in req.edits],
+                            order=req.order or None)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/preview")
+def cr_preview(req: PlanRequest, current_user: CurrentUser = Depends(get_current_user)):
+    return SS.plan_preview(_plan(req, current_user))
+
+
+# ------------------------------------------------------------------ save
+def _save(plan: dict, recorded: list[list[dict]], fail_from: dict, cr_number: str, cr_title: str, current_user) -> dict:
+    merged = SS.merge(plan, recorded, fail_from, cr_number)
+    operation = {
+        "changes": [{k: c.get(k) for k in ("type", "after_step", "from_step", "to_step") if c.get(k) is not None}
+                    for c in plan["changes"]],
+        "edited_steps": plan["edit_count"],
+        "reordered": bool(plan.get("reordered")),
+        "new_step_count": len([a for a in merged if a.get("cr_added_in") == cr_number]),
+    }
+    if fail_from:
+        operation["replay_failed_at_steps"] = sorted(fail_from.values())
+    path = S.save_version(plan["file"], merged, cr_number, cr_title, operation)
+    data = S.load(path)
+    try:  # make it the user's own recording, so it shows in Run Saved Recording with the usual sharing/versions
+        from backend import recording_access
+        from database.db import get_session
+        with get_session() as session:
+            recording_access.create_recording_with_initial_version(
+                session, owner_user_id=current_user.user_id, name=data["recording_name"], path=Path(path),
+                recording_json=data,
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("[cr] saved %s but could not register it for user_id=%s", path, current_user.user_id)
+    steps = S.logical_steps(data["actions"])
+    rows = S.step_rows(steps)
+    for row, a in zip(rows, steps):
+        row["new"] = a.get("cr_added_in") == cr_number
+    return {"file": path, "name": data["recording_name"], "version": data["cr"]["version"], "steps": rows,
+            "new_step_count": operation["new_step_count"], "edited_steps": plan["edit_count"]}
+
+
+@router.post("/save_direct")
+def cr_save_direct(req: StartRequest, current_user: CurrentUser = Depends(get_current_user)):
+    """Saves a new version WITHOUT opening a browser - for a change request
+    that only removes steps and/or edits Step / Screen / Data in the table."""
+    plan = _plan(req, current_user)
+    if plan["segments"]:
+        raise HTTPException(400, "This change request has parts to record - use Start.")
+    if not plan["changes"] and not plan["edit_count"] and not plan.get("reordered"):
+        raise HTTPException(400, "Nothing was changed - add a change, move or delete a row, or edit a row in the table.")
+    return _save(plan, [], {}, req.cr_number.strip(), req.cr_title.strip(), current_user)
+
+
+# ------------------------------------------------------------------ session
+@router.post("/start")
+async def cr_start(req: StartRequest, current_user: CurrentUser = Depends(get_current_user)):
+    """Opens the session's browser on the USER'S OWN PC through their
+    connected local agent (same as normal recording's POST /api/start) -
+    never on the machine running the backend. ALLOW_SERVER_FALLBACK
+    (backend/api.py, local-dev-only) falls back to a browser opened by the
+    backend itself when no agent is connected; without it, no agent means
+    a 409 telling the user to start their desktop app, same as normal
+    recording.
+
+    Agent-mode sessions are per user - this user's session never blocks, or
+    is visible to, anyone else's."""
+    from backend import agent_registry
+    from backend.api import ALLOW_SERVER_FALLBACK, NO_AGENT_ERROR
+
+    uid = current_user.user_id
+    conn = agent_registry.get_for_user(uid)
+    if conn is not None and await AB.ensure(uid) is not None:   # also restores one that survived a backend restart
+        raise HTTPException(409, "You already have a 'Record from here' session running - save or cancel it first.")
+
+    with SS.LOCK:
+        if conn is not None:
+            if AB.has_state(uid) or AB.is_reserved(uid):
+                raise HTTPException(409, "You already have a 'Record from here' session running - save or cancel it first.")
+        else:
+            if not ALLOW_SERVER_FALLBACK:
+                raise HTTPException(409, NO_AGENT_ERROR)
+            if _server_session_active():
+                if _owns_server_session(current_user):
+                    raise HTTPException(409, "You already have a 'Record from here' session running - save or cancel it first.")
+                raise HTTPException(409, "Another user is using 'Record from here' on this server right now - try again shortly.")
+        if _normal_recording_busy(current_user):
+            raise HTTPException(409, "A normal recording is in progress - finish it first.")
+        if not req.cr_number.strip():
+            raise HTTPException(400, "Enter the change request number.")
+        plan = _plan(req, current_user)
+        if not plan["segments"]:
+            raise HTTPException(400, "Nothing to record - add an insert, replace or add-at-end change "
+                                     "(removing steps or editing rows is saved without a browser).")
+        # Reserve before releasing the lock: building the test code and waiting
+        # for the agent below can take a few seconds.
+        if conn is not None:
+            AB.reserve(uid)
+        else:
+            SS.SESSION.update({"plan": plan, "launching": True, "user_id": uid})
 
     try:
-        while True:
-            time.sleep(60)
-    except KeyboardInterrupt:
-        # Restore normal power management
-        ctypes.windll.kernel32.SetThreadExecutionState(
-            ES_CONTINUOUS
-        )
-        print("\nNormal power settings restored.")
+        if conn is not None:
+            await AB.start(conn, plan, req.cr_number.strip(), req.cr_title.strip(), req.headless, uid)
+        else:
+            # SS.start() sets launching/owner itself and clears "launching" when the
+            # browser is up (or failed) - it must NOT be reset here, or the session
+            # looks inactive to everyone while the browser is still opening.
+            SS.start(plan, req.cr_number.strip(), req.cr_title.strip(), req.headless, user_id=uid)
+    except Exception as exc:
+        if conn is not None:
+            AB.release(uid)
+        else:
+            SS.SESSION.update({"plan": None, "launching": False, "user_id": None})
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(502, str(exc)) from exc
+    return {"started": True, "mode": "agent" if conn is not None else "server", **SS.plan_preview(plan)}
 
-if __name__ == "__main__":
-    keep_pc_awake()
+
+@router.get("/status")
+async def cr_status(current_user: CurrentUser = Depends(get_current_user)):
+    """The caller's own session only. Another user's server-mode session is
+    reported as "busy_by_other" with no detail."""
+    uid = current_user.user_id
+    st = await AB.status(uid)
+    if st.get("active"):
+        return st
+    if not _owns_server_session(current_user):
+        return {"active": False, "busy_by_other": _server_session_active()}
+    return SS.status()
+
+
+@router.post("/next")
+async def cr_next(current_user: CurrentUser = Depends(get_current_user)):
+    """Done with this change: keep what was recorded and replay on to the next one."""
+    uid = current_user.user_id
+    if await AB.ensure(uid) is not None:
+        try:
+            await AB.next_change(uid)
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"ok": True}
+    _require_server_session_owner(current_user)
+    rec = SS.SESSION["rec"]
+    if rec is None or rec.phase != "recording":
+        raise HTTPException(409, "Not recording right now.")
+    if rec.seg >= len(rec.segments) - 1:
+        raise HTTPException(409, "This is the last change - press Stop & Save.")
+    rec.next_change()
+    return {"ok": True}
+
+
+@router.post("/continue")
+async def cr_continue(current_user: CurrentUser = Depends(get_current_user)):
+    uid = current_user.user_id
+    if await AB.ensure(uid) is not None:
+        try:
+            step = await AB.continue_from_failure(uid)
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"ok": True, "record_from_step": step}
+    _require_server_session_owner(current_user)
+    rec = SS.SESSION["rec"]
+    if rec is None or rec.phase != "replay_failed":
+        raise HTTPException(409, "Nothing to continue.")
+    rec.continue_from_failure()
+    return {"ok": True, "record_from_step": rec.failed_step}
+
+
+@router.post("/cancel")
+async def cr_cancel(current_user: CurrentUser = Depends(get_current_user)):
+    """Ends the caller's session and discards anything unsaved. Also clears a
+    session left open on the person's PC that the server has lost track of
+    (e.g. after a backend restart)."""
+    from backend import agent_registry
+    uid = current_user.user_id
+    if AB.has_state(uid) or agent_registry.get_for_user(uid) is not None:
+        await AB.cancel(uid)
+    if _server_session_active():
+        _require_server_session_owner(current_user)
+        with SS.LOCK:
+            SS.stop_session(timeout=10)
+            SS.SESSION.update({"plan": None, "start_error": None, "user_id": None})
+    return {"cancelled": True}
+
+
+@router.post("/stop_and_save")
+async def cr_stop_and_save(current_user: CurrentUser = Depends(get_current_user)):
+    uid = current_user.user_id
+    st = await AB.ensure(uid)
+    if st is not None:
+        plan, cr_number, cr_title = st["plan"], st["cr_number"], st["cr_title"] or ""
+        try:
+            recorded, fail_from = await AB.stop_and_save(uid)
+        except AB.AgentUnreachable as exc:
+            # Nothing is forgotten: the recording is safe on the PC and the
+            # session stays, so the person can simply press Stop & Save again.
+            raise HTTPException(502, "Could not reach your PC to finish the recording - it is safe there. "
+                                     "Check the desktop app is running, then press Stop & Save again.") from exc
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if not any(recorded) and not plan["edit_count"] and not plan.get("reordered") and not any(not c["record"] for c in plan["changes"]):
+            await AB.ack(uid)   # nothing to keep - release the session
+            raise HTTPException(400, "No new steps were recorded - nothing saved. The original recording is unchanged.")
+        result = _save(plan, recorded, fail_from, cr_number, cr_title, current_user)
+        await AB.ack(uid)       # only now may the agent (and this server) forget the recording
+        return result
+
+    _require_server_session_owner(current_user)
+    with SS.LOCK:
+        rec, plan = SS.SESSION["rec"], SS.SESSION["plan"]
+        if rec is None or plan is None:
+            raise HTTPException(400, "No 'Record from here' session is running.")
+        if rec.phase != "recording":
+            raise HTTPException(409, "Not recording yet - wait until the replay has finished ('Recording now').")
+        if rec.seg < len(rec.segments) - 1:
+            raise HTTPException(409, f"Change {rec.seg + 1} of {len(rec.segments)} - press Done to go on to the next "
+                                     f"change first (or Cancel).")
+        fail_from = dict(rec.fail_from)
+        recorded = SS.stop_session()
+        cr_number, cr_title = SS.SESSION["cr_number"], SS.SESSION["cr_title"] or ""
+        SS.SESSION.update({"plan": None, "user_id": None})
+    if not any(recorded) and not plan["edit_count"] and not plan.get("reordered") and not any(not c["record"] for c in plan["changes"]):
+        raise HTTPException(400, "No new steps were recorded - nothing saved. The original recording is unchanged.")
+    return _save(plan, recorded, fail_from, cr_number, cr_title, current_user)
+
+
+@router.post("/check")
+async def cr_check(file: str, request: Request, headless: bool = False,
+                   current_user: CurrentUser = Depends(get_current_user)):
+    """Runs a saved version once - through EXACTLY the same code as Run Saved
+    Recording (backend/api.py's run_saved_recording): the browser opens on the
+    USER'S OWN PC through their connected local agent, never on the server.
+    No connected agent = the same 409 "start the desktop app / agent" message
+    (the dev-only ALLOW_SERVER_FALLBACK is the one exception, as everywhere
+    else). Permission, activity log, report and error handling all come from
+    that one function, so the two can never drift apart again.
+
+    (This used to call run_recording() directly with no agent hand-off, which
+    ran the whole test - and opened Edge - on the machine hosting the backend.)"""
+    from backend.api import RunRecordingRequest, run_saved_recording
+    file = _check_file(file, current_user)
+    report = await run_saved_recording(RunRecordingRequest(recording_file=file, headless=headless), request, current_user)
+    return {"ok": report.get("status") == "Success", "transaction": report}
+
+
+async def shutdown() -> None:
+    """Called on backend shutdown. A browser THIS process opened (dev-only
+    server mode) is closed so it is not left behind. Agent-mode sessions are
+    deliberately NOT cancelled: they run on people's own PCs, their plan is
+    saved under output/cr_sessions/, and they are picked up again
+    (agent_bridge.ensure) when the backend is back."""
+    try:
+        SS.stop_session(timeout=10)
+    except Exception:  # noqa: BLE001
+        pass
