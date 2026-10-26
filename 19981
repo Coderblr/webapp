@@ -1,340 +1,97 @@
 """
-Record from here - the data side. Nothing here uses AI: everything is read
-from the saved recordings.
+One-time repair: give recordings that have NO application one, from the address they were recorded on.
 
-* logical_steps()  a recording's actions exactly as the generator uses them
-                   (the same clean-up generator/build.py applies: merged
-                   typing, {{variables}}, calendar clicks folded into one
-                   date step, phantom tab hovers / shutdown tab-closes
-                   removed) - so the step numbers the user picks are the
-                   steps the generated test really runs.
-* describe()       one step in plain words ("Click "Trade Finance"",
-                   "A new tab / window opens") + screen() for the page it
-                   happened on + data_of() for what it types/selects.
-* apply_edits()    the user's changes to Step / Screen / Data in the table.
-* versions         every change request is saved as a NEW recording file
-                   next to the original, with a "cr" block saying which
-                   version it came from. The original is never modified.
-* search()         plain text match over every recording's steps.
+Recordings saved before the server-mode save fix (and some imports) sit directly in recordings/ with no
+"application" in the file, so every screen lists them under "Others". This matches each such recording's
+target_url against config/applications.yaml (same host = same application) and writes that application
+into the file. The file is not moved, so nothing that points at it (versions, shares, execution history)
+breaks. A version snapshot is taken first, like any other edit.
+
+    python tools/assign_recording_applications.py            # dry run: only shows what would change
+    python tools/assign_recording_applications.py --apply    # writes the changes
+
+Recordings whose address matches no configured application are left as "Others". Stop the backend
+first or run it while nobody is editing recordings.
 """
 from __future__ import annotations
 
+import argparse
 import json
-import re
-from datetime import datetime
+import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
 RECORDINGS_DIR = ROOT / "recordings"
 
-CLOSE_ACTIONS = ("window_closed", "window_closed_final")
-# Steps whose "Data" (the value the test types / selects / sets) can be
-# changed straight in the table.
-DATA_ACTIONS = ("type", "paste", "select", "date")
-STEP_TEXT_KEY = "cr_step_text"      # user's own wording for the Step column
-SCREEN_TEXT_KEY = "cr_screen_text"  # user's own wording for the Screen column
 
-
-# ------------------------------------------------------------------ steps
-def logical_steps(actions: list[dict]) -> list[dict]:
-    actions = list(actions or [])
+def _host(url: str) -> str:
     try:
-        from recorder.variable_capture import annotate_variables, coalesce_consecutive_types
-        actions = annotate_variables(coalesce_consecutive_types(actions))
-    except Exception:  # noqa: BLE001 - same best-effort behaviour as generator/build.py
-        pass
-    try:
-        from recorder.date_picker import collapse_date_pickers
-        actions = collapse_date_pickers(actions)
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        from generator.build import _drop_stray_tab_hovers, _drop_teardown_closes
-        actions = _drop_stray_tab_hovers(_drop_teardown_closes(actions))
-    except Exception:  # noqa: BLE001
-        pass
-    return actions
-
-
-def _label(a: dict) -> str:
-    el = a.get("element") or {}
-    if a.get("action") == "date" and a.get("near_anchor"):
-        return "date field (next to the calendar icon)"
-    for key in ("ariaLabel", "placeholder", "name", "text"):
-        v = re.sub(r"\s+", " ", str(el.get(key) or "")).strip()
-        if v:
-            return v[:60]
-    return el.get("tag") or "element"
-
-
-def _is_password(a: dict) -> bool:
-    return ((a.get("element") or {}).get("type") or "").lower() == "password"
-
-
-def default_screen(a: dict) -> str:
-    url = a.get("url")
-    if not url:
-        return ""
-    u = urlparse(url)
-    path = (u.path or "").strip("/")
-    tail = "/".join(path.split("/")[-2:]) if path else ""
-    frag = (u.fragment or "").strip("/")
-    return (tail + (f"#{frag}" if frag else "")) or u.netloc
-
-
-def screen(a: dict) -> str:
-    return a.get(SCREEN_TEXT_KEY) or default_screen(a)
-
-
-def default_describe(a: dict) -> str:
-    kind, v, lab = a.get("action"), a.get("value"), _label(a)
-    el = a.get("element") or {}
-    shown = "••••" if _is_password(a) else v
-    if a.get("resolved_var") and kind in ("type", "paste"):
-        shown = "{{" + a["resolved_var"] + "}}"
-    if kind == "click":
-        if (el.get("type") or "") in ("checkbox", "radio"):
-            return f'{"Tick" if v else "Untick"} "{lab}"'
-        return f'Click "{lab}"'
-    return {
-        "type": f'Enter "{shown}" in {lab}',
-        "paste": f'Paste "{shown}" into {lab}',
-        "select": f'Select "{v}" in {lab}',
-        "keypress": f"Press {v} on {lab}",
-        "copy": f"Copy the value of {lab}" + (f' as {{{{{a["captured_as"]}}}}}' if a.get("captured_as") else ""),
-        "ocr_capture": f"Read the value of {lab} from the screen",
-        "file_upload": f'Upload file "{v}" to {lab}',
-        "date": f'Set date "{v}" in {lab}',
-        "hover": f'Hover over "{lab}"',
-        "scroll": f"Scroll {v or 'the page'}",
-        "delay": f"Wait {v} seconds",
-        "assert_text": f'Check that {lab} shows "{v}"',
-        "assert_ocr_text": f'Check that the page shows "{v}"',
-        "menu_check": "Check every link in the navigation menu",
-        "new_window": "A new tab / window opens",
-        "window_closed": "Tab / window closes",
-        "window_closed_final": "Browser tab closes (end of flow)",
-        "dialog": f'Accept browser {a.get("dialog_type") or "alert"} "{str(v or "")[:40]}"',
-    }.get(kind, f"{kind} {lab}")
-
-
-def describe(a: dict) -> str:
-    return a.get(STEP_TEXT_KEY) or default_describe(a)
-
-
-def data_of(a: dict) -> str:
-    if a.get("action") not in DATA_ACTIONS:
-        return ""
-    if _is_password(a):
-        return "••••"
-    if a.get("resolved_var") and a.get("action") in ("type", "paste"):
-        return "{{" + a["resolved_var"] + "}}"
-    return "" if a.get("value") is None else str(a.get("value"))
-
-
-def data_editable(a: dict) -> bool:
-    return a.get("action") in DATA_ACTIONS and not _is_password(a) and not a.get("resolved_var")
-
-
-def step_rows(steps: list[dict]) -> list[dict]:
-    return [{"no": i, "step": describe(a), "screen": screen(a), "data": data_of(a),
-             "data_editable": data_editable(a), "action": a.get("action")}
-            for i, a in enumerate(steps, start=1)]
-
-
-def tail_start(steps: list[dict]) -> int:
-    """How many steps come before the closing tab/window steps at the very
-    end ("add at the end" goes before those)."""
-    i = len(steps)
-    while i > 0 and steps[i - 1].get("action") in CLOSE_ACTIONS:
-        i -= 1
-    return i
-
-
-def apply_edits(steps: list[dict], edits: list[dict] | None) -> int:
-    """Applies the user's table edits to `steps` in place. Each edit:
-    {"no": 1-based step number, "step"?: str, "screen"?: str, "data"?: str}.
-    Step and Screen are wording only (kept with the step, shown wherever
-    the step is listed); Data changes the value the test really types,
-    selects or sets. An edit that equals the current text changes nothing.
-    Returns how many steps were changed."""
-    changed = 0
-    for e in edits or []:
-        try:
-            a = steps[int(e.get("no")) - 1]
-        except (TypeError, ValueError, IndexError):
-            continue
-        touched = False
-        if e.get("step") is not None:
-            text = str(e["step"]).strip()
-            if text != describe(a):
-                if text and text != default_describe(a):
-                    a[STEP_TEXT_KEY] = text[:200]
-                else:
-                    a.pop(STEP_TEXT_KEY, None)
-                touched = True
-        if e.get("screen") is not None:
-            text = str(e["screen"]).strip()
-            if text != screen(a):
-                if text and text != default_screen(a):
-                    a[SCREEN_TEXT_KEY] = text[:200]
-                else:
-                    a.pop(SCREEN_TEXT_KEY, None)
-                touched = True
-        if e.get("data") is not None and data_editable(a):
-            text = str(e["data"])
-            if text != data_of(a):
-                a["value"] = text
-                touched = True
-        changed += 1 if touched else 0
-    return changed
-
-
-# ------------------------------------------------------------------ files & versions
-def is_inside_recordings(path: str | Path) -> bool:
-    try:
-        Path(path).resolve().relative_to(RECORDINGS_DIR.resolve())
-        return True
+        return (urlparse((url or "").strip()).hostname or "").lower()
     except ValueError:
-        return False
+        return ""
 
 
-def load(file: str | Path) -> dict:
-    p = Path(file).resolve()
-    if not is_inside_recordings(p):
-        raise ValueError("Not a saved recording.")
-    return json.loads(p.read_text())
+def _load_applications() -> dict:
+    import yaml
+    path = ROOT / "config" / "applications.yaml"
+    if not path.exists():
+        return {}
+    return (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("applications") or {}
 
 
-def base_name(data: dict, file: str | Path) -> str:
-    return (data.get("cr") or {}).get("base_name") or data.get("recording_name") or Path(file).stem
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--apply", action="store_true", help="write the changes (default: dry run)")
+    args = ap.parse_args()
 
+    by_host: dict[str, str] = {}
+    for name, url in _load_applications().items():
+        h = _host(url)
+        if h:
+            by_host.setdefault(h, name)
+    if not by_host:
+        print("No applications with an address in config/applications.yaml - nothing to match against.")
+        return 1
 
-def root_file(data: dict, file: str | Path) -> str:
-    return (data.get("cr") or {}).get("root_file") or str(Path(file).resolve())
-
-
-def application_of(file: str | Path, data: dict) -> str:
-    """The application a recording belongs to - the same rule Run Saved Recording uses
-    (runner/run_recording.list_saved_recordings): the "application" stored in the file, else the
-    recordings/<application>/ folder it sits in, else "Others" for a file directly under recordings/.
-    Agent-mode recordings, UiPath imports and older files often have only the folder."""
-    app = data.get("application")
-    if not app:
+    changed = unmatched = 0
+    for f in sorted(RECORDINGS_DIR.glob("*.json")):          # only files directly in recordings/ (no folder)
         try:
-            rel = Path(file).resolve().relative_to(RECORDINGS_DIR.resolve())
-            if len(rel.parts) > 1:
-                app = rel.parts[0]
-        except ValueError:
-            app = None
-    return app or "Others"
-
-
-def recording_row(file: str | Path, data: dict) -> dict:
-    cr = data.get("cr") or {}
-    return {"file": str(Path(file).resolve()), "name": base_name(data, file), "version": cr.get("version", 1),
-            "cr_number": cr.get("cr_number"), "cr_title": cr.get("cr_title"),
-            "recorded_at": data.get("recorded_at") or "", "target_url": data.get("target_url"),
-            "application": application_of(file, data), "root_file": root_file(data, file),
-            "action_count": len(data.get("actions") or [])}
-
-
-def all_recording_rows() -> list[dict]:
-    rows = []
-    if not RECORDINGS_DIR.exists():
-        return rows
-    for f in RECORDINGS_DIR.rglob("*.json"):
-        if "versions" in f.relative_to(RECORDINGS_DIR).parts[:-1]:
-            continue  # backend/recording_access.py's own version snapshots, not recordings
-        try:
-            data = json.loads(f.read_text())
-        except Exception:  # noqa: BLE001
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
             continue
-        if not isinstance(data, dict) or "actions" not in data:
+        if not isinstance(data, dict) or "actions" not in data or data.get("application"):
             continue
-        rows.append(recording_row(f, data))
-    rows.sort(key=lambda r: (r["name"].lower(), -int(r["version"] or 1)))
-    return rows
-
-
-def next_version(root: str) -> int:
-    return 1 + max([int(r["version"] or 1) for r in all_recording_rows() if r["root_file"] == root] or [1])
-
-
-def _slug(s: str, n: int = 40) -> str:
-    return ("_".join(filter(None, re.sub(r"[^A-Za-z0-9]+", "_", s or "").split("_"))) or "x")[:n]
-
-
-def save_version(base_file: str, actions: list[dict], cr_number: str, cr_title: str, operation: dict) -> str:
-    """Writes the new version next to the original and returns its path.
-    Everything else in the original file (application, source type, menu
-    check settings ...) is carried over unchanged."""
-    data = load(base_file)
-    rec_dir = Path(base_file).resolve().parent
-    root = root_file(data, base_file)
-    version = next_version(root)
-    name = base_name(data, base_file)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    payload = {
-        **{k: v for k, v in data.items() if k not in ("actions", "cr", "recording_name", "recorded_at")},
-        "recorded_at": ts,
-        "recording_name": f"{name} v{version} ({cr_number})",
-        "actions": actions,
-        "cr": {"cr_number": cr_number, "cr_title": cr_title, "version": version, "base_name": name,
-               "root_file": root, "based_on_file": str(Path(base_file).resolve()),
-               "based_on_version": (data.get("cr") or {}).get("version", 1), "created_at": datetime.now().isoformat(),
-               **operation},
-    }
-    path = rec_dir / f"{_slug(name)}_v{version}_{_slug(cr_number, 20)}_{ts}.json"
-    path.write_text(json.dumps(payload, indent=2, default=str))
-    return str(path)
-
-
-# ------------------------------------------------------------------ search
-_cache: dict[str, tuple[float, list[dict], dict]] = {}
-
-
-def _steps_cached(f: Path) -> tuple[list[dict], dict]:
-    key, mtime = str(f), f.stat().st_mtime
-    hit = _cache.get(key)
-    if hit and hit[0] == mtime:
-        return hit[1], hit[2]
-    data = json.loads(f.read_text())
-    steps = logical_steps(data.get("actions") or [])
-    _cache[key] = (mtime, steps, data)
-    return steps, data
-
-
-def search(query: str, limit: int = 300, files: list[str] | None = None) -> list[dict]:
-    """Every step whose wording, screen, address or element text contains
-    all the words of `query`. `files` limits the search to those recordings
-    (the caller passes the ones the user may see)."""
-    words = [w for w in re.split(r"\s+", (query or "").lower().strip()) if w]
-    if not words:
-        return []
-    paths = [Path(f) for f in files] if files is not None else [Path(r["file"]) for r in all_recording_rows()]
-    hits = []
-    for f in sorted(paths):
-        try:
-            steps, data = _steps_cached(f)
-        except Exception:  # noqa: BLE001
+        app = by_host.get(_host(data.get("target_url", "")))
+        if not app:
+            unmatched += 1
+            print(f"  stays Others : {f.name}  ({data.get('target_url') or 'no address'})")
             continue
-        cr = data.get("cr") or {}
-        for row, a in zip(step_rows(steps), steps):
-            el = a.get("element") or {}
-            blob = " ".join([row["step"], row["screen"], row["data"], str(a.get("url") or "")] +
-                            [str(el.get(k) or "") for k in ("ariaLabel", "placeholder", "name", "text")]).lower()
-            if all(w in blob for w in words):
-                hits.append({
-                    # keys the existing "Find steps" page reads
-                    "recording_file": str(f.resolve()), "recording_name": base_name(data, f),
-                    "application": application_of(f, data),
-                    "step_index": row["no"], "step_description": row["step"], "step_action": row["action"],
-                    "step_label": _label(a), "step_value": row["data"],
-                    # extra detail
-                    "screen": row["screen"], "version": cr.get("version", 1), "cr_number": cr.get("cr_number"),
-                })
-                if len(hits) >= limit:
-                    return hits
-    return hits
+        changed += 1
+        print(f"  -> {app:12} : {f.name}  ({data.get('target_url')})")
+        if args.apply:
+            try:
+                from database.db import get_session, init_db
+                from backend.recording_access import get_or_create_recording, snapshot_version
+                init_db()
+                with get_session() as session:
+                    rec = get_or_create_recording(session, f)
+                    data["application"] = app
+                    snapshot_version(session, recording=rec, recording_json=data,
+                                     version_number=(rec.current_version_number or 1) + 1, created_by_user_id=None,
+                                     change_summary=f"Application set to {app} (tools/assign_recording_applications.py)")
+            except Exception as e:  # noqa: BLE001 - fall back to a plain write if the version store is unavailable
+                print(f"     (no version snapshot: {e}) - writing the file directly")
+                data["application"] = app
+                f.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    print(f"\n{changed} recording(s) {'updated' if args.apply else 'would be updated'}, {unmatched} stay under Others.")
+    if changed and not args.apply:
+        print("Run again with --apply to write the changes.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
