@@ -1,97 +1,14 @@
-"""
-One-time repair: give recordings that have NO application one, from the address they were recorded on.
+SELECT 'MAIN' AS db_name, m.name AS table_name,
+       p.name AS column_name, p.type, p.pk
+FROM main.sqlite_master AS m
+JOIN pragma_table_info(m.name, 'main') AS p
+WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'
 
-Recordings saved before the server-mode save fix (and some imports) sit directly in recordings/ with no
-"application" in the file, so every screen lists them under "Others". This matches each such recording's
-target_url against config/applications.yaml (same host = same application) and writes that application
-into the file. The file is not moved, so nothing that points at it (versions, shares, execution history)
-breaks. A version snapshot is taken first, like any other edit.
+UNION ALL
 
-    python tools/assign_recording_applications.py            # dry run: only shows what would change
-    python tools/assign_recording_applications.py --apply    # writes the changes
+SELECT 'SECOND', m.name, p.name, p.type, p.pk
+FROM db2.sqlite_master AS m
+JOIN pragma_table_info(m.name, 'db2') AS p
+WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'
 
-Recordings whose address matches no configured application are left as "Others". Stop the backend
-first or run it while nobody is editing recordings.
-"""
-from __future__ import annotations
-
-import argparse
-import json
-import sys
-from pathlib import Path
-from urllib.parse import urlparse
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-
-RECORDINGS_DIR = ROOT / "recordings"
-
-
-def _host(url: str) -> str:
-    try:
-        return (urlparse((url or "").strip()).hostname or "").lower()
-    except ValueError:
-        return ""
-
-
-def _load_applications() -> dict:
-    import yaml
-    path = ROOT / "config" / "applications.yaml"
-    if not path.exists():
-        return {}
-    return (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("applications") or {}
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--apply", action="store_true", help="write the changes (default: dry run)")
-    args = ap.parse_args()
-
-    by_host: dict[str, str] = {}
-    for name, url in _load_applications().items():
-        h = _host(url)
-        if h:
-            by_host.setdefault(h, name)
-    if not by_host:
-        print("No applications with an address in config/applications.yaml - nothing to match against.")
-        return 1
-
-    changed = unmatched = 0
-    for f in sorted(RECORDINGS_DIR.glob("*.json")):          # only files directly in recordings/ (no folder)
-        try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(data, dict) or "actions" not in data or data.get("application"):
-            continue
-        app = by_host.get(_host(data.get("target_url", "")))
-        if not app:
-            unmatched += 1
-            print(f"  stays Others : {f.name}  ({data.get('target_url') or 'no address'})")
-            continue
-        changed += 1
-        print(f"  -> {app:12} : {f.name}  ({data.get('target_url')})")
-        if args.apply:
-            try:
-                from database.db import get_session, init_db
-                from backend.recording_access import get_or_create_recording, snapshot_version
-                init_db()
-                with get_session() as session:
-                    rec = get_or_create_recording(session, f)
-                    data["application"] = app
-                    snapshot_version(session, recording=rec, recording_json=data,
-                                     version_number=(rec.current_version_number or 1) + 1, created_by_user_id=None,
-                                     change_summary=f"Application set to {app} (tools/assign_recording_applications.py)")
-            except Exception as e:  # noqa: BLE001 - fall back to a plain write if the version store is unavailable
-                print(f"     (no version snapshot: {e}) - writing the file directly")
-                data["application"] = app
-                f.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-    print(f"\n{changed} recording(s) {'updated' if args.apply else 'would be updated'}, {unmatched} stay under Others.")
-    if changed and not args.apply:
-        print("Run again with --apply to write the changes.")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+ORDER BY table_name, db_name;
