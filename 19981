@@ -1,17 +1,152 @@
-SELECT 'MAIN' AS db_name, 'recordings' AS table_name, *
-FROM pragma_foreign_key_list('recordings', 'main')
-UNION ALL
-SELECT 'MAIN', 'recording_versions', *
-FROM pragma_foreign_key_list('recording_versions', 'main')
-UNION ALL
-SELECT 'MAIN', 'recording_shares', *
-FROM pragma_foreign_key_list('recording_shares', 'main')
-UNION ALL
-SELECT 'MAIN', 'sessions', *
-FROM pragma_foreign_key_list('sessions', 'main')
-UNION ALL
-SELECT 'MAIN', 'activity_logs', *
-FROM pragma_foreign_key_list('activity_logs', 'main')
-UNION ALL
-SELECT 'MAIN', 'user_application_access', *
-FROM pragma_foreign_key_list('user_application_access', 'main');
+
+import sqlite3
+import shutil
+from pathlib import Path
+
+# 1. MAIN DATABASE — database you want to keep
+MAIN_DB = Path(
+    r"C:\Users\1085271\Desktop\ai-test-recorder-pw\ai-test-recorder-pw\database\test_recorder.db"
+)
+
+# 2. SECOND DATABASE — ADD ITS FULL PATH HERE
+SECOND_DB = Path(
+    r"C:\PASTE\YOUR\SECOND\DATABASE\PATH\HERE.db"
+)
+
+# 3. Tables to merge
+TABLES = [
+    "users",
+    "applications",
+    "user_application_access",
+    "recordings",
+    "recording_versions",
+    "recording_shares",
+    "sessions",
+    "activity_logs",
+]
+
+def merge_databases():
+    if not MAIN_DB.exists():
+        raise FileNotFoundError(f"Main database not found: {MAIN_DB}")
+
+    if not SECOND_DB.is_file():
+        raise FileNotFoundError(
+            f"Second database not found: {SECOND_DB}"
+        )
+
+    if MAIN_DB.resolve() == SECOND_DB.resolve():
+        raise ValueError("Both paths point to the same database.")
+
+    # Back up the main database before modifying it.
+    backup = MAIN_DB.with_name(
+        MAIN_DB.stem + "_backup" + MAIN_DB.suffix
+    )
+    shutil.copy2(MAIN_DB, backup)
+    print(f"Backup created: {backup}")
+
+    # Open main database and attach the second database.
+    con = sqlite3.connect(str(MAIN_DB))
+    try:
+        con.execute("PRAGMA foreign_keys = OFF")
+        con.execute(
+            "ATTACH DATABASE ? AS source_db",
+            (str(SECOND_DB.resolve()),),
+        )
+
+        # Verify all required tables exist.
+        for db_alias in ("main", "source_db"):
+            existing = {
+                row[0]
+                for row in con.execute(
+                    f"SELECT name FROM {db_alias}.sqlite_master "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+            missing = set(TABLES) - existing
+            if missing:
+                raise RuntimeError(
+                    f"{db_alias} is missing tables: {sorted(missing)}"
+                )
+
+        # Stop if column structures differ.
+        for table in TABLES:
+            main_cols = [
+                row[1] for row in con.execute(
+                    f"PRAGMA main.table_info('{table}')"
+                )
+            ]
+            source_cols = [
+                row[1] for row in con.execute(
+                    f"PRAGMA source_db.table_info('{table}')"
+                )
+            ]
+            if main_cols != source_cols:
+                raise RuntimeError(
+                    f"Column mismatch in {table}. "
+                    "No merge was performed."
+                )
+
+        # IMPORTANT:
+        # This initial version only inserts rows with non-conflicting
+        # primary keys. It does not remap conflicting IDs or repair
+        # foreign-key references.
+        con.execute("BEGIN")
+        for table in TABLES:
+            info = list(
+                con.execute(f"PRAGMA main.table_info('{table}')")
+            )
+            pk_cols = [
+                row[1] for row in sorted(info, key=lambda r: r[5])
+                if row[5] > 0
+            ]
+
+            if not pk_cols:
+                raise RuntimeError(
+                    f"{table} has no primary key; review manually."
+                )
+
+            condition = " AND ".join(
+                f"main_table.{col} IS source_table.{col}"
+                for col in pk_cols
+            )
+
+            columns = ", ".join(f'"{c}"' for c in
+                                [row[1] for row in info])
+            con.execute(
+                f'INSERT INTO main."{table}" ({columns}) '
+                f'SELECT {", ".join("source_table."+chr(34)+row[1]+chr(34) for row in info)} '
+                f'FROM source_db."{table}" AS source_table '
+                f'WHERE NOT EXISTS ('
+                f' SELECT 1 FROM main."{table}" AS main_table '
+                f' WHERE {condition}'
+                f')'
+            )
+
+            print(f"{table}: {con.execute('SELECT changes()').fetchone()[0]} rows inserted")
+
+        # Verify relationships before committing.
+        violations = con.execute(
+            "PRAGMA main.foreign_key_check"
+        ).fetchall()
+
+        if violations:
+            raise RuntimeError(
+                f"Foreign-key violations detected: {violations[:10]}. "
+                "Changes will be rolled back."
+            )
+
+        con.commit()
+        print("Merge completed successfully.")
+
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        try:
+            con.execute("DETACH DATABASE source_db")
+        except sqlite3.Error:
+            pass
+        con.close()
+
+if __name__ == "__main__":
+    merge_databases()
