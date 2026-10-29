@@ -1,19 +1,27 @@
 
 import sqlite3
 import shutil
+import uuid
 from pathlib import Path
 
-# 1. MAIN DATABASE — database you want to keep
+# =====================================================
+# 1. DATABASE PATHS — CHANGE THESE TWO PATHS
+# =====================================================
+
+# Main database: the database you want to keep
 MAIN_DB = Path(
     r"C:\Users\1085271\Desktop\ai-test-recorder-pw\ai-test-recorder-pw\database\test_recorder.db"
 )
 
-# 2. SECOND DATABASE — ADD ITS FULL PATH HERE
+# Second database: the database whose data you want to merge
 SECOND_DB = Path(
-    r"C:\PASTE\YOUR\SECOND\DATABASE\PATH\HERE.db"
+    r"C:\Users\1085271\Desktop\test_scripts\ai-test-recorder-pw\database\test_recorder.db"
 )
 
-# 3. Tables to merge
+# =====================================================
+# 2. TABLES TO MERGE
+# =====================================================
+
 TABLES = [
     "users",
     "applications",
@@ -25,9 +33,190 @@ TABLES = [
     "activity_logs",
 ]
 
+
+def qi(name):
+    """Safely quote SQLite identifiers."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def columns(conn, db, table):
+    return list(conn.execute(
+        f"PRAGMA {db}.table_info({qi(table)})"
+    ))
+
+
+def table_names(conn, db):
+    return {
+        row[0]
+        for row in conn.execute(
+            f"SELECT name FROM {db}.sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+
+
+def primary_keys(info):
+    return [
+        row[1]
+        for row in sorted(info, key=lambda r: r[5])
+        if row[5] > 0
+    ]
+
+
+def foreign_keys(conn, db, table):
+    groups = {}
+    for row in conn.execute(
+        f"PRAGMA {db}.foreign_key_list({qi(table)})"
+    ):
+        groups.setdefault(row[0], []).append(row)
+
+    return [
+        sorted(group, key=lambda r: r[1])
+        for group in groups.values()
+    ]
+
+
+def unique_indexes(conn, table, pk_cols):
+    result = []
+
+    for row in conn.execute(
+        f"PRAGMA main.index_list({qi(table)})"
+    ):
+        if not row[2]:
+            continue
+
+        index_name = row[1]
+        origin = row[3] if len(row) > 3 else None
+
+        cols = [
+            item[2]
+            for item in conn.execute(
+                f"PRAGMA main.index_info({qi(index_name)})"
+            )
+            if item[2] is not None
+        ]
+
+        if not cols or cols == pk_cols or origin == "pk":
+            continue
+
+        result.append(cols)
+
+    return result
+
+
+def dependency_order(conn):
+    dependencies = {table: set() for table in TABLES}
+
+    for table in TABLES:
+        for group in foreign_keys(conn, "source_db", table):
+            parent = group[0][2]
+            if parent in dependencies and parent != table:
+                dependencies[table].add(parent)
+
+    result = []
+    remaining = {
+        table: set(parents)
+        for table, parents in dependencies.items()
+    }
+
+    while remaining:
+        ready = [
+            table for table, parents in remaining.items()
+            if not parents
+        ]
+
+        if not ready:
+            raise RuntimeError(
+                "Circular foreign-key dependencies detected: "
+                + ", ".join(remaining)
+                + ". Review the schema before merging."
+            )
+
+        for table in ready:
+            result.append(table)
+            remaining.pop(table)
+
+        for parents in remaining.values():
+            parents.difference_update(ready)
+
+    return result
+
+
+def find_existing(conn, table, unique_cols, row):
+    if any(row.get(col) is None for col in unique_cols):
+        return None
+
+    condition = " AND ".join(
+        f"{qi(col)} IS ?" for col in unique_cols
+    )
+
+    return conn.execute(
+        f"SELECT * FROM main.{qi(table)} "
+        f"WHERE {condition} LIMIT 1",
+        tuple(row[col] for col in unique_cols),
+    ).fetchone()
+
+
+def generate_new_pk(conn, table, pk_cols, info, used):
+    if len(pk_cols) != 1:
+        raise RuntimeError(
+            f"{table}: conflicting composite primary key. "
+            "Automatic remapping is not supported."
+        )
+
+    col = pk_cols[0]
+    declared_type = next(
+        row[2] for row in info if row[1] == col
+    ).upper()
+
+    if "INT" in declared_type:
+        maximum = conn.execute(
+            f"SELECT MAX({qi(col)}) FROM main.{qi(table)}"
+        ).fetchone()[0]
+
+        candidate = (maximum or 0) + 1
+        while (candidate,) in used:
+            candidate += 1
+        return candidate
+
+    candidate = str(uuid.uuid4())
+    while (candidate,) in used:
+        candidate = str(uuid.uuid4())
+
+    return candidate
+
+
+def remap_foreign_keys(conn, table, row, mappings):
+    for group in foreign_keys(conn, "source_db", table):
+        parent = group[0][2]
+        child_cols = [item[3] for item in group]
+        parent_cols = [item[4] for item in group]
+
+        if not all(parent_cols):
+            parent_info = columns(conn, "main", parent)
+            parent_cols = primary_keys(parent_info)
+
+        old_values = tuple(row.get(col) for col in child_cols)
+
+        if any(value is None for value in old_values):
+            continue
+
+        parent_info = columns(conn, "main", parent)
+        parent_pk = primary_keys(parent_info)
+
+        if parent_cols == parent_pk:
+            mapped = mappings.get(parent, {}).get(old_values)
+
+            if mapped is not None:
+                for col, value in zip(child_cols, mapped):
+                    row[col] = value
+
+
 def merge_databases():
-    if not MAIN_DB.exists():
-        raise FileNotFoundError(f"Main database not found: {MAIN_DB}")
+    if not MAIN_DB.is_file():
+        raise FileNotFoundError(
+            f"Main database not found: {MAIN_DB}"
+        )
 
     if not SECOND_DB.is_file():
         raise FileNotFoundError(
@@ -35,118 +224,242 @@ def merge_databases():
         )
 
     if MAIN_DB.resolve() == SECOND_DB.resolve():
-        raise ValueError("Both paths point to the same database.")
+        raise ValueError(
+            "Both paths point to the same database."
+        )
 
-    # Back up the main database before modifying it.
     backup = MAIN_DB.with_name(
-        MAIN_DB.stem + "_backup" + MAIN_DB.suffix
+        MAIN_DB.stem + "_backup_before_merge" + MAIN_DB.suffix
     )
-    shutil.copy2(MAIN_DB, backup)
+
+    if backup.exists():
+        raise FileExistsError(
+            f"Backup already exists: {backup}\n"
+            "Rename it or change the backup filename in the script."
+        )
+
+    # Create a consistent SQLite backup.
+    backup_source = sqlite3.connect(str(MAIN_DB))
+    try:
+        backup_target = sqlite3.connect(str(backup))
+        try:
+            backup_source.backup(backup_target)
+        finally:
+            backup_target.close()
+    finally:
+        backup_source.close()
+
     print(f"Backup created: {backup}")
 
-    # Open main database and attach the second database.
-    con = sqlite3.connect(str(MAIN_DB))
+    conn = sqlite3.connect(str(MAIN_DB))
+
     try:
-        con.execute("PRAGMA foreign_keys = OFF")
-        con.execute(
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute(
             "ATTACH DATABASE ? AS source_db",
             (str(SECOND_DB.resolve()),),
         )
 
-        # Verify all required tables exist.
-        for db_alias in ("main", "source_db"):
-            existing = {
-                row[0]
-                for row in con.execute(
-                    f"SELECT name FROM {db_alias}.sqlite_master "
-                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-                )
-            }
-            missing = set(TABLES) - existing
+        for db in ("main", "source_db"):
+            missing = set(TABLES) - table_names(conn, db)
             if missing:
                 raise RuntimeError(
-                    f"{db_alias} is missing tables: {sorted(missing)}"
+                    f"{db} is missing tables: {sorted(missing)}"
                 )
 
-        # Stop if column structures differ.
+        # Validate schema compatibility before writing anything.
         for table in TABLES:
-            main_cols = [
-                row[1] for row in con.execute(
-                    f"PRAGMA main.table_info('{table}')"
-                )
-            ]
-            source_cols = [
-                row[1] for row in con.execute(
-                    f"PRAGMA source_db.table_info('{table}')"
-                )
-            ]
-            if main_cols != source_cols:
+            main_info = columns(conn, "main", table)
+            source_info = columns(conn, "source_db", table)
+
+            main_names = {row[1] for row in main_info}
+            source_names = {row[1] for row in source_info}
+
+            for col in main_info:
+                name = col[1]
+                not_null = col[3]
+                default = col[4]
+                pk = col[5]
+
+                if (
+                    name not in source_names
+                    and not_null
+                    and default is None
+                    and pk == 0
+                ):
+                    raise RuntimeError(
+                        f"{table}.{name} is required in the main "
+                        "database but missing from the second database."
+                    )
+
+            if not main_names.intersection(source_names):
                 raise RuntimeError(
-                    f"Column mismatch in {table}. "
-                    "No merge was performed."
+                    f"No common columns found for {table}."
                 )
 
-        # IMPORTANT:
-        # This initial version only inserts rows with non-conflicting
-        # primary keys. It does not remap conflicting IDs or repair
-        # foreign-key references.
-        con.execute("BEGIN")
-        for table in TABLES:
-            info = list(
-                con.execute(f"PRAGMA main.table_info('{table}')")
-            )
-            pk_cols = [
-                row[1] for row in sorted(info, key=lambda r: r[5])
-                if row[5] > 0
+        order = dependency_order(conn)
+        print("Merge order:", " -> ".join(order))
+
+        # mappings[table][source primary-key tuple] = target PK tuple
+        mappings = {}
+        inserted = {table: 0 for table in TABLES}
+        reused = {table: 0 for table in TABLES}
+
+        conn.execute("BEGIN IMMEDIATE")
+
+        for table in order:
+            main_info = columns(conn, "main", table)
+            source_info = columns(conn, "source_db", table)
+
+            main_names = [row[1] for row in main_info]
+            source_names = {row[1] for row in source_info}
+
+            common_cols = [
+                col for col in main_names if col in source_names
             ]
 
-            if not pk_cols:
+            pk_cols = primary_keys(main_info)
+            source_pk = primary_keys(source_info)
+
+            if not pk_cols or set(pk_cols) != set(source_pk):
                 raise RuntimeError(
-                    f"{table} has no primary key; review manually."
+                    f"Primary-key definitions differ in {table}: "
+                    f"main={pk_cols}, source={source_pk}"
                 )
 
-            condition = " AND ".join(
-                f"main_table.{col} IS source_table.{col}"
-                for col in pk_cols
+            unique_sets = unique_indexes(conn, table, pk_cols)
+            mappings[table] = {}
+
+            select_cols = ", ".join(qi(col) for col in common_cols)
+
+            cursor = conn.execute(
+                f"SELECT {select_cols} "
+                f"FROM source_db.{qi(table)}"
             )
 
-            columns = ", ".join(f'"{c}"' for c in
-                                [row[1] for row in info])
-            con.execute(
-                f'INSERT INTO main."{table}" ({columns}) '
-                f'SELECT {", ".join("source_table."+chr(34)+row[1]+chr(34) for row in info)} '
-                f'FROM source_db."{table}" AS source_table '
-                f'WHERE NOT EXISTS ('
-                f' SELECT 1 FROM main."{table}" AS main_table '
-                f' WHERE {condition}'
-                f')'
-            )
+            source_rows = [
+                dict(zip(common_cols, values))
+                for values in cursor.fetchall()
+            ]
 
-            print(f"{table}: {con.execute('SELECT changes()').fetchone()[0]} rows inserted")
+            pk_select = ", ".join(qi(col) for col in pk_cols)
 
-        # Verify relationships before committing.
-        violations = con.execute(
+            used = {
+                tuple(values)
+                for values in conn.execute(
+                    f"SELECT {pk_select} FROM main.{qi(table)}"
+                )
+            }
+
+            for source_row in source_rows:
+                row = dict(source_row)
+
+                original_pk = tuple(
+                    source_row[col] for col in source_pk
+                )
+
+                remap_foreign_keys(conn, table, row, mappings)
+
+                # Reuse a matching row found through a unique key.
+                existing = None
+
+                for unique_cols in unique_sets:
+                    if not all(
+                        col in row for col in unique_cols
+                    ):
+                        continue
+
+                    existing = find_existing(
+                        conn, table, unique_cols, row
+                    )
+
+                    if existing is not None:
+                        break
+
+                if existing is not None:
+                    target = dict(
+                        zip(main_names, existing)
+                    )
+                    mappings[table][original_pk] = tuple(
+                        target[col] for col in pk_cols
+                    )
+                    reused[table] += 1
+                    continue
+
+                target_pk = tuple(row[col] for col in pk_cols)
+
+                # Allocate a new key if this primary key is occupied.
+                if target_pk in used:
+                    new_pk = generate_new_pk(
+                        conn, table, pk_cols, main_info, used
+                    )
+                    row[pk_cols[0]] = new_pk
+                    target_pk = (new_pk,)
+
+                insert_cols = [
+                    col for col in common_cols if col in row
+                ]
+
+                col_sql = ", ".join(
+                    qi(col) for col in insert_cols
+                )
+                placeholders = ", ".join(
+                    "?" for _ in insert_cols
+                )
+                values = tuple(row[col] for col in insert_cols)
+
+                try:
+                    conn.execute(
+                        f"INSERT INTO main.{qi(table)} "
+                        f"({col_sql}) VALUES ({placeholders})",
+                        values,
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise RuntimeError(
+                        f"Insert failed in {table}, source PK "
+                        f"{original_pk}: {exc}. Transaction rolled back."
+                    ) from exc
+
+                mappings[table][original_pk] = target_pk
+                used.add(target_pk)
+                inserted[table] += 1
+
+        # Validate every declared FK before committing.
+        violations = conn.execute(
             "PRAGMA main.foreign_key_check"
         ).fetchall()
 
         if violations:
             raise RuntimeError(
-                f"Foreign-key violations detected: {violations[:10]}. "
-                "Changes will be rolled back."
+                "Foreign-key validation failed. Examples: "
+                f"{violations[:10]}. Transaction rolled back."
             )
 
-        con.commit()
-        print("Merge completed successfully.")
+        conn.commit()
+
+        print("\nMERGE COMPLETED SUCCESSFULLY")
+
+        for table in order:
+            print(
+                f"{table}: {inserted[table]} inserted, "
+                f"{reused[table]} matched to existing rows"
+            )
+
+        print(f"Backup location: {backup}")
 
     except Exception:
-        con.rollback()
+        if conn.in_transaction:
+            conn.rollback()
         raise
+
     finally:
         try:
-            con.execute("DETACH DATABASE source_db")
+            conn.execute("DETACH DATABASE source_db")
         except sqlite3.Error:
             pass
-        con.close()
+
+        conn.close()
+
 
 if __name__ == "__main__":
     merge_databases()
