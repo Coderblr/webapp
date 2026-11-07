@@ -1,507 +1,120 @@
-"""
-Small CRUD helpers over the ORM models, used by backend/api.py,
-backend/auth_routes.py, backend/admin_routes.py, backend/profile_routes.py,
-backend/recording_access.py, and backend/recording_routes.py. Scoped to
-auth/session/activity/recording-ownership data - see
-runner/transaction_store.py for recording-RUN history (file-based, not
-here) and recordings/ for recording CONTENT (also file-based - see
-database/models.py's Recording/RecordingVersion for how the two relate).
-"""
-from __future__ import annotations
-import json
-from datetime import datetime, timedelta
-from typing import Optional
-
-from sqlalchemy.orm import Session
-
-from database.models import User, UserSession, ActivityLog, Recording, RecordingVersion, RecordingShare
-
-
-# ---- Users --------------------------------------------------------------
-
-def create_user(session: Session, name: str, department: Optional[str] = None, status: str = "Active") -> User:
-    """Legacy helper (pre-auth). Still used to satisfy the NOT NULL legacy
-    `name`/`department` columns when creating an account via create_user_account
-    below - not intended to be called directly for new accounts."""
-    user = User(name=name.strip(), department=(department or "").strip() or None, status=status)
-    session.add(user)
-    session.flush()
-    return user
-
-
-def create_user_account(
-    session: Session,
-    *,
-    username: str,
-    first_name: str,
-    last_name: str,
-    department_code: Optional[str],
-    email: Optional[str],
-    password_hash: str,
-    role: str = "user",
-) -> User:
-    """Creates a full auth-enabled account (used by the admin panel)."""
-    user = User(
-        username=username.strip(),
-        first_name=first_name.strip(),
-        last_name=last_name.strip(),
-        department_code=(department_code or "").strip() or None,
-        email=(email or "").strip() or None,
-        role=role,
-        password_hash=password_hash,
-        must_change_password=True,
-        auth_provider="local",
-        # legacy mirror fields, kept in sync so the recorder/report code
-        # (which only knows about `name`/`department`) keeps working as-is
-        name=f"{first_name.strip()} {last_name.strip()}".strip(),
-        department=(department_code or "").strip() or None,
-        status="Active",
-    )
-    session.add(user)
-    session.flush()
-    return user
-
-
-def get_user_by_username(session: Session, username: str) -> Optional[User]:
-    return session.query(User).filter(User.username == username.strip()).first()
-
-
-def update_user_account(
-    session: Session,
-    user_id: int,
-    *,
-    first_name: Optional[str] = None,
-    last_name: Optional[str] = None,
-    department_code: Optional[str] = None,
-    email: Optional[str] = None,
-    role: Optional[str] = None,
-    status: Optional[str] = None,
-) -> Optional[User]:
-    user = session.get(User, user_id)
-    if user is None:
-        return None
-    if first_name is not None:
-        user.first_name = first_name.strip()
-    if last_name is not None:
-        user.last_name = last_name.strip()
-    if department_code is not None:
-        user.department_code = department_code.strip() or None
-        user.department = user.department_code
-    if email is not None:
-        user.email = email.strip() or None
-    if role is not None:
-        user.role = role
-    if status is not None:
-        user.status = status
-    # keep legacy display name in sync
-    user.name = f"{user.first_name} {user.last_name}".strip() or user.username
-    session.flush()
-    return user
-
-
-def set_user_password(session: Session, user_id: int, password_hash: str, must_change_password: bool) -> Optional[User]:
-    user = session.get(User, user_id)
-    if user:
-        user.password_hash = password_hash
-        user.must_change_password = must_change_password
-        session.flush()
-    return user
-
-
-def mark_login(session: Session, user_id: int) -> None:
-    user = session.get(User, user_id)
-    if user:
-        user.last_login_at = datetime.utcnow()
-        session.flush()
-
-
-def list_users(session: Session, active_only: bool = False):
-    q = session.query(User)
-    if active_only:
-        q = q.filter(User.status == "Active")
-    return q.order_by(User.name).all()
-
-
-def list_user_accounts(session: Session, status: Optional[str] = None, role: Optional[str] = None, search: Optional[str] = None):
-    q = session.query(User)
-    if status:
-        q = q.filter(User.status == status)
-    if role:
-        q = q.filter(User.role == role)
-    if search:
-        like = f"%{search.strip()}%"
-        q = q.filter(
-            (User.username.ilike(like))
-            | (User.first_name.ilike(like))
-            | (User.last_name.ilike(like))
-            | (User.email.ilike(like))
-        )
-    return q.order_by(User.created_date.desc()).all()
-
-
-def get_user(session: Session, user_id: int) -> Optional[User]:
-    return session.get(User, user_id)
-
-
-def set_user_status(session: Session, user_id: int, status: str) -> Optional[User]:
-    user = session.get(User, user_id)
-    if user:
-        user.status = status
-        session.flush()
-    return user
-
-
-def soft_delete_user(session: Session, user_id: int) -> Optional[User]:
-    """Deletion never removes the row (that would orphan the audit trail /
-    transaction history) - it marks the account Deleted, which blocks login
-    and drops it out of the active user/recording-owner lists."""
-    return set_user_status(session, user_id, "Deleted")
-
-
-def count_users_by_status(session: Session) -> dict:
-    from sqlalchemy import func
-    rows = session.query(User.status, func.count(User.user_id)).group_by(User.status).all()
-    return {status: count for status, count in rows}
-
-
-# ---- Sessions -------------------------------------------------------------
-
-def create_session(
-    session: Session, user_id: int, ip_address: Optional[str], user_agent: Optional[str],
-    session_max_hours: int, is_agent: bool = False,
-) -> UserSession:
-    now = datetime.utcnow()
-    sess = UserSession(
-        user_id=user_id,
-        created_at=now,
-        last_activity_at=now,
-        expires_at=now + timedelta(hours=session_max_hours),
-        ip_address=ip_address,
-        user_agent=(user_agent or "")[:255],
-        is_agent=is_agent,
-    )
-    session.add(sess)
-    session.flush()
-    return sess
-
-
-def get_active_session(session: Session, session_id: str) -> Optional[UserSession]:
-    return (
-        session.query(UserSession)
-        .filter(UserSession.session_id == session_id, UserSession.revoked.is_(False))
-        .first()
-    )
-
-
-def touch_session(session: Session, session_id: str) -> None:
-    sess = session.get(UserSession, session_id)
-    if sess:
-        sess.last_activity_at = datetime.utcnow()
-        session.flush()
-
-
-def revoke_session(session: Session, session_id: str, reason: str = "logout") -> Optional[UserSession]:
-    sess = session.get(UserSession, session_id)
-    if sess:
-        sess.revoked = True
-        sess.revoked_reason = reason
-        session.flush()
-    return sess
-
-
-def revoke_all_sessions_for_user(session: Session, user_id: int, reason: str = "admin_revoked") -> int:
-    sessions = (
-        session.query(UserSession)
-        .filter(UserSession.user_id == user_id, UserSession.revoked.is_(False))
-        .all()
-    )
-    for s in sessions:
-        s.revoked = True
-        s.revoked_reason = reason
-    session.flush()
-    return len(sessions)
-
-
-def list_active_sessions(session: Session, idle_cutoff: datetime, include_agents: bool = False):
-    """Sessions that are not revoked, not past their hard expiry, and have
-    had activity more recently than idle_cutoff - i.e. genuinely "online
-    right now" for the admin's live view. The desktop agent's own long-lived
-    session (is_agent) is left out unless asked for: it keeps itself active, so a person who logged out of the
-    web page would otherwise still be listed as signed in."""
-    q = session.query(UserSession).filter(
-        UserSession.revoked.is_(False),
-        UserSession.expires_at > datetime.utcnow(),
-        UserSession.last_activity_at >= idle_cutoff,
-    )
-    if not include_agents:
-        q = q.filter(UserSession.is_agent.is_(False))
-    return q.order_by(UserSession.last_activity_at.desc()).all()
-
-
-# ---- Activity log -----------------------------------------------------------
-
-def log_activity(
-    session: Session,
-    *,
-    user_id: Optional[int],
-    session_id: Optional[str],
-    action: str,
-    status: str = "SUCCESS",
-    details: Optional[dict] = None,
-    endpoint: Optional[str] = None,
-    ip_address: Optional[str] = None,
-) -> ActivityLog:
-    entry = ActivityLog(
-        user_id=user_id,
-        session_id=session_id,
-        action=action,
-        status=status,
-        details=json.dumps(details) if details is not None else None,
-        endpoint=endpoint,
-        ip_address=ip_address,
-    )
-    session.add(entry)
-    session.flush()
-    return entry
-
-
-def list_activity(
-    session: Session,
-    user_id: Optional[int] = None,
-    action: Optional[str] = None,
-    since: Optional[datetime] = None,
-    until: Optional[datetime] = None,
-    limit: int = 200,
-):
-    q = session.query(ActivityLog).order_by(ActivityLog.timestamp.desc())
-    if user_id is not None:
-        q = q.filter(ActivityLog.user_id == user_id)
-    if action:
-        q = q.filter(ActivityLog.action == action)
-    if since:
-        q = q.filter(ActivityLog.timestamp >= since)
-    if until:
-        q = q.filter(ActivityLog.timestamp <= until)
-    return q.limit(limit).all()
-
-
-# ---- Recordings (ownership/versions/shares) --------------------------------
-
-def create_recording(
-    session: Session, *, owner_user_id: Optional[int], name: str, file_path: str,
-    schema_version: str = "2.0",
-) -> Recording:
-    rec = Recording(
-        owner_user_id=owner_user_id, name=name, file_path=file_path,
-        schema_version=schema_version, current_version_number=1,
-    )
-    session.add(rec)
-    session.flush()
-    return rec
-
-
-def get_recording(session: Session, recording_id: int) -> Optional[Recording]:
-    return session.get(Recording, recording_id)
-
-
-def get_recording_by_path(session: Session, file_path: str) -> Optional[Recording]:
-    return session.query(Recording).filter(Recording.file_path == file_path).first()
-
-
-def touch_recording(session: Session, recording_id: int, *, current_version_number: int) -> Optional[Recording]:
-    rec = session.get(Recording, recording_id)
-    if rec:
-        rec.current_version_number = current_version_number
-        rec.updated_at = datetime.utcnow()
-        session.flush()
-    return rec
-
-
-def create_recording_version(
-    session: Session, *, recording_id: int, version_number: int, file_path: str,
-    created_by_user_id: Optional[int], change_summary: Optional[str] = None,
-    recording_hash: Optional[str] = None,
-) -> RecordingVersion:
-    ver = RecordingVersion(
-        recording_id=recording_id, version_number=version_number, file_path=file_path,
-        created_by_user_id=created_by_user_id, change_summary=change_summary, recording_hash=recording_hash,
-    )
-    session.add(ver)
-    session.flush()
-    return ver
-
-
-def list_recording_versions(session: Session, recording_id: int):
-    return (
-        session.query(RecordingVersion)
-        .filter(RecordingVersion.recording_id == recording_id)
-        .order_by(RecordingVersion.version_number.desc())
-        .all()
-    )
-
-
-def get_recording_version(session: Session, recording_id: int, version_number: int) -> Optional[RecordingVersion]:
-    return (
-        session.query(RecordingVersion)
-        .filter(RecordingVersion.recording_id == recording_id, RecordingVersion.version_number == version_number)
-        .first()
-    )
-
-
-def upsert_share(
-    session: Session, *, recording_id: int, shared_with_user_id: int, shared_by_user_id: int,
-    can_execute: bool = True, can_edit: bool = False, can_export: bool = False,
-    expires_at: Optional[datetime] = None,
-) -> RecordingShare:
-    """Re-sharing with the same user updates the existing row (permissions,
-    expiry, who most recently granted it) rather than creating a duplicate -
-    see RecordingShare's UniqueConstraint(recording_id, shared_with_user_id)."""
-    share = (
-        session.query(RecordingShare)
-        .filter(
-            RecordingShare.recording_id == recording_id,
-            RecordingShare.shared_with_user_id == shared_with_user_id,
-        )
-        .first()
-    )
-    if share is None:
-        share = RecordingShare(recording_id=recording_id, shared_with_user_id=shared_with_user_id)
-        session.add(share)
-    share.shared_by_user_id = shared_by_user_id
-    share.can_execute = can_execute
-    share.can_edit = can_edit
-    share.can_export = can_export
-    share.expires_at = expires_at
-    session.flush()
-    return share
-
-
-def list_shares_for_recording(session: Session, recording_id: int):
-    return session.query(RecordingShare).filter(RecordingShare.recording_id == recording_id).all()
-
-
-def list_shares_for_user(session: Session, user_id: int):
-    """Every share GRANTED TO this user - i.e. their "Shared With Me" list."""
-    return session.query(RecordingShare).filter(RecordingShare.shared_with_user_id == user_id).all()
-
-
-def get_share_by_id(session: Session, share_id: int) -> Optional[RecordingShare]:
-    return session.get(RecordingShare, share_id)
-
-
-def get_share(session: Session, recording_id: int, user_id: int) -> Optional[RecordingShare]:
-    return (
-        session.query(RecordingShare)
-        .filter(RecordingShare.recording_id == recording_id, RecordingShare.shared_with_user_id == user_id)
-        .first()
-    )
-
-
-def delete_share(session: Session, share_id: int) -> bool:
-    share = session.get(RecordingShare, share_id)
-    if share is None:
-        return False
-    session.delete(share)
-    session.flush()
-    return True
-
-
-# ---------------------------------------------------------------------------------------------------------------
-# Application registry + user-to-application access (see backend/app_access.py for how these are enforced)
-# ---------------------------------------------------------------------------------------------------------------
-from database.models import Application, UserApplicationAccess  # noqa: E402
-from database.app_names import app_key as _app_key, clean_name as _clean_app_name  # noqa: E402
-
-APP_PERMISSIONS = ("view", "record", "edit", "execute", "upload", "delete", "export")
-APP_DEFAULT_PERMISSIONS = ("view", "record", "edit", "execute", "upload", "export")
-
-
-def list_applications(session: Session, include_inactive: bool = True) -> list[Application]:
-    q = session.query(Application)
-    if not include_inactive:
-        q = q.filter(Application.status == "Active")
-    return q.order_by(Application.name).all()
-
-
-def get_application(session: Session, application_id: int) -> Optional[Application]:
-    return session.get(Application, application_id)
-
-
-def get_application_by_name(session: Session, name: str) -> Optional[Application]:
-    return session.query(Application).filter(Application.name_key == _app_key(name)).first()
-
-
-def create_application(session: Session, *, name: str, display_name: Optional[str] = None,
-                       base_url: Optional[str] = None) -> Application:
-    name = _clean_app_name(name)
-    if get_application_by_name(session, name) is not None:
-        raise ValueError(f"Application {name!r} already exists.")
-    a = Application(name=name, name_key=_app_key(name), display_name=(display_name or name).strip(),
-                    base_url=(base_url or None), status="Active")
-    session.add(a)
-    session.flush()
-    return a
-
-
-def _normalise_permissions(perms) -> dict[str, bool]:
-    wanted = set(APP_DEFAULT_PERMISSIONS if perms is None else perms)
-    unknown = wanted - set(APP_PERMISSIONS)
-    if unknown:
-        raise ValueError(f"Unknown permission(s): {', '.join(sorted(unknown))}")
-    if wanted and "view" not in wanted:
-        wanted.add("view")      # any other permission is meaningless without being able to see the application
-    return {f"can_{p}": (p in wanted) for p in APP_PERMISSIONS}
-
-
-def access_row(session: Session, user_id: int, application_id: int) -> Optional[UserApplicationAccess]:
-    return (session.query(UserApplicationAccess)
-            .filter(UserApplicationAccess.user_id == user_id,
-                    UserApplicationAccess.application_id == application_id).first())
-
-
-def list_user_access(session: Session, user_id: int) -> list[UserApplicationAccess]:
-    return (session.query(UserApplicationAccess).filter(UserApplicationAccess.user_id == user_id)
-            .order_by(UserApplicationAccess.application_id).all())
-
-
-def list_access_for_users(session: Session, user_ids: list[int]) -> dict[int, list[UserApplicationAccess]]:
-    """One query for many users (no N+1 when listing the admin user table)."""
-    out: dict[int, list[UserApplicationAccess]] = {uid: [] for uid in user_ids}
-    if not user_ids:
-        return out
-    for row in session.query(UserApplicationAccess).filter(UserApplicationAccess.user_id.in_(user_ids)).all():
-        out[row.user_id].append(row)
-    return out
-
-
-def list_application_users(session: Session, application_id: int) -> list[tuple[UserApplicationAccess, "User"]]:
-    return (session.query(UserApplicationAccess, User).join(User, User.user_id == UserApplicationAccess.user_id)
-            .filter(UserApplicationAccess.application_id == application_id).order_by(User.username).all())
-
-
-def upsert_user_access(session: Session, *, user_id: int, application_id: int, permissions=None,
-                       assigned_by: Optional[int] = None) -> tuple[UserApplicationAccess, bool]:
-    """Create or update one grant (never a duplicate - the table has a unique (user, application) constraint).
-    Returns (row, created)."""
-    flags = _normalise_permissions(permissions)
-    row = access_row(session, user_id, application_id)
-    created = row is None
-    if created:
-        row = UserApplicationAccess(user_id=user_id, application_id=application_id, assigned_by=assigned_by, **flags)
-        session.add(row)
-    else:
-        for k, v in flags.items():
-            setattr(row, k, v)
-        row.assigned_by = assigned_by
-        row.updated_at = datetime.utcnow()
-    session.flush()
-    return row, created
-
-
-def revoke_user_access(session: Session, *, user_id: int, application_id: int) -> bool:
-    row = access_row(session, user_id, application_id)
-    if row is None:
-        return False
-    session.delete(row)
-    session.flush()
-    return True
+import { useCallback, useEffect, useState } from "react";
+import Head from "next/head";
+import Layout from "@/components/Layout";
+import RequireAuth from "@/components/RequireAuth";
+import { adminApi } from "@/lib/api";
+import { Button, Callout, DataTable, PageHeader, Panel, PanelHeader } from "@/components/ui";
+
+function idleLabel(seconds) {
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+export default function AdminSessionsPage() {
+  const [sessions, setSessions] = useState([]);
+  const [error, setError] = useState(null);
+  const [busyId, setBusyId] = useState(null);
+  const [notice, setNotice] = useState(null);
+
+  const load = useCallback(async () => {
+    try {
+      setSessions(await adminApi.listSessions());
+      setError(null);
+    } catch (e) {
+      setError(e.detail || e.message);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+    const interval = setInterval(load, 15000); // auto-refresh - this is a "who's online right now" view
+    return () => clearInterval(interval);
+  }, [load]);
+
+  async function handleRevoke(s) {
+    if (!window.confirm(`Force-logout ${s.username}?`)) return;
+    setBusyId(s.session_id);
+    setNotice(null);
+    try {
+      await adminApi.revokeSession(s.session_id);
+      setNotice({ tone: "success", text: `${s.username} has been signed out.` });
+      await load();
+    } catch (err) {
+      setNotice({ tone: "error", text: err.detail || err.message });
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  return (
+    <RequireAuth adminOnly>
+      <Layout>
+        <Head>
+          <title>Active sessions - AI Test Recorder</title>
+        </Head>
+
+        <PageHeader
+          title="Sessions"
+          description="Everyone currently signed in on the website (a logged-out user is not listed), refreshed every 15 seconds."
+          action={(
+      <Button variant="secondary" onClick={load}>
+        Refresh now
+      </Button>
+          )}
+        />
+
+        {error && <Callout tone="error">{error}</Callout>}
+        {notice && (
+          <div className="mb-4">
+            <Callout tone={notice.tone}>{notice.text}</Callout>
+          </div>
+        )}
+
+        <Panel>
+          <PanelHeader title={`${sessions.length} online`} />
+          <div className="px-5 py-5">
+            <DataTable
+              columns={[
+                { key: "user", label: "User" },
+                { key: "username", label: "Username", mono: true },
+                { key: "role", label: "Role" },
+                { key: "agent", label: "Agent" },
+                { key: "recording", label: "Recording" },
+                { key: "logged_in_at", label: "Logged in", mono: true },
+                { key: "idle", label: "Idle for", mono: true },
+                { key: "ip", label: "IP address", mono: true },
+                { key: "actions", label: "" },
+              ]}
+              rows={sessions.map((s) => ({
+                user: s.full_name,
+                username: s.username,
+                role: s.role,
+                agent: s.agent_connected ? <span className="text-xs font-medium text-emerald-600">Connected</span> : <span className="text-xs text-muted">—</span>,
+                recording: s.recording_active ? (
+                  <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-signal-rust">
+                    <span className="pulse-dot h-1.5 w-1.5 rounded-full bg-signal-rust" />
+                    Live
+                  </span>
+                ) : (
+                  <span className="text-xs text-muted">—</span>
+                ),
+                logged_in_at: new Date(s.created_at).toLocaleString(),
+                idle: idleLabel(s.idle_seconds),
+                ip: s.ip_address || "—",
+                actions: (
+                  <button
+                    className="text-xs font-medium text-signal-rust hover:underline disabled:opacity-40"
+                    disabled={busyId === s.session_id}
+                    onClick={() => handleRevoke(s)}
+                  >
+                    Force logout
+                  </button>
+                ),
+              }))}
+            />
+          </div>
+        </Panel>
+      </Layout>
+    </RequireAuth>
+  );
+}
