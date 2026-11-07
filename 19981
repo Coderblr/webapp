@@ -1,22 +1,171 @@
-// The server stores and sends times in UTC, written without a timezone marker (e.g. "2026-11-07T06:07:15").
-// new Date() reads such a string as the browser's OWN local time, so it showed the UTC clock time as if it were
-// local - wrong by the timezone offset. These helpers read it as UTC and show it in the viewer's PC date, time
-// and timezone.
+import { useEffect, useState } from "react";
+import Head from "next/head";
+import Layout from "@/components/Layout";
+import RequireAuth from "@/components/RequireAuth";
+import { adminApi } from "@/lib/api";
+import { fmtLocalDateTime } from "@/lib/time";
+import { getToken } from "@/lib/auth-storage";
+import { Button, Callout, DataTable, Disclosure, Field, PageHeader, Panel, PanelHeader, Select, StatusBadge, TextInput } from "@/components/ui";
 
-/** A Date for a server timestamp (UTC unless it already carries a timezone), or null. */
-export function parseServerTime(value) {
-  if (!value) return null;
-  const s = String(value);
-  const d = new Date(/(Z|[+-]\d\d:?\d\d)$/i.test(s) ? s : `${s}Z`);
-  return Number.isNaN(d.getTime()) ? null : d;
+const ACTIONS = [
+  "LOGIN", "LOGIN_FAILED", "LOGOUT", "PASSWORD_CHANGED", "PASSWORD_CHANGE_FAILED",
+  "START_RECORDING", "STOP_AND_SAVE", "RUN_CHECK", "RUN_RECORDING",
+  "USER_CREATED", "USER_UPDATED", "USER_DELETED", "PASSWORD_RESET_BY_ADMIN",
+  "PROFILE_UPDATED", "SESSION_REVOKED",
+];
+
+function downloadCsv(url, token, filename) {
+  fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+    .then((r) => r.text())
+    .then((text) => {
+      const blob = new Blob([text], { type: "text/csv" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    });
 }
 
-/** "07 Nov 2026, 11:37:15 am IST" - the viewer's local date, time and timezone. */
-export function fmtLocalDateTime(value, empty = "—") {
-  const d = parseServerTime(value);
-  if (!d) return empty;
-  return d.toLocaleString(undefined, {
-    day: "2-digit", month: "short", year: "numeric",
-    hour: "2-digit", minute: "2-digit", second: "2-digit", timeZoneName: "short",
-  });
+export default function AdminActivityPage() {
+  const [users, setUsers] = useState([]);
+  const [rows, setRows] = useState([]);
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const [userId, setUserId] = useState("");
+  const [action, setAction] = useState("");
+  const [since, setSince] = useState("");
+  const [until, setUntil] = useState("");
+
+  useEffect(() => {
+    adminApi.listUsers().then(setUsers).catch(() => {});
+  }, []);
+
+  async function load() {
+    setBusy(true);
+    setError(null);
+    try {
+      const data = await adminApi.listActivity({
+        user_id: userId || undefined,
+        action: action || undefined,
+        since: since ? new Date(since).toISOString() : undefined,
+        until: until ? new Date(until).toISOString() : undefined,
+      });
+      setRows(data);
+    } catch (e) {
+      setError(e.detail || e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <RequireAuth adminOnly>
+      <Layout>
+        <Head>
+          <title>Activity monitor - AI Test Recorder</title>
+        </Head>
+
+        <PageHeader
+          title="Activity"
+          description="Every action by every user. Filter and export as needed."
+          action={(
+      <Button
+        variant="secondary"
+        onClick={() =>
+          downloadCsv(
+            adminApi.exportActivityUrl({
+              user_id: userId || undefined,
+              action: action || undefined,
+              since: since ? new Date(since).toISOString() : undefined,
+              until: until ? new Date(until).toISOString() : undefined,
+            }),
+            getToken(),
+            "activity_export.csv"
+          )
+        }
+      >
+        Export CSV
+      </Button>
+          )}
+        />
+
+        <Panel className="mb-6">
+          <div className="grid gap-4 px-5 py-5 sm:grid-cols-4">
+            <Field label="User">
+              <Select value={userId} onChange={(e) => setUserId(e.target.value)}>
+                <option value="">All users</option>
+                {users.map((u) => (
+                  <option key={u.user_id} value={u.user_id}>
+                    {u.username}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Action">
+              <Select value={action} onChange={(e) => setAction(e.target.value)}>
+                <option value="">All actions</option>
+                {ACTIONS.map((a) => (
+                  <option key={a} value={a}>
+                    {a}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Since">
+              <TextInput type="datetime-local" value={since} onChange={(e) => setSince(e.target.value)} />
+            </Field>
+            <Field label="Until">
+              <TextInput type="datetime-local" value={until} onChange={(e) => setUntil(e.target.value)} />
+            </Field>
+          </div>
+          <div className="border-t border-line px-5 py-3">
+            <Button onClick={load} disabled={busy}>
+              {busy ? "Loading..." : "Apply filters"}
+            </Button>
+          </div>
+        </Panel>
+
+        {error && <Callout tone="error">{error}</Callout>}
+
+        <Panel>
+          <PanelHeader title={`${rows.length} events`} />
+          <div className="px-5 py-5">
+            <DataTable
+              columns={[
+                { key: "timestamp", label: "When", mono: true },
+                { key: "username", label: "User" },
+                { key: "action", label: "Action", mono: true },
+                { key: "status", label: "Status" },
+                { key: "endpoint", label: "Endpoint", mono: true },
+                { key: "ip", label: "IP", mono: true },
+                { key: "details", label: "Details" },
+              ]}
+              rows={rows.map((r) => ({
+                timestamp: fmtLocalDateTime(r.timestamp),
+                username: r.username || "—",
+                action: r.action,
+                status: <StatusBadge status={r.status === "SUCCESS" ? "Success" : "Failed"} />,
+                endpoint: r.endpoint || "",
+                ip: r.ip_address || "",
+                details: r.details ? (
+                  <Disclosure title="view">
+                    <pre className="whitespace-pre-wrap break-words font-mono text-xs">{r.details}</pre>
+                  </Disclosure>
+                ) : (
+                  ""
+                ),
+              }))}
+            />
+          </div>
+        </Panel>
+      </Layout>
+    </RequireAuth>
+  );
 }
