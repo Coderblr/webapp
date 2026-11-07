@@ -1,686 +1,390 @@
-import { Fragment, useEffect, useRef, useState } from "react";
-import { checksApi, recordingsApi } from "@/lib/api";
-import { Panel, Disclosure, Callout, Spinner, Button, Select } from "@/components/ui";
-import RuntimeStepConfig, { newRuntimeConfig, runtimeConfigForSave } from "@/components/runtime/RuntimeStepConfig";
-import CheckEditor, { newCheck } from "@/components/checks/CheckEditor";
-import CheckSuggestions, { LocatorSuggestions } from "@/components/checks/CheckSuggestions";
+"""
+Everything here requires an admin (get_current_admin). This is the "admin
+can keep an eye on every user" surface:
 
-// Check rows ("assert") and "remember a value" rows are edited in their own panel, not in the grid cells.
-const CHECK_ROWS = new Set(["assert", "capture_text"]);
+  User management     POST/GET/PUT/DELETE /api/admin/users, reset-password
+  Live sessions        GET /api/admin/sessions, POST .../revoke
+  Activity monitor     GET /api/admin/activity (+ /export as CSV)
+  Dashboard stats       GET /api/admin/dashboard/stats
+"""
+from __future__ import annotations
+import asyncio
+import csv
+import io
+from datetime import datetime, timedelta
+from typing import Optional
 
-// Editor-side, a check's "same element as step N" is tied to the ROW (so it survives moving rows); the server
-// stores step numbers. These two convert between them.
-function targetsToRowIds(rows) {
-  const idAt = (n) => rows[n - 1]?._id;
-  const conv = (tgt) => (tgt && tgt.step_no && idAt(tgt.step_no) ? { ...tgt, step_row_id: idAt(tgt.step_no) } : tgt);
-  return rows.map((r) => (r.action === "assert" && r.assertion?.target
-    ? { ...r, assertion: { ...r.assertion, target: conv(r.assertion.target) } }
-    : r.action === "capture_text" && r.capture_cfg?.target ? { ...r, capture_cfg: { ...r.capture_cfg, target: conv(r.capture_cfg.target) } } : r));
-}
-function toSaveTarget(tgt, rows) {
-  if (!tgt || !tgt.step_row_id) return tgt;
-  const n = rows.findIndex((r) => r._id === tgt.step_row_id) + 1;
-  const { step_row_id, step_no, ...rest } = tgt; // eslint-disable-line no-unused-vars
-  // the row still exists: the server resolves that step's element again (its current locators);
-  // the row was deleted: keep the selectors the check already had
-  return n > 0 ? { step_no: n, ...(rest.text_mode ? { text_mode: rest.text_mode } : {}) } : rest;
-}
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from fastapi.responses import StreamingResponse
 
-const ACTION_LABELS = {
-  click: "CLICK-C",
-  type: "INPUT-C",
-  select: "DROPDOWN-S",
-  keypress: "KEYPRESS",
-  delay: "DELAY",
-  scroll: "SCROLL",
-  window_closed: "CLOSETAB",
-  assert_text: "VERIFICATION",
-  assert_ocr_text: "VERIFY-OCR",
-  file_upload: "UPLOAD",
-  copy: "CAPTURE",
-  ocr_capture: "CAPTURE-OCR",
-  // Recorded by the recorder itself when hovering opens a menu. Without an
-  // entry here the dropdown showed a hover row as "CLICK-C".
-  hover: "HOVER",
-  // Checks every link of the site's navigation menu - no element needed,
-  // the menu is found on the live page when the test runs.
-  menu_check: "MENU-CHECK",
-  // Recorded by the recorder itself: a pasted value, a date field, a browser dialog, a new tab.
-  paste: "PASTE-C",
-  date: "DATE-C",
-  dialog: "DIALOG",
-  new_window: "NEW-TAB",
-  // Checks verified on every run, and values remembered for a before/after check (automation/checks.py).
-  assert: "CHECK ✓",
-  capture_text: "REMEMBER",
-  checkpoint: "CHECKPOINT",
-  wait_condition: "WAIT-UNTIL",
-  workflow_ref: "WORKFLOW",
-};
+from database.db import get_session
+from database import repository as repo
+from runner import transaction_store
+from backend import recording_sessions, agent_registry
+from auth.dependencies import get_current_admin, get_client_ip, CurrentUser
+from auth.security import hash_password, generate_temp_password, validate_password_strength
+from auth.config import IDLE_TIMEOUT_MINUTES
+from auth.schemas import CreateUserRequest, UpdateUserRequest, ResetPasswordRequest, UserOut, CreateUserResponse
 
-// These come only from a recording / another editor - they can be kept, moved or deleted, not created here.
-const KEEP_ONLY = new Set(["dialog", "new_window", "checkpoint", "wait_condition", "workflow_ref"]);
+router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(get_current_admin)])
 
-const NEEDS_SELECTOR = new Set(["click", "type", "select", "assert_text", "file_upload", "copy", "ocr_capture", "hover", "paste", "date"]);
-const NEEDS_NAME = new Set(["click", "type", "select", "assert_text", "file_upload", "copy", "ocr_capture", "hover", "paste", "date"]);
-const INPUT_PLACEHOLDER = {
-  delay: "seconds, e.g. 3",
-  scroll: "DOWN-4 or UP-2",
-  type: "value to type",
-  paste: "value to paste",
-  date: "date, e.g. 15/11/2026",
-  select: "option to select",
-  assert_text: "text expected to appear",
-  // Page-level (no element/selector needed) - checks the text is visible
-  // ANYWHERE on screen via OCR, not inside one specific DOM element - see
-  // generator/templates/page.tmpl's assert_ocr_text_visible.
-  assert_ocr_text: "text expected to appear on screen (via OCR)",
-  file_upload: "file name",
-  copy: "variable name",
-  ocr_capture: "variable name",
-  menu_check: "optional: CSS selector of the menu, e.g. nav",
-};
 
-// Every row gets a stable id (client-side only, never sent to the server) so a
-// row keeps its own typed-but-not-yet-parsed selector text and error message
-// when it is dragged / moved, instead of those sticking to the position.
-let rowIdCounter = 1;
-const withId = (step) => ({ ...step, _id: `r${rowIdCounter++}` });
-const stripId = ({ _id, ...rest }) => rest; // eslint-disable-line no-unused-vars
+def _user_out(user) -> UserOut:
+    return UserOut.model_validate(user)
 
-function blankStep() {
-  return withId({ action: "click", label: "", value: "", locators: [], raw_selector: "" });
-}
 
-function selectorCellText(step, drafts, id) {
-  if (id in drafts) return drafts[id];
-  // Prefer the EXACT text from the spreadsheet's "present element" column
-  // (if this step came from a UiPath import, or was previously edited via
-  // a pasted selector) - a reconstructed "ID: username" summary from the
-  // parsed locators is a fallback for steps that never had raw selector
-  // text at all (e.g. a real browser recording, which only ever produces
-  // parsed locators - there's no spreadsheet cell to preserve for those).
-  if (step.raw_selector) return step.raw_selector;
-  if (!step.locators || step.locators.length === 0) return "";
-  return step.locators.map((l) => `${l.strategy}: ${l.value}`).join("\n");
-}
+# ---- Users ------------------------------------------------------------------
 
-/**
- * A 5-column grid - Action/Method, Name, Present element, Input - matching
- * the UiPath spreadsheet's own layout exactly, so editing a saved
- * recording here feels like editing the same Excel sheet, not a
- * different kind of form. Every cell is directly editable inline (click
- * in, type, tab/click away) rather than opening a separate edit dialog.
- *
- * The "present element" cell accepts the SAME <webctrl .../> snippet
- * format the spreadsheet's own column does - pasted text is parsed into
- * real locators automatically when you click out of the cell (see
- * recordingsApi.parseSelector, reusing the Excel importer's own parser).
- */
-export default function StepEditor({ recordingFile, onSaved, reloadKey = 0 }) {
-  const [steps, setSteps] = useState([]);
-  const loadedSnapshot = useRef("");                       // the grid as last loaded / saved (to spot unsaved edits)
-  const [stale, setStale] = useState(false);               // the recording changed elsewhere while edits were pending
-  const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [loadError, setLoadError] = useState(null);
-  const [notice, setNotice] = useState(null);
+@router.post("/users", response_model=CreateUserResponse)
+def create_user(req: CreateUserRequest, request: Request, admin: CurrentUser = Depends(get_current_admin)):
+    ip = get_client_ip(request)
+    with get_session() as db:
+        if repo.get_user_by_username(db, req.username):
+            raise HTTPException(status_code=400, detail=f"Username/ADID '{req.username}' already exists.")
 
-  const [selectorDrafts, setSelectorDrafts] = useState({});   // row _id -> text
-  const [parsingRow, setParsingRow] = useState(null);          // row _id
-  const [selectorErrors, setSelectorErrors] = useState({});    // row _id -> message
+        temp_password = req.temp_password.strip() or generate_temp_password()
+        error = validate_password_strength(temp_password)
+        if error:
+            raise HTTPException(status_code=400, detail=f"Temp password: {error}")
 
-  // drag and drop (by the handle on the left of each row)
-  const [configRow, setConfigRow] = useState(null);  // row _id whose runtime settings are open
-  const [checkRow, setCheckRow] = useState(null);    // row _id whose check settings are open
-  const [catalog, setCatalog] = useState(null);      // check types / templates (GET /api/checks/catalog)
-  const [savedIds, setSavedIds] = useState([]);      // row ids in the order last loaded / saved (suggestions refer to it)
-  const [suggesting, setSuggesting] = useState(null); // "checks" | "review" | "locators" while asking the server
-  const [dialog, setDialog] = useState(null);        // { kind, items, aiAvailable }
-  const [armedRow, setArmedRow] = useState(null);   // row index whose handle is pressed -> that row becomes draggable
-  const [dragFrom, setDragFrom] = useState(null);
-  const [dragOver, setDragOver] = useState(null);   // { index, after } drop marker
-
-  useEffect(() => {
-    if (recordingFile) load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [recordingFile]);
-  useEffect(() => { checksApi.catalog().then(setCatalog).catch(() => setCatalog(null)); }, []);
-
-  // The recording was changed from outside this grid (the Test data panel saved new values). Saving this grid
-  // would write its old copy back over them, so load the saved recording again - unless the grid has unsaved
-  // edits of its own: those are not thrown away, the user is asked.
-  const firstKey = useRef(true);
-  useEffect(() => {
-    if (firstKey.current) { firstKey.current = false; return; }
-    if (!recordingFile) return;
-    if (JSON.stringify(steps) === loadedSnapshot.current) load();
-    else setStale(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reloadKey]);
-
-  function loadRows(raw) {
-    const rows = targetsToRowIds(raw.map(withId));
-    loadedSnapshot.current = JSON.stringify(rows);
-    setStale(false);
-    setSteps(rows);
-    setSavedIds(rows.map((r) => r._id));
-  }
-
-  async function load() {
-    setLoading(true);
-    setLoadError(null);
-    setSelectorDrafts({});
-    setSelectorErrors({});
-    try {
-      const r = await recordingsApi.getSteps(recordingFile);
-      loadRows(r.steps);
-    } catch (e) {
-      setLoadError(e.detail || e.message);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  function updateField(i, field, value) {
-    setSteps((prev) =>
-      prev.map((s, idx) => {
-        if (idx !== i) return s;
-        const updated = { ...s, [field]: value };
-        // For capture-type steps, "Name" doubles as the variable name
-        // (captured_as) - there's no separate column for it, to keep this
-        // grid exactly 5 columns like the spreadsheet.
-        if (field === "label" && (s.action === "copy" || s.action === "ocr_capture")) {
-          updated.captured_as = value;
-        }
-        return updated;
-      })
-    );
-  }
-
-  function addRow() {
-    setSteps((prev) => [...prev, blankStep()]);
-  }
-
-  function deleteRow(i) {
-    setSteps((prev) => prev.filter((_, idx) => idx !== i));
-  }
-
-  // Moves the row at `from` so it ends up at index `to` (0-based, final position).
-  function moveRowTo(from, to) {
-    if (from === to || from < 0 || to < 0 || from >= steps.length || to >= steps.length) return;
-    setSteps((prev) => {
-      const next = [...prev];
-      const [row] = next.splice(from, 1);
-      next.splice(to, 0, row);
-      return next;
-    });
-  }
-
-  function moveRow(i, delta) {
-    moveRowTo(i, i + delta);
-  }
-
-  function endDrag() {
-    setArmedRow(null);
-    setDragFrom(null);
-    setDragOver(null);
-  }
-
-  function handleDragOver(e, i) {
-    if (dragFrom === null) return;
-    e.preventDefault();
-    const rect = e.currentTarget.getBoundingClientRect();
-    const after = e.clientY > rect.top + rect.height / 2;
-    if (!dragOver || dragOver.index !== i || dragOver.after !== after) setDragOver({ index: i, after });
-  }
-
-  function handleDrop(e) {
-    e.preventDefault();
-    if (dragFrom !== null && dragOver) {
-      // dropping "after row k" / "before row k" -> final index once the dragged row is lifted out
-      let to = dragOver.index + (dragOver.after ? 1 : 0);
-      if (dragFrom < to) to -= 1;
-      moveRowTo(dragFrom, to);
-    }
-    endDrag();
-  }
-
-  async function handleSelectorBlur(i, id, text) {
-    // Clicking in and out of the cell without changing anything must not re-parse (or fail on) the text shown there.
-    if (steps[i] && steps[i].locators?.length && text === selectorCellText(steps[i], {}, id)) return;
-    setSelectorDrafts((prev) => ({ ...prev, [id]: text }));
-    updateField(i, "raw_selector", text);
-    if (!text.trim()) {
-      updateField(i, "locators", []);
-      return;
-    }
-    setParsingRow(id);
-    setSelectorErrors((prev) => ({ ...prev, [id]: null }));
-    try {
-      const r = await recordingsApi.parseSelector(text);
-      if (r.locators.length === 0) {
-        setSelectorErrors((prev) => ({ ...prev, [id]: "No selector found in this text." }));
-        return;
-      }
-      // look the row up by id again: it may have been moved while the parse was running
-      setSteps((prev) =>
-        prev.map((s) =>
-          s._id !== id ? s : { ...s, locators: r.locators, label: !s.label && r.suggested_label ? r.suggested_label : s.label }
+        user = repo.create_user_account(
+            db,
+            username=req.username,
+            first_name=req.first_name,
+            last_name=req.last_name,
+            department_code=req.department_code,
+            email=req.email,
+            password_hash=hash_password(temp_password),
+            role=req.role,
         )
-      );
-    } catch (e) {
-      setSelectorErrors((prev) => ({ ...prev, [id]: e.detail || e.message }));
-    } finally {
-      setParsingRow(null);
-    }
-  }
+        repo.log_activity(
+            db, user_id=admin.user_id, session_id=admin.session_id, action="USER_CREATED", status="SUCCESS",
+            details={"created_user_id": user.user_id, "username": user.username, "role": user.role},
+            endpoint="/api/admin/users", ip_address=ip,
+        )
+        out = _user_out(user).model_dump()
+        out["temp_password"] = temp_password  # only ever returned once, right after creation
+        return out
 
-  // ---- checks ------------------------------------------------------------------------------------------------
-  function insertRowAfter(index, row) {
-    setSteps((prev) => [...prev.slice(0, index + 1), row, ...prev.slice(index + 1)]);
-  }
-  function addCheckAfter(index) {
-    const prevRow = steps[index];
-    const cfg = newCheck();
-    if (prevRow && (prevRow.locators || []).length) cfg.target = { step_row_id: prevRow._id };   // its element, by default
-    const row = withId({ action: "assert", label: "", assertion: cfg, locators: [], value: "" });
-    insertRowAfter(index, row);
-    setCheckRow(row._id);
-  }
-  function addRememberAfter(index) {
-    const row = withId({ action: "capture_text", label: "value_before", capture_cfg: { name: "value_before", source: "selector", target: {} }, locators: [], value: "" });
-    insertRowAfter(index, row);
-    setCheckRow(row._id);
-  }
-  function patchRow(id, patch) {
-    setSteps((prev) => prev.map((s) => (s._id === id ? { ...s, ...patch } : s)));
-  }
-  const rowNo = (id) => steps.findIndex((s) => s._id === id) + 1;
 
-  // Suggestions are made for the recording as last SAVED; accepted ones are put into the grid (save to keep them).
-  async function askSuggestions(kind) {
-    setSuggesting(kind);
-    setNotice(null);
-    try {
-      if (kind === "locators") {
-        const r = await checksApi.suggestLocators(recordingFile);
-        setDialog({ kind, items: r.suggestions || [], aiAvailable: r.ai_available });
-      } else if (kind === "review") {
-        const r = await checksApi.review(recordingFile);
-        setDialog({ kind, aiAvailable: r.ai_available, items: (r.suggestions || []).map((s) => ({
-          key: `r${s.step_no}`, step_no: s.step_no, title: `Check at step ${s.step_no}${s.changed ? "" : " (fine as it is)"}`,
-          current: s.current, assertion: s.assertion, reason: s.reason, source: s.source })) });
-      } else {
-        const r = await checksApi.suggest(recordingFile);
-        setDialog({ kind, aiAvailable: r.ai_available, items: (r.suggestions || []).map((s, k) => ({
-          key: `s${k}`, insert_after: s.insert_after, title: `New check after step ${s.insert_after}`,
-          assertion: s.assertion, reason: s.reason, source: s.source })) });
-      }
-    } catch (e) {
-      setNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setSuggesting(null);
-    }
-  }
+@router.get("/users")
+def list_users(
+    status: Optional[str] = Query(default=None),
+    role: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None),
+):
+    with get_session() as db:
+        users = repo.list_user_accounts(db, status=status, role=role, search=search)
+        return [_user_out(u) for u in users]
 
-  function applySuggestions(decided) {
-    const accepted = decided.filter((d) => d.decision === "accept");
-    const rejected = decided.filter((d) => d.decision === "reject");
-    setSteps((prev) => {
-      let rows = [...prev];
-      const savedRow = (n) => savedIds[n - 1];
-      // a target pointing at a saved step number -> that row (it may have moved since)
-      const fix = (cfg) => (cfg?.target?.step_no && savedRow(cfg.target.step_no)
-        ? { ...cfg, target: { ...cfg.target, step_row_id: savedRow(cfg.target.step_no) } } : cfg);
-      for (const d of decided.filter((x) => x.step_no)) {            // recorded checks: replace / mark reviewed
-        const id = savedRow(d.step_no);
-        rows = rows.map((r) => (r._id !== id ? r : d.decision === "accept"
-          ? { ...r, assertion: { ...fix(d.assertion), target: d.assertion.target?.step_no ? fix(d.assertion).target : (d.assertion.target || r.assertion?.target) },
-              label: d.assertion.name || r.label, original: r.original ? { ...r.original, check_review: { decision: "accept" } } : r.original }
-          : { ...r, original: r.original ? { ...r.original, check_review: { decision: "reject" } } : r.original }));
-      }
-      for (const d of [...accepted.filter((x) => x.insert_after !== undefined)].sort((a, b) => b.insert_after - a.insert_after)) {
-        const anchorId = d.insert_after ? savedRow(d.insert_after) : null;
-        const at = anchorId ? rows.findIndex((r) => r._id === anchorId) : -1;
-        const row = withId({ action: "assert", label: d.assertion.name || "", assertion: { on_fail: "continue", ...fix(d.assertion) },
-                             locators: [], value: "", check_source: "ai" });
-        rows = [...rows.slice(0, at + 1), row, ...rows.slice(at + 1)];
-      }
-      return rows;
-    });
-    setDialog(null);
-    setNotice({ tone: "success", text: `${accepted.length} suggestion(s) accepted${rejected.length ? `, ${rejected.length} rejected` : ""} - review them in the grid and press Save changes.` });
-  }
 
-  function applyLocators(decisions) {
-    setSteps((prev) => prev.map((r) => {
-      const d = decisions.find((x) => savedIds[x.step_no - 1] === r._id);
-      if (!d) return r;
-      const locs = r.locators || [];
-      const cut = locs.findIndex((l) => String(l.note || "").includes("generated"));
-      const add = d.locators.filter((l) => !locs.some((x) => x.strategy === l.strategy && x.value === l.value)).map((l) => ({ ...l, note: "suggested" }));
-      return { ...r, locators: cut < 0 ? [...locs, ...add] : [...locs.slice(0, cut), ...add, ...locs.slice(cut)], raw_selector: null };
-    }));
-    setDialog(null);
-    setNotice({ tone: "success", text: `Locators added to ${decisions.length} step(s) - press Save changes to keep them.` });
-  }
+@router.get("/users/{user_id}", response_model=UserOut)
+def get_user(user_id: int):
+    with get_session() as db:
+        user = repo.get_user(db, user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found.")
+        return _user_out(user)
 
-  const pendingReview = steps.some((s) => s.action === "assert" && s.original?.check_context && !s.original?.check_review);
 
-  async function saveAll() {
-    const missingSelector = steps.findIndex((s) => NEEDS_SELECTOR.has(s.action) && s.locators.length === 0);
-    if (missingSelector !== -1) {
-      const bad = steps[missingSelector];
-      setNotice({ tone: "error", text: bad.raw_selector
-        ? `Row ${missingSelector + 1}: the selector text could not be read. Use an id (#login), a CSS selector, an XPath (//button[@id='x']) or a UiPath <webctrl .../> line.`
-        : `Row ${missingSelector + 1} (${ACTION_LABELS[bad.action] || bad.action}) needs a selector in "Present element" before saving - or delete the row if it is empty.` });
-      return;
-    }
-    setSaving(true);
-    setNotice(null);
-    try {
-      const r = await recordingsApi.updateSteps(recordingFile, steps.map((s) => {
-        const out = { ...stripId(s), runtime_config: runtimeConfigForSave(s.runtime_config) };
-        if (s.action === "assert") out.assertion = { ...(s.assertion || {}), target: toSaveTarget(s.assertion?.target, steps) };
-        if (s.action === "capture_text") out.capture_cfg = { ...(s.capture_cfg || {}), target: toSaveTarget(s.capture_cfg?.target, steps) };
-        return out;
-      }));
-      loadRows(r.steps);
-      setSelectorDrafts({});
-      setSelectorErrors({});
-      setNotice({ tone: "success", text: `Saved - this recording now has ${r.steps.length} steps.` });
-      if (onSaved) onSaved();
-    } catch (e) {
-      setNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setSaving(false);
-    }
-  }
+@router.put("/users/{user_id}", response_model=UserOut)
+def update_user(user_id: int, req: UpdateUserRequest, request: Request, admin: CurrentUser = Depends(get_current_admin)):
+    ip = get_client_ip(request)
+    with get_session() as db:
+        user = repo.update_user_account(
+            db, user_id,
+            first_name=req.first_name, last_name=req.last_name, department_code=req.department_code,
+            email=req.email, role=req.role, status=req.status,
+        )
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found.")
+        repo.log_activity(
+            db, user_id=admin.user_id, session_id=admin.session_id, action="USER_UPDATED", status="SUCCESS",
+            details={"updated_user_id": user_id, **req.model_dump(exclude_none=True)},
+            endpoint=f"/api/admin/users/{user_id}", ip_address=ip,
+        )
+        return _user_out(user)
 
-  const cellClass = "border border-line px-0 py-0 align-top";
-  const inputClass = "w-full min-w-[7rem] border-0 bg-transparent px-2 py-1.5 text-sm text-ink focus:bg-brand-blueLight focus:outline-none";
 
-  return (
-    <Panel>
-      <div className="px-5 py-4">
-        <Disclosure title={`Edit steps (Excel-style) — ${steps.length} step${steps.length === 1 ? "" : "s"}`} defaultOpen>
-          <div className="space-y-3">
-            <p className="text-xs text-muted">
-              Same columns as your spreadsheet - click any cell to edit. Drag a row by the <strong>⋮⋮</strong> handle (or use ↑ ↓) to move it, and press <strong>✕</strong> to delete it. Paste a selector into &quot;Present element&quot;
-              exactly like the Excel column; it parses automatically when you click away. Changes apply once you click
-              &quot;Save changes&quot; below.
-            </p>
+@router.delete("/users/{user_id}")
+def delete_user(user_id: int, request: Request, admin: CurrentUser = Depends(get_current_admin)):
+    if user_id == admin.user_id:
+        raise HTTPException(status_code=400, detail="You cannot delete your own account.")
+    ip = get_client_ip(request)
+    with get_session() as db:
+        user = repo.soft_delete_user(db, user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found.")
+        repo.revoke_all_sessions_for_user(db, user_id, reason="account_deleted")
+        repo.log_activity(
+            db, user_id=admin.user_id, session_id=admin.session_id, action="USER_DELETED", status="SUCCESS",
+            details={"deleted_user_id": user_id, "username": user.username},
+            endpoint=f"/api/admin/users/{user_id}", ip_address=ip,
+        )
+        return {"ok": True}
 
-            {stale && (
-              <Callout tone="error">
-                The test data of this recording was changed and saved after you started editing here. Saving this grid now would put the old values back.{" "}
-                <button type="button" className="font-medium underline" onClick={load}>Reload steps</button> (your unsaved edits here are lost).
-              </Callout>
-            )}
-            {loading && <Spinner label="Loading steps..." />}
-            {loadError && <Callout tone="error">Could not load steps: {loadError}</Callout>}
 
-            {!loading && !loadError && (
-              <>
-                <div className="max-h-[75vh] min-h-[24rem] w-full overflow-auto rounded-sm border border-line scroll-thin">
-                  <table className="w-full min-w-[56rem] border-collapse text-left text-sm">
-                    <thead className="sticky top-0 z-10 bg-rail">
-                      <tr>
-                        <th className="w-8 border border-line px-1 py-2" title="Drag a row by its handle to move it" />
-                        <th className="border border-line px-2 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">#</th>
-                        <th className="border border-line px-2 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">Action/Method</th>
-                        <th className="border border-line px-2 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">Name</th>
-                        <th className="border border-line px-2 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">Present element</th>
-                        <th className="border border-line px-2 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">Input</th>
-                        <th className="border border-line px-2 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600"></th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {steps.map((s, i) => (
-                        <Fragment key={s._id}>
-                        <tr
-                          draggable={armedRow === i}
-                          onDragStart={(e) => {
-                            setDragFrom(i);
-                            e.dataTransfer.effectAllowed = "move";
-                            try { e.dataTransfer.setData("text/plain", String(i + 1)); } catch { /* old browsers */ }
-                          }}
-                          onDragOver={(e) => handleDragOver(e, i)}
-                          onDrop={handleDrop}
-                          onDragEnd={endDrag}
-                          className={`odd:bg-panel even:bg-[#FBFDFF] ${dragFrom === i ? "opacity-40" : ""}`}
-                          style={
-                            dragOver && dragOver.index === i && dragFrom !== null && dragFrom !== i
-                              ? { boxShadow: `inset 0 ${dragOver.after ? "-3px" : "3px"} 0 0 #1F5FE0` }
-                              : undefined
-                          }
-                        >
-                          <td className="border border-line px-0 py-1.5 text-center">
-                            <span
-                              role="button"
-                              aria-label={`Drag step ${i + 1} to move it`}
-                              title="Drag to move this step"
-                              onMouseDown={() => setArmedRow(i)}
-                              onMouseUp={() => setArmedRow(null)}
-                              className="inline-block cursor-grab select-none px-1 text-base leading-none text-muted hover:text-ink active:cursor-grabbing"
-                            >
-                              ⋮⋮
-                            </span>
-                          </td>
-                          <td className="border border-line px-2 py-1.5 text-xs text-muted">{i + 1}</td>
-                          {CHECK_ROWS.has(s.action) ? (
-                            <>
-                              <td className={cellClass}>
-                                <button type="button" onClick={() => setCheckRow(checkRow === s._id ? null : s._id)}
-                                  className={`w-full px-2 py-1.5 text-left text-sm font-semibold ${s.action === "assert" ? "text-signal-tealDark" : "text-signal-slate"}`}>
-                                  {String(s.check_source || "").startsWith("verify-") ? "VERIFY" : ACTION_LABELS[s.action]}
-                                  {s.check_source === "ai" || s.original?.check_source === "ai" || s.check_source === "verify-ai" || s.check_source === "verify-hybrid" ? " ✨" : ""}
-                                </button>
-                              </td>
-                              <td className={cellClass}>
-                                <input className={inputClass} value={s.label || ""} placeholder={s.action === "assert" ? "e.g. Loan saved" : "e.g. balance_before"}
-                                  onChange={(e) => patchRow(s._id, s.action === "assert"
-                                    ? { label: e.target.value, assertion: { ...(s.assertion || {}), name: e.target.value } }
-                                    : { label: e.target.value, capture_cfg: { ...(s.capture_cfg || {}), name: e.target.value } })} />
-                              </td>
-                              <td className={cellClass}>
-                                <button type="button" onClick={() => setCheckRow(s._id)} className="block w-full px-2 py-1.5 text-left text-xs text-muted">
-                                  {(() => {
-                                    const tgt = (s.action === "assert" ? s.assertion : s.capture_cfg)?.target || {};
-                                    if (tgt.step_row_id) return `Element of step ${rowNo(tgt.step_row_id) || "?"}`;
-                                    if (tgt.preset) return tgt.preset.replace(/_/g, " ");
-                                    if (tgt.label) return tgt.label;
-                                    if (tgt.locators) return "The element marked while recording";
-                                    if (tgt.selector) return tgt.selector;
-                                    const needsElement = (catalog?.types || []).find((x) => x.type === s.assertion?.type)?.target === "element";
-                                    return s.action === "assert" && !needsElement ? "The page" : "⚠ Choose where to look";
-                                  })()}
-                                </button>
-                              </td>
-                              <td className={cellClass}>
-                                <button type="button" onClick={() => setCheckRow(s._id)} className="block w-full px-2 py-1.5 text-left text-sm text-ink">
-                                  {s.action === "assert"
-                                    ? `${(catalog?.types || []).find((x) => x.type === s.assertion?.type)?.label || s.assertion?.type || ""}${
-                                        s.assertion?.expected !== undefined && s.assertion?.expected !== "" ? `: ${s.assertion.expected}` : ""}`
-                                    : "remember its value"}
-                                </button>
-                              </td>
-                            </>
-                          ) : (
-                          <>
-                          <td className={cellClass}>
-                            <Select
-                              value={s.action}
-                              onChange={(e) => {
-                                const newAction = e.target.value;
-                                updateField(i, "action", newAction);
-                                if (newAction === "copy" || newAction === "ocr_capture") updateField(i, "captured_as", s.label || "");
-                              }}
-                              className="border-0 bg-transparent px-2 py-1.5 text-sm focus:outline-none"
-                            >
-                              {Object.entries(ACTION_LABELS).filter(([value]) => !KEEP_ONLY.has(value) || s.action === value).map(([value, label]) => (
-                                <option key={value} value={value}>
-                                  {label}
-                                </option>
-                              ))}
-                            </Select>
-                          </td>
-                          <td className={cellClass}>
-                            {NEEDS_NAME.has(s.action) ? (
-                              <input
-                                className={inputClass}
-                                value={s.label || ""}
-                                onChange={(e) => updateField(i, "label", e.target.value)}
-                                placeholder="e.g. Login Button"
-                              />
-                            ) : (
-                              <span className="block px-2 py-1.5 text-xs text-muted">—</span>
-                            )}
-                          </td>
-                          <td className={cellClass}>
-                            {NEEDS_SELECTOR.has(s.action) ? (
-                              <div>
-                                <textarea
-                                  className="w-full min-w-[16rem] resize-y border-0 bg-transparent px-2 py-1.5 font-mono text-xs text-ink focus:bg-brand-blueLight focus:outline-none"
-                                  rows={2}
-                                  defaultValue={selectorCellText(s, selectorDrafts, s._id)}
-                                  onBlur={(e) => handleSelectorBlur(i, s._id, e.target.value)}
-                                  placeholder="<html app='msedge.exe' />&#10;<webctrl id='username' tag='INPUT' />"
-                                />
-                                {parsingRow === s._id && <div className="px-2 pb-1 text-xs text-muted">Parsing...</div>}
-                                {selectorErrors[s._id] && <div className="px-2 pb-1 text-xs text-signal-rust">{selectorErrors[s._id]}</div>}
-                              </div>
-                            ) : (
-                              <span className="block px-2 py-1.5 text-xs text-muted">—</span>
-                            )}
-                          </td>
-                          <td className={cellClass}>
-                            <input
-                              className={inputClass}
-                              value={s.value || ""}
-                              onChange={(e) => updateField(i, "value", e.target.value)}
-                              placeholder={INPUT_PLACEHOLDER[s.action] || ""}
-                            />
-                          </td>
-                          </>
-                          )}
-                          <td className="border border-line px-1 py-1.5 text-center">
-                            <div className="flex items-center justify-center gap-1">
-                              <button type="button" onClick={() => addCheckAfter(i)} title="Add a check right after this step"
-                                aria-label={`Add a check after step ${i + 1}`} className="rounded-sm px-1 text-xs font-semibold text-signal-tealDark hover:bg-[#F0FDF7]">
-                                ✓+
-                              </button>
-                              {(s.runtime_input_types || []).length > 0 && (
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    if (!s.runtime_config?.configurable) updateField(i, "runtime_config", newRuntimeConfig(s));
-                                    setConfigRow(configRow === s._id ? null : s._id);
-                                  }}
-                                  title={s.runtime_config?.configurable
-                                    ? `Value chosen for each run: ${s.runtime_config.variable_name}`
-                                    : "Let each run choose this step's value"}
-                                  aria-label={`Runtime value settings for step ${i + 1}`}
-                                  className={`rounded-sm px-1 ${s.runtime_config?.configurable ? "bg-brand-blue text-white" : "text-muted hover:text-ink"}`}
-                                >
-                                  ⚙
-                                </button>
-                              )}
-                              <button type="button" className="px-1 text-muted hover:text-ink disabled:opacity-30" disabled={i === 0} onClick={() => moveRow(i, -1)} title="Move up">
-                                ↑
-                              </button>
-                              <button type="button" className="px-1 text-muted hover:text-ink disabled:opacity-30" disabled={i === steps.length - 1} onClick={() => moveRow(i, 1)} title="Move down">
-                                ↓
-                              </button>
-                              <button type="button" className="rounded-sm px-1.5 font-semibold text-signal-rust hover:bg-[#FBEEEA]" onClick={() => deleteRow(i)} title="Delete this step" aria-label={`Delete step ${i + 1}`}>
-                                ✕
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                        {checkRow === s._id && CHECK_ROWS.has(s.action) && (
-                          <tr>
-                            <td colSpan={7} className="border border-line px-3 py-3">
-                              <CheckEditor row={s} rows={steps} catalog={catalog} onChange={(patch) => patchRow(s._id, patch)} />
-                              <div className="mt-2 flex gap-3 text-xs">
-                                <button type="button" className="font-medium text-brand-blue" onClick={() => setCheckRow(null)}>Done</button>
-                                <span className="text-muted">Saved with “Save changes” below.</span>
-                              </div>
-                            </td>
-                          </tr>
-                        )}
-                        {configRow === s._id && s.runtime_config?.configurable && (
-                          <tr>
-                            <td colSpan={7} className="border border-line px-3 py-3">
-                              <RuntimeStepConfig step={s} config={s.runtime_config} onChange={(cfg) => updateField(i, "runtime_config", cfg)} />
-                              <div className="mt-2 flex gap-3 text-xs">
-                                <button type="button" className="font-medium text-brand-blue" onClick={() => setConfigRow(null)}>Done</button>
-                                <button type="button" className="font-medium text-signal-rust"
-                                  onClick={() => { updateField(i, "runtime_config", null); setConfigRow(null); }}>
-                                  Stop asking for this value (always use the recorded one)
-                                </button>
-                              </div>
-                            </td>
-                          </tr>
-                        )}
-                        </Fragment>
-                      ))}
-                      {steps.length === 0 && (
-                        <tr>
-                          <td colSpan={7} className="border border-line px-3 py-4 text-center text-sm text-muted">
-                            No steps yet - add one below.
-                          </td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
+@router.post("/users/{user_id}/reset-password")
+def reset_password(user_id: int, req: ResetPasswordRequest, request: Request, admin: CurrentUser = Depends(get_current_admin)):
+    ip = get_client_ip(request)
+    temp_password = req.temp_password.strip() or generate_temp_password()
+    error = validate_password_strength(temp_password)
+    if error:
+        raise HTTPException(status_code=400, detail=f"Temp password: {error}")
+    with get_session() as db:
+        user = repo.set_user_password(db, user_id, hash_password(temp_password), must_change_password=True)
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found.")
+        repo.revoke_all_sessions_for_user(db, user_id, reason="password_reset")
+        repo.log_activity(
+            db, user_id=admin.user_id, session_id=admin.session_id, action="PASSWORD_RESET_BY_ADMIN", status="SUCCESS",
+            details={"target_user_id": user_id, "username": user.username},
+            endpoint=f"/api/admin/users/{user_id}/reset-password", ip_address=ip,
+        )
+        return {"ok": True, "temp_password": temp_password}
 
-                <div className="flex flex-wrap items-center gap-2">
-                  <Button variant="secondary" onClick={addRow}>
-                    + Add row
-                  </Button>
-                  <Button variant="secondary" onClick={() => addCheckAfter(steps.length - 1)}>✓ Add check</Button>
-                  <Button variant="secondary" onClick={() => addRememberAfter(steps.length - 1)} title="For a check that a value changed (before / after)">
-                    ⧉ Remember a value
-                  </Button>
-                  <Button variant="secondary" onClick={() => askSuggestions("checks")} disabled={!!suggesting}>
-                    {suggesting === "checks" ? "Thinking..." : "✨ Suggest checks"}
-                  </Button>
-                  {pendingReview && (
-                    <Button variant="secondary" onClick={() => askSuggestions("review")} disabled={!!suggesting}>
-                      {suggesting === "review" ? "Reviewing..." : "✨ Review recorded checks"}
-                    </Button>
-                  )}
-                  <Button variant="ghost" onClick={() => askSuggestions("locators")} disabled={!!suggesting}
-                    title="Steps found only by a long generated path - add sturdier ways to find them">
-                    {suggesting === "locators" ? "Looking..." : "Strengthen locators"}
-                  </Button>
-                  <Button onClick={saveAll} disabled={saving}>
-                    {saving ? "Saving..." : "Save changes"}
-                  </Button>
-                  <Button variant="secondary" onClick={load} disabled={saving}>
-                    Discard &amp; reload
-                  </Button>
-                </div>
-                {notice && <Callout tone={notice.tone}>{notice.text}</Callout>}
-                {dialog && dialog.kind !== "locators" && (
-                  <CheckSuggestions
-                    title={dialog.kind === "review" ? "Checks you marked while recording" : "Suggested checks"}
-                    items={dialog.items} catalog={catalog} aiAvailable={dialog.aiAvailable}
-                    onDone={applySuggestions} onCancel={() => setDialog(null)}
-                  />
-                )}
-                {dialog && dialog.kind === "locators" && (
-                  <LocatorSuggestions items={dialog.items} aiAvailable={dialog.aiAvailable}
-                    onDone={applyLocators} onCancel={() => setDialog(null)} />
-                )}
-              </>
-            )}
-          </div>
-        </Disclosure>
-      </div>
-    </Panel>
-  );
-}
+
+# ---- Live sessions ("who's online") ------------------------------------------
+
+@router.get("/agents")
+def list_connected_agents():
+    """Per-installation visibility (spec: agent_id, user_id, status,
+    hostname, version, last_seen, connected_at) - one row per currently
+    registered desktop agent, across every user, not just the caller's
+    own. A stale (missed-heartbeat) connection is flagged rather than
+    silently listed as healthy - see agent_registry.is_stale."""
+    connections = agent_registry.list_agents()
+    with get_session() as db:
+        users_by_id = {u.user_id: u for u in repo.list_users(db)}
+        out = []
+        for conn in connections:
+            user = users_by_id.get(conn.user_id)
+            out.append({
+                # One row per signed-in user on an agent: "agent_id" is that connection's id (what reset /
+                # disconnect below act on - just this user), "pc_agent_id" the PC's agent installation.
+                "agent_id": conn.key,
+                "pc_agent_id": conn.agent_id,
+                "users_on_this_pc": agent_registry.users_on_agent(conn.agent_id),
+                "user_id": conn.user_id,
+                "username": user.username if user else "unknown",
+                "full_name": f"{user.first_name} {user.last_name}".strip() if user else "unknown",
+                "hostname": conn.hostname,
+                "version": conn.version,
+                "busy": conn.busy,
+                "connected_at": conn.connected_at,
+                "last_seen": conn.last_seen,
+                "stale": agent_registry.is_stale(conn),
+            })
+        return out
+
+
+@router.post("/agents/{agent_id}/reset")
+async def reset_agent(agent_id: str, request: Request, admin: CurrentUser = Depends(get_current_admin)):
+    """Sends CLOSE_BROWSER to a specific agent - closes any stray browser
+    and clears its internal `busy` flag (see local_agent/command_handler.py).
+
+    This exists specifically because /disconnect above does NOT fix a
+    stuck-busy agent: CommandHandler (and its `busy` flag) is created once
+    per agent PROCESS lifetime (see local_agent/client.py), not per
+    connection, so force-closing the WebSocket just makes the agent
+    reconnect with the same stuck state. If a recording/test genuinely
+    never reached its own cleanup (browser closed manually outside the
+    app, a crash, or - before AGENT_TEST_TIMEOUT_SECONDS was tuned up -
+    the backend giving up on a slow-but-still-running execution) the
+    agent shows "Agent is busy with another recording/test execution" for
+    every future action until this is called (or the whole agent process
+    is restarted by hand) - this is the built-in fix instead of that."""
+    conn = agent_registry.get_by_agent_id(agent_id)
+    if conn is None:
+        raise HTTPException(status_code=404, detail="Agent not connected.")
+    ip = get_client_ip(request)
+    try:
+        response = await agent_registry.send_command(conn, "CLOSE_BROWSER", {}, timeout=15)
+    except (asyncio.TimeoutError, ConnectionError) as e:
+        raise HTTPException(status_code=502, detail=f"Agent did not respond to reset: {e}")
+    conn.busy = False
+    with get_session() as db:
+        repo.log_activity(
+            db, user_id=admin.user_id, session_id=admin.session_id, action="AGENT_RESET_BY_ADMIN",
+            status="SUCCESS", details={"agent_id": agent_id, "target_user_id": conn.user_id},
+            endpoint=f"/api/admin/agents/{agent_id}/reset", ip_address=ip,
+        )
+    return {"ok": response.get("ok", True)}
+
+
+@router.post("/agents/{agent_id}/disconnect")
+async def disconnect_agent(agent_id: str, request: Request, admin: CurrentUser = Depends(get_current_admin)):
+    """Force-closes a specific agent's WebSocket connection - the desktop
+    app's own reconnect loop (local_agent/connection_manager.py) will
+    immediately try to reconnect, so this is a "kick and let it come back"
+    action, not a permanent ban (use the Users/Sessions pages to actually
+    revoke access if that's the intent).
+
+    NOTE: this does NOT clear a stuck `busy` flag - see /reset above for
+    that; CommandHandler's busy state survives a reconnect since it's
+    scoped to the agent process, not the connection."""
+    conn = agent_registry.get_by_agent_id(agent_id)
+    if conn is None:
+        raise HTTPException(status_code=404, detail="Agent not connected.")
+    ip = get_client_ip(request)
+    try:
+        await conn.websocket.close(code=1000, reason="Disconnected by admin")
+    except Exception:
+        pass
+    agent_registry.unregister(conn.key, conn.websocket)    # this user's connection only
+    with get_session() as db:
+        repo.log_activity(
+            db, user_id=admin.user_id, session_id=admin.session_id, action="AGENT_DISCONNECTED_BY_ADMIN",
+            status="SUCCESS", details={"agent_id": agent_id, "target_user_id": conn.user_id},
+            endpoint=f"/api/admin/agents/{agent_id}/disconnect", ip_address=ip,
+        )
+    return {"ok": True}
+
+
+@router.get("/sessions")
+def list_sessions():
+    """Includes `recording_active` per session - see
+    backend/recording_sessions.py - so an admin can see not just who's
+    logged in, but who's actively recording a flow right now."""
+    with get_session() as db:
+        idle_cutoff = datetime.utcnow() - timedelta(minutes=IDLE_TIMEOUT_MINUTES)
+        sessions = repo.list_active_sessions(db, idle_cutoff)
+        out = []
+        for s in sessions:
+            user = repo.get_user(db, s.user_id)
+            state = recording_sessions.get_state(s.session_id, s.user_id)
+            out.append({
+                "session_id": s.session_id,
+                "user_id": s.user_id,
+                "username": user.username if user else "unknown",
+                "full_name": f"{user.first_name} {user.last_name}".strip() if user else "unknown",
+                "role": user.role if user else "unknown",
+                "created_at": s.created_at.isoformat(),
+                "last_activity_at": s.last_activity_at.isoformat(),
+                "idle_seconds": int((datetime.utcnow() - s.last_activity_at).total_seconds()),
+                "ip_address": s.ip_address,
+                "user_agent": s.user_agent,
+                "recording_active": state.get("recorder") is not None,
+                # the person's desktop agent being connected is separate from being signed in on the web
+                "agent_connected": agent_registry.get_for_user(s.user_id) is not None,
+            })
+        return out
+
+
+@router.post("/sessions/{session_id}/revoke")
+def revoke_session(session_id: str, request: Request, admin: CurrentUser = Depends(get_current_admin)):
+    ip = get_client_ip(request)
+    with get_session() as db:
+        sess = repo.revoke_session(db, session_id, reason="admin_revoked")
+        if sess is None:
+            raise HTTPException(status_code=404, detail="Session not found.")
+        repo.log_activity(
+            db, user_id=admin.user_id, session_id=admin.session_id, action="SESSION_REVOKED", status="SUCCESS",
+            details={"revoked_session_id": session_id, "target_user_id": sess.user_id},
+            endpoint=f"/api/admin/sessions/{session_id}/revoke", ip_address=ip,
+        )
+        return {"ok": True}
+
+
+# ---- Activity monitor -------------------------------------------------------
+
+def _parse_activity_filters(user_id, action, since, until):
+    since_dt = datetime.fromisoformat(since) if since else None
+    until_dt = datetime.fromisoformat(until) if until else None
+    return user_id, action, since_dt, until_dt
+
+
+@router.get("/activity")
+def list_activity(
+    user_id: Optional[int] = Query(default=None),
+    action: Optional[str] = Query(default=None),
+    since: Optional[str] = Query(default=None, description="ISO date/time"),
+    until: Optional[str] = Query(default=None, description="ISO date/time"),
+    limit: int = Query(default=200, le=2000),
+):
+    uid, act, since_dt, until_dt = _parse_activity_filters(user_id, action, since, until)
+    with get_session() as db:
+        rows = repo.list_activity(db, user_id=uid, action=act, since=since_dt, until=until_dt, limit=limit)
+        users_by_id = {u.user_id: u for u in repo.list_users(db)}
+        return [
+            {
+                "id": r.id,
+                "user_id": r.user_id,
+                "username": users_by_id[r.user_id].username if r.user_id in users_by_id else None,
+                "action": r.action,
+                "status": r.status,
+                "details": r.details,
+                "endpoint": r.endpoint,
+                "ip_address": r.ip_address,
+                "timestamp": r.timestamp.isoformat(),
+            }
+            for r in rows
+        ]
+
+
+@router.get("/activity/export")
+def export_activity(
+    user_id: Optional[int] = Query(default=None),
+    action: Optional[str] = Query(default=None),
+    since: Optional[str] = Query(default=None),
+    until: Optional[str] = Query(default=None),
+):
+    uid, act, since_dt, until_dt = _parse_activity_filters(user_id, action, since, until)
+    with get_session() as db:
+        rows = repo.list_activity(db, user_id=uid, action=act, since=since_dt, until=until_dt, limit=5000)
+        users_by_id = {u.user_id: u for u in repo.list_users(db)}
+
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["id", "timestamp", "username", "action", "status", "endpoint", "ip_address", "details"])
+        for r in rows:
+            writer.writerow([
+                r.id, r.timestamp.isoformat(),
+                users_by_id[r.user_id].username if r.user_id in users_by_id else "",
+                r.action, r.status, r.endpoint or "", r.ip_address or "", r.details or "",
+            ])
+        buf.seek(0)
+        return StreamingResponse(
+            iter([buf.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=activity_export.csv"},
+        )
+
+
+# ---- Dashboard stats ---------------------------------------------------------
+
+@router.get("/dashboard/stats")
+def dashboard_stats():
+    with get_session() as db:
+        idle_cutoff = datetime.utcnow() - timedelta(minutes=IDLE_TIMEOUT_MINUTES)
+        active_sessions = repo.list_active_sessions(db, idle_cutoff)
+        users_by_status = repo.count_users_by_status(db)
+        today = datetime.utcnow().date()
+        today_start = datetime(today.year, today.month, today.day)
+
+        # Recording-run counts come from transactions/*.json, not the
+        # database - see runner/transaction_store.py.
+        txns_today = transaction_store.count_transactions_since(today_start)
+        txns_success_today = transaction_store.count_transactions_since(today_start, status="Success")
+
+        recent_activity = repo.list_activity(db, limit=15)
+        users_by_id = {u.user_id: u for u in repo.list_users(db)}
+
+        return {
+            "total_users": sum(users_by_status.values()),
+            "active_users": users_by_status.get("Active", 0),
+            "inactive_users": users_by_status.get("Inactive", 0),
+            "online_now": len(active_sessions),
+            "recording_now": recording_sessions.count_active_recordings(),
+            "runs_today": txns_today,
+            "runs_success_today": txns_success_today,
+            "recent_activity": [
+                {
+                    "username": users_by_id[r.user_id].username if r.user_id in users_by_id else None,
+                    "action": r.action,
+                    "status": r.status,
+                    "timestamp": r.timestamp.isoformat(),
+                }
+                for r in recent_activity
+            ],
+        }
