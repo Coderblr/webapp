@@ -1,390 +1,507 @@
 """
-Everything here requires an admin (get_current_admin). This is the "admin
-can keep an eye on every user" surface:
-
-  User management     POST/GET/PUT/DELETE /api/admin/users, reset-password
-  Live sessions        GET /api/admin/sessions, POST .../revoke
-  Activity monitor     GET /api/admin/activity (+ /export as CSV)
-  Dashboard stats       GET /api/admin/dashboard/stats
+Small CRUD helpers over the ORM models, used by backend/api.py,
+backend/auth_routes.py, backend/admin_routes.py, backend/profile_routes.py,
+backend/recording_access.py, and backend/recording_routes.py. Scoped to
+auth/session/activity/recording-ownership data - see
+runner/transaction_store.py for recording-RUN history (file-based, not
+here) and recordings/ for recording CONTENT (also file-based - see
+database/models.py's Recording/RecordingVersion for how the two relate).
 """
 from __future__ import annotations
-import asyncio
-import csv
-import io
+import json
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Query
-from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
 
-from database.db import get_session
-from database import repository as repo
-from runner import transaction_store
-from backend import recording_sessions, agent_registry
-from auth.dependencies import get_current_admin, get_client_ip, CurrentUser
-from auth.security import hash_password, generate_temp_password, validate_password_strength
-from auth.config import IDLE_TIMEOUT_MINUTES
-from auth.schemas import CreateUserRequest, UpdateUserRequest, ResetPasswordRequest, UserOut, CreateUserResponse
-
-router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(get_current_admin)])
+from database.models import User, UserSession, ActivityLog, Recording, RecordingVersion, RecordingShare
 
 
-def _user_out(user) -> UserOut:
-    return UserOut.model_validate(user)
+# ---- Users --------------------------------------------------------------
+
+def create_user(session: Session, name: str, department: Optional[str] = None, status: str = "Active") -> User:
+    """Legacy helper (pre-auth). Still used to satisfy the NOT NULL legacy
+    `name`/`department` columns when creating an account via create_user_account
+    below - not intended to be called directly for new accounts."""
+    user = User(name=name.strip(), department=(department or "").strip() or None, status=status)
+    session.add(user)
+    session.flush()
+    return user
 
 
-# ---- Users ------------------------------------------------------------------
+def create_user_account(
+    session: Session,
+    *,
+    username: str,
+    first_name: str,
+    last_name: str,
+    department_code: Optional[str],
+    email: Optional[str],
+    password_hash: str,
+    role: str = "user",
+) -> User:
+    """Creates a full auth-enabled account (used by the admin panel)."""
+    user = User(
+        username=username.strip(),
+        first_name=first_name.strip(),
+        last_name=last_name.strip(),
+        department_code=(department_code or "").strip() or None,
+        email=(email or "").strip() or None,
+        role=role,
+        password_hash=password_hash,
+        must_change_password=True,
+        auth_provider="local",
+        # legacy mirror fields, kept in sync so the recorder/report code
+        # (which only knows about `name`/`department`) keeps working as-is
+        name=f"{first_name.strip()} {last_name.strip()}".strip(),
+        department=(department_code or "").strip() or None,
+        status="Active",
+    )
+    session.add(user)
+    session.flush()
+    return user
 
-@router.post("/users", response_model=CreateUserResponse)
-def create_user(req: CreateUserRequest, request: Request, admin: CurrentUser = Depends(get_current_admin)):
-    ip = get_client_ip(request)
-    with get_session() as db:
-        if repo.get_user_by_username(db, req.username):
-            raise HTTPException(status_code=400, detail=f"Username/ADID '{req.username}' already exists.")
 
-        temp_password = req.temp_password.strip() or generate_temp_password()
-        error = validate_password_strength(temp_password)
-        if error:
-            raise HTTPException(status_code=400, detail=f"Temp password: {error}")
+def get_user_by_username(session: Session, username: str) -> Optional[User]:
+    return session.query(User).filter(User.username == username.strip()).first()
 
-        user = repo.create_user_account(
-            db,
-            username=req.username,
-            first_name=req.first_name,
-            last_name=req.last_name,
-            department_code=req.department_code,
-            email=req.email,
-            password_hash=hash_password(temp_password),
-            role=req.role,
+
+def update_user_account(
+    session: Session,
+    user_id: int,
+    *,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    department_code: Optional[str] = None,
+    email: Optional[str] = None,
+    role: Optional[str] = None,
+    status: Optional[str] = None,
+) -> Optional[User]:
+    user = session.get(User, user_id)
+    if user is None:
+        return None
+    if first_name is not None:
+        user.first_name = first_name.strip()
+    if last_name is not None:
+        user.last_name = last_name.strip()
+    if department_code is not None:
+        user.department_code = department_code.strip() or None
+        user.department = user.department_code
+    if email is not None:
+        user.email = email.strip() or None
+    if role is not None:
+        user.role = role
+    if status is not None:
+        user.status = status
+    # keep legacy display name in sync
+    user.name = f"{user.first_name} {user.last_name}".strip() or user.username
+    session.flush()
+    return user
+
+
+def set_user_password(session: Session, user_id: int, password_hash: str, must_change_password: bool) -> Optional[User]:
+    user = session.get(User, user_id)
+    if user:
+        user.password_hash = password_hash
+        user.must_change_password = must_change_password
+        session.flush()
+    return user
+
+
+def mark_login(session: Session, user_id: int) -> None:
+    user = session.get(User, user_id)
+    if user:
+        user.last_login_at = datetime.utcnow()
+        session.flush()
+
+
+def list_users(session: Session, active_only: bool = False):
+    q = session.query(User)
+    if active_only:
+        q = q.filter(User.status == "Active")
+    return q.order_by(User.name).all()
+
+
+def list_user_accounts(session: Session, status: Optional[str] = None, role: Optional[str] = None, search: Optional[str] = None):
+    q = session.query(User)
+    if status:
+        q = q.filter(User.status == status)
+    if role:
+        q = q.filter(User.role == role)
+    if search:
+        like = f"%{search.strip()}%"
+        q = q.filter(
+            (User.username.ilike(like))
+            | (User.first_name.ilike(like))
+            | (User.last_name.ilike(like))
+            | (User.email.ilike(like))
         )
-        repo.log_activity(
-            db, user_id=admin.user_id, session_id=admin.session_id, action="USER_CREATED", status="SUCCESS",
-            details={"created_user_id": user.user_id, "username": user.username, "role": user.role},
-            endpoint="/api/admin/users", ip_address=ip,
-        )
-        out = _user_out(user).model_dump()
-        out["temp_password"] = temp_password  # only ever returned once, right after creation
-        return out
+    return q.order_by(User.created_date.desc()).all()
 
 
-@router.get("/users")
-def list_users(
-    status: Optional[str] = Query(default=None),
-    role: Optional[str] = Query(default=None),
-    search: Optional[str] = Query(default=None),
-):
-    with get_session() as db:
-        users = repo.list_user_accounts(db, status=status, role=role, search=search)
-        return [_user_out(u) for u in users]
+def get_user(session: Session, user_id: int) -> Optional[User]:
+    return session.get(User, user_id)
 
 
-@router.get("/users/{user_id}", response_model=UserOut)
-def get_user(user_id: int):
-    with get_session() as db:
-        user = repo.get_user(db, user_id)
-        if user is None:
-            raise HTTPException(status_code=404, detail="User not found.")
-        return _user_out(user)
+def set_user_status(session: Session, user_id: int, status: str) -> Optional[User]:
+    user = session.get(User, user_id)
+    if user:
+        user.status = status
+        session.flush()
+    return user
 
 
-@router.put("/users/{user_id}", response_model=UserOut)
-def update_user(user_id: int, req: UpdateUserRequest, request: Request, admin: CurrentUser = Depends(get_current_admin)):
-    ip = get_client_ip(request)
-    with get_session() as db:
-        user = repo.update_user_account(
-            db, user_id,
-            first_name=req.first_name, last_name=req.last_name, department_code=req.department_code,
-            email=req.email, role=req.role, status=req.status,
-        )
-        if user is None:
-            raise HTTPException(status_code=404, detail="User not found.")
-        repo.log_activity(
-            db, user_id=admin.user_id, session_id=admin.session_id, action="USER_UPDATED", status="SUCCESS",
-            details={"updated_user_id": user_id, **req.model_dump(exclude_none=True)},
-            endpoint=f"/api/admin/users/{user_id}", ip_address=ip,
-        )
-        return _user_out(user)
+def soft_delete_user(session: Session, user_id: int) -> Optional[User]:
+    """Deletion never removes the row (that would orphan the audit trail /
+    transaction history) - it marks the account Deleted, which blocks login
+    and drops it out of the active user/recording-owner lists."""
+    return set_user_status(session, user_id, "Deleted")
 
 
-@router.delete("/users/{user_id}")
-def delete_user(user_id: int, request: Request, admin: CurrentUser = Depends(get_current_admin)):
-    if user_id == admin.user_id:
-        raise HTTPException(status_code=400, detail="You cannot delete your own account.")
-    ip = get_client_ip(request)
-    with get_session() as db:
-        user = repo.soft_delete_user(db, user_id)
-        if user is None:
-            raise HTTPException(status_code=404, detail="User not found.")
-        repo.revoke_all_sessions_for_user(db, user_id, reason="account_deleted")
-        repo.log_activity(
-            db, user_id=admin.user_id, session_id=admin.session_id, action="USER_DELETED", status="SUCCESS",
-            details={"deleted_user_id": user_id, "username": user.username},
-            endpoint=f"/api/admin/users/{user_id}", ip_address=ip,
-        )
-        return {"ok": True}
+def count_users_by_status(session: Session) -> dict:
+    from sqlalchemy import func
+    rows = session.query(User.status, func.count(User.user_id)).group_by(User.status).all()
+    return {status: count for status, count in rows}
 
 
-@router.post("/users/{user_id}/reset-password")
-def reset_password(user_id: int, req: ResetPasswordRequest, request: Request, admin: CurrentUser = Depends(get_current_admin)):
-    ip = get_client_ip(request)
-    temp_password = req.temp_password.strip() or generate_temp_password()
-    error = validate_password_strength(temp_password)
-    if error:
-        raise HTTPException(status_code=400, detail=f"Temp password: {error}")
-    with get_session() as db:
-        user = repo.set_user_password(db, user_id, hash_password(temp_password), must_change_password=True)
-        if user is None:
-            raise HTTPException(status_code=404, detail="User not found.")
-        repo.revoke_all_sessions_for_user(db, user_id, reason="password_reset")
-        repo.log_activity(
-            db, user_id=admin.user_id, session_id=admin.session_id, action="PASSWORD_RESET_BY_ADMIN", status="SUCCESS",
-            details={"target_user_id": user_id, "username": user.username},
-            endpoint=f"/api/admin/users/{user_id}/reset-password", ip_address=ip,
-        )
-        return {"ok": True, "temp_password": temp_password}
+# ---- Sessions -------------------------------------------------------------
+
+def create_session(
+    session: Session, user_id: int, ip_address: Optional[str], user_agent: Optional[str],
+    session_max_hours: int, is_agent: bool = False,
+) -> UserSession:
+    now = datetime.utcnow()
+    sess = UserSession(
+        user_id=user_id,
+        created_at=now,
+        last_activity_at=now,
+        expires_at=now + timedelta(hours=session_max_hours),
+        ip_address=ip_address,
+        user_agent=(user_agent or "")[:255],
+        is_agent=is_agent,
+    )
+    session.add(sess)
+    session.flush()
+    return sess
 
 
-# ---- Live sessions ("who's online") ------------------------------------------
-
-@router.get("/agents")
-def list_connected_agents():
-    """Per-installation visibility (spec: agent_id, user_id, status,
-    hostname, version, last_seen, connected_at) - one row per currently
-    registered desktop agent, across every user, not just the caller's
-    own. A stale (missed-heartbeat) connection is flagged rather than
-    silently listed as healthy - see agent_registry.is_stale."""
-    connections = agent_registry.list_agents()
-    with get_session() as db:
-        users_by_id = {u.user_id: u for u in repo.list_users(db)}
-        out = []
-        for conn in connections:
-            user = users_by_id.get(conn.user_id)
-            out.append({
-                # One row per signed-in user on an agent: "agent_id" is that connection's id (what reset /
-                # disconnect below act on - just this user), "pc_agent_id" the PC's agent installation.
-                "agent_id": conn.key,
-                "pc_agent_id": conn.agent_id,
-                "users_on_this_pc": agent_registry.users_on_agent(conn.agent_id),
-                "user_id": conn.user_id,
-                "username": user.username if user else "unknown",
-                "full_name": f"{user.first_name} {user.last_name}".strip() if user else "unknown",
-                "hostname": conn.hostname,
-                "version": conn.version,
-                "busy": conn.busy,
-                "connected_at": conn.connected_at,
-                "last_seen": conn.last_seen,
-                "stale": agent_registry.is_stale(conn),
-            })
-        return out
+def get_active_session(session: Session, session_id: str) -> Optional[UserSession]:
+    return (
+        session.query(UserSession)
+        .filter(UserSession.session_id == session_id, UserSession.revoked.is_(False))
+        .first()
+    )
 
 
-@router.post("/agents/{agent_id}/reset")
-async def reset_agent(agent_id: str, request: Request, admin: CurrentUser = Depends(get_current_admin)):
-    """Sends CLOSE_BROWSER to a specific agent - closes any stray browser
-    and clears its internal `busy` flag (see local_agent/command_handler.py).
-
-    This exists specifically because /disconnect above does NOT fix a
-    stuck-busy agent: CommandHandler (and its `busy` flag) is created once
-    per agent PROCESS lifetime (see local_agent/client.py), not per
-    connection, so force-closing the WebSocket just makes the agent
-    reconnect with the same stuck state. If a recording/test genuinely
-    never reached its own cleanup (browser closed manually outside the
-    app, a crash, or - before AGENT_TEST_TIMEOUT_SECONDS was tuned up -
-    the backend giving up on a slow-but-still-running execution) the
-    agent shows "Agent is busy with another recording/test execution" for
-    every future action until this is called (or the whole agent process
-    is restarted by hand) - this is the built-in fix instead of that."""
-    conn = agent_registry.get_by_agent_id(agent_id)
-    if conn is None:
-        raise HTTPException(status_code=404, detail="Agent not connected.")
-    ip = get_client_ip(request)
-    try:
-        response = await agent_registry.send_command(conn, "CLOSE_BROWSER", {}, timeout=15)
-    except (asyncio.TimeoutError, ConnectionError) as e:
-        raise HTTPException(status_code=502, detail=f"Agent did not respond to reset: {e}")
-    conn.busy = False
-    with get_session() as db:
-        repo.log_activity(
-            db, user_id=admin.user_id, session_id=admin.session_id, action="AGENT_RESET_BY_ADMIN",
-            status="SUCCESS", details={"agent_id": agent_id, "target_user_id": conn.user_id},
-            endpoint=f"/api/admin/agents/{agent_id}/reset", ip_address=ip,
-        )
-    return {"ok": response.get("ok", True)}
+def touch_session(session: Session, session_id: str) -> None:
+    sess = session.get(UserSession, session_id)
+    if sess:
+        sess.last_activity_at = datetime.utcnow()
+        session.flush()
 
 
-@router.post("/agents/{agent_id}/disconnect")
-async def disconnect_agent(agent_id: str, request: Request, admin: CurrentUser = Depends(get_current_admin)):
-    """Force-closes a specific agent's WebSocket connection - the desktop
-    app's own reconnect loop (local_agent/connection_manager.py) will
-    immediately try to reconnect, so this is a "kick and let it come back"
-    action, not a permanent ban (use the Users/Sessions pages to actually
-    revoke access if that's the intent).
-
-    NOTE: this does NOT clear a stuck `busy` flag - see /reset above for
-    that; CommandHandler's busy state survives a reconnect since it's
-    scoped to the agent process, not the connection."""
-    conn = agent_registry.get_by_agent_id(agent_id)
-    if conn is None:
-        raise HTTPException(status_code=404, detail="Agent not connected.")
-    ip = get_client_ip(request)
-    try:
-        await conn.websocket.close(code=1000, reason="Disconnected by admin")
-    except Exception:
-        pass
-    agent_registry.unregister(conn.key, conn.websocket)    # this user's connection only
-    with get_session() as db:
-        repo.log_activity(
-            db, user_id=admin.user_id, session_id=admin.session_id, action="AGENT_DISCONNECTED_BY_ADMIN",
-            status="SUCCESS", details={"agent_id": agent_id, "target_user_id": conn.user_id},
-            endpoint=f"/api/admin/agents/{agent_id}/disconnect", ip_address=ip,
-        )
-    return {"ok": True}
+def revoke_session(session: Session, session_id: str, reason: str = "logout") -> Optional[UserSession]:
+    sess = session.get(UserSession, session_id)
+    if sess:
+        sess.revoked = True
+        sess.revoked_reason = reason
+        session.flush()
+    return sess
 
 
-@router.get("/sessions")
-def list_sessions():
-    """Includes `recording_active` per session - see
-    backend/recording_sessions.py - so an admin can see not just who's
-    logged in, but who's actively recording a flow right now."""
-    with get_session() as db:
-        idle_cutoff = datetime.utcnow() - timedelta(minutes=IDLE_TIMEOUT_MINUTES)
-        sessions = repo.list_active_sessions(db, idle_cutoff)
-        out = []
-        for s in sessions:
-            user = repo.get_user(db, s.user_id)
-            state = recording_sessions.get_state(s.session_id, s.user_id)
-            out.append({
-                "session_id": s.session_id,
-                "user_id": s.user_id,
-                "username": user.username if user else "unknown",
-                "full_name": f"{user.first_name} {user.last_name}".strip() if user else "unknown",
-                "role": user.role if user else "unknown",
-                "created_at": s.created_at.isoformat(),
-                "last_activity_at": s.last_activity_at.isoformat(),
-                "idle_seconds": int((datetime.utcnow() - s.last_activity_at).total_seconds()),
-                "ip_address": s.ip_address,
-                "user_agent": s.user_agent,
-                "recording_active": state.get("recorder") is not None,
-                # the person's desktop agent being connected is separate from being signed in on the web
-                "agent_connected": agent_registry.get_for_user(s.user_id) is not None,
-            })
-        return out
+def revoke_all_sessions_for_user(session: Session, user_id: int, reason: str = "admin_revoked") -> int:
+    sessions = (
+        session.query(UserSession)
+        .filter(UserSession.user_id == user_id, UserSession.revoked.is_(False))
+        .all()
+    )
+    for s in sessions:
+        s.revoked = True
+        s.revoked_reason = reason
+    session.flush()
+    return len(sessions)
 
 
-@router.post("/sessions/{session_id}/revoke")
-def revoke_session(session_id: str, request: Request, admin: CurrentUser = Depends(get_current_admin)):
-    ip = get_client_ip(request)
-    with get_session() as db:
-        sess = repo.revoke_session(db, session_id, reason="admin_revoked")
-        if sess is None:
-            raise HTTPException(status_code=404, detail="Session not found.")
-        repo.log_activity(
-            db, user_id=admin.user_id, session_id=admin.session_id, action="SESSION_REVOKED", status="SUCCESS",
-            details={"revoked_session_id": session_id, "target_user_id": sess.user_id},
-            endpoint=f"/api/admin/sessions/{session_id}/revoke", ip_address=ip,
-        )
-        return {"ok": True}
+def list_active_sessions(session: Session, idle_cutoff: datetime, include_agents: bool = False):
+    """Sessions that are not revoked, not past their hard expiry, and have
+    had activity more recently than idle_cutoff - i.e. genuinely "online
+    right now" for the admin's live view. The desktop agent's own long-lived
+    session (is_agent) is left out unless asked for: it keeps itself active, so a person who logged out of the
+    web page would otherwise still be listed as signed in."""
+    q = session.query(UserSession).filter(
+        UserSession.revoked.is_(False),
+        UserSession.expires_at > datetime.utcnow(),
+        UserSession.last_activity_at >= idle_cutoff,
+    )
+    if not include_agents:
+        q = q.filter(UserSession.is_agent.is_(False))
+    return q.order_by(UserSession.last_activity_at.desc()).all()
 
 
-# ---- Activity monitor -------------------------------------------------------
+# ---- Activity log -----------------------------------------------------------
 
-def _parse_activity_filters(user_id, action, since, until):
-    since_dt = datetime.fromisoformat(since) if since else None
-    until_dt = datetime.fromisoformat(until) if until else None
-    return user_id, action, since_dt, until_dt
+def log_activity(
+    session: Session,
+    *,
+    user_id: Optional[int],
+    session_id: Optional[str],
+    action: str,
+    status: str = "SUCCESS",
+    details: Optional[dict] = None,
+    endpoint: Optional[str] = None,
+    ip_address: Optional[str] = None,
+) -> ActivityLog:
+    entry = ActivityLog(
+        user_id=user_id,
+        session_id=session_id,
+        action=action,
+        status=status,
+        details=json.dumps(details) if details is not None else None,
+        endpoint=endpoint,
+        ip_address=ip_address,
+    )
+    session.add(entry)
+    session.flush()
+    return entry
 
 
-@router.get("/activity")
 def list_activity(
-    user_id: Optional[int] = Query(default=None),
-    action: Optional[str] = Query(default=None),
-    since: Optional[str] = Query(default=None, description="ISO date/time"),
-    until: Optional[str] = Query(default=None, description="ISO date/time"),
-    limit: int = Query(default=200, le=2000),
+    session: Session,
+    user_id: Optional[int] = None,
+    action: Optional[str] = None,
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
+    limit: int = 200,
 ):
-    uid, act, since_dt, until_dt = _parse_activity_filters(user_id, action, since, until)
-    with get_session() as db:
-        rows = repo.list_activity(db, user_id=uid, action=act, since=since_dt, until=until_dt, limit=limit)
-        users_by_id = {u.user_id: u for u in repo.list_users(db)}
-        return [
-            {
-                "id": r.id,
-                "user_id": r.user_id,
-                "username": users_by_id[r.user_id].username if r.user_id in users_by_id else None,
-                "action": r.action,
-                "status": r.status,
-                "details": r.details,
-                "endpoint": r.endpoint,
-                "ip_address": r.ip_address,
-                "timestamp": r.timestamp.isoformat(),
-            }
-            for r in rows
-        ]
+    q = session.query(ActivityLog).order_by(ActivityLog.timestamp.desc())
+    if user_id is not None:
+        q = q.filter(ActivityLog.user_id == user_id)
+    if action:
+        q = q.filter(ActivityLog.action == action)
+    if since:
+        q = q.filter(ActivityLog.timestamp >= since)
+    if until:
+        q = q.filter(ActivityLog.timestamp <= until)
+    return q.limit(limit).all()
 
 
-@router.get("/activity/export")
-def export_activity(
-    user_id: Optional[int] = Query(default=None),
-    action: Optional[str] = Query(default=None),
-    since: Optional[str] = Query(default=None),
-    until: Optional[str] = Query(default=None),
-):
-    uid, act, since_dt, until_dt = _parse_activity_filters(user_id, action, since, until)
-    with get_session() as db:
-        rows = repo.list_activity(db, user_id=uid, action=act, since=since_dt, until=until_dt, limit=5000)
-        users_by_id = {u.user_id: u for u in repo.list_users(db)}
+# ---- Recordings (ownership/versions/shares) --------------------------------
 
-        buf = io.StringIO()
-        writer = csv.writer(buf)
-        writer.writerow(["id", "timestamp", "username", "action", "status", "endpoint", "ip_address", "details"])
-        for r in rows:
-            writer.writerow([
-                r.id, r.timestamp.isoformat(),
-                users_by_id[r.user_id].username if r.user_id in users_by_id else "",
-                r.action, r.status, r.endpoint or "", r.ip_address or "", r.details or "",
-            ])
-        buf.seek(0)
-        return StreamingResponse(
-            iter([buf.getvalue()]),
-            media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=activity_export.csv"},
+def create_recording(
+    session: Session, *, owner_user_id: Optional[int], name: str, file_path: str,
+    schema_version: str = "2.0",
+) -> Recording:
+    rec = Recording(
+        owner_user_id=owner_user_id, name=name, file_path=file_path,
+        schema_version=schema_version, current_version_number=1,
+    )
+    session.add(rec)
+    session.flush()
+    return rec
+
+
+def get_recording(session: Session, recording_id: int) -> Optional[Recording]:
+    return session.get(Recording, recording_id)
+
+
+def get_recording_by_path(session: Session, file_path: str) -> Optional[Recording]:
+    return session.query(Recording).filter(Recording.file_path == file_path).first()
+
+
+def touch_recording(session: Session, recording_id: int, *, current_version_number: int) -> Optional[Recording]:
+    rec = session.get(Recording, recording_id)
+    if rec:
+        rec.current_version_number = current_version_number
+        rec.updated_at = datetime.utcnow()
+        session.flush()
+    return rec
+
+
+def create_recording_version(
+    session: Session, *, recording_id: int, version_number: int, file_path: str,
+    created_by_user_id: Optional[int], change_summary: Optional[str] = None,
+    recording_hash: Optional[str] = None,
+) -> RecordingVersion:
+    ver = RecordingVersion(
+        recording_id=recording_id, version_number=version_number, file_path=file_path,
+        created_by_user_id=created_by_user_id, change_summary=change_summary, recording_hash=recording_hash,
+    )
+    session.add(ver)
+    session.flush()
+    return ver
+
+
+def list_recording_versions(session: Session, recording_id: int):
+    return (
+        session.query(RecordingVersion)
+        .filter(RecordingVersion.recording_id == recording_id)
+        .order_by(RecordingVersion.version_number.desc())
+        .all()
+    )
+
+
+def get_recording_version(session: Session, recording_id: int, version_number: int) -> Optional[RecordingVersion]:
+    return (
+        session.query(RecordingVersion)
+        .filter(RecordingVersion.recording_id == recording_id, RecordingVersion.version_number == version_number)
+        .first()
+    )
+
+
+def upsert_share(
+    session: Session, *, recording_id: int, shared_with_user_id: int, shared_by_user_id: int,
+    can_execute: bool = True, can_edit: bool = False, can_export: bool = False,
+    expires_at: Optional[datetime] = None,
+) -> RecordingShare:
+    """Re-sharing with the same user updates the existing row (permissions,
+    expiry, who most recently granted it) rather than creating a duplicate -
+    see RecordingShare's UniqueConstraint(recording_id, shared_with_user_id)."""
+    share = (
+        session.query(RecordingShare)
+        .filter(
+            RecordingShare.recording_id == recording_id,
+            RecordingShare.shared_with_user_id == shared_with_user_id,
         )
+        .first()
+    )
+    if share is None:
+        share = RecordingShare(recording_id=recording_id, shared_with_user_id=shared_with_user_id)
+        session.add(share)
+    share.shared_by_user_id = shared_by_user_id
+    share.can_execute = can_execute
+    share.can_edit = can_edit
+    share.can_export = can_export
+    share.expires_at = expires_at
+    session.flush()
+    return share
 
 
-# ---- Dashboard stats ---------------------------------------------------------
+def list_shares_for_recording(session: Session, recording_id: int):
+    return session.query(RecordingShare).filter(RecordingShare.recording_id == recording_id).all()
 
-@router.get("/dashboard/stats")
-def dashboard_stats():
-    with get_session() as db:
-        idle_cutoff = datetime.utcnow() - timedelta(minutes=IDLE_TIMEOUT_MINUTES)
-        active_sessions = repo.list_active_sessions(db, idle_cutoff)
-        users_by_status = repo.count_users_by_status(db)
-        today = datetime.utcnow().date()
-        today_start = datetime(today.year, today.month, today.day)
 
-        # Recording-run counts come from transactions/*.json, not the
-        # database - see runner/transaction_store.py.
-        txns_today = transaction_store.count_transactions_since(today_start)
-        txns_success_today = transaction_store.count_transactions_since(today_start, status="Success")
+def list_shares_for_user(session: Session, user_id: int):
+    """Every share GRANTED TO this user - i.e. their "Shared With Me" list."""
+    return session.query(RecordingShare).filter(RecordingShare.shared_with_user_id == user_id).all()
 
-        recent_activity = repo.list_activity(db, limit=15)
-        users_by_id = {u.user_id: u for u in repo.list_users(db)}
 
-        return {
-            "total_users": sum(users_by_status.values()),
-            "active_users": users_by_status.get("Active", 0),
-            "inactive_users": users_by_status.get("Inactive", 0),
-            "online_now": len(active_sessions),
-            "recording_now": recording_sessions.count_active_recordings(),
-            "runs_today": txns_today,
-            "runs_success_today": txns_success_today,
-            "recent_activity": [
-                {
-                    "username": users_by_id[r.user_id].username if r.user_id in users_by_id else None,
-                    "action": r.action,
-                    "status": r.status,
-                    "timestamp": r.timestamp.isoformat(),
-                }
-                for r in recent_activity
-            ],
-        }
+def get_share_by_id(session: Session, share_id: int) -> Optional[RecordingShare]:
+    return session.get(RecordingShare, share_id)
+
+
+def get_share(session: Session, recording_id: int, user_id: int) -> Optional[RecordingShare]:
+    return (
+        session.query(RecordingShare)
+        .filter(RecordingShare.recording_id == recording_id, RecordingShare.shared_with_user_id == user_id)
+        .first()
+    )
+
+
+def delete_share(session: Session, share_id: int) -> bool:
+    share = session.get(RecordingShare, share_id)
+    if share is None:
+        return False
+    session.delete(share)
+    session.flush()
+    return True
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Application registry + user-to-application access (see backend/app_access.py for how these are enforced)
+# ---------------------------------------------------------------------------------------------------------------
+from database.models import Application, UserApplicationAccess  # noqa: E402
+from database.app_names import app_key as _app_key, clean_name as _clean_app_name  # noqa: E402
+
+APP_PERMISSIONS = ("view", "record", "edit", "execute", "upload", "delete", "export")
+APP_DEFAULT_PERMISSIONS = ("view", "record", "edit", "execute", "upload", "export")
+
+
+def list_applications(session: Session, include_inactive: bool = True) -> list[Application]:
+    q = session.query(Application)
+    if not include_inactive:
+        q = q.filter(Application.status == "Active")
+    return q.order_by(Application.name).all()
+
+
+def get_application(session: Session, application_id: int) -> Optional[Application]:
+    return session.get(Application, application_id)
+
+
+def get_application_by_name(session: Session, name: str) -> Optional[Application]:
+    return session.query(Application).filter(Application.name_key == _app_key(name)).first()
+
+
+def create_application(session: Session, *, name: str, display_name: Optional[str] = None,
+                       base_url: Optional[str] = None) -> Application:
+    name = _clean_app_name(name)
+    if get_application_by_name(session, name) is not None:
+        raise ValueError(f"Application {name!r} already exists.")
+    a = Application(name=name, name_key=_app_key(name), display_name=(display_name or name).strip(),
+                    base_url=(base_url or None), status="Active")
+    session.add(a)
+    session.flush()
+    return a
+
+
+def _normalise_permissions(perms) -> dict[str, bool]:
+    wanted = set(APP_DEFAULT_PERMISSIONS if perms is None else perms)
+    unknown = wanted - set(APP_PERMISSIONS)
+    if unknown:
+        raise ValueError(f"Unknown permission(s): {', '.join(sorted(unknown))}")
+    if wanted and "view" not in wanted:
+        wanted.add("view")      # any other permission is meaningless without being able to see the application
+    return {f"can_{p}": (p in wanted) for p in APP_PERMISSIONS}
+
+
+def access_row(session: Session, user_id: int, application_id: int) -> Optional[UserApplicationAccess]:
+    return (session.query(UserApplicationAccess)
+            .filter(UserApplicationAccess.user_id == user_id,
+                    UserApplicationAccess.application_id == application_id).first())
+
+
+def list_user_access(session: Session, user_id: int) -> list[UserApplicationAccess]:
+    return (session.query(UserApplicationAccess).filter(UserApplicationAccess.user_id == user_id)
+            .order_by(UserApplicationAccess.application_id).all())
+
+
+def list_access_for_users(session: Session, user_ids: list[int]) -> dict[int, list[UserApplicationAccess]]:
+    """One query for many users (no N+1 when listing the admin user table)."""
+    out: dict[int, list[UserApplicationAccess]] = {uid: [] for uid in user_ids}
+    if not user_ids:
+        return out
+    for row in session.query(UserApplicationAccess).filter(UserApplicationAccess.user_id.in_(user_ids)).all():
+        out[row.user_id].append(row)
+    return out
+
+
+def list_application_users(session: Session, application_id: int) -> list[tuple[UserApplicationAccess, "User"]]:
+    return (session.query(UserApplicationAccess, User).join(User, User.user_id == UserApplicationAccess.user_id)
+            .filter(UserApplicationAccess.application_id == application_id).order_by(User.username).all())
+
+
+def upsert_user_access(session: Session, *, user_id: int, application_id: int, permissions=None,
+                       assigned_by: Optional[int] = None) -> tuple[UserApplicationAccess, bool]:
+    """Create or update one grant (never a duplicate - the table has a unique (user, application) constraint).
+    Returns (row, created)."""
+    flags = _normalise_permissions(permissions)
+    row = access_row(session, user_id, application_id)
+    created = row is None
+    if created:
+        row = UserApplicationAccess(user_id=user_id, application_id=application_id, assigned_by=assigned_by, **flags)
+        session.add(row)
+    else:
+        for k, v in flags.items():
+            setattr(row, k, v)
+        row.assigned_by = assigned_by
+        row.updated_at = datetime.utcnow()
+    session.flush()
+    return row, created
+
+
+def revoke_user_access(session: Session, *, user_id: int, application_id: int) -> bool:
+    row = access_row(session, user_id, application_id)
+    if row is None:
+        return False
+    session.delete(row)
+    session.flush()
+    return True
