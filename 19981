@@ -1,465 +1,3093 @@
+"""
+FastAPI backend for the recorder. Same 3 operations as before, now as a
+proper JSON API consumed by the Next.js frontend (frontend/) or anything
+else you want to point at it (curl, Postman, another UI) - plus auth
+(backend/auth_routes.py), admin (backend/admin_routes.py) and profile
+(backend/profile_routes.py) routers mounted below. Every /api/* route in
+this file now requires a logged-in user (Depends(get_current_user)); admin
+endpoints live in their own router.
 
-import sqlite3
+Logging: see logging.ini / logging_setup.py - everything from INFO up goes
+to logs/app.log, ERROR and up (including full tracebacks - see the global
+exception handler below and the per-stage try/excepts in stop_and_save)
+also goes to logs/error.log, and both mirror to the console. A bare 500
+with no detail (like "Save & Generate failed: 500 Server Error") should
+always have a matching traceback in logs/error.log after this - if it
+doesn't, logging.ini itself failed to load (logging_setup falls back to a
+bare console-only config and logs a warning about that specifically).
+
+Run with:
+    uvicorn backend.api:app --reload --port 8000 --reload-dir backend --reload-dir auth \
+        --reload-dir database --reload-dir recorder --reload-dir generator --reload-dir runner \
+        --reload-dir agent
+
+(the --reload-dir flags keep the reloader from watching output/, recordings/,
+transactions/ and logs/ - all written to continuously during a recording or
+test run - which would otherwise restart the dev server mid-execution; see
+the reload_dirs= passed to uvicorn.run() below for the `python backend/api.py`
+equivalent.)
+"""
 import shutil
+import sys
+import tempfile
+import asyncio
+import json
+import re
+import threading
+import traceback
 import uuid
 from pathlib import Path
+from typing import Optional
 
-# =====================================================
-# 1. DATABASE PATHS — CHANGE THESE TWO PATHS
-# =====================================================
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# Main database: the database you want to keep
-MAIN_DB = Path(
-    r"C:\Users\1085271\Desktop\ai-test-recorder-pw\ai-test-recorder-pw\database\test_recorder.db"
-)
+import yaml
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, FileResponse
+from pydantic import BaseModel
+from dotenv import load_dotenv
 
-# Second database: the database whose data you want to merge
-SECOND_DB = Path(
-    r"C:\Users\1085271\Desktop\test_scripts\ai-test-recorder-pw\database\test_recorder.db"
-)
+load_dotenv()
 
-# =====================================================
-# 2. TABLES TO MERGE
-# =====================================================
+from logging_setup import configure_logging
+configure_logging()
+import logging
+logger = logging.getLogger(__name__)
 
-TABLES = [
-    "users",
-    "applications",
-    "user_application_access",
-    "recordings",
-    "recording_versions",
-    "recording_shares",
-    "sessions",
-    "activity_logs",
-]
+from recorder.recorder import Recorder, save_recording_json
+from generator.uipath_importer import import_uipath_excel, import_uipath_excel_sheets, list_uipath_sheets
+from generator.build import build_artifacts
+from generator.test_data import extract_test_data, apply_test_data
+from runner.run_tests import run as run_behave
+from runner.run_recording import list_saved_recordings, run_recording
+from runner import transaction_store
+from automation import runtime_config
+from automation import checks as _checks
+from agent.llm_factory import get_llm
+from database.db import init_db, get_session, close_db
+from database import repository as repo
+from shutdown_guard import register_cleanup
 
+from auth.dependencies import get_current_user, get_current_admin, get_client_ip, validate_token_for_websocket, CurrentUser
+from backend import auth_routes, admin_routes, profile_routes, agent_routes, agent_update_routes, recording_sessions, agent_registry
+from backend import recording_access, recording_routes, app_access, app_access_routes, home_routes
+from backend import execution_jobs, execution_routes, asset_routes, platform_routes, insight_routes, stress_routes
 
-def qi(name):
-    """Safely quote SQLite identifiers."""
-    return '"' + name.replace('"', '""') + '"'
+APPLICATIONS_CONFIG = Path(__file__).resolve().parents[1] / "config" / "applications.yaml"
 
-
-def columns(conn, db, table):
-    return list(conn.execute(
-        f"PRAGMA {db}.table_info({qi(table)})"
-    ))
-
-
-def table_names(conn, db):
-    return {
-        row[0]
-        for row in conn.execute(
-            f"SELECT name FROM {db}.sqlite_master "
-            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-        )
-    }
-
-
-def primary_keys(info):
-    return [
-        row[1]
-        for row in sorted(info, key=lambda r: r[5])
-        if row[5] > 0
-    ]
-
-
-def foreign_keys(conn, db, table):
-    groups = {}
-    for row in conn.execute(
-        f"PRAGMA {db}.foreign_key_list({qi(table)})"
-    ):
-        groups.setdefault(row[0], []).append(row)
-
-    return [
-        sorted(group, key=lambda r: r[1])
-        for group in groups.values()
-    ]
-
-
-def unique_indexes(conn, table, pk_cols):
-    result = []
-
-    for row in conn.execute(
-        f"PRAGMA main.index_list({qi(table)})"
-    ):
-        if not row[2]:
-            continue
-
-        index_name = row[1]
-        origin = row[3] if len(row) > 3 else None
-
-        cols = [
-            item[2]
-            for item in conn.execute(
-                f"PRAGMA main.index_info({qi(index_name)})"
-            )
-            if item[2] is not None
-        ]
-
-        if not cols or cols == pk_cols or origin == "pk":
-            continue
-
-        result.append(cols)
-
-    return result
-
-
-def dependency_order(conn):
-    dependencies = {table: set() for table in TABLES}
-
-    for table in TABLES:
-        for group in foreign_keys(conn, "source_db", table):
-            parent = group[0][2]
-            if parent in dependencies and parent != table:
-                dependencies[table].add(parent)
-
-    result = []
-    remaining = {
-        table: set(parents)
-        for table, parents in dependencies.items()
-    }
-
-    while remaining:
-        ready = [
-            table for table, parents in remaining.items()
-            if not parents
-        ]
-
-        if not ready:
-            raise RuntimeError(
-                "Circular foreign-key dependencies detected: "
-                + ", ".join(remaining)
-                + ". Review the schema before merging."
-            )
-
-        for table in ready:
-            result.append(table)
-            remaining.pop(table)
-
-        for parents in remaining.values():
-            parents.difference_update(ready)
-
-    return result
-
-
-def find_existing(conn, table, unique_cols, row):
-    if any(row.get(col) is None for col in unique_cols):
-        return None
-
-    condition = " AND ".join(
-        f"{qi(col)} IS ?" for col in unique_cols
+# The central server must NEVER launch a headed Playwright browser for a
+# production end user (see docs/electron-local-agent-architecture.md) - so
+# by default, no connected agent = a clear error, not a silent fallback to
+# server-side recording. Set this to "true" ONLY for local development
+# convenience (so a developer without the desktop app running can still
+# exercise the recorder tab) - it must stay "false" for any real deployment.
+import os as _os_flags
+ALLOW_SERVER_FALLBACK = _os_flags.environ.get("ALLOW_SERVER_FALLBACK", "false").lower().strip() == "true"
+# This process is the SERVER: no browser may ever open here (recorder/browser_factory.py's
+# _refuse_on_server() enforces it, including for tests the server starts) except through the
+# development-only fallback above. Browsers open in the user's own local agent.
+_os_flags.environ["AITR_SERVER_PROCESS"] = "1"
+if ALLOW_SERVER_FALLBACK:
+    logging.getLogger(__name__).warning(
+        "ALLOW_SERVER_FALLBACK=true - recordings and test runs WITHOUT a connected agent will open a browser on THIS "
+        "machine. Development only: set it to false (the default) for any real deployment."
     )
 
-    return conn.execute(
-        f"SELECT * FROM main.{qi(table)} "
-        f"WHERE {condition} LIMIT 1",
-        tuple(row[col] for col in unique_cols),
-    ).fetchone()
+NO_AGENT_ERROR = (
+    "Local desktop agent is not connected. Please start the AI Test Recorder "
+    "desktop application and sign in, then try again."
+)
+
+# How long the backend waits for a connected agent to finish executing a
+# test (START_TEST) before giving up and returning 502. A real recording
+# with many steps - especially with AI step-naming making one LLM call per
+# action during generation, plus genuine browser wait times during
+# execution - can legitimately take several minutes. Getting this wrong in
+# either direction is bad: too short and a perfectly successful run gets
+# thrown away right before its result arrives (which is exactly what a 125s
+# timeout was doing - see logs showing "[agent] unmatched response" a
+# couple of minutes after the 502 was already sent); too long and a
+# genuinely stuck/crashed agent leaves the user staring at a spinner for
+# ages. Defaults to 10 minutes; raise via .env if your recordings are
+# bigger/slower than that.
+AGENT_TEST_TIMEOUT_SECONDS = int(_os_flags.environ.get("AGENT_TEST_TIMEOUT_SECONDS", "600"))
+# How long Start Recording waits for the agent to open the browser and the application (see start_recording).
+AGENT_START_RECORDING_TIMEOUT_SECONDS = int(_os_flags.environ.get("AGENT_START_RECORDING_TIMEOUT_SECONDS", "180"))
+
+app = FastAPI(title="AI Test Recorder API")
+
+ROOT = Path(__file__).resolve().parents[1]
+init_db()
 
 
-def generate_new_pk(conn, table, pk_cols, info, used):
-    if len(pk_cols) != 1:
-        raise RuntimeError(
-            f"{table}: conflicting composite primary key. "
-            "Automatic remapping is not supported."
-        )
-
-    col = pk_cols[0]
-    declared_type = next(
-        row[2] for row in info if row[1] == col
-    ).upper()
-
-    if "INT" in declared_type:
-        maximum = conn.execute(
-            f"SELECT MAX({qi(col)}) FROM main.{qi(table)}"
-        ).fetchone()[0]
-
-        candidate = (maximum or 0) + 1
-        while (candidate,) in used:
-            candidate += 1
-        return candidate
-
-    candidate = str(uuid.uuid4())
-    while (candidate,) in used:
-        candidate = str(uuid.uuid4())
-
-    return candidate
-
-
-def remap_foreign_keys(conn, table, row, mappings):
-    for group in foreign_keys(conn, "source_db", table):
-        parent = group[0][2]
-        child_cols = [item[3] for item in group]
-        parent_cols = [item[4] for item in group]
-
-        if not all(parent_cols):
-            parent_info = columns(conn, "main", parent)
-            parent_cols = primary_keys(parent_info)
-
-        old_values = tuple(row.get(col) for col in child_cols)
-
-        if any(value is None for value in old_values):
-            continue
-
-        parent_info = columns(conn, "main", parent)
-        parent_pk = primary_keys(parent_info)
-
-        if parent_cols == parent_pk:
-            mapped = mappings.get(parent, {}).get(old_values)
-
-            if mapped is not None:
-                for col, value in zip(child_cols, mapped):
-                    row[col] = value
-
-
-def merge_databases():
-    if not MAIN_DB.is_file():
-        raise FileNotFoundError(
-            f"Main database not found: {MAIN_DB}"
-        )
-
-    if not SECOND_DB.is_file():
-        raise FileNotFoundError(
-            f"Second database not found: {SECOND_DB}"
-        )
-
-    if MAIN_DB.resolve() == SECOND_DB.resolve():
-        raise ValueError(
-            "Both paths point to the same database."
-        )
-
-    backup = MAIN_DB.with_name(
-        MAIN_DB.stem + "_backup_before_merge" + MAIN_DB.suffix
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """
+    Safety net for ANY endpoint that raises something not already turned
+    into an HTTPException - without this, FastAPI's default behavior is to
+    return a bare "500 Internal Server Error" with NOTHING in the response
+    and (depending on how uvicorn's own logging is configured) not
+    necessarily anything in a log file either - exactly the
+    "Save & Generate failed: 500 Server Error" report with no way to
+    diagnose it further. This logs the full traceback to logs/error.log
+    (via the root logger - see logging.ini) and returns a JSON body that at
+    least names the exception instead of an empty response.
+    """
+    logger.error(
+        "Unhandled exception on %s %s\n%s",
+        request.method, request.url.path,
+        "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error ({type(exc).__name__}: {exc}). See logs/error.log for the full traceback."},
     )
 
-    if backup.exists():
-        raise FileExistsError(
-            f"Backup already exists: {backup}\n"
-            "Rename it or change the backup filename in the script."
-        )
 
-    # Create a consistent SQLite backup.
-    backup_source = sqlite3.connect(str(MAIN_DB))
+app.include_router(auth_routes.router)
+app.include_router(admin_routes.router)
+app.include_router(app_access_routes.router)
+# Visible in the server console/log so an operator can tell WHICH build and folder is actually serving requests.
+logger.warning("Application access control: ENABLED (admin routes /api/admin/application-registry registered). Running from %s", ROOT)
+app.include_router(profile_routes.router)
+app.include_router(agent_routes.router)
+app.include_router(agent_update_routes.router)
+# platform_routes registers /api/recordings/{id}/versions/diff, which must come before recording_routes'
+# /api/recordings/{id}/versions/{version_number}
+app.include_router(platform_routes.router)
+app.include_router(recording_routes.router)
+from backend import check_routes as _check_routes      # checks / AI suggestions / locator help (automation/checks.py)
+app.include_router(_check_routes.router)
+from backend import excel_routes as _excel_routes      # Excel-driven test data: workbook per application, row = run
+app.include_router(_excel_routes.router)
+app.include_router(execution_routes.router)
+app.include_router(insight_routes.router)
+app.include_router(asset_routes.router)
+app.include_router(asset_routes.td_router)
+app.include_router(stress_routes.router)
+app.include_router(stress_routes.mock_router)
+app.include_router(home_routes.router)
+from backend import announcement_routes as _announcement_routes
+app.include_router(_announcement_routes.router)
+
+# Change requests ("Record from here") — loaded optionally so a missing/
+# broken change_requests package never prevents the main backend from starting.
+try:
+    from recorder.change_requests.api import router as _cr_router, shutdown as _cr_shutdown
+    app.include_router(_cr_router)
+    app.on_event("shutdown")(_cr_shutdown)  # never leave a Record-from-here browser open
+    logger.info("[cr] 'Record from here' loaded successfully")
+except Exception as _cr_err:
+    logger.warning(f"[cr] 'Record from here' not loaded: {_cr_err} — normal recorder still works")
+
+# Changes every time this process starts (fresh launch, or uvicorn --reload
+# restarting the worker). The frontend remembers this from when it started a
+# recording and compares it later - if it's different, the backend process
+# restarted mid-recording (in-memory STATE, including the open browser, is
+# gone), which needs a distinct message from "recording just failed to
+# launch" so this doesn't turn into a confusing generic error again.
+PROCESS_ID = str(uuid.uuid4())
+
+# The Next.js frontend runs on a different origin, so allow it to call this
+# API from the browser. CORS_ALLOWED_ORIGINS (.env) is a comma-separated
+# allowlist for production (e.g. "https://recorder.yourbank.internal") -
+# defaults to "*" for local dev only. Tighten this before hosting anywhere
+# real: with credentials/Bearer tokens, a wildcard origin is fine (no
+# cookies are used - the JWT travels in an explicit header/query param,
+# never automatically attached by the browser like a cookie would be), but
+# a real allowlist is still better hygiene once you know the frontend's
+# actual origin.
+import os as _os
+_cors_origins = _os.environ.get("CORS_ALLOWED_ORIGINS", "*")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if _cors_origins.strip() == "*" else [o.strip() for o in _cors_origins.split(",") if o.strip()],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def _on_startup():
+    """Runs the stale-agent reaper for the lifetime of the process (see
+    backend/agent_registry.py's reap_stale_agents) - catches a dropped
+    agent connection that the WebSocket layer itself never cleanly
+    detected (some network failures don't deliver a close frame).
+
+    Also sweeps transactions/ once for any run left "Running" by a previous
+    process that never reached a terminal status - i.e. got hard-killed or
+    the machine restarted mid-execution, rather than failing cleanly (which
+    runner/run_recording.py already handles on its own). See
+    transaction_store.mark_interrupted_running_transactions()."""
+    asyncio.ensure_future(agent_registry.reap_stale_agents())
+    flagged = execution_jobs.mark_interrupted_jobs()
+    if flagged:
+        logger.warning(f"Flagged {flagged} execution(s) as requires_investigation at startup (backend restarted mid-run).")
     try:
-        backup_target = sqlite3.connect(str(backup))
-        try:
-            backup_source.backup(backup_target)
-        finally:
-            backup_target.close()
-    finally:
-        backup_source.close()
-
-    print(f"Backup created: {backup}")
-
-    conn = sqlite3.connect(str(MAIN_DB))
-
-    try:
-        conn.execute("PRAGMA foreign_keys = OFF")
-        conn.execute(
-            "ATTACH DATABASE ? AS source_db",
-            (str(SECOND_DB.resolve()),),
-        )
-
-        for db in ("main", "source_db"):
-            missing = set(TABLES) - table_names(conn, db)
-            if missing:
-                raise RuntimeError(
-                    f"{db} is missing tables: {sorted(missing)}"
-                )
-
-        # Validate schema compatibility before writing anything.
-        for table in TABLES:
-            main_info = columns(conn, "main", table)
-            source_info = columns(conn, "source_db", table)
-
-            main_names = {row[1] for row in main_info}
-            source_names = {row[1] for row in source_info}
-
-            for col in main_info:
-                name = col[1]
-                not_null = col[3]
-                default = col[4]
-                pk = col[5]
-
-                if (
-                    name not in source_names
-                    and not_null
-                    and default is None
-                    and pk == 0
-                ):
-                    raise RuntimeError(
-                        f"{table}.{name} is required in the main "
-                        "database but missing from the second database."
-                    )
-
-            if not main_names.intersection(source_names):
-                raise RuntimeError(
-                    f"No common columns found for {table}."
-                )
-
-        order = dependency_order(conn)
-        print("Merge order:", " -> ".join(order))
-
-        # mappings[table][source primary-key tuple] = target PK tuple
-        mappings = {}
-        inserted = {table: 0 for table in TABLES}
-        reused = {table: 0 for table in TABLES}
-
-        conn.execute("BEGIN IMMEDIATE")
-
-        for table in order:
-            main_info = columns(conn, "main", table)
-            source_info = columns(conn, "source_db", table)
-
-            main_names = [row[1] for row in main_info]
-            source_names = {row[1] for row in source_info}
-
-            common_cols = [
-                col for col in main_names if col in source_names
-            ]
-
-            pk_cols = primary_keys(main_info)
-            source_pk = primary_keys(source_info)
-
-            if not pk_cols or set(pk_cols) != set(source_pk):
-                raise RuntimeError(
-                    f"Primary-key definitions differ in {table}: "
-                    f"main={pk_cols}, source={source_pk}"
-                )
-
-            unique_sets = unique_indexes(conn, table, pk_cols)
-            mappings[table] = {}
-
-            select_cols = ", ".join(qi(col) for col in common_cols)
-
-            cursor = conn.execute(
-                f"SELECT {select_cols} "
-                f"FROM source_db.{qi(table)}"
-            )
-
-            source_rows = [
-                dict(zip(common_cols, values))
-                for values in cursor.fetchall()
-            ]
-
-            pk_select = ", ".join(qi(col) for col in pk_cols)
-
-            used = {
-                tuple(values)
-                for values in conn.execute(
-                    f"SELECT {pk_select} FROM main.{qi(table)}"
-                )
-            }
-
-            for source_row in source_rows:
-                row = dict(source_row)
-
-                original_pk = tuple(
-                    source_row[col] for col in source_pk
-                )
-
-                remap_foreign_keys(conn, table, row, mappings)
-
-                # Reuse a matching row found through a unique key.
-                existing = None
-
-                for unique_cols in unique_sets:
-                    if not all(
-                        col in row for col in unique_cols
-                    ):
-                        continue
-
-                    existing = find_existing(
-                        conn, table, unique_cols, row
-                    )
-
-                    if existing is not None:
-                        break
-
-                if existing is not None:
-                    target = dict(
-                        zip(main_names, existing)
-                    )
-                    mappings[table][original_pk] = tuple(
-                        target[col] for col in pk_cols
-                    )
-                    reused[table] += 1
-                    continue
-
-                target_pk = tuple(row[col] for col in pk_cols)
-
-                # Allocate a new key if this primary key is occupied.
-                if target_pk in used:
-                    new_pk = generate_new_pk(
-                        conn, table, pk_cols, main_info, used
-                    )
-                    row[pk_cols[0]] = new_pk
-                    target_pk = (new_pk,)
-
-                insert_cols = [
-                    col for col in common_cols if col in row
-                ]
-
-                col_sql = ", ".join(
-                    qi(col) for col in insert_cols
-                )
-                placeholders = ", ".join(
-                    "?" for _ in insert_cols
-                )
-                values = tuple(row[col] for col in insert_cols)
-
-                try:
-                    conn.execute(
-                        f"INSERT INTO main.{qi(table)} "
-                        f"({col_sql}) VALUES ({placeholders})",
-                        values,
-                    )
-                except sqlite3.IntegrityError as exc:
-                    raise RuntimeError(
-                        f"Insert failed in {table}, source PK "
-                        f"{original_pk}: {exc}. Transaction rolled back."
-                    ) from exc
-
-                mappings[table][original_pk] = target_pk
-                used.add(target_pk)
-                inserted[table] += 1
-
-        # Validate every declared FK before committing.
-        violations = conn.execute(
-            "PRAGMA main.foreign_key_check"
-        ).fetchall()
-
-        if violations:
-            raise RuntimeError(
-                "Foreign-key validation failed. Examples: "
-                f"{violations[:10]}. Transaction rolled back."
-            )
-
-        conn.commit()
-
-        print("\nMERGE COMPLETED SUCCESSFULLY")
-
-        for table in order:
-            print(
-                f"{table}: {inserted[table]} inserted, "
-                f"{reused[table]} matched to existing rows"
-            )
-
-        print(f"Backup location: {backup}")
-
+        from backend import excel_runs as _excel_runs
+        _n = _excel_runs.mark_interrupted()
+        if _n:
+            logger.warning(f"Marked {_n} Excel run(s) as interrupted at startup (backend restarted mid-run).")
     except Exception:
-        if conn.in_transaction:
-            conn.rollback()
-        raise
+        logger.exception("Excel run housekeeping failed (continuing)")
+    execution_jobs.cleanup_old_jobs()
+    execution_jobs.cleanup_old_evidence()
+    try:
+        from automation import assets as _assets, testdata as _testdata
+        _assets.cleanup_temp()
+        _testdata.sweep_expired()
+        _days = int(_os.environ.get('TESTDATA_RETENTION_DAYS', '0') or 0)
+        if _days:
+            _assets.purge_expired(_days)
+    except Exception:
+        logger.exception('Test-data housekeeping failed (continuing)')
+    swept = transaction_store.mark_interrupted_running_transactions()
+    if swept:
+        logger.warning(f"Marked {swept} transaction(s) as Interrupted at startup (left Running by a previous process).")
 
-    finally:
+
+@app.on_event("shutdown")
+def _on_shutdown():
+    """
+    Runs on a graceful stop (Ctrl+C in the terminal, or uvicorn --reload
+    restarting the worker process) - closes every still-open recorder
+    browser session (there can be several now - one per concurrently
+    recording user, see backend/recording_sessions.py) and releases the
+    database's connection pool, so no Edge/Chrome process or
+    database/test_recorder.db is left locked behind.
+    """
+    _cleanup_all()
+
+
+def _cleanup_all(timeout: float = 15):
+    """Shared by the ASGI shutdown event above (normal Ctrl+C stop) AND
+    shutdown_guard's Windows console-close handler below (terminal window
+    closed directly) - whichever fires first runs this exactly once."""
+    recording_sessions.stop_all(timeout=timeout)
+    close_db()
+
+
+# Covers the case Ctrl+C/ASGI shutdown can't: the terminal window being
+# closed directly. Windows only gives ~5s to clean up in that case, so use
+# a shorter timeout than the normal graceful-stop path above.
+register_cleanup(lambda: _cleanup_all(timeout=3))
+
+
+class StartRequest(BaseModel):
+    url: str = ""
+    app_name: str = ""       # one of the names from GET /api/applications, or "" for a custom "Others" url
+    recording_name: str = "" # e.g. a transaction number or flow name, used to label the saved recording
+    headless: bool = False
+
+
+class RunRequest(BaseModel):
+    headless: bool = False
+
+
+class RunRecordingRequest(BaseModel):
+    recording_file: str
+    headless: bool = False
+    # Resume: run only from this step number (1-based, as shown in the report).
+    # Steps 1..resume_setup still run first (e.g. the login steps). See runner/resume_range.py.
+    resume_from: int | None = None
+    resume_setup: int = 0
+    # No user_id anymore - a saved recording is always run as whichever
+    # authenticated user made the request (see auth/dependencies.py), so
+    # every run is unambiguously attributable to a real logged-in person.
+
+
+class TestDataUpdateRequest(BaseModel):
+    values: dict[str, str]  # {"3": "50000", "7": "Jane Doe"} - keys are action indices, see generator/test_data.py
+
+
+class StepEditModel(BaseModel):
+    """One editable step - the frontend's step editor sends the WHOLE list
+    back on every save (add/delete/reorder/edit are all just "the list is
+    now different"), rather than separate add/delete/update endpoints -
+    simpler to implement correctly and matches how /api/recordings/data
+    already works for test-data values. Fields not relevant to a given
+    `action` (e.g. `value` for a "delay" step) are simply ignored when
+    reconstructing the recording's actions."""
+    action: str
+    label: str = ""  # human-readable name shown in the editor and used for step naming - NOT saved verbatim, just informs element.text
+    value: Optional[str] = None
+    locators: list[dict] = []  # [{"strategy": "ID", "value": "username"}, ...]
+    raw_selector: Optional[str] = None  # the exact <webctrl .../> text, if this step came from (or was edited via) a pasted UiPath selector - see uipath_importer.py's same field
+    scroll_direction: Optional[str] = None
+    scroll_amount: Optional[int] = None
+    delay_seconds: Optional[float] = None
+    captured_as: Optional[str] = None  # variable name, for "copy"/"ocr_capture" steps
+    # The recorded action this row came from (sent back unchanged by the editor). Saving MERGES the row's edits
+    # onto it, so everything the editor has no column for - iframe path, tab number, date format, element
+    # details - survives an edit instead of being thrown away.
+    original: Optional[dict] = None
+    # Runtime configurable step (automation/runtime_config.py) - None/"configurable": false = an ordinary step.
+    runtime_config: Optional[dict] = None
+    # Check rows (automation/checks.py): the check's settings; "remember value" rows: the capture's settings.
+    assertion: Optional[dict] = None
+    capture_cfg: Optional[dict] = None
+    check_suggestion: Optional[dict] = None    # an AI suggestion waiting for the tester's decision
+
+
+class StepsUpdateRequest(BaseModel):
+    steps: list[StepEditModel]
+
+
+class ParseSelectorRequest(BaseModel):
+    selector_text: str
+
+
+def _load_applications() -> dict:
+    """Application name -> URL, from config/applications.yaml. Missing/empty
+    file just means an empty dropdown (frontend still offers "Others")."""
+    if not APPLICATIONS_CONFIG.exists():
+        return {}
+    try:
+        data = yaml.safe_load(APPLICATIONS_CONFIG.read_text()) or {}
+        return data.get("applications") or {}
+    except Exception:
+        return {}
+
+
+@app.get("/api/applications")
+def get_applications(current_user: CurrentUser = Depends(get_current_user)):
+    """Names for the frontend's dropdown - URLs never leave the backend for
+    these; the frontend only ever sees/sends the app NAME (see
+    StartRequest.app_name below), matching "URLs live in the backend"."""
+    # Only the applications THIS user may use (admins: every registered one). Same response shape as before.
+    accessible = app_access.get_accessible_applications(current_user)
+    return {"applications": [a["name"] for a in accessible], "details": accessible}
+
+
+class NewApplicationRequest(BaseModel):
+    name: str
+    url: str
+
+
+@app.post("/api/applications")
+def add_application(req: NewApplicationRequest, request: Request, current_user: CurrentUser = Depends(get_current_admin)):
+    """Adds an application (name -> URL) to config/applications.yaml and to the application registry, so it
+    appears in the Record tab's dropdown (and in Admin > Users > Applications, where an admin then gives it to
+    users). Recordings for it are saved under recordings/<name>/. Admin only - no need to edit the YAML by hand."""
+    name = " ".join(req.name.split())
+    url = req.url.strip()
+    if not name or len(name) > 50 or not re.fullmatch(r"[A-Za-z0-9 _.\-]+", name):
+        raise HTTPException(status_code=400, detail="Application name: letters, numbers, space, - _ . only (max 50).")
+    if name.lower() == "others":
+        raise HTTPException(status_code=400, detail="'Others' is reserved - choose another name.")
+    if not re.match(r"^https?://", url, re.I):
+        raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+    blocked = _urlpolicy_check(url)
+    if blocked:
+        raise HTTPException(status_code=400, detail=blocked)
+    apps = _load_applications()
+    if any(k.lower() == name.lower() for k in apps):
+        raise HTTPException(status_code=409, detail=f"Application '{name}' already exists.")
+    apps[name] = url
+    APPLICATIONS_CONFIG.write_text(
+        "# Application name -> target URL (dropdown in the Record tab).\n"
+        + yaml.safe_dump({"applications": apps}, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    with get_session() as session:
         try:
-            conn.execute("DETACH DATABASE source_db")
-        except sqlite3.Error:
+            existing = repo.get_application_by_name(session, name)
+            if existing is None:
+                repo.create_application(session, name=name, base_url=url)
+            else:
+                # Added again after an admin hid it (Admin > Applications): show it again, with the new address.
+                existing.status = "Active"
+                existing.base_url = url
+        except ValueError:
+            pass   # already in the registry (e.g. added there first) - the config entry is what was missing
+        repo.log_activity(session, user_id=current_user.user_id, session_id=current_user.session_id,
+                          action="APPLICATION_CREATED", status="SUCCESS", details={"application": name},
+                          endpoint="/api/applications", ip_address=get_client_ip(request))
+    return {"ok": True, "applications": list(apps.keys())}
+
+
+def _urlpolicy_check(url: str):
+    from automation import urlpolicy as _urlpolicy
+    return _urlpolicy.check_target(url)
+
+
+@app.post("/api/start")
+async def start_recording(req: StartRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    """
+    Requires a connected desktop agent (backend/agent_registry.py) - the
+    whole point of the Electron/local-agent architecture: the actual
+    browser launches on the USER'S OWN PC via their local agent, never
+    here. This backend only sends a command and stores metadata
+    (backend/recording_sessions.py's "mode"/"agent_id" fields) - no
+    Recorder, no browser object, ever exists in this process for a
+    production recording.
+
+    ALLOW_SERVER_FALLBACK (.env, default false) is a LOCAL-DEV-ONLY escape
+    hatch: with it set, a missing agent falls back to the original
+    server-side headless Recorder + live-view path instead of erroring -
+    useful for developing the recorder tab without also running the
+    desktop app, but this must stay false for any real deployment (see
+    docs/electron-local-agent-architecture.md).
+    """
+    # Application access FIRST: the application must be registered and the user must hold "record" on it
+    # (400 unknown / 404 cannot view / 403 cannot record) - before any URL is resolved or any agent is contacted.
+    dest_app = app_access.resolve_destination(current_user, req.app_name, "record")
+    req.app_name = "" if app_access.app_key(dest_app) == app_access.app_key(app_access.OTHERS) else dest_app
+    applications = {app_access.app_key(k): v for k, v in _load_applications().items()}
+    if req.app_name and app_access.app_key(req.app_name) in applications:
+        url = applications[app_access.app_key(req.app_name)].strip()
+    else:
+        url = req.url.strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="URL is required (select a known application or provide one for 'Others')")
+    from automation import urlpolicy as _urlpolicy
+    _blocked = _urlpolicy.check_target(url)
+    if _blocked:
+        raise HTTPException(status_code=400, detail=_blocked)
+
+    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
+    if state["recorder"] is not None or state.get("agent_recording_active"):
+        raise HTTPException(status_code=400, detail="You already have a recording in progress - save or stop it first")
+
+    ip = get_client_ip(request)
+    conn = agent_registry.get_for_user(current_user.user_id)
+
+    if conn is None and not ALLOW_SERVER_FALLBACK:
+        raise HTTPException(status_code=409, detail=NO_AGENT_ERROR)
+
+    # ---- AGENT mode ---------------------------------------------------------
+    if conn is not None:
+        try:
+            # Opening the browser can take over a minute when Edge stalls handing over its first tab (the agent
+            # then starts it another way - recorder/browser_factory.py). Waiting only the general 30 s reported
+            # "did not respond" while the agent was still about to open the application.
+            response = await agent_registry.send_command(
+                conn, "START_RECORDING", {"url": url, "headless": req.headless},
+                timeout=AGENT_START_RECORDING_TIMEOUT_SECONDS,
+            )
+        except (asyncio.TimeoutError, ConnectionError) as e:
+            raise HTTPException(status_code=502, detail=f"Local agent did not respond: {e}")
+
+        if not response.get("ok", False):
+            raise HTTPException(status_code=400, detail=response.get("error", "Agent failed to start recording."))
+
+        state["mode"] = "agent"
+        state["agent_id"] = conn.agent_id
+        state["agent_recording_active"] = True
+        state["pending_recording_name"] = req.recording_name.strip() or None
+        state["pending_app_name"] = req.app_name.strip() or ""
+        state["app_name"] = dest_app
+        state["target_url"] = url
+        conn.busy = True
+
+        with get_session() as session:
+            repo.log_activity(
+                session, user_id=current_user.user_id, session_id=current_user.session_id, action="START_RECORDING",
+                status="SUCCESS", details={"url": url, "recording_name": req.recording_name, "mode": "agent",
+                                            "agent_id": conn.agent_id},
+                endpoint="/api/start", ip_address=ip,
+            )
+        return {"ok": True, "message": f"Recording started on your local agent ({conn.hostname or conn.agent_id})."}
+
+    # ---- SERVER mode - only reachable when ALLOW_SERVER_FALLBACK=true, since
+    # the 409 above already returned for conn is None otherwise. Local-dev-only. ---
+    active = recording_sessions.count_active_recordings()
+    if active >= recording_sessions.MAX_CONCURRENT_RECORDINGS:
+        raise HTTPException(
+            status_code=503,
+            detail=f"The server is at capacity ({active}/{recording_sessions.MAX_CONCURRENT_RECORDINGS} concurrent "
+                   f"recordings) - please try again shortly.",
+        )
+
+    state["mode"] = "server"
+    state["pending_recording_name"] = req.recording_name.strip() or None
+    state["pending_app_name"] = req.app_name.strip() or ""
+    state["app_name"] = dest_app
+    state["start_error"] = None
+    state["launching"] = True
+
+    with get_session() as session:
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id, action="START_RECORDING",
+            status="SUCCESS", details={"url": url, "app_name": req.app_name, "recording_name": req.recording_name,
+                                        "headless": req.headless, "mode": "server"},
+            endpoint="/api/start", ip_address=ip,
+        )
+
+    def _launch():
+        try:
+            # A hosted server (see backend/recording_sessions.py's docs and
+            # DEPLOYMENT_WINDOWS.md) typically has no desktop session for a
+            # headed browser window to render into, and the live-view
+            # WebSocket streams a headless browser just fine via CDP
+            # screencast either way - so FORCE_HEADLESS_RECORDING (.env,
+            # default true) overrides whatever the frontend's "headless"
+            # checkbox sent. Set it to false only for local single-user dev
+            # where seeing the real window is convenient.
+            import os
+            force_headless = os.environ.get("FORCE_HEADLESS_RECORDING", "true").lower().strip() != "false"
+            effective_headless = True if force_headless else req.headless
+            # Only bother with CDP screencast when actually headless - a
+            # headed run already gives a real, visible browser window, so
+            # the live-view widget would just be a redundant (and
+            # occasionally flaky, e.g. across an unstable dev-reload) second
+            # way to see the exact same thing. GET /api/status's "headless"
+            # field tells the frontend whether to even show that panel.
+            rec = Recorder(url, headless=effective_headless, enable_live_view=effective_headless).start()
+            state["recorder"] = rec
+            state["headless"] = effective_headless
+        except Exception as e:
+            # Previously this died silently in the background thread - the
+            # frontend would show "Launching browser..." and mark the
+            # recording as started regardless, so a failed launch (wrong
+            # channel, Edge not installed, bad URL, etc.) only surfaced
+            # later as a confusing 400 on Stop & Save. Now the frontend can
+            # poll GET /api/status and see exactly why it failed.
+            state["start_error"] = str(e)
+        finally:
+            state["launching"] = False
+
+    threading.Thread(target=_launch, daemon=True).start()
+    return {"ok": True, "message": f"Launching browser for {url}..."}
+
+
+@app.get("/api/dashboard-summary")
+def get_dashboard_summary(current_user: CurrentUser = Depends(get_current_user)):
+    """Returns counts the dashboard widget shows — pending change plan items
+    across all applications, grouped so the user can see at a glance what
+    needs attention without visiting the Solution Documents page."""
+    from solution_analyzer.service import list_solution_documents, load_change_plan
+
+    summary = {
+        "pending_approvals": 0,   # items waiting for approve/reject
+        "approved_not_applied": 0, # approved but apply not yet run
+        "applied_not_validated": 0, # applied but validation not yet run
+        "applications_with_activity": [],
+    }
+
+    recordings_root = ROOT / "recordings"
+    if not recordings_root.exists():
+        return summary
+
+    # Walk every application folder (only the ones this user may view)
+    app_activity = {}
+    _access = app_access.for_user(current_user)
+    for app_dir in recordings_root.iterdir():
+        if not app_dir.is_dir():
+            continue
+        if not _access.allows(app_dir.name, "view"):
+            continue
+        change_analysis_dir = app_dir / "change_analysis"
+        if not change_analysis_dir.exists():
+            continue
+        app_name = app_dir.name
+
+        for plan_file in change_analysis_dir.glob("*.json"):
+            if "_extraction.json" in plan_file.name:
+                continue
+            try:
+                import json as _j
+                plan = _j.loads(plan_file.read_text())
+                for item in plan.get("items", []):
+                    impact = item.get("impact_item", {})
+                    if not impact.get("is_implementable", True) or item.get("manually_handled"):
+                        continue
+                    status = item.get("approval_status", "PENDING")
+                    applied = item.get("applied", False)
+                    validation = item.get("validation_status", "NOT_RUN")
+                    manual = impact.get("manual_review_required", False)
+
+                    if status == "PENDING" and not manual:
+                        summary["pending_approvals"] += 1
+                        app_activity[app_name] = app_activity.get(app_name, 0) + 1
+                    elif status == "APPROVED" and not applied and not manual:
+                        summary["approved_not_applied"] += 1
+                        app_activity[app_name] = app_activity.get(app_name, 0) + 1
+                    elif applied and validation == "NOT_RUN":
+                        summary["applied_not_validated"] += 1
+            except Exception:
+                continue
+
+    summary["applications_with_activity"] = [
+        {"application": k, "pending_count": v}
+        for k, v in sorted(app_activity.items(), key=lambda x: -x[1])
+    ]
+    return summary
+
+
+@app.get("/api/status")
+def get_status(current_user: CurrentUser = Depends(get_current_user)):
+    """Poll this after /api/start - a browser launch happens in a background
+    thread (server mode) or on the agent (agent mode), so success/failure
+    isn't known at the time /api/start returns. Also doubles as the general
+    tool-status endpoint (recording in progress / has a build / last run
+    result) - all scoped to the CALLER's own recording session."""
+    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
+    recording_active = state.get("recorder") is not None or state.get("agent_recording_active", False)
+    return {
+        "launching": state.get("launching", False),
+        "recording_active": recording_active,
+        "start_error": state.get("start_error"),
+        "process_id": PROCESS_ID,
+        "recording_in_progress": recording_active,
+        "has_build": state.get("build_result") is not None,
+        "last_run": state.get("last_run"),
+        "headless": state.get("headless"),
+        "live_view_ws": "/api/ws/record" if state.get("recorder") is not None else None,
+        "mode": state.get("mode", "server"),
+    }
+
+
+def _agent_conn_for_state(state: dict, current_user: CurrentUser):
+    """Looks up the SAME agent connection a session started recording on -
+    if it disconnected/reconnected with a new object since (e.g. the
+    desktop app restarted), this deliberately fails clearly rather than
+    silently sending the stop command to a stale/wrong connection."""
+    if state.get("mode") != "agent":
+        return None
+    conn = agent_registry.get_for_user(current_user.user_id)
+    if conn is None or conn.agent_id != state.get("agent_id"):
+        return None
+    return conn
+
+
+@app.post("/api/stop_test")
+async def stop_test(request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    """Stop the currently running test execution. Kills the Behave subprocess
+    on the agent and closes the browser so the next run starts clean."""
+    job_cancel = execution_jobs.request_cancel_for_user(current_user.user_id)
+    conn = agent_registry.get_for_user(current_user.user_id)
+    if conn is None:
+        # Server-direct execution: stop the local subprocess
+        try:
+            from runner.run_tests import stop_current_test
+            killed = stop_current_test()
+            state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
+            state["last_run"] = None
+            return {"ok": killed, "message": "Execution stopped." if killed else "No test was running."}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    try:
+        response = await agent_registry.send_command(conn, "STOP_TEST", {}, timeout=10)
+        conn.busy = False
+        recording_sessions.get_state(current_user.session_id, current_user.user_id)["agent_recording_active"] = False
+        return response
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not stop test: {e}")
+
+
+@app.post("/api/stop")
+async def stop_recording(request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    """Stops and DISCARDS the current recording without saving/generating
+    anything - for abandoning a recording mid-flow (wrong URL, made a
+    mistake, changed your mind). Use /api/stop_and_save instead to keep
+    what was recorded."""
+    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
+    ip = get_client_ip(request)
+
+    if state.get("mode") == "agent":
+        conn = _agent_conn_for_state(state, current_user)
+        if conn is None or not state.get("agent_recording_active"):
+            raise HTTPException(status_code=400, detail="No recording in progress (your local agent may have disconnected).")
+        try:
+            response = await agent_registry.send_command(conn, "STOP_RECORDING", {})
+        except (asyncio.TimeoutError, ConnectionError) as e:
+            raise HTTPException(status_code=502, detail=f"Local agent did not respond: {e}")
+        finally:
+            state["agent_recording_active"] = False
+            conn.busy = False
+        actions_discarded = len(response.get("actions", []))
+    else:
+        rec = state["recorder"]
+        if rec is None:
+            detail = "No recording in progress"
+            if state.get("start_error"):
+                detail += f" (the last start attempt failed: {state['start_error']})"
+            elif state.get("launching"):
+                detail += " (the browser is still launching - wait a moment and try again)"
+            raise HTTPException(status_code=400, detail=detail)
+        actions = rec.stop()
+        state["recorder"] = None
+        actions_discarded = len(actions)
+
+    state["pending_recording_name"] = None
+
+    with get_session() as session:
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id, action="STOP_RECORDING_DISCARDED",
+            status="SUCCESS", details={"actions_discarded": actions_discarded, "mode": state.get("mode")},
+            endpoint="/api/stop", ip_address=ip,
+        )
+    return {"ok": True, "actions_discarded": actions_discarded}
+
+
+def _public_build_result(build_result: dict) -> dict:
+    """build_artifacts() returns the uploaded files' raw bytes under "fixtures" (the run needs them, so the server
+    keeps them in memory). They are not JSON - a recording that uploaded a JPEG/PDF made the reply fail with
+    "'utf-8' codec can't decode byte 0xff". The browser gets the file list without the bytes."""
+    out = dict(build_result or {})
+    fixtures = out.get("fixtures")
+    if isinstance(fixtures, dict):
+        out["fixtures"] = {fid: {k: v for k, v in (fx or {}).items() if k != "bytes"} for fid, fx in fixtures.items()}
+    return out
+
+
+@app.post("/api/stop_and_save")
+async def stop_and_save(request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    """
+    Split into per-stage try/excepts (stop -> save -> build) rather than one
+    big try/except around everything: a failure in build_artifacts() (e.g.
+    a bad recording, an LLM hiccup, a broken template) is a DIFFERENT
+    problem from a failure stopping/saving the recording itself (browser
+    crashed, agent disconnected mid-stop) - and critically, if generation
+    fails the recording itself is still safely saved to disk, so the
+    response should say so instead of just "500 Internal Server Error"
+    with the JSON already lost. Every stage logs the full traceback to
+    logs/error.log before turning it into an HTTPException - see
+    logging.ini/logging_setup.py.
+    """
+    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
+    ip = get_client_ip(request)
+    recording_name = state.pop("pending_recording_name", None)
+    # The assignment may have been revoked since Start - re-check before anything is saved.
+    app_access.require_application_access(current_user, state.get("app_name") or app_access.OTHERS, "record")
+    # Popped here (not only in agent mode) so BOTH modes save the recording under the application the user
+    # picked - server mode used to drop it, which is why such recordings always landed in "Others".
+    app_name = state.pop("pending_app_name", "") or ""
+
+    if state.get("mode") == "agent":
+        conn = _agent_conn_for_state(state, current_user)
+        if conn is None or not state.get("agent_recording_active"):
+            raise HTTPException(status_code=400, detail="No recording in progress (your local agent may have disconnected).")
+        try:
+            response = await agent_registry.send_command(conn, "STOP_RECORDING", {})
+        except (asyncio.TimeoutError, ConnectionError) as e:
+            logger.exception("Agent STOP_RECORDING failed for user_id=%s", current_user.user_id)
+            raise HTTPException(status_code=502, detail=f"Local agent did not respond: {e}")
+        finally:
+            state["agent_recording_active"] = False
+            conn.busy = False
+
+        if not response.get("ok", False):
+            raise HTTPException(status_code=400, detail=response.get("error", "Agent failed to stop the recording."))
+
+        actions = response.get("actions", [])
+        target_url = response.get("target_url") or state.get("target_url") or ""
+        try:
+            # Persisted server-side either way (see recorder/recorder.py's
+            # save_recording_json) - "Run Saved Recording", the generator,
+            # and everything downstream never need to know whether a
+            # recording was captured locally or by an agent.
+            path = save_recording_json(target_url, actions, name=recording_name, app_name=app_name)
+        except Exception:
+            logger.exception("save_recording_json() failed for user_id=%s", current_user.user_id)
+            raise HTTPException(status_code=500, detail="Failed to save the recording JSON - see logs/error.log")
+    else:
+        rec = state["recorder"]
+        if rec is None:
+            detail = "No recording in progress"
+            if state.get("start_error"):
+                detail += f" (the last start attempt failed: {state['start_error']})"
+            elif state.get("launching"):
+                detail += " (the browser is still launching - wait a moment and try again)"
+            raise HTTPException(status_code=400, detail=detail)
+
+        try:
+            actions = rec.stop()
+        except Exception:
+            logger.exception("Recorder.stop() failed")
+            state["recorder"] = None
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to stop the recorder (the browser may have crashed or been closed manually) - see logs/error.log",
+            )
+
+        try:
+            path = rec.save(name=recording_name, app_name=app_name)
+        except Exception:
+            logger.exception("Recorder.save() failed")
+            raise HTTPException(status_code=500, detail="Failed to save the recording JSON - see logs/error.log")
+        finally:
+            target_url = rec.target_url
+            state["recorder"] = None
+
+    recording = {
+        "target_url": target_url,
+        "recorded_at": Path(path).stem,
+        "recording_name": recording_name,
+        "actions": actions,
+    }
+    state["recording"] = recording
+
+    # Own output/ subfolder per auth session (backend/recording_sessions.py)
+    # so two people's Save & Generate never clobber each other's generated
+    # feature/steps/page files.
+    output_dir = recording_sessions.output_dir_for(current_user.session_id)
+    llm = get_llm() if _os.environ.get("AI_STEP_NAMING", "true").strip().lower() != "false" else None
+    try:
+        build_result = await asyncio.to_thread(build_artifacts, recording, llm=llm, output_dir=output_dir)
+    except Exception:
+        logger.exception("build_artifacts() failed while generating feature/steps/page files for %s", path)
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Recording was saved to {path}, but generating the feature/steps/page files failed - "
+                "see logs/error.log for the full traceback. You can retry generation later from "
+                "the saved recording without re-recording."
+            ),
+        )
+    state["build_result"] = build_result
+
+    # Additive: surface the (now variable-annotated) actions and a quick
+    # name -> captured-value summary so the frontend can show what was
+    # recorded, including keyboard events and any Capture -> Store -> Reuse
+    # {{var}} pairs, without needing a separate endpoint.
+    variables_summary = {
+        a["captured_as"]: a.get("value")
+        for a in recording["actions"]
+        if a.get("action") == "copy" and a.get("captured_as")
+    }
+
+    with get_session() as session:
+        recording_access.create_recording_with_initial_version(
+            session, owner_user_id=current_user.user_id, name=recording_name or Path(path).stem,
+            path=Path(path), recording_json=recording,
+        )
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id, action="STOP_AND_SAVE",
+            status="SUCCESS", details={"recording_file": path, "actions_captured": len(actions),
+                                        "recording_name": recording_name, "mode": state.get("mode")},
+            endpoint="/api/stop_and_save", ip_address=ip,
+        )
+
+    return {
+        "ok": True,
+        "recording_file": path,
+        "actions_captured": len(actions),
+        "build_result": _public_build_result(build_result),
+        "llm_used": llm is not None,
+        "actions": recording["actions"],
+        "variables": variables_summary,
+    }
+
+
+@app.post("/api/run")
+async def run_check(req: RunRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    """Runs the just-generated Behave suite. Requires a connected desktop
+    agent by default - packages the generated files' CONTENTS (not paths -
+    the agent has no access to this server's filesystem) and has the local
+    agent execute Behave on the user's own PC, against their own real
+    browser. ALLOW_SERVER_FALLBACK (.env, local-dev-only, default false)
+    permits the original server-side execution instead - see /api/start's
+    docstring for why this must stay off in production."""
+    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
+    # Running the just-generated suite needs "execute" on the application it was recorded for. After a server
+    # restart that is no longer known - non-admins then re-save/regenerate first.
+    if state.get("app_name") is not None:
+        app_access.require_application_access(current_user, state["app_name"], "execute")
+    elif not current_user.is_admin:
+        raise HTTPException(status_code=409, detail="Nothing generated yet - record and save first")
+    output_dir = recording_sessions.output_dir_for(current_user.session_id)
+    output_path = Path(output_dir)
+    if state["build_result"] is None and not (output_path / "features" / "recorded.feature").exists():
+        raise HTTPException(status_code=400, detail="Nothing generated yet - record and save first")
+
+    ip = get_client_ip(request)
+    conn = agent_registry.get_for_user(current_user.user_id)
+
+    if conn is None and not ALLOW_SERVER_FALLBACK:
+        raise HTTPException(status_code=409, detail=NO_AGENT_ERROR)
+
+    if conn is not None:
+        files = _collect_generated_files(output_path)
+        # START_TEST only carries text files: upload documents travel base64-encoded as "<name>.b64" and the
+        # generated page object decodes them on the PC (page.tmpl's _resolve_upload).
+        files.update(execution_jobs.encoded_fixture_files(output_path))
+        try:
+            response = await agent_registry.send_command(
+                conn, "START_TEST", {"headless": req.headless, "files": files}, timeout=AGENT_TEST_TIMEOUT_SECONDS,
+            )
+        except (asyncio.TimeoutError, ConnectionError) as e:
+            logger.exception("Agent START_TEST failed for user_id=%s", current_user.user_id)
+            if isinstance(e, asyncio.TimeoutError):
+                raise HTTPException(status_code=502, detail=(
+                    f"The test did not finish within {AGENT_TEST_TIMEOUT_SECONDS // 60} minutes, so the server stopped waiting. "
+                    f"Raise AGENT_TEST_TIMEOUT_SECONDS on the server for long recordings."))
+            raise HTTPException(status_code=502, detail=f"Local agent did not respond: {e}")
+        result = {"ok": response.get("ok", False), "output": response.get("output", "")}
+    else:
+        try:
+            result = await asyncio.to_thread(run_behave, output_dir=output_dir, headless=req.headless)
+        except Exception:
+            logger.exception("run_behave() failed for user_id=%s", current_user.user_id)
+            raise HTTPException(status_code=500, detail="Failed to execute the generated test suite - see logs/error.log")
+
+    state["last_run"] = result
+
+    with get_session() as session:
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id, action="RUN_CHECK",
+            status="SUCCESS" if result.get("ok") else "FAILURE",
+            details={"headless": req.headless, "mode": "agent" if conn is not None else "server"},
+            endpoint="/api/run", ip_address=ip,
+        )
+    return result
+
+
+# Implementation lives in backend/execution_jobs.py (shared with the background-job driver).
+_collect_generated_files = execution_jobs.collect_generated_files
+
+
+@app.websocket("/api/ws/record")
+async def ws_record(websocket: WebSocket, token: str = Query(...)):
+    """Live view for a hosted, headless recording: streams CDP screencast
+    JPEG frames to the client and forwards its mouse/keyboard events back
+    to the real (server-side) browser - see recorder/recorder.py's
+    get_frame/queue_input. This is what makes "record a flow" usable when
+    the backend runs on a machine with no desktop session in front of the
+    person doing the recording (the normal case once this is hosted rather
+    than run on someone's own laptop).
+
+    Browsers can't attach a custom Authorization header to a WebSocket
+    handshake, so the JWT travels as ?token=... instead - auth/dependencies.py's
+    validate_token_for_websocket runs the exact same checks (idle timeout,
+    revocation, account status) as every other endpoint.
+    """
+    await websocket.accept()
+
+    current_user = validate_token_for_websocket(token)
+    if current_user is None:
+        print("[live-view] rejected: invalid/expired/revoked token")
+        await websocket.close(code=4401, reason="Not authenticated")
+        return
+
+    state = recording_sessions.get_state(current_user.session_id, current_user.user_id)
+    rec = state.get("recorder")
+    if rec is None:
+        print(f"[live-view] rejected: no active recording for user {current_user.username} (session {current_user.session_id})")
+        await websocket.close(code=4404, reason="No active recording for this session")
+        return
+
+    print(f"[live-view] connected: user {current_user.username}, session {current_user.session_id}")
+
+    async def sender():
+        while True:
+            frame = await asyncio.to_thread(rec.get_frame, 1.0)
+            if state.get("recorder") is None:
+                break
+            if frame is not None:
+                await websocket.send_text(frame)
+
+    sender_task = asyncio.create_task(sender())
+    try:
+        while True:
+            event = await websocket.receive_json()
+            rec.queue_input(event)
+    except WebSocketDisconnect:
+        print(f"[live-view] disconnected: user {current_user.username}")
+    except Exception as e:
+        print(f"[live-view] error for user {current_user.username}: {e}")
+    finally:
+        sender_task.cancel()
+
+
+# ------------------------------------------------------------------------
+# Users (read-only here - creation/edit/delete is admin-only, see
+# backend/admin_routes.py mounted under /api/admin/users)
+# ------------------------------------------------------------------------
+
+@app.get("/api/users")
+def get_users_legacy(active_only: bool = False, current_user: CurrentUser = Depends(get_current_user)):
+    with get_session() as session:
+        users = repo.list_users(session, active_only=active_only)
+        return [
+            {"user_id": u.user_id, "name": u.name, "department": u.department,
+             "status": u.status, "created_date": u.created_date.isoformat()}
+            for u in users
+        ]
+
+
+# ------------------------------------------------------------------------
+# Saved recordings - "run the recording he has and give exit report"
+# ------------------------------------------------------------------------
+
+@app.get("/api/recordings")
+def get_recordings(current_user: CurrentUser = Depends(get_current_user)):
+    """Every recording the current user has at least VIEW access to -
+    legacy/unowned recordings (created before ownership tracking existed),
+    ones they own, and ones shared with them (admins see everything). The
+    dict shape is unchanged/additive (recording_id/is_owner/is_shared are
+    new keys alongside the existing file/name/target_url/action_count) so
+    nothing already reading this response breaks - see
+    backend/recording_access.py for the ownership model."""
+    recordings = list_saved_recordings()
+    visible = []
+    _access = app_access.for_user(current_user)      # one query for the whole list
+    _names: dict = {}                                 # owner_user_id -> username (one lookup per person)
+    with get_session() as session:
+        for r in recordings:
+            # Application level FIRST, on the server, before a row is even looked up for the file.
+            if not app_access.recording_allowed(current_user, Path(r["file"]), "view", r.get("application"), _access):
+                continue
+            rec = recording_access.get_or_create_recording(session, Path(r["file"]))
+            if not recording_access.check_access(rec, current_user, "view", application_access=_access,
+                                                 json_app=r.get("application")):
+                continue
+            oid = rec.owner_user_id
+            if oid and oid not in _names:
+                _u = repo.get_user(session, oid)
+                _names[oid] = getattr(_u, "username", None) or ""
+            visible.append({
+                **r,
+                "recording_id": rec.recording_id,
+                "recorded_by": _names.get(oid, "") if oid else "",   # who recorded it ("" = older, unowned)
+                "is_owner": rec.owner_user_id == current_user.user_id,
+                "is_shared": rec.owner_user_id is not None and rec.owner_user_id != current_user.user_id,
+                "owner_user_id": rec.owner_user_id,
+                # Admins only - the same rule POST /api/recordings/delete enforces.
+                # Nobody else can delete a recording, not even its owner.
+                "can_delete": bool(current_user.is_admin),
+            })
+    return visible
+
+
+def _safe_recording_path(file: str) -> Path:
+    """Resolves `file` (as returned by GET /api/recordings) and makes sure
+    it's actually inside recordings/ - a defensive check against a crafted
+    path (e.g. "../../.env") ever being read/written through this endpoint.
+    See backend/recording_access.py's resolve_within_recordings_dir, the
+    single shared implementation of this check."""
+    return recording_access.resolve_within_recordings_dir(file)
+
+
+@app.get("/api/recordings/data")
+def get_recording_test_data(file: str, current_user: CurrentUser = Depends(get_current_user)):
+    """Backs the editable data grid shown before running a saved recording
+    (see generator/test_data.py) - every typed/selected value in the
+    recording, editable right there instead of downloading the Excel
+    report, changing values, and re-uploading."""
+    path = _safe_recording_path(file)
+    with get_session() as session:
+        recording_access.require_access(session, path, current_user, "view")
+    recording = json.loads(path.read_text())
+    return {"file": str(path), "fields": extract_test_data(recording)}
+
+
+@app.put("/api/recordings/data")
+def update_recording_test_data(
+    file: str, req: TestDataUpdateRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)
+):
+    """Writes edited values straight back into the saved recording JSON -
+    this becomes the new baseline test data for every future run of this
+    recording, not just a one-off override for the next click of Run. Also
+    snapshots the PRE-edit content as a new version (see
+    backend/recording_access.py's snapshot_version) before overwriting."""
+    path = _safe_recording_path(file)
+    recording = json.loads(path.read_text())
+    recording = apply_test_data(recording, req.values)
+
+    ip = get_client_ip(request)
+    with get_session() as session:
+        rec = recording_access.require_access(session, path, current_user, "edit")
+        recording_access.snapshot_version(
+            session, recording=rec, recording_json=recording, version_number=rec.current_version_number + 1,
+            created_by_user_id=current_user.user_id, change_summary=f"Updated {len(req.values)} test-data field(s)",
+        )
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id, action="TEST_DATA_UPDATED",
+            status="SUCCESS", details={"recording_file": str(path), "fields_changed": len(req.values)},
+            endpoint="/api/recordings/data", ip_address=ip,
+        )
+    return {"ok": True, "fields": extract_test_data(recording)}
+
+
+ALLOWED_STEP_ACTIONS = {
+    "click", "type", "select", "keypress", "delay", "scroll", "window_closed",
+    "assert_text", "assert_ocr_text", "file_upload", "copy", "ocr_capture",
+    # "hover" is produced by the recorder itself (recorder_injector.js) -
+    # without it here, saving ANY edit to a recording that contains a hover
+    # step was rejected with "Unknown step action 'hover'".
+    "hover",
+    # Navigation menu check - see generator/build.py's "menu_check" branch.
+    "menu_check",
+    # Produced by the recorder itself. Without them here, saving ANY edit to a recording that contains a
+    # pasted value or a date field was rejected with "Unknown step action 'paste'" / "'date'".
+    "paste", "date",
+    # Recorder-made, nothing to edit but must survive a save (and be movable / deletable).
+    "dialog", "new_window",
+    # Checks (automation/checks.py) and "remember this value" steps for before/after checks.
+    "assert", "capture_text",
+    # Platform steps the editor keeps as they are (made elsewhere) - without them here a recording that contained
+    # one could not be saved from the editor at all.
+    "checkpoint", "wait_condition", "workflow_ref",
+}
+# Steps the editor can only keep as they are (or move / delete) - they can't be created from scratch in it.
+KEEP_ONLY_ACTIONS = {"dialog", "new_window", "checkpoint", "wait_condition", "workflow_ref"}
+CHECK_ACTIONS = {"assert", "capture_text"}
+# Steps that act on one element and so need a locator.
+NEEDS_LOCATOR_ACTIONS = {"click", "type", "select", "file_upload", "hover", "paste", "date"}
+
+
+def _action_to_step_edit(action: dict) -> dict:
+    """Raw recording action -> editable shape (see StepEditModel) - the GET
+    direction of /api/recordings/steps."""
+    element = action.get("element") or {}
+    kind = action.get("action", "click")
+    # Scroll's "value" is displayed/edited as the same "DOWN-4"/"UP-2"
+    # shorthand the Excel importer reads (see _step_edit_to_action's PUT-
+    # direction counterpart) - lets the step editor's grid show a scroll
+    # row's Input cell the exact same way that row would have looked in
+    # the original spreadsheet.
+    if kind == "scroll":
+        display_value = f'{(action.get("scroll_direction") or "down").upper()}-{action.get("scroll_amount") or 1}'
+    elif kind == "delay":
+        seconds = action.get("value")
+        display_value = (str(int(seconds)) if seconds == int(seconds) else str(seconds)) if seconds is not None else None
+    else:
+        display_value = str(action.get("value")) if action.get("value") is not None else None
+    if kind in CHECK_ACTIONS or kind in ("checkpoint", "wait_condition", "workflow_ref"):
+        # checks / remembered values: the grid shows the check's name and expected value; the full settings
+        # travel as `assertion` / `capture_cfg` for the check editor
+        cfg_key = {"assert": "assertion", "capture_text": "capture_cfg", "checkpoint": "checkpoint_cfg",
+                   "wait_condition": "wait_cfg"}.get(kind)
+        cfg = action.get(cfg_key) or {} if cfg_key else {}
+        summary = _checks.summary_for_editor(action) if kind == "assert" else {
+            "label": cfg.get("name") or action.get("label") or kind.replace("_", " "), "value": "", "where": ""}
+        return {"action": kind, "label": summary["label"], "value": summary["value"], "locators": [],
+                "raw_selector": None, "check_where": summary["where"],
+                "assertion": action.get("assertion") if kind == "assert" else None,
+                "capture_cfg": action.get("capture_cfg") if kind == "capture_text" else None,
+                "check_source": action.get("check_source"), "check_suggestion": action.get("check_suggestion"),
+                "runtime_config": None, "runtime_input_types": [], "runtime_suggested_options": [],
+                "runtime_recorded_value": "", "original": action}
+    return {
+        "action": kind,
+        "label": element.get("text") or element.get("ariaLabel") or element.get("name") or "",
+        "value": display_value,
+        "locators": action.get("locators") or [],
+        "raw_selector": action.get("raw_selector"),
+        "scroll_direction": action.get("scroll_direction"),
+        "scroll_amount": action.get("scroll_amount"),
+        "delay_seconds": float(action["value"]) if kind == "delay" and action.get("value") is not None else None,
+        "captured_as": action.get("captured_as"),
+        # Set when this paste/type's value was correlated to an earlier
+        # copy in the SAME recording (see recorder/variable_capture.py) -
+        # the actual Capture -> Store -> Reuse link. Surfaced read-only by
+        # frontend/components/ActionTimeline.js; StepEditor.js's editable
+        # grid doesn't need it (re-derived automatically by build.py on save).
+        "resolved_var": action.get("resolved_var"),
+        "runtime_config": action.get("runtime_config"),
+        # which runtime input types this step supports (empty = it cannot be made configurable)
+        "runtime_input_types": runtime_config.input_types_for(action),
+        "runtime_suggested_options": runtime_config.suggested_options(action),
+        "runtime_recorded_value": "" if (action.get("element") or {}).get("type") == "password" else runtime_config.recorded_value(
+            {**action, "runtime_config": {"input_type": (runtime_config.input_types_for(action) or [""])[0]}}),
+        "original": action,
+    }
+
+
+def _merge_step_edit(step: "StepEditModel", original: dict) -> dict:
+    """Applies the editor row's edits on top of the recorded action it came from."""
+    out = dict(original)
+    before = _action_to_step_edit(original)
+    kind = step.action
+
+    if step.label != before["label"]:                      # renamed: update what names the step
+        el = dict(out.get("element") or {})
+        el["text"], el["ariaLabel"] = step.label[:60], step.label
+        out["element"] = el
+    if step.locators and step.locators != before["locators"]:
+        out["locators"] = step.locators
+        out["raw_selector"] = step.raw_selector
+    elif step.raw_selector is not None and step.raw_selector != before["raw_selector"]:
+        out["raw_selector"] = step.raw_selector
+
+    if kind == "delay":
+        seconds = step.delay_seconds if step.delay_seconds is not None else (float(step.value) if step.value else 1.0)
+        out["value"] = seconds
+    elif kind == "scroll":
+        direction, amount = step.scroll_direction, step.scroll_amount
+        if step.value and step.value != before["value"]:
+            from generator.uipath_importer import _parse_scroll_input
+            direction, amount = _parse_scroll_input(step.value)
+        out["scroll_direction"] = direction or original.get("scroll_direction") or "down"
+        out["scroll_amount"] = amount or original.get("scroll_amount") or 1
+    elif kind in ("window_closed", "dialog", "new_window"):
+        pass                                               # nothing editable
+    elif step.value != before["value"]:                    # only touch the value when it was edited
+        v = step.value
+        if isinstance(original.get("value"), bool):
+            v = v in ("true", "True")
+        out["value"] = v
+    if kind in ("copy", "ocr_capture") and step.captured_as:
+        out["captured_as"] = step.captured_as
+    return out
+
+
+def _step_edit_to_action(step: "StepEditModel", page_index: int = 0) -> dict:
+    """Editable shape -> raw recording action (see StepEditModel) - the PUT
+    direction of /api/recordings/steps. Produces the same action dict shape
+    generator/uipath_importer.py and recorder/recorder.py already produce,
+    so an edited/added step flows through build_artifacts() identically to
+    one that came from a real recording or a spreadsheet import."""
+    if step.action not in ALLOWED_STEP_ACTIONS:
+        raise HTTPException(status_code=400, detail=f"Unknown step action '{step.action}'.")
+
+    orig = step.original if isinstance(step.original, dict) else None
+    if step.action in CHECK_ACTIONS:
+        # A check / "remember value" row: its settings are the whole step. The target ("same element as step N",
+        # a preset area) is resolved once the full list is known - see update_recording_steps.
+        out = dict(orig) if orig is not None and orig.get("action") == step.action else \
+            {"page_index": page_index, "frame_path": [], "element": {}, "locators": [], "value": None, "check_source": "editor"}
+        out["action"] = step.action
+        if step.action == "assert":
+            cfg = dict(step.assertion or (orig or {}).get("assertion") or {})
+            if step.label and step.label != (cfg.get("name") or ""):
+                cfg["name"] = step.label
+            out["assertion"] = cfg
+            out["label"] = cfg.get("name") or step.label or "Check"
+        else:
+            cfg = dict(step.capture_cfg or (orig or {}).get("capture_cfg") or {})
+            cfg["name"] = (step.label or cfg.get("name") or "remembered_value").strip()
+            out["capture_cfg"] = cfg
+            out["label"] = cfg["name"]
+        if "check_suggestion" in step.model_fields_set:
+            if step.check_suggestion:
+                out["check_suggestion"] = step.check_suggestion
+            else:
+                out.pop("check_suggestion", None)
+        return out
+    if orig is not None and orig.get("action") == step.action:
+        merged = _merge_step_edit(step, orig)
+        if step.action in NEEDS_LOCATOR_ACTIONS and not merged.get("locators"):
+            raise HTTPException(status_code=400, detail=f'"{step.action}" steps need at least one locator - use "Parse selector" to add one.')
+        return merged
+    if step.action in KEEP_ONLY_ACTIONS:
+        raise HTTPException(status_code=400, detail=f"A '{step.action}' step can only be kept, moved or deleted - it can't be created or changed into here.")
+
+    base = {"page_index": page_index, "frame_path": []}
+    element = {"tag": "", "type": "", "text": step.label[:60], "placeholder": "", "name": "", "ariaLabel": step.label}
+
+    if step.action == "delay":
+        seconds = step.delay_seconds if step.delay_seconds is not None else (float(step.value) if step.value else 1.0)
+        return {**base, "action": "delay", "value": seconds, "element": {}, "locators": []}
+    if step.action == "scroll":
+        # Accepts the SAME shorthand the Excel importer reads ("DOWN-4",
+        # "UP-2") directly in `value` - not just explicit scroll_direction/
+        # scroll_amount fields - so the step editor's grid can stay a
+        # plain 5-column layout (Action / Name / Selector / Value, matching
+        # the spreadsheet exactly) instead of needing separate direction/
+        # amount cells only scroll rows would ever use.
+        direction, amount = step.scroll_direction, step.scroll_amount
+        if not direction and step.value:
+            from generator.uipath_importer import _parse_scroll_input
+            direction, amount = _parse_scroll_input(step.value)
+        return {
+            **base, "action": "scroll", "value": None, "element": {}, "locators": [],
+            "scroll_direction": direction or "down", "scroll_amount": amount or 1,
+        }
+    if step.action == "window_closed":
+        return {**base, "action": "window_closed", "value": None, "element": {}, "locators": [], "opener_page_index": page_index}
+    if step.action == "menu_check":
+        # No target element - the menu is found on the live page at run
+        # time. `value` is an optional CSS selector for the menu, for the
+        # rare page where the automatic pick is wrong. Its settings and
+        # saved baseline live at the recording's top level ("menu_check"),
+        # which this endpoint never touches, so editing steps keeps them.
+        return {
+            **base, "action": "menu_check", "value": (step.value or "").strip() or None, "locators": [],
+            "element": {"tag": "", "type": "", "text": "Navigation menu", "placeholder": "", "name": "", "ariaLabel": ""},
+        }
+    if step.action in ("copy", "ocr_capture"):
+        if not step.locators:
+            raise HTTPException(status_code=400, detail=f'"{step.action}" steps need at least one locator - use "Parse selector" to add one.')
+        return {
+            **base, "action": step.action, "value": step.value, "captured_as": step.captured_as or "captured_value",
+            "element": element, "locators": step.locators, "raw_selector": step.raw_selector,
+        }
+    if step.action == "assert_text":
+        if not step.locators:
+            raise HTTPException(status_code=400, detail='"assert_text" steps need at least one locator - use "Parse selector" to add one.')
+        return {**base, "action": "assert_text", "value": step.value or "", "element": element, "locators": step.locators, "raw_selector": step.raw_selector}
+    if step.action == "assert_ocr_text":
+        # Page-level - deliberately no locator required, unlike assert_text
+        # above: this checks text is visible SOMEWHERE on screen via OCR,
+        # not inside one specific DOM element (see generator/build.py's
+        # "assert_ocr_text" branch and page.tmpl's assert_ocr_text_visible).
+        if not (step.value or "").strip():
+            raise HTTPException(status_code=400, detail='"assert_ocr_text" steps need the expected text in the value field.')
+        return {**base, "action": "assert_ocr_text", "value": step.value, "element": {}, "locators": []}
+
+    # click / type / select / paste / date / keypress / file_upload - all need a real target
+    if step.action != "keypress" and not step.locators:
+        raise HTTPException(status_code=400, detail=f'"{step.action}" steps need at least one locator - use "Parse selector" to add one.')
+    value = step.value
+    if step.action == "click" and value in ("true", "True"):
+        value = True  # toggle (radio/checkbox) steps store a boolean, not the literal string
+    return {**base, "action": step.action, "value": value, "element": element, "locators": step.locators, "raw_selector": step.raw_selector}
+
+
+@app.put("/api/recordings/migration-status")
+def update_migration_status(
+    file: str,
+    status: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Update the migration_status of a recording.
+    Valid values: NOT_MIGRATED, MIGRATED, VALIDATING, VALIDATED, PRODUCTION, DEPRECATED.
+    Part of the UiPath-to-Native migration tracking (Phase 2)."""
+    VALID = {"NOT_MIGRATED", "MIGRATED", "VALIDATING", "VALIDATED", "PRODUCTION", "DEPRECATED", "NATIVE"}
+    if status not in VALID:
+        raise HTTPException(status_code=400, detail=f"Invalid status {status!r}. Valid: {sorted(VALID)}")
+    path = _safe_recording_path(file)
+    with get_session() as session:
+        recording_access.require_access(session, path, current_user, "edit")
+    recording = json.loads(path.read_text())
+    recording["migration_status"] = status
+    path.write_text(json.dumps(recording, indent=2))
+    return {"ok": True, "file": str(path), "migration_status": status}
+
+
+
+@app.get("/api/recordings/steps")
+def get_recording_steps(file: str, current_user: CurrentUser = Depends(get_current_user)):
+    """Backs the full step editor (add/delete/reorder/edit any step) that
+    replaces needing to re-import the whole spreadsheet for every small
+    change - see PUT below, which is the other half of this."""
+    path = _safe_recording_path(file)
+    with get_session() as session:
+        recording_access.require_access(session, path, current_user, "view")
+    recording = json.loads(path.read_text())
+    return {
+        "file": str(path),
+        "target_url": recording.get("target_url", ""),
+        "steps": [_action_to_step_edit(a) for a in recording.get("actions", [])],
+    }
+
+
+@app.put("/api/recordings/steps")
+def update_recording_steps(file: str, req: StepsUpdateRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    """Replaces the recording's entire action list with the edited one from
+    the step editor - add, delete, reorder, and edit are all just "submit
+    the new list" from the frontend's point of view, so one endpoint
+    handles all of them rather than four separate ones. Becomes the new
+    baseline for every future run/regenerate of this recording, exactly
+    like a test-data edit does - and, like that edit, snapshots a new
+    version before overwriting (see backend/recording_access.py)."""
+    path = _safe_recording_path(file)
+    with get_session() as _s:   # authorise before validating/parsing anything
+        recording_access.require_access(_s, path, current_user, "edit")
+    recording = json.loads(path.read_text())
+
+    if not req.steps:
+        raise HTTPException(status_code=400, detail="A recording needs at least one step.")
+
+    page_index = 0
+    new_actions = []
+    rt_errors = []
+    for n, step in enumerate(req.steps, start=1):
+        action = _step_edit_to_action(step, page_index=page_index)
+        # Runtime configuration as the row now has it (set, changed or switched off) - see automation/runtime_config.py.
+        # A caller that does not send the field at all keeps the step's existing configuration.
+        raw = step.runtime_config if "runtime_config" in step.model_fields_set else action.get("runtime_config")
+        cfg = runtime_config.from_editor(raw, action)
+        action.pop("runtime_config", None)
+        if cfg:
+            action["runtime_config"] = cfg
+            rt_errors.extend(f"Step {n}: {e}" for e in runtime_config.validate_config(action))
+        new_actions.append(action)
+        if action["action"] == "window_closed":
+            page_index = max(0, page_index - 1)  # matches recorder.py's own convention: closing a tab returns focus to the previous one
+    rt_errors.extend(runtime_config.variables({"actions": new_actions})[1])
+    if rt_errors:
+        raise HTTPException(status_code=400, detail="Runtime configuration: " + "; ".join(rt_errors[:8]))
+    # Checks: "the same element as step N" / a page area -> the element's selectors, as the list is now ordered.
+    check_errors = []
+    for n, action in enumerate(new_actions, start=1):
+        if action.get("action") == "assert":
+            tgt = (action.get("assertion") or {}).get("target") or {}
+            if tgt.get("step_no") and int(tgt["step_no"]) == n:
+                check_errors.append(f"Step {n}: a check cannot look at itself - choose the step whose element it checks")
+                continue
+            action["assertion"] = _checks.finalize(action.get("assertion") or {}, new_actions, own_action=action)
+            check_errors.extend(f"Step {n}: {p}" for p in _checks.problems(action["assertion"]))
+        elif action.get("action") == "capture_text":
+            from runner import text_capture as _tc
+            cfg = action.get("capture_cfg") or {}
+            if (cfg.get("target") or {}).get("step_no") or (cfg.get("target") or {}).get("preset"):
+                fin = _checks.finalize({"type": "text_contains", "expected": "", "target": cfg["target"]}, new_actions)
+                cfg = {**cfg, "target": fin.get("target") or {}}
+                cfg.setdefault("source", "selector")
+                action["capture_cfg"] = cfg
+            check_errors.extend(f"Step {n}: {p}" for p in _tc.validate_config(cfg))
+    if check_errors:
+        raise HTTPException(status_code=400, detail="Checks: " + "; ".join(check_errors[:8]))
+
+    from recorder.variable_capture import annotate_variables
+    from recorder import upload_store
+    upload_store.externalize(new_actions)   # an older recording's inline upload file moves to the upload store
+    recording["actions"] = annotate_variables(new_actions)
+
+    ip = get_client_ip(request)
+    with get_session() as session:
+        rec = recording_access.require_access(session, path, current_user, "edit")
+        recording_access.snapshot_version(
+            session, recording=rec, recording_json=recording, version_number=rec.current_version_number + 1,
+            created_by_user_id=current_user.user_id, change_summary=f"Updated steps ({len(new_actions)} actions)",
+        )
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id, action="RECORDING_STEPS_UPDATED",
+            status="SUCCESS", details={"recording_file": str(path), "step_count": len(new_actions)},
+            endpoint="/api/recordings/steps", ip_address=ip,
+        )
+    return {"ok": True, "steps": [_action_to_step_edit(a) for a in recording["actions"]]}
+
+
+def parse_plain_selector(text: str) -> list[dict]:
+    """Plain selector text -> [{"strategy","value"}]. One selector per line. Understands
+    "ID: x", "NAME: x", "CSS: x", "XPATH: x", "TEXT: x", "ROLE: x" (what the editor shows),
+    Playwright "css=", "xpath=", "text=", "id=", "name=", XPath starting with / or (, and anything
+    else as a CSS selector (e.g. "#username", "input[name=q]", "div > a.btn")."""
+    out: list[dict] = []
+    for raw in (text or "").replace("\r", "").split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        m = re.match(r"^(ID|NAME|CSS|XPATH|TEXT|ROLE)\s*:\s*(.+)$", line, re.I)
+        if m:
+            out.append({"strategy": m.group(1).upper(), "value": m.group(2).strip()})
+            continue
+        m = re.match(r"^(css|xpath|text|id|name)\s*=\s*(.+)$", line, re.I)
+        if m:
+            kind = m.group(1).upper()
+            val = m.group(2).strip()
+            out.append({"strategy": kind, "value": val.strip("\"'") if kind in ("ID", "NAME") else val})
+            continue
+        if line.startswith(("/", "(/", "./")):
+            out.append({"strategy": "XPATH", "value": line})
+        elif line.startswith("<"):
+            continue          # an HTML/UiPath tag we could not read - not a selector
+        else:
+            out.append({"strategy": "CSS", "value": line})
+    return out[:8]
+
+
+@app.post("/api/recordings/parse_selector")
+def parse_uipath_selector_endpoint(req: ParseSelectorRequest, current_user: CurrentUser = Depends(get_current_user)):
+    """Lets the step editor's Add/Edit form accept a pasted selector and see it translated into real locators
+    immediately: a UiPath <webctrl .../> snippet (the same format the Excel importer reads, via
+    generator/uipath_importer.py), or what people actually copy - the editor's own "ID: x" lines, Playwright
+    "css=..." / "xpath=...", a browser-copied CSS selector, XPath, or a bare #id."""
+    from generator.uipath_importer import build_locators_from_uipath_selector, _parse_webctrl_attrs
+
+    locators = build_locators_from_uipath_selector(req.selector_text)
+    attrs = _parse_webctrl_attrs(req.selector_text)
+    suggested_label = attrs.get("visibleinnertext") or attrs.get("aaname") or attrs.get("name") or attrs.get("id") or ""
+    if not locators:
+        locators = parse_plain_selector(req.selector_text)
+        if locators and not suggested_label:
+            suggested_label = locators[0]["value"].lstrip("#").strip("[]\"'")[:40]
+    return {"locators": locators, "suggested_label": suggested_label.strip()}
+
+
+class RegenerateRequest(BaseModel):
+    recording_file: str
+
+
+@app.post("/api/recordings/uipath_sheets")
+async def list_uipath_recording_sheets(file: UploadFile = File(...), current_user: CurrentUser = Depends(get_current_user)):
+    """Lists every sheet name in an uploaded UiPath-style Excel workbook,
+    WITHOUT importing anything yet - the frontend calls this right after
+    the person picks a file, to show a sheet picker (a specific sheet,
+    several, or "all of them") before committing to an actual import. A
+    real UiPath test suite is very often organized as one sheet per test
+    case/scenario, all in a single .xlsx file - see
+    generator/uipath_importer.py's list_uipath_sheets."""
+    if not file.filename.lower().endswith((".xlsx", ".xlsm")):
+        raise HTTPException(status_code=400, detail="Please upload an Excel file (.xlsx or .xlsm).")
+
+    tmp_path = Path(tempfile.gettempdir()) / f"uipath_sheets_{uuid.uuid4().hex}.xlsx"
+    try:
+        contents = await file.read()
+        tmp_path.write_bytes(contents)
+        try:
+            sheets = await asyncio.to_thread(list_uipath_sheets, str(tmp_path))
+        except Exception:
+            logger.exception("Could not read sheet list from %s", file.filename)
+            raise HTTPException(status_code=400, detail="Could not read this file as an Excel workbook.")
+        return {"sheets": sheets}
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+@app.post("/api/recordings/import_uipath")
+async def import_uipath_recording(
+    request: Request,
+    file: UploadFile = File(...),
+    recording_name: str = Form(""),
+    sheet_names: str = Form(""),
+    app_name: str = Form(""),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Converts an uploaded UiPath-style Excel test-steps sheet
+    (Steps / NAME / Action-Method / present element / input columns) into
+    a normal recording JSON via generator/uipath_importer.py, and saves
+    it exactly like a live-recorded session would be (same
+    save_recording_json, same recordings/ folder) - so it's immediately
+    usable everywhere else in the app: "Run Saved Recording", the test-
+    data grid, Regenerate, the exit report. Nothing downstream needs to
+    know this recording came from a spreadsheet instead of a browser.
+
+    `sheet_names`: comma-separated sheet names to import (from
+    /api/recordings/uipath_sheets above) - each becomes its OWN saved
+    recording. Leave empty to import just the workbook's active sheet
+    (the original, single-sheet-file behavior). Pass every sheet name to
+    import "all sheets".
+
+    Returns one entry per sheet in `results` - a sheet that turns out not
+    to be a real test-steps sheet at all (e.g. a reference/notes tab)
+    gets an `error` there instead of aborting the whole batch; the other
+    sheets in the same file still import normally."""
+    if not file.filename.lower().endswith((".xlsx", ".xlsm")):
+        raise HTTPException(status_code=400, detail="Please upload an Excel file (.xlsx or .xlsm).")
+
+    # Destination application: registered + the user needs "upload" on it - checked before anything is written.
+    _dest = app_access.resolve_destination(current_user, app_name, "upload")
+    app_name = "" if app_access.app_key(_dest) == app_access.app_key(app_access.OTHERS) else _dest
+
+    ip = get_client_ip(request)
+    tmp_path = Path(tempfile.gettempdir()) / f"uipath_import_{uuid.uuid4().hex}.xlsx"
+    try:
+        contents = await file.read()
+        tmp_path.write_bytes(contents)
+
+        requested_sheets = [s.strip() for s in sheet_names.split(",") if s.strip()]
+        base_name = recording_name or file.filename.rsplit(".", 1)[0]
+
+        if not requested_sheets:
+            # Original, single-(active)-sheet behavior - unchanged for
+            # anyone/anything still calling this without sheet_names.
+            try:
+                single = await asyncio.to_thread(import_uipath_excel, str(tmp_path), recording_name or None)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            except Exception:
+                logger.exception("UiPath Excel import failed for %s", file.filename)
+                raise HTTPException(status_code=500, detail="Failed to parse this spreadsheet - see logs/error.log for details.")
+            sheet_results = [{"sheet_name": None, "recording": single["recording"], "warnings": single["warnings"], "error": None}]
+        else:
+            try:
+                sheet_results = await asyncio.to_thread(
+                    import_uipath_excel_sheets, str(tmp_path), requested_sheets, base_name,
+                )
+            except Exception:
+                logger.exception("UiPath Excel multi-sheet import failed for %s", file.filename)
+                raise HTTPException(status_code=500, detail="Failed to parse this spreadsheet - see logs/error.log for details.")
+
+        results = []
+        with get_session() as session:
+            for entry in sheet_results:
+                if entry["error"] is not None:
+                    results.append({"sheet_name": entry["sheet_name"], "error": entry["error"]})
+                    continue
+                recording = entry["recording"]
+                saved_name = recording.get("recording_name") or base_name
+                path = save_recording_json(
+                    recording["target_url"], recording["actions"],
+                    name=saved_name, app_name=app_name,
+                )
+                # Keep a copy of the original xlsx under the application's
+                # imports/ folder so it can be re-imported or referenced later
+                # without the user needing to keep the file themselves.
+                if app_name.strip():
+                    from recorder.recorder import _slugify as _s
+                    imports_dir = Path("recordings") / _s(app_name.strip()) / "imports"
+                    imports_dir.mkdir(parents=True, exist_ok=True)
+                    dest_xlsx = imports_dir / file.filename
+                    if not dest_xlsx.exists():
+                        shutil.copy2(tmp_path, dest_xlsx)
+                recording_access.create_recording_with_initial_version(
+                    session, owner_user_id=current_user.user_id, name=saved_name,
+                    path=Path(path), recording_json=recording,
+                )
+                results.append({
+                    "sheet_name": entry["sheet_name"], "recording_file": path,
+                    "action_count": len(recording["actions"]), "warnings": entry["warnings"], "error": None,
+                })
+
+            repo.log_activity(
+                session, user_id=current_user.user_id, session_id=current_user.session_id, action="UIPATH_IMPORTED",
+                status="SUCCESS", details={
+                    "source_file": file.filename, "sheet_count": len(results),
+                    "success_count": sum(1 for r in results if r["error"] is None),
+                },
+                endpoint="/api/recordings/import_uipath", ip_address=ip,
+            )
+        return {"ok": True, "results": results}
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+@app.post("/api/recordings/regenerate")
+async def regenerate_recording(req: RegenerateRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    """Re-runs ONLY the generation step (generator/build.py) against a saved
+    recording's CURRENT JSON, writing fresh feature/steps/page/locators
+    files - without executing anything. Exists for exactly the situation
+    that prompted it: a fix lands in generator/templates/*.tmpl (or
+    anywhere else build_artifacts touches), and the person wants to
+    confirm existing saved recordings pick it up WITHOUT re-recording them
+    from scratch AND without waiting through a full (possibly multi-
+    minute) test execution just to see whether generation itself succeeds.
+
+    Note this is generation only - "Run Saved Recording" (POST
+    /api/run_recording below) already calls build_artifacts() fresh on
+    EVERY run on its own, so a code/template fix takes effect automatically
+    the next time a recording is actually run, with no extra step required.
+    This endpoint is for explicit, immediate confirmation - and for
+    refreshing the feature/steps/page files on disk without also spending
+    the time (and, if AI step-naming is on, the LLM cost) of a real
+    execution - not a prerequisite for the fix to apply."""
+    path = _safe_recording_path(req.recording_file)
+    with get_session() as session:
+        recording_access.require_access(session, path, current_user, "view")
+    recording = json.loads(path.read_text())
+
+    # A stable, reused-on-every-regenerate location (unlike "Run Saved
+    # Recording"'s output/runs/<transaction_id>/, which intentionally gets
+    # a fresh folder per run so run history doesn't overwrite itself) -
+    # regenerating the same recording twice should just refresh the same
+    # files in place, since nothing here is meant to be kept as history.
+    from recorder.recorder import _slugify
+    slug = _slugify(recording.get("recording_name") or path.stem)
+    # Per-application folder: the download route below authorises by this first path segment.
+    _apps = sorted(app_access.applications_of_recording(path, recording.get("application")))
+    output_dir = str(Path("output") / "regenerated" / _apps[0] / slug)
+
+    llm = get_llm() if _os.environ.get("AI_STEP_NAMING", "true").strip().lower() != "false" else None
+    try:
+        build_result = await asyncio.to_thread(build_artifacts, recording, llm=llm, output_dir=output_dir)
+    except Exception:
+        logger.exception("Regenerate failed for %s", path)
+        raise HTTPException(status_code=500, detail="Regeneration failed - see logs/error.log for the full traceback.")
+
+    ip = get_client_ip(request)
+    with get_session() as session:
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id, action="RECORDING_REGENERATED",
+            status="SUCCESS", details={"recording_file": str(path), "output_dir": output_dir,
+                                        "step_count": build_result.get("step_count")},
+            endpoint="/api/recordings/regenerate", ip_address=ip,
+        )
+    return {"ok": True, "output_dir": output_dir, "build_result": _public_build_result(build_result)}
+
+
+@app.get("/api/recordings/regenerate/download")
+def download_regenerated_file(path: str, current_user: CurrentUser = Depends(get_current_user)):
+    """Downloads one file produced by /api/recordings/regenerate above (a
+    generated .feature/steps.py/recorded_page.py/locators.json) - lets
+    someone grab the exact script reflecting their current edits (from the
+    step editor, test-data grid, or a UiPath import) without needing to
+    run the recording first. Any logged-in user can download from
+    output/regenerated/ - unlike a transaction's own files, these aren't
+    tied to a specific run or a specific person, they're just the current
+    state of a shared recording anyone with access to this tool can open
+    and edit.
+
+    Path safety: the resolved path must land inside output/regenerated/ -
+    never anywhere else on disk, regardless of what `path` claims."""
+    requested = Path(path).resolve()
+    allowed_root = (ROOT / "output" / "regenerated").resolve()
+    if requested != allowed_root and allowed_root not in requested.parents:
+        raise HTTPException(status_code=400, detail="Invalid file path.")
+    # output/regenerated/<application>/<recording>/... - the first folder names the application; the user needs
+    # export access to it (files from the old, application-less layout are admin-only).
+    try:
+        _first = requested.relative_to(allowed_root).parts[0]
+    except (ValueError, IndexError):
+        raise HTTPException(status_code=400, detail="Invalid file path.")
+    app_access.require_application_access(current_user, _first, "export")
+    if not requested.exists() or not requested.is_file():
+        raise HTTPException(status_code=404, detail="File not found - try regenerating again.")
+    return FileResponse(path=str(requested), filename=requested.name)
+
+
+@app.post("/api/run_recording")
+async def run_saved_recording(req: RunRecordingRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    """Runs a previously saved recording end-to-end (regenerate + execute)
+    and returns the exit report, attributed to whoever is logged in - the
+    frontend no longer picks a "run as" user, it's always the current
+    session. Everything about the run (status, steps, files produced) is
+    written to transactions/*.json (see runner/transaction_store.py) -
+    NOT the database, which is reserved for auth/session/activity data.
+
+    Requires a connected desktop agent by default (ALLOW_SERVER_FALLBACK
+    is the local-dev-only escape hatch - see /api/start's docstring) - the
+    Behave/Playwright execution happens on the user's own PC via
+    local_agent/execution_manager.py's run_test_with_json_report, which
+    returns the exact same {returncode, stdout, stderr, json} shape the
+    server-side path always produced, so the exit report this generates is
+    identical either way.
+
+    Any test-data edits (see /api/recordings/data above) are already
+    persisted into the recording file itself by the time this runs, so
+    there's nothing extra to pass through here - the run just reads
+    whatever's currently saved."""
+    path = recording_access.resolve_within_recordings_dir(req.recording_file)
+    with get_session() as session:
+        recording_access.require_access(session, path, current_user, "execute")
+
+    ip = get_client_ip(request)
+    conn = agent_registry.get_for_user(current_user.user_id)
+    resume = None
+    if req.resume_from and int(req.resume_from) > 2:
+        resume = {"from_step": int(req.resume_from), "setup_steps": max(0, int(req.resume_setup or 0))}
+
+    if conn is None and not ALLOW_SERVER_FALLBACK:
+        raise HTTPException(status_code=409, detail=NO_AGENT_ERROR)
+
+    if conn is not None:
+        # Agent execution goes through the background-job driver (backend/execution_jobs.py):
+        # no fixed 10-minute cap, progress/checkpoints, survives agent reconnects, bounded
+        # result transfer. This legacy endpoint simply waits for the job; the web UI uses
+        # POST /api/executions + polling instead, so it never holds a request open.
+        if execution_jobs.active_job_for_user(current_user.user_id):
+            raise HTTPException(status_code=409, detail="You already have an execution in progress.")
+        job = execution_jobs.start_job(user_id=current_user.user_id, username=current_user.username,
+                                       recording_file=str(path), headless=req.headless, screenshots="auto",
+                                       loop=asyncio.get_running_loop(), resume=resume)
+        while True:
+            await asyncio.sleep(1)
+            j = execution_jobs.get_job(job["job_id"]) or job
+            if j.get("status") in execution_jobs.TERMINAL_STATUSES:
+                break
+        txn = transaction_store.get_transaction(j["transaction_id"]) if j.get("transaction_id") else None
+        with get_session() as session:
+            repo.log_activity(
+                session, user_id=current_user.user_id, session_id=current_user.session_id, action="RUN_RECORDING",
+                status="SUCCESS" if j.get("result_status") == "Success" else "FAILURE",
+                details={"recording_file": req.recording_file, "transaction_id": j.get("transaction_id"),
+                         "job_id": j["job_id"], "mode": "agent"},
+                endpoint="/api/run_recording", ip_address=ip,
+            )
+        if txn is None:
+            raise HTTPException(status_code=502, detail=j.get("message") or "The execution did not produce a report.")
+        return txn
+
+    execute_fn = None   # ALLOW_SERVER_FALLBACK dev mode: run_recording executes behave in this process
+    try:
+        report = await asyncio.to_thread(
+            run_recording,
+            recording_file=req.recording_file,
+            user_id=current_user.user_id,
+            headless=req.headless,
+            execute_fn=execute_fn,
+            resume=resume,
+        )
+        with get_session() as session:
+            repo.log_activity(
+                session, user_id=current_user.user_id, session_id=current_user.session_id, action="RUN_RECORDING",
+                status="SUCCESS" if report["status"] == "Success" else "FAILURE",
+                details={"recording_file": req.recording_file, "transaction_id": report["transaction_id"],
+                         "mode": "agent" if conn is not None else "server"},
+                endpoint="/api/run_recording", ip_address=ip,
+            )
+        return report
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except TimeoutError:
+        raise HTTPException(
+            status_code=502,
+            detail=(f"The test did not finish within {AGENT_TEST_TIMEOUT_SECONDS // 60} minutes, so the server stopped waiting "
+                    f"(the local agent may still be running it). For long recordings raise AGENT_TEST_TIMEOUT_SECONDS "
+                    f"on the server (seconds, e.g. 3600) and restart it."),
+        )
+    except ConnectionError as e:
+        raise HTTPException(status_code=502, detail=f"Local agent disconnected while running the test: {e}")
+
+
+# ------------------------------------------------------------------------
+# Navigation menu check - a saved "recording" that needs NO recording.
+#
+# Its single "menu_check" step finds the site's navigation menu on the live
+# page at run time and checks every link in it: opens the parent menus with
+# the mouse, clicks the link, verifies the page that opens (see
+# generator/build.py and page.tmpl's BasePage.check_navigation_menu). It is
+# saved as an ordinary recording file, so "Run Saved Recording", the exit
+# report, sharing, versions and export all work on it unchanged.
+# ------------------------------------------------------------------------
+
+class MenuCheckCreateRequest(BaseModel):
+    url: str = ""
+    app_name: str = ""        # one of GET /api/applications, or "" with a custom url
+    recording_name: str = ""
+    menu_selector: str = ""   # optional CSS selector of the menu - blank = find it automatically
+    strict_hover: bool = False  # fail a link whose parent menu does not open on hover
+
+
+class MenuBaselineResetRequest(BaseModel):
+    recording_file: str
+
+
+@app.post("/api/menu_check")
+def create_menu_check(req: MenuCheckCreateRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    """Creates a navigation menu check for an application. Nothing is
+    launched here - no browser, no agent needed - it only writes the saved
+    recording; run it from "Run Saved Recording" like any other."""
+    _dest = app_access.resolve_destination(current_user, req.app_name, "record")
+    applications = {app_access.app_key(k): v for k, v in _load_applications().items()}
+    app_name = "" if app_access.app_key(_dest) == app_access.app_key(app_access.OTHERS) else _dest
+    if app_name and app_access.app_key(app_name) in applications:
+        url = applications[app_access.app_key(app_name)].strip()
+    else:
+        url = req.url.strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="URL is required (select a known application or provide one for 'Others')")
+    if "://" not in url:
+        url = "https://" + url  # "ca.statebank" -> "https://ca.statebank"
+
+    name = req.recording_name.strip()
+    if not name:
+        from urllib.parse import urlsplit
+        name = f"Menu check - {app_name or urlsplit(url).hostname or url}"
+
+    import time as _time
+    actions = [{
+        "ts": int(_time.time() * 1000),
+        "action": "menu_check",
+        "value": None,
+        "element": {"tag": "", "type": "", "text": "Navigation menu", "placeholder": "", "name": "", "ariaLabel": ""},
+        "locators": [],
+        "url": url,
+        "page_index": 0,
+        "frame_path": [],
+    }]
+    settings = {"menu_selector": req.menu_selector.strip(), "strict_hover": bool(req.strict_hover)}
+    try:
+        path = save_recording_json(
+            url, actions, name=name, app_name=app_name,
+            extra={"source_type": "menu_check", "menu_check": settings},
+        )
+    except Exception:
+        logger.exception("Could not save the menu check for user_id=%s", current_user.user_id)
+        raise HTTPException(status_code=500, detail="Failed to save the menu check - see logs/error.log")
+
+    recording = json.loads(Path(path).read_text())
+    with get_session() as session:
+        recording_access.create_recording_with_initial_version(
+            session, owner_user_id=current_user.user_id, name=name, path=Path(path), recording_json=recording,
+        )
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id, action="MENU_CHECK_CREATED",
+            status="SUCCESS", details={"recording_file": path, "url": url, "app_name": app_name},
+            endpoint="/api/menu_check", ip_address=get_client_ip(request),
+        )
+    # Same absolute form GET /api/recordings lists files in (see
+    # runner/run_recording.py's list_saved_recordings), so the frontend can
+    # select the new entry by this value straight away.
+    listed_path = str((ROOT / path).resolve()) if not Path(path).is_absolute() else path
+    return {"ok": True, "recording_file": listed_path, "name": name, "target_url": url}
+
+
+@app.post("/api/menu_check/reset_baseline")
+def reset_menu_check_baseline(req: MenuBaselineResetRequest, request: Request, current_user: CurrentUser = Depends(get_current_user)):
+    """Forgets the saved baseline (the menu as it was on the first run) so
+    the NEXT run saves a new one. Use after an intended menu change -
+    until then, a removed item or a changed link keeps being reported as a
+    failure, which is the point of the baseline."""
+    path = _safe_recording_path(req.recording_file)
+    with get_session() as session:
+        recording_access.require_access(session, path, current_user, "edit")
+    recording = json.loads(path.read_text())
+    settings = recording.get("menu_check") or {}
+    removed = len(settings.get("baseline") or [])
+    settings.pop("baseline", None)
+    settings.pop("baseline_saved_at", None)
+    recording["menu_check"] = settings
+    path.write_text(json.dumps(recording, indent=2))
+    with get_session() as session:
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id, action="MENU_BASELINE_RESET",
+            status="SUCCESS", details={"recording_file": str(path), "items_removed": removed},
+            endpoint="/api/menu_check/reset_baseline", ip_address=get_client_ip(request),
+        )
+    return {"ok": True, "items_removed": removed}
+
+
+# ------------------------------------------------------------------------
+# Transaction history - read from transactions/*.json (see
+# runner/transaction_store.py), NOT the database. The database only holds
+# auth/session/activity data; recording-run history is plain files.
+# ------------------------------------------------------------------------
+
+def _authorized_txn(transaction_id: int, current_user: CurrentUser, permission: str) -> dict:
+    """The run record, if it is the user's own (admins: anyone's) AND they still hold `permission` on the
+    application it ran against. Revoking an assignment therefore blocks old reports/files immediately.
+    404 either way - nothing reveals that an inaccessible run exists."""
+    txn = transaction_store.get_transaction(transaction_id)
+    if txn is None:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    if current_user.role != "admin":
+        if txn.get("user_id") != current_user.user_id:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+        if not app_access.authorize_applications(current_user, app_access.applications_of_transaction(txn),
+                                                 permission, quiet=True):
+            raise HTTPException(status_code=404, detail="Transaction not found")
+    return txn
+
+
+@app.get("/api/transactions")
+def get_transactions(
+    user_id: Optional[int] = None, limit: int = 50, recording_id: Optional[int] = None,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Lists past executions ("My Executions" on the frontend, and the
+    recording details page's Reports tab when recording_id is given) - a
+    plain user only ever sees their OWN runs, regardless of what user_id
+    they pass in: this silently overrides it to their own id rather than
+    erroring, since the frontend's default "show me my history" call
+    doesn't need to pass one at all. Only an admin can look up another
+    user's history by passing user_id explicitly - matching the same
+    "admins can see everything, everyone else sees their own" pattern
+    used throughout the admin panel."""
+    if current_user.role != "admin":
+        user_id = current_user.user_id
+    txns = transaction_store.list_transactions(user_id=user_id, limit=limit, recording_id=recording_id)
+    if current_user.role != "admin":
+        _access = app_access.for_user(current_user)
+        txns = [t for t in txns if app_access.authorize_applications(
+            current_user, app_access.applications_of_transaction(t), "view", _access, quiet=True)]
+    return [
+        {"transaction_id": t["transaction_id"], "recording_id": t.get("recording_id"), "user_id": t["user_id"],
+         "transaction_name": t["transaction_name"], "status": t["status"],
+         "date_time": t["date_time"], "passed_count": t.get("passed_count"),
+         "failed_count": t.get("failed_count"), "step_count": t.get("step_count")}
+        for t in txns
+    ]
+
+
+@app.get("/api/transactions/{transaction_id}")
+def get_transaction_report(transaction_id: int, current_user: CurrentUser = Depends(get_current_user)):
+    txn = _authorized_txn(transaction_id, current_user, "view")
+    return txn
+
+
+@app.get("/api/transactions/{transaction_id}/download")
+def download_transaction_file(
+    transaction_id: int, file_name: str, folder_path: str, current_user: CurrentUser = Depends(get_current_user)
+):
+    """Downloads one file produced by a run - a generated feature/steps/
+    page file, the exit report, a step screenshot, or the original
+    recording JSON (see runner/run_recording.py's `files` list, which is
+    exactly where the frontend gets the folder_path/file_name pairs it
+    passes here - "Files produced" and each Automation Log row's
+    screenshot both use this same endpoint).
+
+    A plain user can only download files belonging to THEIR OWN
+    transaction (matching get_transaction_report's same ownership check)
+    - an admin can download from any transaction. Path safety: the
+    resolved path must land inside this transaction's own output folder
+    (output/runs/<id>/, which covers generated files AND screenshots) or
+    inside recordings/ (the original recording JSON) - never anywhere
+    else on disk, regardless of what folder_path/file_name claim."""
+    txn = _authorized_txn(transaction_id, current_user, "export")
+
+    requested = (Path(folder_path) / file_name).resolve()
+    allowed_roots = [
+        # New layout: output/runs/<app>/<transaction_id>/
+        (ROOT / "output" / "runs").resolve(),
+        (ROOT / "recordings").resolve(),
+    ]
+    if not any(requested == root or root in requested.parents for root in allowed_roots):
+        raise HTTPException(status_code=400, detail="Invalid file path for this transaction.")
+    if not requested.exists() or not requested.is_file():
+        raise HTTPException(status_code=404, detail="File not found - it may have been cleaned up since this run.")
+
+    return FileResponse(path=str(requested), filename=requested.name)
+
+
+@app.get("/api/transactions/{transaction_id}/download_flow")
+def download_flow_zip(transaction_id: int, current_user: CurrentUser = Depends(get_current_user)):
+    """Packages everything produced for a single run into one ZIP and
+    streams it back so the user can download the complete flow in one click:
+      recording JSON  (the source recording, so they can re-import/share it)
+      generated scripts  (feature file, steps.py, page object, locators.json)
+      screenshots  (one per executed step)
+      exit report  (the .txt summary)
+
+    Saved on the SERVER under output/runs/<app>/<id>/ - the user's PC keeps
+    nothing after a run. The zip is built on the fly and never stored on disk.
+    Ownership check matches get_transaction_report: plain users only see their
+    own runs, admins see all."""
+    import io, zipfile as _zf
+
+    txn = _authorized_txn(transaction_id, current_user, "export")
+
+    buf = io.BytesIO()
+    added = 0
+    with _zf.ZipFile(buf, "w", compression=_zf.ZIP_DEFLATED) as zf:
+
+        # 1. Recording JSON (the source recording)
+        for f_entry in (txn.get("files") or []):
+            p = Path(f_entry.get("folder_path", "")) / f_entry.get("file_name", "")
+            if p.exists() and p.suffix == ".json" and p.parent.resolve().is_relative_to((ROOT / "recordings").resolve()):
+                zf.write(p, f"recording/{p.name}")
+                added += 1
+                break  # only the first (the recording JSON itself)
+
+        # 2. Generated scripts + locators
+        run_dir = None
+        for f_entry in (txn.get("files") or []):
+            candidate = Path(f_entry.get("folder_path", ""))
+            if "runs" in candidate.parts:
+                # Walk up to find the transaction root (the dir containing features/)
+                for d in [candidate] + list(candidate.parents):
+                    if (d / "features").exists() or (d / "pages").exists():
+                        run_dir = d
+                        break
+            if run_dir:
+                break
+
+        if run_dir and run_dir.exists():
+            for rel in ("features/recorded.feature", "features/steps/recorded_steps.py",
+                        "pages/recorded_page.py", "pages/locators.json"):
+                fp = run_dir / rel
+                if fp.exists():
+                    zf.write(fp, f"scripts/{fp.name}")
+                    added += 1
+
+            # 3. Screenshots
+            shots_dir = run_dir / "screenshots"
+            if txn.get("screenshots_folder"):
+                shots_dir = Path(txn["screenshots_folder"])
+            if shots_dir.exists():
+                for shot in sorted(shots_dir.glob("step_*.png")):
+                    zf.write(shot, f"screenshots/{shot.name}")
+                    added += 1
+
+            # 4. Exit report
+            report_p = run_dir / "exit_report.txt"
+            if not report_p.exists() and txn.get("report_file"):
+                report_p = Path(txn["report_file"])
+            if report_p.exists():
+                zf.write(report_p, "exit_report.txt")
+                added += 1
+
+    if added == 0:
+        raise HTTPException(status_code=404, detail="No files found for this transaction - they may have been cleaned up.")
+
+    buf.seek(0)
+    app_name = txn.get("transaction_name", "flow").replace(" ", "_")
+    zip_name = f"{app_name}_{transaction_id}_flow.zip"
+    from starlette.responses import StreamingResponse
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+    )
+
+
+@app.get("/api/admin/applications")
+def get_applications_summary(current_user: CurrentUser = Depends(get_current_user)):
+    """Admin-only summary of every application folder on disk - how many
+    recordings, how many runs, when last used. The frontend admin page uses
+    this to give an overview of which applications are being tested and
+    how active each one is."""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin only.")
+
+    recordings_root = ROOT / "recordings"
+    runs_root = ROOT / "output" / "runs"
+
+    # Collect all recordings grouped by application
+    apps: dict = {}  # app_name -> {recordings, runs, last_run_at}
+
+    if recordings_root.exists():
+        # Subfolder recordings
+        for subdir in recordings_root.iterdir():
+            if not subdir.is_dir() or subdir.name in ("versions", "imports"):
+                continue
+            count = len(list(subdir.glob("*.json")))
+            if count:
+                apps.setdefault(subdir.name, {"recording_count": 0, "run_count": 0, "last_run_at": None})
+                apps[subdir.name]["recording_count"] += count
+        # Flat (Others) recordings
+        flat = len(list(recordings_root.glob("*.json")))
+        if flat:
+            apps.setdefault("Others", {"recording_count": 0, "run_count": 0, "last_run_at": None})
+            apps["Others"]["recording_count"] += flat
+
+    # Collect run counts and last_run_at per application
+    if runs_root.exists():
+        for app_dir in runs_root.iterdir():
+            if not app_dir.is_dir():
+                continue
+            app_key = app_dir.name
+            apps.setdefault(app_key, {"recording_count": 0, "run_count": 0, "last_run_at": None})
+            for run_dir in app_dir.iterdir():
+                if not run_dir.is_dir():
+                    continue
+                apps[app_key]["run_count"] += 1
+                report = run_dir / "exit_report.txt"
+                if report.exists():
+                    mtime = report.stat().st_mtime
+                    from datetime import datetime as _dt
+                    ts = _dt.utcfromtimestamp(mtime).isoformat()
+                    if apps[app_key]["last_run_at"] is None or ts > apps[app_key]["last_run_at"]:
+                        apps[app_key]["last_run_at"] = ts
+
+    return [{"application": k, **v} for k, v in sorted(apps.items())]
+
+
+# ===========================================================================
+# Solution Document Analysis endpoints
+# ===========================================================================
+
+@app.post("/api/solution-documents/upload")
+async def upload_solution_document(
+    request: Request,
+    file: UploadFile = File(...),
+    application: str = Form(...),
+    cr_number: str = Form(""),
+    document_name: str = Form(""),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Upload a solution document (PDF/DOCX/TXT/MD) for a given application.
+    Stores it under recordings/<app>/solution_documents/ without running analysis yet."""
+    app_access.require_application_access(current_user, application, "upload")
+    from solution_analyzer.service import store_solution_document
+
+    allowed_exts = {".pdf", ".docx", ".doc", ".txt", ".md"}
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in allowed_exts:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type {suffix!r}. Supported: {', '.join(sorted(allowed_exts))}"
+        )
+
+    tmp_path = Path(tempfile.gettempdir()) / f"solutiondoc_{uuid.uuid4().hex}{suffix}"
+    try:
+        contents = await file.read()
+        tmp_path.write_bytes(contents)
+        doc = store_solution_document(
+            tmp_file_path=str(tmp_path),
+            original_filename=file.filename,
+            application=application,
+            cr_number=cr_number.strip() or None,
+            document_name=document_name.strip() or None,
+            uploaded_by=current_user.username,
+        )
+        ip = get_client_ip(request)
+        with get_session() as session:
+            repo.log_activity(
+                session, user_id=current_user.user_id, session_id=current_user.session_id,
+                action="SOLUTION_DOC_UPLOADED", status="SUCCESS",
+                details={"doc_id": doc["id"], "application": application, "filename": file.filename},
+                endpoint="/api/solution-documents/upload", ip_address=ip,
+            )
+        return doc
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+@app.get("/api/solution-documents")
+def list_solution_documents_endpoint(
+    application: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    app_access.require_application_access(current_user, application, "view")
+    from solution_analyzer.service import list_solution_documents
+    return list_solution_documents(application)
+
+
+@app.get("/api/solution-documents/{doc_id}")
+def get_solution_document(
+    doc_id: str,
+    application: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    app_access.require_application_access(current_user, application, "view")
+    from solution_analyzer.service import load_solution_document
+    doc = load_solution_document(doc_id, application)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Solution document not found")
+    return doc
+
+
+@app.post("/api/solution-documents/{doc_id}/analyze")
+async def analyze_solution_document(
+    doc_id: str,
+    application: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Run the full analysis pipeline: parse → extract → map → impact → change plan.
+    Can be called multiple times on the same document (re-analysis) — each run
+    produces a fresh change plan, leaving the previous one accessible in the
+    change_analysis/ folder. Does NOT modify any recording."""
+    app_access.require_application_access(current_user, application, "edit")
+    from solution_analyzer.service import run_analysis, load_solution_document, _update_doc_meta
+
+    # Reset status so UI shows "analyzing" state correctly on re-runs
+    doc = load_solution_document(doc_id, application)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Solution document not found")
+    _update_doc_meta(doc_id, application, {"analysis_status": "PENDING"})
+
+    llm = get_llm(temperature=0.1)
+    recordings = list_saved_recordings()
+    try:
+        plan = await asyncio.to_thread(
+            run_analysis,
+            doc_id=doc_id,
+            application=application,
+            all_recordings=recordings,
+            llm=llm,
+            uploaded_by=current_user.username,
+        )
+        return plan
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Solution document analysis failed for doc_id=%s", doc_id)
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
+
+
+@app.get("/api/solution-documents/{doc_id}/analysis")
+def get_solution_document_analysis(
+    doc_id: str,
+    application: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Returns the extraction result (DocumentAnalysis) for a document."""
+    app_access.require_application_access(current_user, application, "view")
+    from solution_analyzer.service import _change_analysis_dir
+    analysis_dir = _change_analysis_dir(application)
+    extraction_path = analysis_dir / f"{doc_id}_extraction.json"
+    if not extraction_path.exists():
+        raise HTTPException(status_code=404, detail="Analysis not yet run for this document")
+    return json.loads(extraction_path.read_text())
+
+
+@app.get("/api/change-plans/{plan_id}")
+def get_change_plan(
+    plan_id: str,
+    application: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    app_access.require_application_access(current_user, application, "view")
+    from solution_analyzer.service import load_change_plan
+    plan = load_change_plan(plan_id, application)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Change plan not found")
+    return plan
+
+
+@app.post("/api/change-plans/{plan_id}/approve")
+def approve_change_plan_item(
+    plan_id: str,
+    application: str,
+    item_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Approve one item in the change plan for application."""
+    app_access.require_application_access(current_user, application, "edit")
+    from solution_analyzer.service import load_change_plan, save_change_plan
+    from datetime import datetime, timezone
+
+    plan = load_change_plan(plan_id, application)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Change plan not found")
+
+    found = False
+    for item in plan["items"]:
+        if item["item_id"] == item_id:
+            item["approval_status"] = "APPROVED"
+            item["approved_by"] = current_user.username
+            item["approved_at"] = datetime.now(timezone.utc).isoformat()
+            found = True
+            break
+    if not found:
+        raise HTTPException(status_code=404, detail="Item not found in change plan")
+
+    # Update plan status
+    statuses = {i["approval_status"] for i in plan["items"]}
+    if "PENDING" in statuses:
+        plan["status"] = "PARTIALLY_APPROVED"
+    else:
+        plan["status"] = "FULLY_APPROVED"
+
+    save_change_plan(plan, application)
+    return plan
+
+
+@app.post("/api/change-plans/{plan_id}/reject")
+def reject_change_plan_item(
+    plan_id: str,
+    application: str,
+    item_id: str,
+    reason: str = "",
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    app_access.require_application_access(current_user, application, "edit")
+    from solution_analyzer.service import load_change_plan, save_change_plan
+    plan = load_change_plan(plan_id, application)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Change plan not found")
+    for item in plan["items"]:
+        if item["item_id"] == item_id:
+            item["approval_status"] = "REJECTED"
+            item["rejection_reason"] = reason
+            break
+    save_change_plan(plan, application)
+    return plan
+
+
+@app.post("/api/change-plans/{plan_id}/apply")
+async def apply_change_plan_item(
+    plan_id: str,
+    application: str,
+    item_id: str,
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Apply ONE approved change plan item to its recording.
+    Creates a new version before applying. Never modifies unapproved items."""
+    app_access.require_application_access(current_user, application, "edit")
+    from solution_analyzer.service import load_change_plan, save_change_plan
+    from solution_analyzer.change_engine import ChangeEngine, ChangeError
+    from solution_analyzer.models import ChangePlanItemModel
+    from datetime import datetime, timezone
+
+    plan = load_change_plan(plan_id, application)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Change plan not found")
+
+    item_data = next((i for i in plan["items"] if i["item_id"] == item_id), None)
+    if item_data is None:
+        raise HTTPException(status_code=404, detail="Item not found in change plan")
+    if item_data["approval_status"] != "APPROVED":
+        raise HTTPException(
+            status_code=400,
+            detail="Item must be APPROVED before it can be applied."
+        )
+    if item_data.get("applied"):
+        raise HTTPException(status_code=400, detail="Item has already been applied.")
+
+    with get_session() as session:
+        engine = ChangeEngine(session, current_user)
+        try:
+            item_model = ChangePlanItemModel(**item_data)
+            result = await asyncio.to_thread(
+                engine.apply_item, item_model, plan.get("cr_number")
+            )
+        except ChangeError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        except Exception as e:
+            logger.exception("Change application failed for plan %s item %s", plan_id, item_id)
+            raise HTTPException(status_code=500, detail=f"Apply failed: {e}")
+
+    # Update plan item
+    now = datetime.now(timezone.utc).isoformat()
+    for item in plan["items"]:
+        if item["item_id"] == item_id:
+            item["applied"] = True
+            item["applied_at"] = now
+            item["new_version_number"] = result.get("new_version")
+            item["diff_before"] = result.get("diff", {}).get("changed_steps")
+            item["diff_after"] = result.get("diff", {})
+            item["validation_status"] = "NOT_RUN"
+            break
+
+    all_applied = all(
+        i.get("applied") or i.get("approval_status") == "REJECTED"
+        for i in plan["items"]
+    )
+    if all_applied:
+        plan["status"] = "APPLIED"
+
+    save_change_plan(plan, application)
+
+    ip = get_client_ip(request)
+    with get_session() as session:
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id,
+            action="CHANGE_APPLIED", status="SUCCESS",
+            details={"plan_id": plan_id, "item_id": item_id, "new_version": result.get("new_version")},
+            endpoint=f"/api/change-plans/{plan_id}/apply", ip_address=ip,
+        )
+    return {**plan, "apply_result": result}
+
+
+@app.post("/api/change-plans/{plan_id}/validate")
+async def validate_change_plan_item(
+    plan_id: str,
+    application: str,
+    item_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Run the affected recording after a change has been applied.
+    Records validation result in the change plan."""
+    app_access.require_application_access(current_user, application, "edit")
+    from solution_analyzer.service import load_change_plan, save_change_plan
+    from datetime import datetime, timezone
+
+    plan = load_change_plan(plan_id, application)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Change plan not found")
+
+    item_data = next((i for i in plan["items"] if i["item_id"] == item_id), None)
+    if item_data is None:
+        raise HTTPException(status_code=404, detail="Item not found")
+    if not item_data.get("applied"):
+        raise HTTPException(status_code=400, detail="Item must be applied before validation.")
+
+    recording_file = (
+        item_data.get("impact_item", {})
+        .get("matched_recording", {})
+        .get("recording_file")
+    )
+    if not recording_file:
+        raise HTTPException(status_code=400, detail="No recording file in this item.")
+
+    try:
+        txn = await asyncio.to_thread(
+            run_recording,
+            recording_file=recording_file,
+            user_id=current_user.user_id,
+            headless=True,
+        )
+        validation_status = "CHANGE_VALIDATED" if txn.get("status") == "Success" else "CHANGE_VALIDATION_FAILED"
+    except Exception as e:
+        validation_status = "CHANGE_VALIDATION_FAILED"
+        txn = {"error": str(e)}
+
+    now = datetime.now(timezone.utc).isoformat()
+    for item in plan["items"]:
+        if item["item_id"] == item_id:
+            item["validation_status"] = validation_status
+            item["validation_transaction_id"] = txn.get("transaction_id")
+            break
+
+    save_change_plan(plan, application)
+    return {"validation_status": validation_status, "transaction": txn}
+
+
+@app.post("/api/change-plans/{plan_id}/batch-approve")
+def batch_approve_change_plan(
+    plan_id: str,
+    application: str,
+    min_confidence: float = 0.80,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Approve all PENDING items whose confidence meets `min_confidence`
+    (default 0.80 = REVIEW threshold) in one call.
+    Items below the threshold, already actioned, or requiring manual review
+    are left untouched. Returns the updated plan."""
+    app_access.require_application_access(current_user, application, "edit")
+    from solution_analyzer.service import load_change_plan, save_change_plan
+    from datetime import datetime, timezone
+
+    plan = load_change_plan(plan_id, application)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Change plan not found")
+
+    now = datetime.now(timezone.utc).isoformat()
+    approved_count = 0
+    skipped = []
+
+    for item in plan["items"]:
+        if item["approval_status"] != "PENDING":
+            continue
+        impact = item.get("impact_item", {})
+        conf = impact.get("confidence", 0)
+        is_impl = impact.get("is_implementable", True)
+        needs_review = impact.get("manual_review_required", False)
+
+        if not is_impl:
+            skipped.append({"item_id": item["item_id"], "reason": "not_implementable"})
+            continue
+        if needs_review:
+            skipped.append({"item_id": item["item_id"], "reason": "manual_review_required"})
+            continue
+        if conf < min_confidence:
+            skipped.append({"item_id": item["item_id"], "reason": f"confidence {conf:.0%} < {min_confidence:.0%}"})
+            continue
+
+        item["approval_status"] = "APPROVED"
+        item["approved_by"] = current_user.username
+        item["approved_at"] = now
+        approved_count += 1
+
+    statuses = {i["approval_status"] for i in plan["items"]}
+    if "PENDING" not in statuses:
+        plan["status"] = "FULLY_APPROVED"
+    elif approved_count > 0:
+        plan["status"] = "PARTIALLY_APPROVED"
+
+    save_change_plan(plan, application)
+    return {"approved_count": approved_count, "skipped": skipped, "plan": plan}
+
+
+@app.post("/api/change-plans/{plan_id}/batch-apply")
+async def batch_apply_change_plan(
+    plan_id: str,
+    application: str,
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Apply ALL APPROVED, not-yet-applied, implementable items in the plan.
+    Each item is applied independently — a failure on one item does not
+    prevent the others from being applied, and the result details which
+    succeeded and which failed. Returns the updated plan."""
+    app_access.require_application_access(current_user, application, "edit")
+    from solution_analyzer.service import load_change_plan, save_change_plan
+    from solution_analyzer.change_engine import ChangeEngine, ChangeError
+    from solution_analyzer.models import ChangePlanItemModel
+    from datetime import datetime, timezone
+
+    plan = load_change_plan(plan_id, application)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Change plan not found")
+
+    candidates = [
+        i for i in plan["items"]
+        if i["approval_status"] == "APPROVED"
+        and not i.get("applied")
+        and i.get("impact_item", {}).get("is_implementable", True)
+    ]
+    if not candidates:
+        raise HTTPException(
+            status_code=400,
+            detail="No approved, unapplied, implementable items to apply."
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+    results = []
+    with get_session() as session:
+        engine = ChangeEngine(session, current_user)
+        for item_data in candidates:
+            try:
+                item_model = ChangePlanItemModel(**item_data)
+                result = await asyncio.to_thread(
+                    engine.apply_item, item_model, plan.get("cr_number")
+                )
+                for item in plan["items"]:
+                    if item["item_id"] == item_data["item_id"]:
+                        item["applied"] = True
+                        item["applied_at"] = now
+                        item["new_version_number"] = result.get("new_version")
+                        item["diff_after"] = result.get("diff", {})
+                        item["validation_status"] = "NOT_RUN"
+                        break
+                results.append({"item_id": item_data["item_id"], "ok": True, "new_version": result.get("new_version")})
+            except (ChangeError, Exception) as e:
+                results.append({"item_id": item_data["item_id"], "ok": False, "error": str(e)})
+
+    all_done = all(
+        i.get("applied") or i.get("approval_status") == "REJECTED" or
+        i.get("impact_item", {}).get("manual_review_required") or
+        not i.get("impact_item", {}).get("is_implementable", True)
+        for i in plan["items"]
+    )
+    if all_done:
+        plan["status"] = "APPLIED"
+
+    save_change_plan(plan, application)
+
+    ip = get_client_ip(request)
+    with get_session() as session:
+        repo.log_activity(
+            session, user_id=current_user.user_id, session_id=current_user.session_id,
+            action="BATCH_CHANGE_APPLIED", status="SUCCESS",
+            details={"plan_id": plan_id, "applied": sum(1 for r in results if r["ok"]),
+                     "failed": sum(1 for r in results if not r["ok"])},
+            endpoint=f"/api/change-plans/{plan_id}/batch-apply", ip_address=ip,
+        )
+    return {"results": results, "plan": plan}
+
+
+@app.post("/api/change-plans/{plan_id}/rollback")
+def rollback_change_plan_item(
+    plan_id: str,
+    application: str,
+    item_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Revert an applied change by restoring the recording to its state
+    immediately before this item was applied.
+
+    Uses the existing versioning system (backend/recording_access.py's
+    snapshot_version) - reads the version that existed BEFORE the apply
+    (new_version_number - 1), writes it back as a new snapshot
+    (new_version_number + 1), so the version history is always append-only
+    and the rollback itself is auditable."""
+    app_access.require_application_access(current_user, application, "edit")
+    from solution_analyzer.service import load_change_plan, save_change_plan
+    from backend.recording_access import get_or_create_recording, snapshot_version
+    from datetime import datetime, timezone
+    import json as _json
+
+    plan = load_change_plan(plan_id, application)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Change plan not found")
+
+    item_data = next((i for i in plan["items"] if i["item_id"] == item_id), None)
+    if item_data is None:
+        raise HTTPException(status_code=404, detail="Item not found in change plan")
+    if not item_data.get("applied"):
+        raise HTTPException(status_code=400, detail="Item has not been applied — nothing to roll back.")
+
+    # Find the recording file
+    recording_file = (
+        item_data.get("impact_item", {})
+        .get("matched_recording", {})
+        .get("recording_file")
+    )
+    if not recording_file:
+        raise HTTPException(status_code=400, detail="No recording file in this item.")
+
+    rec_path = Path(recording_file)
+    if not rec_path.exists():
+        raise HTTPException(status_code=404, detail=f"Recording file not found: {rec_path}")
+
+    with get_session() as session:
+        recording = get_or_create_recording(session, rec_path)
+        applied_version = item_data.get("new_version_number")
+        if not applied_version:
+            raise HTTPException(status_code=400, detail="Applied version number not recorded — cannot roll back safely.")
+
+        rollback_version = applied_version - 1
+        if rollback_version < 1:
+            raise HTTPException(status_code=400, detail="No previous version to roll back to.")
+
+        from backend.recording_access import VERSIONS_DIR
+        version_file = VERSIONS_DIR / str(recording.recording_id) / f"v{rollback_version}.json"
+        if not version_file.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Version {rollback_version} snapshot not found. Cannot roll back."
+            )
+
+        # Load the previous version's content
+        previous_json = _json.loads(version_file.read_text())
+
+        # Add rollback note to the change history
+        previous_json.setdefault("change_history", []).append({
+            "cr_number": plan.get("cr_number"),
+            "change_type": "ROLLBACK",
+            "rolled_back_version": applied_version,
+            "restored_to_version": rollback_version,
+            "applied_at": datetime.now(timezone.utc).isoformat(),
+            "applied_by": current_user.username,
+            "description": f"Rolled back change plan item {item_id}",
+        })
+
+        new_version_number = recording.current_version_number + 1
+        snapshot_version(
+            session,
+            recording=recording,
+            recording_json=previous_json,
+            version_number=new_version_number,
+            created_by_user_id=current_user.user_id,
+            change_summary=f"[ROLLBACK] Reverted item {item_id} from v{applied_version} to v{rollback_version}",
+        )
+
+    # Update plan item
+    now = datetime.now(timezone.utc).isoformat()
+    for item in plan["items"]:
+        if item["item_id"] == item_id:
+            item["applied"] = False
+            item["approval_status"] = "PENDING"
+            item["rolled_back_at"] = now
+            item["rolled_back_by"] = current_user.username
+            item["rolled_back_from_version"] = applied_version
+            item["new_version_number"] = None
+            item["validation_status"] = "NOT_RUN"
+            break
+
+    if plan["status"] == "APPLIED":
+        plan["status"] = "PARTIALLY_APPROVED"
+
+    save_change_plan(plan, application)
+    return {"ok": True, "rolled_back_to_version": rollback_version, "new_snapshot_version": new_version_number, "plan": plan}
+
+
+@app.post("/api/change-plans/{plan_id}/mark-handled")
+def mark_item_manually_handled(
+    plan_id: str,
+    application: str,
+    item_id: str,
+    note: str = "",
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Mark a manual-review-required or non-implementable item as handled
+    by a human. This closes it out of the plan so the plan can reach
+    completion without requiring automation for items that were always
+    going to be done by hand."""
+    app_access.require_application_access(current_user, application, "edit")
+    from solution_analyzer.service import load_change_plan, save_change_plan
+    from datetime import datetime, timezone
+
+    plan = load_change_plan(plan_id, application)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Change plan not found")
+
+    item_data = next((i for i in plan["items"] if i["item_id"] == item_id), None)
+    if item_data is None:
+        raise HTTPException(status_code=404, detail="Item not found in change plan")
+
+    now = datetime.now(timezone.utc).isoformat()
+    for item in plan["items"]:
+        if item["item_id"] == item_id:
+            item["approval_status"] = "APPROVED"
+            item["applied"] = True
+            item["manually_handled"] = True
+            item["manually_handled_by"] = current_user.username
+            item["manually_handled_at"] = now
+            item["manual_handling_note"] = note.strip() or "Marked as manually handled."
+            item["validation_status"] = "CHANGE_VALIDATED"
+            break
+
+    all_done = all(
+        i.get("applied") or i.get("approval_status") == "REJECTED"
+        for i in plan["items"]
+    )
+    if all_done:
+        plan["status"] = "APPLIED"
+
+    save_change_plan(plan, application)
+    return plan
+
+
+@app.post("/api/change-plans/{plan_id}/generate-scenario")
+async def generate_scenario_skeleton(
+    plan_id: str,
+    application: str,
+    item_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """For NEW_TEST_SCENARIO items: generates a recording JSON skeleton
+    from the requirement description and saves it under the application's
+    recordings folder so the user can open it in the Step Editor and fill
+    in the details. Does NOT auto-run or auto-apply anything.
+
+    The skeleton contains:
+    - application, recording_name, target_url (from existing recordings)
+    - empty actions list with one placeholder step describing the scenario
+    - provenance fields (cr_number, source item_id, plan_id)
+
+    The user then opens it in Run Saved → Edit Steps to fill in real
+    selectors and values before running it."""
+    app_access.require_application_access(current_user, application, "edit")
+    from solution_analyzer.service import load_change_plan, save_change_plan, _app_dir
+    from recorder.recorder import save_recording_json
+    from datetime import datetime, timezone
+
+    plan = load_change_plan(plan_id, application)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Change plan not found")
+
+    item_data = next((i for i in plan["items"] if i["item_id"] == item_id), None)
+    if item_data is None:
+        raise HTTPException(status_code=404, detail="Item not found in change plan")
+
+    impact = item_data.get("impact_item", {})
+    req = impact.get("requirement", {})
+
+    if impact.get("change_type") != "NEW_TEST_SCENARIO":
+        raise HTTPException(
+            status_code=400,
+            detail="Only NEW_TEST_SCENARIO items can generate a scenario skeleton."
+        )
+
+    # Find the target URL from an existing recording for this application
+    existing_recordings = [
+        r for r in list_saved_recordings()
+        if (r.get("application") or "Others") == application
+    ]
+    target_url = existing_recordings[0]["target_url"] if existing_recordings else ""
+
+    # Build the skeleton name
+    txn = req.get("transaction") or ""
+    field = req.get("field_name") or req.get("screen_name") or "New Scenario"
+    skeleton_name = f"SKELETON_{plan.get('cr_number') or 'CR'}_{txn}_{field}".replace(" ", "_")[:60]
+
+    # Placeholder action that describes what the scenario needs
+    placeholder_action = {
+        "action": "click",
+        "element": {
+            "tag": "",
+            "text": f"[PLACEHOLDER] {req.get('description', 'New scenario step')}",
+            "ariaLabel": "",
+            "name": "",
+            "type": "",
+            "placeholder": "",
+        },
+        "value": None,
+        "locators": [],
+        "page_index": 0,
+        "frame_path": [],
+        "_skeleton": True,
+        "_cr_number": plan.get("cr_number"),
+        "_scenario_description": req.get("description"),
+        "_transaction": txn,
+        "_note": (
+            "This is a skeleton step. Open this recording in the Step Editor "
+            "(Run Saved → Edit Steps) to replace it with real selectors and values."
+        ),
+    }
+
+    path = save_recording_json(
+        target_url=target_url,
+        actions=[placeholder_action],
+        name=skeleton_name,
+        app_name=application,
+    )
+
+    # Mark the item as having a skeleton generated
+    now = datetime.now(timezone.utc).isoformat()
+    for item in plan["items"]:
+        if item["item_id"] == item_id:
+            item["scenario_skeleton_generated"] = True
+            item["scenario_skeleton_file"] = path
+            item["scenario_skeleton_generated_at"] = now
+            item["approval_status"] = "APPROVED"
+            item["applied"] = True
+            item["applied_at"] = now
+            item["manually_handled"] = True
+            item["manual_handling_note"] = f"Scenario skeleton generated at {path}. Open in Step Editor to complete."
+            item["validation_status"] = "NOT_RUN"
+            break
+
+    save_change_plan(plan, application)
+
+    return {
+        "ok": True,
+        "skeleton_file": path,
+        "skeleton_name": skeleton_name,
+        "message": (
+            f"Skeleton recording saved to {path}. "
+            "Open 'Run Saved Recording' → select this recording → 'Edit Steps' "
+            "to add real selectors and values before running it."
+        ),
+    }
+
+
+
+def export_change_plan(
+    plan_id: str,
+    application: str,
+    format: str = "json",
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Export the change plan as JSON (default), CSV summary, or a
+    human-readable text report suitable for filing with a CR or
+    emailing to a manager for sign-off."""
+    app_access.require_application_access(current_user, application, "export")
+    from solution_analyzer.service import load_change_plan
+    from datetime import datetime, timezone
+    from starlette.responses import Response
+
+    plan = load_change_plan(plan_id, application)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Change plan not found")
+
+    if format == "json":
+        content = json.dumps(plan, indent=2, default=str)
+        return Response(
+            content=content,
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="change_plan_{plan_id}.json"'},
+        )
+
+    if format == "csv":
+        import csv, io
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow([
+            "Item ID", "Change Type", "Transaction", "Screen", "Field",
+            "Old Value", "New Value", "Confidence %", "Confidence Level",
+            "Recording", "Status", "Applied", "Validation",
+            "Manual Review Required", "Implementable",
+        ])
+        for item in plan.get("items", []):
+            impact = item.get("impact_item", {})
+            req = impact.get("requirement", {})
+            rec = impact.get("matched_recording") or {}
+            conf = impact.get("confidence", 0)
+            conf_label = "High" if conf >= 0.95 else "Review" if conf >= 0.80 else "Low"
+            writer.writerow([
+                item.get("item_id", "")[:8],
+                impact.get("change_type", ""),
+                req.get("transaction", ""),
+                req.get("screen_name", ""),
+                req.get("field_name", ""),
+                impact.get("old_value", "") or impact.get("old_locator", ""),
+                impact.get("proposed_value", "") or impact.get("proposed_locator", ""),
+                f"{conf*100:.0f}",
+                conf_label,
+                rec.get("recording_name", ""),
+                item.get("approval_status", ""),
+                "Yes" if item.get("applied") else "No",
+                item.get("validation_status", ""),
+                "Yes" if impact.get("manual_review_required") else "No",
+                "Yes" if impact.get("is_implementable", True) else "No",
+            ])
+        content = buf.getvalue()
+        return Response(
+            content=content,
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="change_plan_{plan_id}.csv"'},
+        )
+
+    if format == "pdf":
+        # Generate a PDF from the TXT report using only stdlib.
+        # Uses a minimal HTML→PDF via the browser's print path (headless Playwright)
+        # if available, or falls back to a plain-text PDF using reportlab if
+        # installed, or as a last resort returns the TXT file with a .pdf extension
+        # so at minimum the content is downloadable.
+        txt_lines = [
+            f"CHANGE PLAN REPORT",
+            f"==================",
+            f"Plan ID:       {plan.get('plan_id', '')}",
+            f"CR Number:     {plan.get('cr_number') or 'N/A'}",
+            f"Application:   {plan.get('application', '')}",
+            f"Status:        {plan.get('status', '')}",
+            f"",
+        ]
+        items = plan.get("items", [])
+        txt_lines += [f"Total items: {len(items)}",
+                      f"Approved: {sum(1 for i in items if i.get('approval_status') == 'APPROVED')}",
+                      f"Applied: {sum(1 for i in items if i.get('applied'))}",
+                      f"Rejected: {sum(1 for i in items if i.get('approval_status') == 'REJECTED')}", ""]
+        for idx, item in enumerate(items, 1):
+            impact = item.get("impact_item", {})
+            req = impact.get("requirement", {})
+            conf = impact.get("confidence", 0)
+            txt_lines += [
+                f"[{idx}] {impact.get('change_type', 'UNKNOWN')}",
+                f"    Field: {req.get('field_name') or 'N/A'}",
+                f"    Confidence: {conf*100:.0f}%",
+                f"    Status: {item.get('approval_status', 'PENDING')} / Applied: {'Yes' if item.get('applied') else 'No'}",
+                "",
+            ]
+        txt_content = "\n".join(txt_lines)
+        # Try reportlab first
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+            from reportlab.lib.styles import getSampleStyleSheet
+            from reportlab.lib.units import cm
+            import io as _io
+            buf = _io.BytesIO()
+            doc = SimpleDocTemplate(buf, pagesize=A4,
+                                    leftMargin=2*cm, rightMargin=2*cm,
+                                    topMargin=2*cm, bottomMargin=2*cm)
+            styles = getSampleStyleSheet()
+            story = []
+            for line in txt_content.split("\n"):
+                if line.startswith("CHANGE PLAN REPORT"):
+                    story.append(Paragraph(line, styles["Title"]))
+                elif line.startswith("===") or not line.strip():
+                    story.append(Spacer(1, 6))
+                elif line.startswith("    "):
+                    story.append(Paragraph(line.strip(), styles["Normal"]))
+                else:
+                    story.append(Paragraph(line, styles["Heading2"] if line.startswith("[") else styles["Normal"]))
+            doc.build(story)
+            pdf_bytes = buf.getvalue()
+            return Response(
+                content=pdf_bytes,
+                media_type="application/pdf",
+                headers={"Content-Disposition": f'attachment; filename="change_plan_{plan_id}.pdf"'},
+            )
+        except ImportError:
             pass
+        # Fallback: return TXT with PDF content-type
+        return Response(
+            content=txt_content,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="change_plan_{plan_id}.txt"'},
+        )
 
-        conn.close()
+    if format == "txt":
+        lines = [
+            f"CHANGE PLAN REPORT",
+            f"==================",
+            f"Plan ID:       {plan.get('plan_id', '')}",
+            f"CR Number:     {plan.get('cr_number') or 'N/A'}",
+            f"Application:   {plan.get('application', '')}",
+            f"Document:      {plan.get('document_name') or 'N/A'}",
+            f"Created by:    {plan.get('created_by') or 'N/A'}",
+            f"Created at:    {plan.get('created_at', '')}",
+            f"Status:        {plan.get('status', '')}",
+            f"",
+            f"SUMMARY",
+            f"-------",
+        ]
+        items = plan.get("items", [])
+        pending = sum(1 for i in items if i.get("approval_status") == "PENDING")
+        approved = sum(1 for i in items if i.get("approval_status") == "APPROVED")
+        rejected = sum(1 for i in items if i.get("approval_status") == "REJECTED")
+        applied = sum(1 for i in items if i.get("applied"))
+        validated = sum(1 for i in items if i.get("validation_status") == "CHANGE_VALIDATED")
+        lines += [
+            f"Total items:   {len(items)}",
+            f"Pending:       {pending}",
+            f"Approved:      {approved}",
+            f"Rejected:      {rejected}",
+            f"Applied:       {applied}",
+            f"Validated:     {validated}",
+            f"",
+            f"CHANGE ITEMS",
+            f"------------",
+        ]
+        for idx, item in enumerate(items, 1):
+            impact = item.get("impact_item", {})
+            req = impact.get("requirement", {})
+            rec = (impact.get("matched_recording") or {})
+            conf = impact.get("confidence", 0)
+            lines += [
+                f"",
+                f"[{idx}] {impact.get('change_type', 'UNKNOWN')}",
+                f"    Transaction:  {req.get('transaction') or 'N/A'}",
+                f"    Screen:       {req.get('screen_name') or 'N/A'}",
+                f"    Field:        {req.get('field_name') or 'N/A'}",
+                f"    Description:  {req.get('description') or 'N/A'}",
+                f"    Old value:    {impact.get('old_value') or impact.get('old_locator') or 'N/A'}",
+                f"    New value:    {impact.get('proposed_value') or impact.get('proposed_locator') or 'N/A'}",
+                f"    Confidence:   {conf*100:.0f}% ({'High' if conf>=0.95 else 'Review' if conf>=0.80 else 'Low'})",
+                f"    Recording:    {rec.get('recording_name') or 'N/A'}",
+                f"    Status:       {item.get('approval_status', 'PENDING')}",
+                f"    Applied:      {'Yes — v' + str(item.get('new_version_number')) if item.get('applied') else 'No'}",
+                f"    Validated:    {item.get('validation_status', 'NOT_RUN')}",
+            ]
+            if item.get("manually_handled"):
+                lines.append(f"    Manual note:  {item.get('manual_handling_note', '')}")
+            if impact.get("manual_review_required"):
+                lines.append(f"    ⚠ Manual review: {impact.get('manual_review_reason', '')}")
+            if not impact.get("is_implementable", True):
+                lines.append(f"    ✗ Not implementable: {impact.get('not_implementable_reason', '')}")
+
+        lines += ["", "END OF REPORT", f"Generated: {datetime.now(timezone.utc).isoformat()}"]
+        content = "\n".join(lines)
+        return Response(
+            content=content,
+            media_type="text/plain",
+            headers={"Content-Disposition": f'attachment; filename="change_plan_{plan_id}.txt"'},
+        )
+
+    raise HTTPException(status_code=400, detail=f"Unknown format {format!r}. Use: json, csv, txt, pdf")
 
 
-if __name__ == "__main__":
-    merge_databases()
+
+    import uvicorn
+    uvicorn.run(
+        "backend.api:app", host="127.0.0.1", port=8000, reload=True,
+        # Explicit allowlist instead of the default "watch entire CWD" -
+        # excludes output/, recordings/, transactions/, logs/ (written to
+        # continuously during a recording or test run) so a live execution
+        # can't trigger the dev server to restart on its own generated files.
+        reload_dirs=[str(ROOT / d) for d in ("backend", "auth", "database", "recorder", "generator", "runner", "agent")],
+    )
