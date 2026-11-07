@@ -1,121 +1,70 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import { useRouter } from "next/router";
-import { authApi, setUnauthorizedHandler } from "@/lib/api";
-import { getToken, setToken, clearToken } from "@/lib/auth-storage";
+"""
+Central auth configuration - every JWT/session/SSO knob lives here, read
+from environment variables (.env, see .env.example) with sane local-dev
+defaults.
 
-const AuthContext = createContext(null);
+SSO note (read this before wiring up SBI SSO later):
+  AUTH_PROVIDER stays "local" until an SSO integration is added. The
+  intended shape when that happens is:
 
-// Requirement: auto-logout after 12 hours with no interaction. The server
-// independently enforces the same idle window on every API call
-// (see auth/dependencies.py) - this client-side timer is what makes it
-// happen even if the user just sits on a page making no requests at all,
-// and gives a friendly warning before it fires.
-const IDLE_LIMIT_MS = 12 * 60 * 60 * 1000; // 12 hours - keep in sync with IDLE_TIMEOUT_MINUTES in .env (720)
-const IDLE_WARNING_MS = 60 * 1000; // show a "you're about to be logged out" banner 60s ahead
+    1. The IdP (ADFS / Azure AD / whatever SBI standardizes on) redirects
+       back to POST /api/auth/sso/callback with a SAML assertion or OIDC
+       code (see auth/providers.py - authenticate_sso() is the single
+       function to implement).
+    2. That function resolves/creates the local User row (matched on
+       `username` = the IdP's ADID/UPN claim) exactly like
+       authenticate_local() does today, and hands back the same User
+       object.
+    3. From there everything is identical to the local-password path:
+       backend/auth_routes.py's _issue_session_and_token() creates the
+       UserSession + JWT the same way regardless of which provider
+       authenticated the user.
 
-export function AuthProvider({ children }) {
-  const router = useRouter();
-  const [user, setUser] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [idleWarning, setIdleWarning] = useState(false);
-  const lastActivityRef = useRef(Date.now());
-  const idleWarnedRef = useRef(false);
+  Nothing about session handling, the idle timeout, JWT shape, or the
+  admin/activity views needs to change for SSO - only authenticate_sso()
+  gets filled in, and AUTH_PROVIDER gets set to "sso" (or a per-request
+  toggle if both need to coexist during rollout).
+"""
+import os
 
-  const goToLogin = useCallback(
-    (message) => {
-      clearToken();
-      setUser(null);
-      const query = message ? { reason: message } : {};
-      router.replace({ pathname: "/login", query });
-    },
-    [router]
-  );
+AUTH_PROVIDER = os.environ.get("AUTH_PROVIDER", "local")  # "local" | "sso"
 
-  // Wire the API client's 401 handler straight to logout - a session that
-  // the server considers dead (idle timeout, revoked, expired) should kick
-  // the user out immediately no matter which page triggered the call.
-  useEffect(() => {
-    setUnauthorizedHandler((detail) => goToLogin(detail));
-  }, [goToLogin]);
+JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "dev-only-secret-change-me-in-.env")
+JWT_ALGORITHM = "HS256"
 
-  // ---- bootstrap: is there a valid token already? ------------------------
-  useEffect(() => {
-    const token = getToken();
-    if (!token) {
-      setLoading(false);
-      return;
-    }
-    authApi
-      .me()
-      .then((u) => setUser(u))
-      .catch(() => clearToken())
-      .finally(() => setLoading(false));
-  }, []);
+# The JWT's own expiry is intentionally longer than the idle timeout below -
+# actual session liveness is enforced server-side via UserSession, so an
+# unused-but-valid token still gets rejected once idle. This is just an
+# outer ceiling.
+ACCESS_TOKEN_MAX_MINUTES = int(os.environ.get("ACCESS_TOKEN_MAX_MINUTES", "720"))  # 12h (must not be shorter than the idle timeout)
 
-  // ---- idle timer ----------------------------------------------------------
-  useEffect(() => {
-    if (!user) return;
+# Auto-logout after this many minutes of no authenticated requests (12 hours: testers often step away).
+IDLE_TIMEOUT_MINUTES = int(os.environ.get("IDLE_TIMEOUT_MINUTES", "720"))
 
-    const markActive = () => {
-      lastActivityRef.current = Date.now();
-      if (idleWarnedRef.current) {
-        idleWarnedRef.current = false;
-        setIdleWarning(false);
-      }
-    };
+# A desktop agent's WebSocket connection isn't a human browser tab - it's a
+# background process that can legitimately go quiet for a while (laptop
+# asleep, network blip) without anyone having "walked away." Forcing a
+# re-login (username + password, typed by a human) every time that happens
+# defeats the point of a persistent agent. Sessions created via
+# POST /api/agent/pair use this instead of IDLE_TIMEOUT_MINUTES above - see
+# auth/dependencies.py's _validate_and_touch, which picks the constant
+# based on UserSession.is_agent.
+AGENT_IDLE_TIMEOUT_MINUTES = int(os.environ.get("AGENT_IDLE_TIMEOUT_MINUTES", str(30 * 24 * 60)))  # 30 days
 
-    const events = ["mousemove", "mousedown", "keydown", "scroll", "touchstart", "aitr-keepalive"];
-    events.forEach((e) => window.addEventListener(e, markActive, { passive: true }));
+# How long a paired agent session lasts before it needs re-pairing
+# (re-authenticating with username/password once) regardless of activity -
+# the agent equivalent of SESSION_MAX_HOURS below, just much longer since
+# re-pairing requires a human present at the keyboard.
+AGENT_SESSION_MAX_HOURS = int(os.environ.get("AGENT_SESSION_MAX_HOURS", str(90 * 24)))  # 90 days
 
-    const interval = setInterval(() => {
-      const idleFor = Date.now() - lastActivityRef.current;
-      if (idleFor >= IDLE_LIMIT_MS) {
-        goToLogin("Your session timed out due to inactivity. Please log in again.");
-      } else if (idleFor >= IDLE_LIMIT_MS - IDLE_WARNING_MS) {
-        idleWarnedRef.current = true;
-        setIdleWarning(true);
-      }
-    }, 1000);
+# Absolute session ceiling regardless of activity (forces a fresh login
+# periodically even if the user never goes idle).
+SESSION_MAX_HOURS = int(os.environ.get("SESSION_MAX_HOURS", "12"))
 
-    return () => {
-      events.forEach((e) => window.removeEventListener(e, markActive));
-      clearInterval(interval);
-    };
-  }, [user, goToLogin]);
+# Where the frontend lives - only used to build the redirect target once
+# SSO is implemented (IdP -> /api/auth/sso/callback -> this URL + a token,
+# landing on the frontend's /sso/complete page). Not used by anything
+# today.
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
 
-  async function login(username, password) {
-    const data = await authApi.login(username, password);
-    setToken(data.access_token);
-    setUser(data.user);
-    return data; // { must_change_password, user, ... }
-  }
-
-  async function logout() {
-    try {
-      await authApi.logout();
-    } catch {
-      /* best effort - clear locally regardless */
-    }
-    clearToken();
-    setUser(null);
-    router.replace("/login");
-  }
-
-  async function refreshUser() {
-    const u = await authApi.me();
-    setUser(u);
-    return u;
-  }
-
-  return (
-    <AuthContext.Provider value={{ user, loading, login, logout, refreshUser, idleWarning }}>
-      {children}
-    </AuthContext.Provider>
-  );
-}
-
-export function useAuth() {
-  const ctx = useContext(AuthContext);
-  if (!ctx) throw new Error("useAuth must be used within AuthProvider");
-  return ctx;
-}
+MIN_PASSWORD_LENGTH = int(os.environ.get("MIN_PASSWORD_LENGTH", "8"))
