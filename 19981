@@ -1,120 +1,121 @@
-import { useCallback, useEffect, useState } from "react";
-import Head from "next/head";
-import Layout from "@/components/Layout";
-import RequireAuth from "@/components/RequireAuth";
-import { adminApi } from "@/lib/api";
-import { Button, Callout, DataTable, PageHeader, Panel, PanelHeader } from "@/components/ui";
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/router";
+import { authApi, setUnauthorizedHandler } from "@/lib/api";
+import { getToken, setToken, clearToken } from "@/lib/auth-storage";
 
-function idleLabel(seconds) {
-  if (seconds < 60) return `${seconds}s`;
-  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
-}
+const AuthContext = createContext(null);
 
-export default function AdminSessionsPage() {
-  const [sessions, setSessions] = useState([]);
-  const [error, setError] = useState(null);
-  const [busyId, setBusyId] = useState(null);
-  const [notice, setNotice] = useState(null);
+// Requirement: auto-logout after 12 hours with no interaction. The server
+// independently enforces the same idle window on every API call
+// (see auth/dependencies.py) - this client-side timer is what makes it
+// happen even if the user just sits on a page making no requests at all,
+// and gives a friendly warning before it fires.
+const IDLE_LIMIT_MS = 12 * 60 * 60 * 1000; // 12 hours - keep in sync with IDLE_TIMEOUT_MINUTES in .env (720)
+const IDLE_WARNING_MS = 60 * 1000; // show a "you're about to be logged out" banner 60s ahead
 
-  const load = useCallback(async () => {
-    try {
-      setSessions(await adminApi.listSessions());
-      setError(null);
-    } catch (e) {
-      setError(e.detail || e.message);
+export function AuthProvider({ children }) {
+  const router = useRouter();
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [idleWarning, setIdleWarning] = useState(false);
+  const lastActivityRef = useRef(Date.now());
+  const idleWarnedRef = useRef(false);
+
+  const goToLogin = useCallback(
+    (message) => {
+      clearToken();
+      setUser(null);
+      const query = message ? { reason: message } : {};
+      router.replace({ pathname: "/login", query });
+    },
+    [router]
+  );
+
+  // Wire the API client's 401 handler straight to logout - a session that
+  // the server considers dead (idle timeout, revoked, expired) should kick
+  // the user out immediately no matter which page triggered the call.
+  useEffect(() => {
+    setUnauthorizedHandler((detail) => goToLogin(detail));
+  }, [goToLogin]);
+
+  // ---- bootstrap: is there a valid token already? ------------------------
+  useEffect(() => {
+    const token = getToken();
+    if (!token) {
+      setLoading(false);
+      return;
     }
+    authApi
+      .me()
+      .then((u) => setUser(u))
+      .catch(() => clearToken())
+      .finally(() => setLoading(false));
   }, []);
 
+  // ---- idle timer ----------------------------------------------------------
   useEffect(() => {
-    load();
-    const interval = setInterval(load, 15000); // auto-refresh - this is a "who's online right now" view
-    return () => clearInterval(interval);
-  }, [load]);
+    if (!user) return;
 
-  async function handleRevoke(s) {
-    if (!window.confirm(`Force-logout ${s.username}?`)) return;
-    setBusyId(s.session_id);
-    setNotice(null);
+    const markActive = () => {
+      lastActivityRef.current = Date.now();
+      if (idleWarnedRef.current) {
+        idleWarnedRef.current = false;
+        setIdleWarning(false);
+      }
+    };
+
+    const events = ["mousemove", "mousedown", "keydown", "scroll", "touchstart", "aitr-keepalive"];
+    events.forEach((e) => window.addEventListener(e, markActive, { passive: true }));
+
+    const interval = setInterval(() => {
+      const idleFor = Date.now() - lastActivityRef.current;
+      if (idleFor >= IDLE_LIMIT_MS) {
+        goToLogin("Your session timed out due to inactivity. Please log in again.");
+      } else if (idleFor >= IDLE_LIMIT_MS - IDLE_WARNING_MS) {
+        idleWarnedRef.current = true;
+        setIdleWarning(true);
+      }
+    }, 1000);
+
+    return () => {
+      events.forEach((e) => window.removeEventListener(e, markActive));
+      clearInterval(interval);
+    };
+  }, [user, goToLogin]);
+
+  async function login(username, password) {
+    const data = await authApi.login(username, password);
+    setToken(data.access_token);
+    setUser(data.user);
+    return data; // { must_change_password, user, ... }
+  }
+
+  async function logout() {
     try {
-      await adminApi.revokeSession(s.session_id);
-      setNotice({ tone: "success", text: `${s.username} has been signed out.` });
-      await load();
-    } catch (err) {
-      setNotice({ tone: "error", text: err.detail || err.message });
-    } finally {
-      setBusyId(null);
+      await authApi.logout();
+    } catch {
+      /* best effort - clear locally regardless */
     }
+    clearToken();
+    setUser(null);
+    router.replace("/login");
+  }
+
+  async function refreshUser() {
+    const u = await authApi.me();
+    setUser(u);
+    return u;
   }
 
   return (
-    <RequireAuth adminOnly>
-      <Layout>
-        <Head>
-          <title>Active sessions - AI Test Recorder</title>
-        </Head>
-
-        <PageHeader
-          title="Sessions"
-          description="Everyone currently signed in on the website (a logged-out user is not listed), refreshed every 15 seconds."
-          action={(
-      <Button variant="secondary" onClick={load}>
-        Refresh now
-      </Button>
-          )}
-        />
-
-        {error && <Callout tone="error">{error}</Callout>}
-        {notice && (
-          <div className="mb-4">
-            <Callout tone={notice.tone}>{notice.text}</Callout>
-          </div>
-        )}
-
-        <Panel>
-          <PanelHeader title={`${sessions.length} online`} />
-          <div className="px-5 py-5">
-            <DataTable
-              columns={[
-                { key: "user", label: "User" },
-                { key: "username", label: "Username", mono: true },
-                { key: "role", label: "Role" },
-                { key: "agent", label: "Agent" },
-                { key: "recording", label: "Recording" },
-                { key: "logged_in_at", label: "Logged in", mono: true },
-                { key: "idle", label: "Idle for", mono: true },
-                { key: "ip", label: "IP address", mono: true },
-                { key: "actions", label: "" },
-              ]}
-              rows={sessions.map((s) => ({
-                user: s.full_name,
-                username: s.username,
-                role: s.role,
-                agent: s.agent_connected ? <span className="text-xs font-medium text-emerald-600">Connected</span> : <span className="text-xs text-muted">—</span>,
-                recording: s.recording_active ? (
-                  <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-signal-rust">
-                    <span className="pulse-dot h-1.5 w-1.5 rounded-full bg-signal-rust" />
-                    Live
-                  </span>
-                ) : (
-                  <span className="text-xs text-muted">—</span>
-                ),
-                logged_in_at: new Date(s.created_at).toLocaleString(),
-                idle: idleLabel(s.idle_seconds),
-                ip: s.ip_address || "—",
-                actions: (
-                  <button
-                    className="text-xs font-medium text-signal-rust hover:underline disabled:opacity-40"
-                    disabled={busyId === s.session_id}
-                    onClick={() => handleRevoke(s)}
-                  >
-                    Force logout
-                  </button>
-                ),
-              }))}
-            />
-          </div>
-        </Panel>
-      </Layout>
-    </RequireAuth>
+    <AuthContext.Provider value={{ user, loading, login, logout, refreshUser, idleWarning }}>
+      {children}
+    </AuthContext.Provider>
   );
+}
+
+export function useAuth() {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error("useAuth must be used within AuthProvider");
+  return ctx;
 }
