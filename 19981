@@ -1,879 +1,686 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { api } from "@/lib/api";
-import { recordingsApi, executionsApi, transactionsApi } from "@/lib/api";
-import ExecutionProgress, { ACTIVE as ACTIVE_STATUSES } from "@/components/ExecutionProgress";
-import RuntimeInputDialog from "@/components/runtime/RuntimeInputDialog";
-import ExecutionDetails from "@/components/ExecutionDetails";
-import ValidationReport from "@/components/ValidationReport";
-import { errorDetail, validateApi } from "@/lib/platformApi";
-import ReportView from "@/components/ReportView";
-import StepEditor from "@/components/StepEditor";
-import RuntimeConfigPanel, { missingRequired, valuesToSend } from "@/components/runtime/RuntimeConfigPanel";
-import ShareDialog from "@/components/ShareDialog";
-import VersionHistory from "@/components/VersionHistory";
-import Link from "next/link";
-import { useAuth } from "@/context/AuthContext";
-import {
-  Button,
-  Callout,
-  Checkbox,
-  Disclosure,
-  Field,
-  Panel,
-  Select,
-  Spinner,
-  TextInput,
-} from "@/components/ui";
+import { Fragment, useEffect, useRef, useState } from "react";
+import { checksApi, recordingsApi } from "@/lib/api";
+import { Panel, Disclosure, Callout, Spinner, Button, Select } from "@/components/ui";
+import RuntimeStepConfig, { newRuntimeConfig, runtimeConfigForSave } from "@/components/runtime/RuntimeStepConfig";
+import CheckEditor, { newCheck } from "@/components/checks/CheckEditor";
+import CheckSuggestions, { LocatorSuggestions } from "@/components/checks/CheckSuggestions";
 
-import { fmtRecordedAt } from "@/lib/recordedAt";
+// Check rows ("assert") and "remember a value" rows are edited in their own panel, not in the grid cells.
+const CHECK_ROWS = new Set(["assert", "capture_text"]);
 
-// A small filter box that sits under a column heading.
-function ColumnFilter({ value, onChange, placeholder = "Filter", label, className = "" }) {
-  return (
-    <input
-      type="text"
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-      placeholder={placeholder}
-      aria-label={label}
-      className={`w-full rounded-sm border border-line bg-white px-2 py-1 text-xs font-normal text-ink placeholder:text-muted focus:border-brand-blue focus:outline-none ${className}`}
-    />
-  );
+// Editor-side, a check's "same element as step N" is tied to the ROW (so it survives moving rows); the server
+// stores step numbers. These two convert between them.
+function targetsToRowIds(rows) {
+  const idAt = (n) => rows[n - 1]?._id;
+  const conv = (tgt) => (tgt && tgt.step_no && idAt(tgt.step_no) ? { ...tgt, step_row_id: idAt(tgt.step_no) } : tgt);
+  return rows.map((r) => (r.action === "assert" && r.assertion?.target
+    ? { ...r, assertion: { ...r.assertion, target: conv(r.assertion.target) } }
+    : r.action === "capture_text" && r.capture_cfg?.target ? { ...r, capture_cfg: { ...r.capture_cfg, target: conv(r.capture_cfg.target) } } : r));
+}
+function toSaveTarget(tgt, rows) {
+  if (!tgt || !tgt.step_row_id) return tgt;
+  const n = rows.findIndex((r) => r._id === tgt.step_row_id) + 1;
+  const { step_row_id, step_no, ...rest } = tgt; // eslint-disable-line no-unused-vars
+  // the row still exists: the server resolves that step's element again (its current locators);
+  // the row was deleted: keep the selectors the check already had
+  return n > 0 ? { step_no: n, ...(rest.text_mode ? { text_mode: rest.text_mode } : {}) } : rest;
 }
 
-const EMPTY_FILTERS = { no: "", app: "", name: "", by: "", when: "", steps: "" };
+const ACTION_LABELS = {
+  click: "CLICK-C",
+  type: "INPUT-C",
+  select: "DROPDOWN-S",
+  keypress: "KEYPRESS",
+  delay: "DELAY",
+  scroll: "SCROLL",
+  window_closed: "CLOSETAB",
+  assert_text: "VERIFICATION",
+  assert_ocr_text: "VERIFY-OCR",
+  file_upload: "UPLOAD",
+  copy: "CAPTURE",
+  ocr_capture: "CAPTURE-OCR",
+  // Recorded by the recorder itself when hovering opens a menu. Without an
+  // entry here the dropdown showed a hover row as "CLICK-C".
+  hover: "HOVER",
+  // Checks every link of the site's navigation menu - no element needed,
+  // the menu is found on the live page when the test runs.
+  menu_check: "MENU-CHECK",
+  // Recorded by the recorder itself: a pasted value, a date field, a browser dialog, a new tab.
+  paste: "PASTE-C",
+  date: "DATE-C",
+  dialog: "DIALOG",
+  new_window: "NEW-TAB",
+  // Checks verified on every run, and values remembered for a before/after check (automation/checks.py).
+  assert: "CHECK ✓",
+  capture_text: "REMEMBER",
+  checkpoint: "CHECKPOINT",
+  wait_condition: "WAIT-UNTIL",
+  workflow_ref: "WORKFLOW",
+};
 
-export default function RunSavedTab({ active = true }) {
-  const { user } = useAuth();
-  const isAdmin = user?.role === "admin";
-  const [recordings, setRecordings] = useState([]);
-  const [recordingsError, setRecordingsError] = useState(null);
-  const [selectedRecFile, setSelectedRecFile] = useState("");
-  // Configurable steps of the selected recording and the values chosen for its next run (RuntimeConfigPanel).
-  const [runtimeVars, setRuntimeVars] = useState([]);
-  const [runtimeValues, setRuntimeValues] = useState({});
-  const [runtimeReload, setRuntimeReload] = useState(0);
-  const [stepsReload, setStepsReload] = useState(0);   // bumped when test data is saved, so Edit steps reloads
-  const [applicationNames, setApplicationNames] = useState([]);
-  const [runHeadless, setRunHeadless] = useState(false);
-  const [testData, setTestData] = useState([]);
-  const [testDataLoading, setTestDataLoading] = useState(false);
-  const [testDataError, setTestDataError] = useState(null);
-  const [editValues, setEditValues] = useState({});
-  const [savingData, setSavingData] = useState(false);
-  const [saveDataNotice, setSaveDataNotice] = useState(null);
-  const [saveDataError, setSaveDataError] = useState(null);
-  const [runBusy, setRunBusy] = useState(false);
-  const [runError, setRunError] = useState(null);
-  const [report, setReport] = useState(null);
-  const [job, setJob] = useState(null);                 // the background execution being watched
-  const [connectionLost, setConnectionLost] = useState(false);
-  const [controlBusy, setControlBusy] = useState(null);
-  const pollToken = useRef(0);                          // bumping this stops an older polling loop
-  const [validation, setValidation] = useState(null);       // the pre-run readiness report
-  const [validating, setValidating] = useState(false);
-  // Resume: run only from this step number; the first N steps (e.g. login) still run.
-  const [resumeFrom, setResumeFrom] = useState("");
-  const [resumeSetup, setResumeSetup] = useState("0");
-  const [regenBusy, setRegenBusy] = useState(false);
-  const [regenNotice, setRegenNotice] = useState(null);
-  const [regenFiles, setRegenFiles] = useState(null);
-  const [downloadingRegen, setDownloadingRegen] = useState(null);
-  const [shareDialogOpen, setShareDialogOpen] = useState(false);
-  const [exportBusy, setExportBusy] = useState(false);
-  // "Create a navigation menu check" form + the selected check's baseline.
-  const [menuApp, setMenuApp] = useState("Others");
-  const [menuUrl, setMenuUrl] = useState("");
-  const [menuName, setMenuName] = useState("");
-  const [menuSelector, setMenuSelector] = useState("");
-  const [menuStrict, setMenuStrict] = useState(false);
-  const [menuBusy, setMenuBusy] = useState(false);
-  const [menuNotice, setMenuNotice] = useState(null);
-  const [baselineBusy, setBaselineBusy] = useState(false);
-  const [baselineNotice, setBaselineNotice] = useState(null);
-  // Deleting is ADMIN-ONLY (the buttons below never render for anyone else).
-  const [delPicked, setDelPicked] = useState({});      // file -> true
-  const [delBusy, setDelBusy] = useState(false);
-  const [delNotice, setDelNotice] = useState(null);
-  // Column filters of the table
-  const [filters, setFilters] = useState(EMPTY_FILTERS);
+// These come only from a recording / another editor - they can be kept, moved or deleted, not created here.
+const KEEP_ONLY = new Set(["dialog", "new_window", "checkpoint", "wait_condition", "workflow_ref"]);
 
-  const selectedRecording = recordings.find((r) => r.file === selectedRecFile) || null;
-  // The step number as the report shows it. A run that was itself resumed carries each row's ORIGINAL number
-  // (`step_no`), so "Resume from step N" keeps pointing at the right step.
-  const firstFailedStep = (() => {
-    const rows = (report && report.steps) || [];
-    const i = rows.findIndex((r) => ["Failed", "Error"].includes(r.status));
-    return i >= 0 ? rows[i].step_no || i + 1 : null;
-  })();
+const NEEDS_SELECTOR = new Set(["click", "type", "select", "assert_text", "file_upload", "copy", "ocr_capture", "hover", "paste", "date"]);
+const NEEDS_NAME = new Set(["click", "type", "select", "assert_text", "file_upload", "copy", "ocr_capture", "hover", "paste", "date"]);
+const INPUT_PLACEHOLDER = {
+  delay: "seconds, e.g. 3",
+  scroll: "DOWN-4 or UP-2",
+  type: "value to type",
+  paste: "value to paste",
+  date: "date, e.g. 15/11/2026",
+  select: "option to select",
+  assert_text: "text expected to appear",
+  // Page-level (no element/selector needed) - checks the text is visible
+  // ANYWHERE on screen via OCR, not inside one specific DOM element - see
+  // generator/templates/page.tmpl's assert_ocr_text_visible.
+  assert_ocr_text: "text expected to appear on screen (via OCR)",
+  file_upload: "file name",
+  copy: "variable name",
+  ocr_capture: "variable name",
+  menu_check: "optional: CSS selector of the menu, e.g. nav",
+};
 
-  async function loadRecordings() {
-    try {
-      const r = await api.getRecordings();
-      setRecordings(r);
-      setRecordingsError(null);
-      if (r.length && !selectedRecFile) setSelectedRecFile(r[0].file);
-    } catch (e) {
-      setRecordingsError(e.detail || e.message);
-    }
-  }
+// Every row gets a stable id (client-side only, never sent to the server) so a
+// row keeps its own typed-but-not-yet-parsed selector text and error message
+// when it is dragged / moved, instead of those sticking to the position.
+let rowIdCounter = 1;
+const withId = (step) => ({ ...step, _id: `r${rowIdCounter++}` });
+const stripId = ({ _id, ...rest }) => rest; // eslint-disable-line no-unused-vars
+
+function blankStep() {
+  return withId({ action: "click", label: "", value: "", locators: [], raw_selector: "" });
+}
+
+function selectorCellText(step, drafts, id) {
+  if (id in drafts) return drafts[id];
+  // Prefer the EXACT text from the spreadsheet's "present element" column
+  // (if this step came from a UiPath import, or was previously edited via
+  // a pasted selector) - a reconstructed "ID: username" summary from the
+  // parsed locators is a fallback for steps that never had raw selector
+  // text at all (e.g. a real browser recording, which only ever produces
+  // parsed locators - there's no spreadsheet cell to preserve for those).
+  if (step.raw_selector) return step.raw_selector;
+  if (!step.locators || step.locators.length === 0) return "";
+  return step.locators.map((l) => `${l.strategy}: ${l.value}`).join("\n");
+}
+
+/**
+ * A 5-column grid - Action/Method, Name, Present element, Input - matching
+ * the UiPath spreadsheet's own layout exactly, so editing a saved
+ * recording here feels like editing the same Excel sheet, not a
+ * different kind of form. Every cell is directly editable inline (click
+ * in, type, tab/click away) rather than opening a separate edit dialog.
+ *
+ * The "present element" cell accepts the SAME <webctrl .../> snippet
+ * format the spreadsheet's own column does - pasted text is parsed into
+ * real locators automatically when you click out of the cell (see
+ * recordingsApi.parseSelector, reusing the Excel importer's own parser).
+ */
+export default function StepEditor({ recordingFile, onSaved, reloadKey = 0 }) {
+  const [steps, setSteps] = useState([]);
+  const loadedSnapshot = useRef("");                       // the grid as last loaded / saved (to spot unsaved edits)
+  const [stale, setStale] = useState(false);               // the recording changed elsewhere while edits were pending
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [loadError, setLoadError] = useState(null);
+  const [notice, setNotice] = useState(null);
+
+  const [selectorDrafts, setSelectorDrafts] = useState({});   // row _id -> text
+  const [parsingRow, setParsingRow] = useState(null);          // row _id
+  const [selectorErrors, setSelectorErrors] = useState({});    // row _id -> message
+
+  // drag and drop (by the handle on the left of each row)
+  const [configRow, setConfigRow] = useState(null);  // row _id whose runtime settings are open
+  const [checkRow, setCheckRow] = useState(null);    // row _id whose check settings are open
+  const [catalog, setCatalog] = useState(null);      // check types / templates (GET /api/checks/catalog)
+  const [savedIds, setSavedIds] = useState([]);      // row ids in the order last loaded / saved (suggestions refer to it)
+  const [suggesting, setSuggesting] = useState(null); // "checks" | "review" | "locators" while asking the server
+  const [dialog, setDialog] = useState(null);        // { kind, items, aiAvailable }
+  const [armedRow, setArmedRow] = useState(null);   // row index whose handle is pressed -> that row becomes draggable
+  const [dragFrom, setDragFrom] = useState(null);
+  const [dragOver, setDragOver] = useState(null);   // { index, after } drop marker
 
   useEffect(() => {
-    api.getApplications().then((r) => {
-      const names = r.applications || [];
-      setApplicationNames(names);
-      setMenuApp((cur) => (names.includes(cur) ? cur : names[0] || ""));
-    }).catch(() => {});
-  }, []);
-
-  // (Re)load the list every time this tab is shown, so a recording saved on the
-  // Record screen appears without a page refresh.
-  useEffect(() => {
-    if (active) loadRecordings();
+    if (recordingFile) load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active]);
+  }, [recordingFile]);
+  useEffect(() => { checksApi.catalog().then(setCatalog).catch(() => setCatalog(null)); }, []);
 
-  async function loadTestData(file) {
-    setTestDataLoading(true);
-    setTestDataError(null);
-    setSaveDataNotice(null);
-    setSaveDataError(null);
-    try {
-      const data = await api.getRecordingTestData(file);
-      setTestData(data.fields);
-      setEditValues(Object.fromEntries(data.fields.map((f) => [f.index, f.value])));
-    } catch (e) {
-      setTestData([]);
-      setEditValues({});
-      setTestDataError(e.detail || e.message);
-    } finally {
-      setTestDataLoading(false);
-    }
-  }
-
+  // The recording was changed from outside this grid (the Test data panel saved new values). Saving this grid
+  // would write its old copy back over them, so load the saved recording again - unless the grid has unsaved
+  // edits of its own: those are not thrown away, the user is asked.
+  const firstKey = useRef(true);
   useEffect(() => {
-    setReport(null);
-    setRegenNotice(null);
-    setRegenFiles(null);
-    setBaselineNotice(null);
-    if (selectedRecFile) loadTestData(selectedRecFile);
+    if (firstKey.current) { firstKey.current = false; return; }
+    if (!recordingFile) return;
+    if (JSON.stringify(steps) === loadedSnapshot.current) load();
+    else setStale(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedRecFile]);
+  }, [reloadKey]);
 
-  function updateValue(index, value) {
-    setEditValues((prev) => ({ ...prev, [index]: value }));
-    setSaveDataNotice(null);
+  function loadRows(raw) {
+    const rows = targetsToRowIds(raw.map(withId));
+    loadedSnapshot.current = JSON.stringify(rows);
+    setStale(false);
+    setSteps(rows);
+    setSavedIds(rows.map((r) => r._id));
   }
 
-  async function saveTestDataOnly() {
-    setSavingData(true);
-    setSaveDataError(null);
-    setSaveDataNotice(null);
+  async function load() {
+    setLoading(true);
+    setLoadError(null);
+    setSelectorDrafts({});
+    setSelectorErrors({});
     try {
-      const data = await api.updateRecordingTestData(selectedRecFile, editValues);
-      setTestData(data.fields);
-      setStepsReload((n) => n + 1);          // the Edit steps grid must show the new values, not its old copy
-      setSaveDataNotice("Test data saved - future runs of this recording will use these values too.");
+      const r = await recordingsApi.getSteps(recordingFile);
+      loadRows(r.steps);
     } catch (e) {
-      setSaveDataError(e.detail || e.message);
+      setLoadError(e.detail || e.message);
     } finally {
-      setSavingData(false);
+      setLoading(false);
     }
   }
 
-  // Polls a background execution until it ends. A failed poll (server restart,
-  // network blip) never ends the run - it only shows "lost contact" and retries
-  // with a growing delay, because the test itself lives on the agent.
-  async function watchJob(jobId) {
-    const token = ++pollToken.current;
-    let delay = 1500;
-    let failures = 0;
-    for (;;) {
-      if (token !== pollToken.current) return;
-      try {
-        const j = await executionsApi.get(jobId);
-        if (token !== pollToken.current) return;
-        setJob(j);
-        setConnectionLost(false);
-        failures = 0;
-        delay = 1500;
-        if (["completed", "cancelled", "failed", "interrupted", "requires_investigation"].includes(j.status)) {
-          if (j.transaction_id) {
-            try {
-              setReport(await transactionsApi.get(j.transaction_id));
-            } catch (e) {
-              setRunError(`The run ended but its report could not be loaded: ${e?.detail || e?.message}`);
-            }
-          } else if (j.message) {
-            setRunError(j.message);
-          }
-          setRunBusy(false);
-          loadRecordings();   // a menu check saves its baseline on the first run
-          return;
+  function updateField(i, field, value) {
+    setSteps((prev) =>
+      prev.map((s, idx) => {
+        if (idx !== i) return s;
+        const updated = { ...s, [field]: value };
+        // For capture-type steps, "Name" doubles as the variable name
+        // (captured_as) - there's no separate column for it, to keep this
+        // grid exactly 5 columns like the spreadsheet.
+        if (field === "label" && (s.action === "copy" || s.action === "ocr_capture")) {
+          updated.captured_as = value;
         }
-      } catch (e) {
-        if (e?.status === 404) {                        // the job is gone (cleaned up) - stop watching
-          setRunError("This execution is no longer available.");
-          setRunBusy(false);
-          return;
-        }
-        failures += 1;
-        if (failures >= 2) setConnectionLost(true);
-        delay = Math.min(delay * 1.5, 10000);
-      }
-      await new Promise((r) => setTimeout(r, delay));
-    }
-  }
-
-  useEffect(() => { setValidation(null); }, [selectedRecFile]);
-  // The panel loads the new recording's values itself (asynchronously, after this runs).
-  useEffect(() => { setRuntimeVars([]); setRuntimeValues({}); }, [selectedRecFile]);
-
-  async function handleFix(item) {
-    setValidating(true);
-    try {
-      await validateApi.fix(selectedRecFile, item.fix);
-      await loadRecordings();
-      setValidation(await validateApi.run(selectedRecFile, { check_environment: validation?.coverage?.environment }));
-    } catch (e) {
-      setRunError(e?.detail || e?.message || "That fix could not be applied.");
-    } finally {
-      setValidating(false);
-    }
-  }
-
-  // Re-attach to a run that is still going after a page reload / navigation.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        // Only the user's OWN runs (mine) - for an admin the plain list holds everyone's, and re-attaching to
-        // another user's run showed it here as running, with Stop / Pause on it.
-        const r = await executionsApi.list({ limit: 5, mine: true });
-        const live = (r.items || []).find((j) =>
-          ACTIVE_STATUSES.includes(j.status));
-        if (live && !cancelled) {
-          setRunBusy(true);
-          setJob(live);
-          watchJob(live.job_id);
-        }
-      } catch (e) { /* not fatal - the user can still start a run */ }
-    })();
-    return () => { cancelled = true; pollToken.current += 1; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // `fileArg` is set when Run is pressed on a row of the table: that recording is
-  // run as it is saved (the test-data / resume settings below belong to the
-  // recording that is currently selected, so they only apply to that one).
-  async function handleRun(fileArg) {
-    const file = typeof fileArg === "string" ? fileArg : selectedRecFile;
-    if (!file) return;
-    const isSelected = file === selectedRecFile;
-    if (!isSelected) setSelectedRecFile(file);
-    setRunError(null);
-    setReport(null);
-    setJob(null);
-    setValidation(null);
-    setRunBusy(true);
-    try {
-      if (isSelected && testData.length > 0) await api.updateRecordingTestData(file, editValues);
-      const from = isSelected ? parseInt(resumeFrom, 10) : NaN;
-      const setup = isSelected ? parseInt(resumeSetup, 10) : 0;
-      const extra = {};
-      if (Number.isFinite(from) && from > 2) {
-        extra.resume_from = from;
-        extra.resume_setup = Number.isFinite(setup) && setup > 0 ? setup : 0;
-      }
-      // Values for this run - only for the recording whose panel the user filled in; a row's own Run button
-      // runs another recording with its defaults.
-      if (isSelected && runtimeVars.length > 0) {
-        const missing = missingRequired(runtimeVars, runtimeValues);
-        if (missing.length) {
-          setRunError(`Choose a value for: ${missing.map((v) => v.display_label || v.variable_name).join(", ")} (Values for this run).`);
-          setRunBusy(false);
-          return;
-        }
-        extra.runtime_values = valuesToSend(runtimeValues);
-      }
-      const started = await executionsApi.start(file, runHeadless, "auto", extra);
-      setJob({ job_id: started.job_id, status: started.status, progress: {}, metrics: {} });
-      watchJob(started.job_id);
-    } catch (e) {
-      const d = errorDetail(e);
-      if (d && d.code === "validation_failed" && d.validation) {
-        // The server refused to start: show the same report the Validate button shows.
-        setValidation({ can_run: false, counts: d.validation.counts, items: d.validation.items, notice: d.validation.notice,
-                        coverage: { static: true, environment: false, application_flow: false } });
-      }
-      setRunError(e?.detail || e?.message || "Execution failed.");
-      setRunBusy(false);
-    }
-  }
-
-  async function controlJob(action) {
-    if (!job) return;
-    setControlBusy(action);
-    try {
-      await executionsApi[action](job.job_id);
-    } catch (e) {
-      setRunError(e?.detail || e?.message || `Unable to ${action} the execution.`);
-    } finally {
-      setControlBusy(null);
-    }
-  }
-
-  async function handleRegenerate() {
-    if (!selectedRecFile) return;
-    setRegenNotice(null);
-    setRegenFiles(null);
-    setRegenBusy(true);
-    try {
-      const r = await recordingsApi.regenerate(selectedRecFile);
-      setRegenNotice({
-        tone: "success",
-        text: `Regenerated (${r.build_result.step_count} steps) - download the scripts below, or just run this recording, which already uses the current code either way.`,
-      });
-      setRegenFiles({
-        feature_file: r.build_result.feature_file,
-        steps_file: r.build_result.steps_file,
-        page_file: r.build_result.page_file,
-        locators_file: r.build_result.locators_file,
-      });
-    } catch (e) {
-      setRegenNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setRegenBusy(false);
-    }
-  }
-
-  async function handleDownloadRegenFile(path, label) {
-    setDownloadingRegen(path);
-    try {
-      await recordingsApi.downloadRegeneratedFile(path);
-    } catch (e) {
-      setRegenNotice({ tone: "error", text: `Could not download ${label}: ${e.detail || e.message}` });
-    } finally {
-      setDownloadingRegen(null);
-    }
-  }
-
-  // ---- delete recordings (admin only) ------------------------------------
-  const delPickedFiles = Object.keys(delPicked).filter((f) => delPicked[f]);
-
-  async function handleDeleteRecordings(files) {
-    if (!isAdmin || !files.length) return;
-    const names = recordings.filter((r) => files.includes(r.file)).map((r) => `  • ${r.name}`).slice(0, 12);
-    const more = files.length > names.length ? `\n  …and ${files.length - names.length} more` : "";
-    if (!window.confirm(
-      `Permanently delete ${files.length} recording(s)?\n\n${names.join("\n")}${more}\n\n` +
-      "This cannot be undone. Past execution reports are kept.",
-    )) return;
-    setDelBusy(true);
-    setDelNotice(null);
-    try {
-      const r = await recordingsApi.deleteRecordings(files);
-      const gone = new Set(r.deleted.map((d) => d.file));
-      setDelPicked({});
-      if (gone.has(selectedRecFile)) { setSelectedRecFile(""); setReport(null); }
-      const list = await api.getRecordings();
-      setRecordings(list);
-      if (gone.has(selectedRecFile)) setSelectedRecFile(list[0]?.file || "");
-      setDelNotice({
-        tone: r.failed.length ? "error" : "success",
-        text:
-          `Deleted ${r.deleted.length} recording(s).` +
-          (r.failed.length ? ` ${r.failed.length} could not be deleted: ` + r.failed.map((f) => f.reason).join("; ") : ""),
-      });
-    } catch (e) {
-      setDelNotice({ tone: "error", text: e.detail || e.message });
-    } finally {
-      setDelBusy(false);
-    }
-  }
-
-  async function handleDownloadOne(rec) {
-    try { await recordingsApi.exportRecording(rec.recording_id); }
-    catch (e) { setRunError(e.detail || e.message); }
-  }
-
-  // ---- table: numbering, application list and column filters ------------
-  // The "#" is the recording's place in the full list (not in the filtered view),
-  // so typing a number in the # filter always finds that same recording.
-  const numbered = useMemo(
-    () => recordings.map((r, i) => ({ ...r, _no: i + 1, _when: fmtRecordedAt(r), _app: r.application || "Others" })),
-    [recordings],
-  );
-  const appChoices = useMemo(() => Array.from(new Set(numbered.map((r) => r._app))).sort((a, b) => a.localeCompare(b)), [numbered]);
-  const tableRows = useMemo(() => {
-    const has = (hay, needle) => String(hay).toLowerCase().includes(needle.trim().toLowerCase());
-    return numbered.filter(
-      (r) =>
-        (!filters.no.trim() || String(r._no) === filters.no.trim() || String(r._no).startsWith(filters.no.trim())) &&
-        (!filters.app || r._app === filters.app) &&
-        (!filters.name.trim() || has(r.name, filters.name)) &&
-        (!filters.by.trim() || has(r.recorded_by || "", filters.by)) &&
-        (!filters.when.trim() || has(r._when, filters.when)) &&
-        (!filters.steps.trim() || String(r.action_count ?? 0).startsWith(filters.steps.trim())),
+        return updated;
+      })
     );
-  }, [numbered, filters]);
-  const filtersActive = Object.values(filters).some((v) => v);
-  const setFilter = (key) => (value) => setFilters((f) => ({ ...f, [key]: value }));
-  const allShownPicked = tableRows.length > 0 && tableRows.every((r) => delPicked[r.file]);
-  const colCount = isAdmin ? 8 : 7;
+  }
 
-  async function handleCreateMenuCheck() {
-    setMenuNotice(null);
-    if (menuApp === "Others" && !menuUrl.trim()) {
-      setMenuNotice({ tone: "error", text: "Enter the website address first." });
+  function addRow() {
+    setSteps((prev) => [...prev, blankStep()]);
+  }
+
+  function deleteRow(i) {
+    setSteps((prev) => prev.filter((_, idx) => idx !== i));
+  }
+
+  // Moves the row at `from` so it ends up at index `to` (0-based, final position).
+  function moveRowTo(from, to) {
+    if (from === to || from < 0 || to < 0 || from >= steps.length || to >= steps.length) return;
+    setSteps((prev) => {
+      const next = [...prev];
+      const [row] = next.splice(from, 1);
+      next.splice(to, 0, row);
+      return next;
+    });
+  }
+
+  function moveRow(i, delta) {
+    moveRowTo(i, i + delta);
+  }
+
+  function endDrag() {
+    setArmedRow(null);
+    setDragFrom(null);
+    setDragOver(null);
+  }
+
+  function handleDragOver(e, i) {
+    if (dragFrom === null) return;
+    e.preventDefault();
+    const rect = e.currentTarget.getBoundingClientRect();
+    const after = e.clientY > rect.top + rect.height / 2;
+    if (!dragOver || dragOver.index !== i || dragOver.after !== after) setDragOver({ index: i, after });
+  }
+
+  function handleDrop(e) {
+    e.preventDefault();
+    if (dragFrom !== null && dragOver) {
+      // dropping "after row k" / "before row k" -> final index once the dragged row is lifted out
+      let to = dragOver.index + (dragOver.after ? 1 : 0);
+      if (dragFrom < to) to -= 1;
+      moveRowTo(dragFrom, to);
+    }
+    endDrag();
+  }
+
+  async function handleSelectorBlur(i, id, text) {
+    // Clicking in and out of the cell without changing anything must not re-parse (or fail on) the text shown there.
+    if (steps[i] && steps[i].locators?.length && text === selectorCellText(steps[i], {}, id)) return;
+    setSelectorDrafts((prev) => ({ ...prev, [id]: text }));
+    updateField(i, "raw_selector", text);
+    if (!text.trim()) {
+      updateField(i, "locators", []);
       return;
     }
-    setMenuBusy(true);
+    setParsingRow(id);
+    setSelectorErrors((prev) => ({ ...prev, [id]: null }));
     try {
-      const r = await recordingsApi.createMenuCheck({
-        app_name: menuApp === "Others" ? "" : menuApp,
-        url: menuUrl,
-        recording_name: menuName,
-        menu_selector: menuSelector,
-        strict_hover: menuStrict,
-      });
-      setMenuNotice({ tone: "success", text: `Created "${r.name}" for ${r.target_url} - it is selected in the table. Click "Run recording" to check the menu.` });
-      setMenuUrl(""); setMenuName(""); setMenuSelector("");
-      await loadRecordings();
-      setSelectedRecFile(r.recording_file);
+      const r = await recordingsApi.parseSelector(text);
+      if (r.locators.length === 0) {
+        setSelectorErrors((prev) => ({ ...prev, [id]: "No selector found in this text." }));
+        return;
+      }
+      // look the row up by id again: it may have been moved while the parse was running
+      setSteps((prev) =>
+        prev.map((s) =>
+          s._id !== id ? s : { ...s, locators: r.locators, label: !s.label && r.suggested_label ? r.suggested_label : s.label }
+        )
+      );
     } catch (e) {
-      setMenuNotice({ tone: "error", text: e.detail || e.message });
+      setSelectorErrors((prev) => ({ ...prev, [id]: e.detail || e.message }));
     } finally {
-      setMenuBusy(false);
+      setParsingRow(null);
     }
   }
 
-  async function handleResetBaseline() {
-    if (!selectedRecFile) return;
-    if (!window.confirm("Forget the saved menu? The next run will save the menu as it is then, and compare later runs against that.")) return;
-    setBaselineBusy(true);
-    setBaselineNotice(null);
+  // ---- checks ------------------------------------------------------------------------------------------------
+  function insertRowAfter(index, row) {
+    setSteps((prev) => [...prev.slice(0, index + 1), row, ...prev.slice(index + 1)]);
+  }
+  function addCheckAfter(index) {
+    const prevRow = steps[index];
+    const cfg = newCheck();
+    if (prevRow && (prevRow.locators || []).length) cfg.target = { step_row_id: prevRow._id };   // its element, by default
+    const row = withId({ action: "assert", label: "", assertion: cfg, locators: [], value: "" });
+    insertRowAfter(index, row);
+    setCheckRow(row._id);
+  }
+  function addRememberAfter(index) {
+    const row = withId({ action: "capture_text", label: "value_before", capture_cfg: { name: "value_before", source: "selector", target: {} }, locators: [], value: "" });
+    insertRowAfter(index, row);
+    setCheckRow(row._id);
+  }
+  function patchRow(id, patch) {
+    setSteps((prev) => prev.map((s) => (s._id === id ? { ...s, ...patch } : s)));
+  }
+  const rowNo = (id) => steps.findIndex((s) => s._id === id) + 1;
+
+  // Suggestions are made for the recording as last SAVED; accepted ones are put into the grid (save to keep them).
+  async function askSuggestions(kind) {
+    setSuggesting(kind);
+    setNotice(null);
     try {
-      await recordingsApi.resetMenuBaseline(selectedRecFile);
-      setBaselineNotice({ tone: "success", text: "Baseline cleared - the next run saves a new one." });
-      await loadRecordings();
+      if (kind === "locators") {
+        const r = await checksApi.suggestLocators(recordingFile);
+        setDialog({ kind, items: r.suggestions || [], aiAvailable: r.ai_available });
+      } else if (kind === "review") {
+        const r = await checksApi.review(recordingFile);
+        setDialog({ kind, aiAvailable: r.ai_available, items: (r.suggestions || []).map((s) => ({
+          key: `r${s.step_no}`, step_no: s.step_no, title: `Check at step ${s.step_no}${s.changed ? "" : " (fine as it is)"}`,
+          current: s.current, assertion: s.assertion, reason: s.reason, source: s.source })) });
+      } else {
+        const r = await checksApi.suggest(recordingFile);
+        setDialog({ kind, aiAvailable: r.ai_available, items: (r.suggestions || []).map((s, k) => ({
+          key: `s${k}`, insert_after: s.insert_after, title: `New check after step ${s.insert_after}`,
+          assertion: s.assertion, reason: s.reason, source: s.source })) });
+      }
     } catch (e) {
-      setBaselineNotice({ tone: "error", text: e.detail || e.message });
+      setNotice({ tone: "error", text: e.detail || e.message });
     } finally {
-      setBaselineBusy(false);
+      setSuggesting(null);
     }
   }
 
-  async function handleExport() {
-    if (!selectedRecording?.recording_id) return;
-    setExportBusy(true);
-    try { await recordingsApi.exportRecording(selectedRecording.recording_id); }
-    catch (e) { setRunError(e.detail || e.message); }
-    finally { setExportBusy(false); }
+  function applySuggestions(decided) {
+    const accepted = decided.filter((d) => d.decision === "accept");
+    const rejected = decided.filter((d) => d.decision === "reject");
+    setSteps((prev) => {
+      let rows = [...prev];
+      const savedRow = (n) => savedIds[n - 1];
+      // a target pointing at a saved step number -> that row (it may have moved since)
+      const fix = (cfg) => (cfg?.target?.step_no && savedRow(cfg.target.step_no)
+        ? { ...cfg, target: { ...cfg.target, step_row_id: savedRow(cfg.target.step_no) } } : cfg);
+      for (const d of decided.filter((x) => x.step_no)) {            // recorded checks: replace / mark reviewed
+        const id = savedRow(d.step_no);
+        rows = rows.map((r) => (r._id !== id ? r : d.decision === "accept"
+          ? { ...r, assertion: { ...fix(d.assertion), target: d.assertion.target?.step_no ? fix(d.assertion).target : (d.assertion.target || r.assertion?.target) },
+              label: d.assertion.name || r.label, original: r.original ? { ...r.original, check_review: { decision: "accept" } } : r.original }
+          : { ...r, original: r.original ? { ...r.original, check_review: { decision: "reject" } } : r.original }));
+      }
+      for (const d of [...accepted.filter((x) => x.insert_after !== undefined)].sort((a, b) => b.insert_after - a.insert_after)) {
+        const anchorId = d.insert_after ? savedRow(d.insert_after) : null;
+        const at = anchorId ? rows.findIndex((r) => r._id === anchorId) : -1;
+        const row = withId({ action: "assert", label: d.assertion.name || "", assertion: { on_fail: "continue", ...fix(d.assertion) },
+                             locators: [], value: "", check_source: "ai" });
+        rows = [...rows.slice(0, at + 1), row, ...rows.slice(at + 1)];
+      }
+      return rows;
+    });
+    setDialog(null);
+    setNotice({ tone: "success", text: `${accepted.length} suggestion(s) accepted${rejected.length ? `, ${rejected.length} rejected` : ""} - review them in the grid and press Save changes.` });
   }
 
-  const thBase = "px-3 py-2 align-top";
+  function applyLocators(decisions) {
+    setSteps((prev) => prev.map((r) => {
+      const d = decisions.find((x) => savedIds[x.step_no - 1] === r._id);
+      if (!d) return r;
+      const locs = r.locators || [];
+      const cut = locs.findIndex((l) => String(l.note || "").includes("generated"));
+      const add = d.locators.filter((l) => !locs.some((x) => x.strategy === l.strategy && x.value === l.value)).map((l) => ({ ...l, note: "suggested" }));
+      return { ...r, locators: cut < 0 ? [...locs, ...add] : [...locs.slice(0, cut), ...add, ...locs.slice(cut)], raw_selector: null };
+    }));
+    setDialog(null);
+    setNotice({ tone: "success", text: `Locators added to ${decisions.length} step(s) - press Save changes to keep them.` });
+  }
+
+  const pendingReview = steps.some((s) => s.action === "assert" && s.original?.check_context && !s.original?.check_review);
+
+  async function saveAll() {
+    const missingSelector = steps.findIndex((s) => NEEDS_SELECTOR.has(s.action) && s.locators.length === 0);
+    if (missingSelector !== -1) {
+      const bad = steps[missingSelector];
+      setNotice({ tone: "error", text: bad.raw_selector
+        ? `Row ${missingSelector + 1}: the selector text could not be read. Use an id (#login), a CSS selector, an XPath (//button[@id='x']) or a UiPath <webctrl .../> line.`
+        : `Row ${missingSelector + 1} (${ACTION_LABELS[bad.action] || bad.action}) needs a selector in "Present element" before saving - or delete the row if it is empty.` });
+      return;
+    }
+    setSaving(true);
+    setNotice(null);
+    try {
+      const r = await recordingsApi.updateSteps(recordingFile, steps.map((s) => {
+        const out = { ...stripId(s), runtime_config: runtimeConfigForSave(s.runtime_config) };
+        if (s.action === "assert") out.assertion = { ...(s.assertion || {}), target: toSaveTarget(s.assertion?.target, steps) };
+        if (s.action === "capture_text") out.capture_cfg = { ...(s.capture_cfg || {}), target: toSaveTarget(s.capture_cfg?.target, steps) };
+        return out;
+      }));
+      loadRows(r.steps);
+      setSelectorDrafts({});
+      setSelectorErrors({});
+      setNotice({ tone: "success", text: `Saved - this recording now has ${r.steps.length} steps.` });
+      if (onSaved) onSaved();
+    } catch (e) {
+      setNotice({ tone: "error", text: e.detail || e.message });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const cellClass = "border border-line px-0 py-0 align-top";
+  const inputClass = "w-full min-w-[7rem] border-0 bg-transparent px-2 py-1.5 text-sm text-ink focus:bg-brand-blueLight focus:outline-none";
 
   return (
-    <div className="min-w-0 space-y-6">
-      {/* ---- 1. Saved recordings table -------------------------------------- */}
-      <Panel>
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-5 py-4">
-          <div>
-            <h2 className="text-sm font-semibold text-ink">Saved Recordings</h2>
-            <p className="mt-0.5 text-xs text-muted">
-              Use the boxes under each heading to filter. Click a row to open its test data and steps below, or press Run to execute it straight away.
+    <Panel>
+      <div className="px-5 py-4">
+        <Disclosure title={`Edit steps (Excel-style) — ${steps.length} step${steps.length === 1 ? "" : "s"}`} defaultOpen>
+          <div className="space-y-3">
+            <p className="text-xs text-muted">
+              Same columns as your spreadsheet - click any cell to edit. Drag a row by the <strong>⋮⋮</strong> handle (or use ↑ ↓) to move it, and press <strong>✕</strong> to delete it. Paste a selector into &quot;Present element&quot;
+              exactly like the Excel column; it parses automatically when you click away. Changes apply once you click
+              &quot;Save changes&quot; below.
             </p>
-          </div>
-          <div className="flex flex-wrap items-center gap-4">
-            <Checkbox label="headless" checked={runHeadless} onChange={setRunHeadless} />
-            {filtersActive && (
-              <button type="button" className="text-xs font-medium text-brand-blue hover:underline" onClick={() => setFilters(EMPTY_FILTERS)}>
-                Clear filters
-              </button>
-            )}
-            {isAdmin && (
-              <Button
-                variant="secondary"
-                onClick={() => handleDeleteRecordings(delPickedFiles)}
-                disabled={delBusy || delPickedFiles.length === 0}
-                className="!text-signal-rust"
-              >
-                {delBusy ? "Deleting…" : `🗑 Delete selected (${delPickedFiles.length})`}
-              </Button>
-            )}
-          </div>
-        </div>
-        {recordingsError && <div className="px-5 pt-4"><Callout tone="error">Could not load recordings: {recordingsError}</Callout></div>}
-        {delNotice && <div className="px-5 pt-4"><Callout tone={delNotice.tone}>{delNotice.text}</Callout></div>}
-        {runError && <div className="px-5 pt-4"><Callout tone="error">Run failed: {runError}</Callout></div>}
-        {validation && <div className="px-5 pt-4"><ValidationReport report={validation} onFix={handleFix} busy={validating} /></div>}
-        {job && (
-          <div className="px-5 pt-4">
-            <ExecutionProgress
-              job={job}
-              connectionLost={connectionLost}
-              busyAction={controlBusy}
-              onPause={() => controlJob("pause")}
-              onResume={() => controlJob("resume")}
-              onCancel={() => controlJob("cancel")}
-            />
-          </div>
-        )}
-        {job?.status === "waiting_for_input" && job.input_request && !job.input_request.answered && (
-          <RuntimeInputDialog
-            key={job.input_request.request_id}
-            jobId={job.job_id}
-            request={job.input_request}
-            onAnswered={() => setJob((j) => (j ? { ...j, status: "resuming", input_request: { ...j.input_request, answered: true } } : j))}
-            onStop={() => controlJob("cancel")}
-          />
-        )}
-        {runBusy && !job && <div className="px-5 pt-4"><Spinner label="Starting..." /></div>}
-        <div className="px-2 py-3 sm:px-5">
-          {recordings.length === 0 && !recordingsError ? (
-            <p className="px-3 py-6 text-center text-sm text-muted">
-              No saved recordings to show. Record one from the Record screen
-              {!isAdmin && " — or ask an admin to give you access to an application"}.
-            </p>
-          ) : (
-            <div className="max-h-[32rem] overflow-auto scroll-thin">
-              <table className="w-full min-w-[52rem] border-collapse text-left text-sm">
-                <thead className="sticky top-0 z-10 bg-panel shadow-[0_1px_0_0_#D8E1EF]">
-                  <tr className="text-xs font-semibold text-slate-600">
-                    {isAdmin && (
-                      <th className={`${thBase} w-8`}>
-                        <input
-                          type="checkbox"
-                          aria-label="Select all shown recordings"
-                          checked={allShownPicked}
-                          onChange={(e) =>
-                            setDelPicked((prev) => {
-                              const next = { ...prev };
-                              tableRows.forEach((r) => { if (e.target.checked) next[r.file] = true; else delete next[r.file]; });
-                              return next;
-                            })
-                          }
-                        />
-                      </th>
-                    )}
-                    <th className={`${thBase} w-20`}>
-                      <div className="mb-1">#</div>
-                      <ColumnFilter value={filters.no} onChange={setFilter("no")} placeholder="No." label="Filter by number" />
-                    </th>
-                    <th className={`${thBase} w-44`}>
-                      <div className="mb-1">Application</div>
-                      <select
-                        value={filters.app}
-                        onChange={(e) => setFilter("app")(e.target.value)}
-                        aria-label="Filter by application"
-                        className="w-full rounded-sm border border-line bg-white px-1.5 py-1 text-xs font-normal text-ink focus:border-brand-blue focus:outline-none"
-                      >
-                        <option value="">All</option>
-                        {appChoices.map((a) => <option key={a} value={a}>{a}</option>)}
-                      </select>
-                    </th>
-                    <th className={thBase}>
-                      <div className="mb-1">Recording Name</div>
-                      <ColumnFilter value={filters.name} onChange={setFilter("name")} placeholder="Search name" label="Filter by recording name" />
-                    </th>
-                    <th className={`${thBase} w-40`}>
-                      <div className="mb-1">Recorded By</div>
-                      <ColumnFilter value={filters.by} onChange={setFilter("by")} placeholder="Search user" label="Filter by user who recorded" />
-                    </th>
-                    <th className={`${thBase} w-52`}>
-                      <div className="mb-1">Date &amp; Time</div>
-                      <ColumnFilter value={filters.when} onChange={setFilter("when")} placeholder="e.g. 2026-10-22" label="Filter by date and time" />
-                    </th>
-                    <th className={`${thBase} w-28`}>
-                      <div className="mb-1">Total Steps</div>
-                      <ColumnFilter value={filters.steps} onChange={setFilter("steps")} placeholder="e.g. 25" label="Filter by total steps" />
-                    </th>
-                    <th className={`${thBase} text-right`}><div className="mb-1">Actions</div></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {tableRows.map((r) => (
-                    <tr
-                      key={r.file}
-                      onClick={() => setSelectedRecFile(r.file)}
-                      className={`cursor-pointer border-t border-line hover:bg-rail ${r.file === selectedRecFile ? "bg-brand-blueLight" : ""}`}
-                    >
-                      {isAdmin && (
-                        <td className="px-3 py-3" onClick={(e) => e.stopPropagation()}>
-                          <input
-                            type="checkbox"
-                            aria-label={`Select ${r.name}`}
-                            checked={!!delPicked[r.file]}
-                            onChange={(e) =>
-                              setDelPicked((prev) => {
-                                const next = { ...prev };
-                                if (e.target.checked) next[r.file] = true; else delete next[r.file];
-                                return next;
-                              })
-                            }
-                          />
-                        </td>
-                      )}
-                      <td className="px-3 py-3 text-muted">{r._no}</td>
-                      <td className="px-3 py-3 font-medium text-ink">{r._app}</td>
-                      <td className="max-w-xs break-words px-3 py-3 text-ink">
-                        {r.name}
-                        {r.migration_status && r.migration_status !== "NATIVE" && r.migration_status !== "UNKNOWN" && (
-                          <span className="ml-2 rounded bg-rail px-1.5 py-0.5 text-[10px] font-semibold text-muted">{r.migration_status}</span>
-                        )}
-                      </td>
-                      <td className="break-words px-3 py-3 text-ink">{r.recorded_by || <span className="text-muted">-</span>}</td>
-                      <td className="whitespace-nowrap px-3 py-3 text-muted">{r._when}</td>
-                      <td className="px-3 py-3 font-mono text-ink">{r.action_count ?? 0}</td>
-                      <td className="px-3 py-3" onClick={(e) => e.stopPropagation()}>
-                        <div className="flex items-center justify-end gap-2">
-                          <Button onClick={() => handleRun(r.file)} disabled={runBusy} className="!px-4 !py-1.5">Run</Button>
-                          <button
-                            type="button"
-                            title={r.recording_id ? "Download recording package" : "Download is not available for this older recording"}
-                            disabled={!r.recording_id}
-                            onClick={() => handleDownloadOne(r)}
-                            className="rounded-lg border border-line p-2 text-brand-blue hover:border-brand-blue disabled:cursor-not-allowed disabled:opacity-30"
-                          >
-                            <svg viewBox="0 0 20 20" fill="currentColor" className="h-4 w-4"><path fillRule="evenodd" d="M10 3a1 1 0 011 1v7.586l2.293-2.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 111.414-1.414L9 11.586V4a1 1 0 011-1zM4 15a1 1 0 011 1v1h10v-1a1 1 0 112 0v1a2 2 0 01-2 2H5a2 2 0 01-2-2v-1a1 1 0 011-1z" clipRule="evenodd" /></svg>
-                          </button>
-                          {isAdmin && (
-                            <button
-                              type="button"
-                              title="Delete recording (admin only)"
-                              onClick={() => handleDeleteRecordings([r.file])}
-                              className="rounded-lg border border-line p-2 text-signal-rust hover:border-signal-rust"
-                            >
-                              <svg viewBox="0 0 20 20" fill="currentColor" className="h-4 w-4"><path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" /></svg>
-                            </button>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                  {tableRows.length === 0 && (
-                    <tr><td colSpan={colCount} className="px-3 py-6 text-center text-sm text-muted">Nothing matches these filters.</td></tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          )}
-          {recordings.length > 0 && (
-            <p className="mt-2 px-1 text-xs text-muted">
-              Showing {tableRows.length} of {recordings.length} recording{recordings.length === 1 ? "" : "s"}.
-            </p>
-          )}
-        </div>
-      </Panel>
 
-      {/* ---- 2. Run controls for the recording picked in the table ----------- */}
-      {selectedRecording && (
-        <Panel>
-          <div className="space-y-3 px-5 py-4">
-            <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-              <div className="min-w-0">
-                <p className="truncate text-sm font-semibold text-ink">{selectedRecording.name}</p>
-                <p className="text-xs text-muted">
-                  {selectedRecording.application || "Others"} · {selectedRecording.action_count ?? 0} steps ·{" "}
-                  {selectedRecording.is_owner ? "you own it" : selectedRecording.is_shared ? "shared with you" : "open to everyone with access to this application"}
-                </p>
-              </div>
-              <div className="ml-auto flex flex-wrap items-center gap-2">
-                <Button onClick={() => handleRun()} disabled={runBusy}>{runBusy ? "Running..." : "▶ Run recording"}</Button>
-                {runBusy && job && <Button variant="secondary" onClick={() => controlJob("cancel")} disabled={!!controlBusy}>⬛ Stop</Button>}
-                <Button variant="secondary" onClick={handleRegenerate} disabled={regenBusy} title="Refresh this recording's generated feature/steps/page files without running anything">
-                  {regenBusy ? "Regenerating..." : "Regenerate"}
-                </Button>
-                {selectedRecording.recording_id && (
-                  <Link href={`/recordings/${selectedRecording.recording_id}`} className="inline-flex items-center px-2 py-2 text-sm font-medium text-signal-slate underline decoration-line underline-offset-4 hover:text-ink">
-                    View details →
-                  </Link>
-                )}
-                {selectedRecording.is_owner && <Button variant="ghost" onClick={() => setShareDialogOpen(true)}>Share</Button>}
-                <Button variant="ghost" onClick={handleExport} disabled={exportBusy}>{exportBusy ? "Exporting..." : "Export"}</Button>
-              </div>
-            </div>
-
-            {shareDialogOpen && (
-              <ShareDialog recordingId={selectedRecording.recording_id} recordingName={selectedRecording.name} onClose={() => setShareDialogOpen(false)} />
-            )}
-
-            {selectedRecording.recording_id && (
-              <RuntimeConfigPanel
-                key={`${selectedRecording.recording_id}-${runtimeReload}`}
-                recordingId={selectedRecording.recording_id}
-                values={runtimeValues}
-                onChange={setRuntimeValues}
-                onLoaded={setRuntimeVars}
-              />
-            )}
-
-            {firstFailedStep && (
-              <Callout tone="info">
-                Last run first failed at step {firstFailedStep}.{" "}
-                <button type="button" className="font-semibold text-brand-blue underline" onClick={() => setResumeFrom(String(firstFailedStep))}>
-                  Resume from step {firstFailedStep}
-                </button>
+            {stale && (
+              <Callout tone="error">
+                The test data of this recording was changed and saved after you started editing here. Saving this grid now would put the old values back.{" "}
+                <button type="button" className="font-medium underline" onClick={load}>Reload steps</button> (your unsaved edits here are lost).
               </Callout>
             )}
+            {loading && <Spinner label="Loading steps..." />}
+            {loadError && <Callout tone="error">Could not load steps: {loadError}</Callout>}
 
-            {selectedRecording.has_menu_check && (
-              <div className="space-y-2">
-                <Callout>
-                  This is a navigation menu check.{" "}
-                  {selectedRecording.menu_baseline_count > 0
-                    ? `Baseline saved: ${selectedRecording.menu_baseline_count} menu links${selectedRecording.menu_baseline_saved_at ? ` (${selectedRecording.menu_baseline_saved_at} UTC)` : ""}. A link that disappears or points somewhere else is reported as failed.`
-                    : "No baseline yet - the first run saves the menu as it is, and later runs are compared against it."}
-                </Callout>
-                {selectedRecording.menu_baseline_count > 0 && (
-                  <Button variant="ghost" onClick={handleResetBaseline} disabled={baselineBusy}>
-                    {baselineBusy ? "Clearing..." : "Menu changed on purpose? Reset baseline"}
-                  </Button>
-                )}
-                {baselineNotice && <Callout tone={baselineNotice.tone}>{baselineNotice.text}</Callout>}
-              </div>
-            )}
-
-            {regenNotice && <Callout tone={regenNotice.tone}>{regenNotice.text}</Callout>}
-            {regenFiles && (
-              <div className="flex flex-wrap gap-2">
-                {[
-                  { path: regenFiles.feature_file, label: "Feature file" },
-                  { path: regenFiles.steps_file, label: "Steps (.py)" },
-                  { path: regenFiles.page_file, label: "Page object (.py)" },
-                  { path: regenFiles.locators_file, label: "Locators (.json)" },
-                ].map(({ path, label }) =>
-                  path && (
-                    <button key={path} type="button"
-                      className="rounded-sm border border-line bg-panel px-2.5 py-1 text-xs font-medium text-brand-blue hover:border-brand-blue/40 disabled:opacity-40"
-                      disabled={downloadingRegen === path}
-                      onClick={() => handleDownloadRegenFile(path, label)}>
-                      {downloadingRegen === path ? "Downloading..." : `⬇ ${label}`}
-                    </button>
-                  )
-                )}
-              </div>
-            )}
-
-            <Disclosure title="Resume from a step (optional)" defaultOpen={!!resumeFrom}>
-              <div className="grid gap-3 sm:grid-cols-2">
-                <Field label="Start from step number" hint="Leave empty to run all steps. Steps before this are skipped and shown as Skipped in the report.">
-                  <TextInput type="number" min="2" value={resumeFrom} onChange={(e) => setResumeFrom(e.target.value)} placeholder="e.g. 400" />
-                </Field>
-                <Field label="Always run the first N steps" hint="Use this for steps the page needs first, such as opening the site and logging in (e.g. 12).">
-                  <TextInput type="number" min="0" value={resumeSetup} onChange={(e) => setResumeSetup(e.target.value)} />
-                </Field>
-                {resumeFrom && (
-                  <button type="button" className="text-left text-xs font-medium text-brand-blue" onClick={() => setResumeFrom("")}>
-                    Clear - run all steps
-                  </button>
-                )}
-              </div>
-            </Disclosure>
-          </div>
-        </Panel>
-      )}
-
-      {/* ---- 3. Test data (full width, below the table) ---------------------- */}
-      {selectedRecFile && (
-        <Panel>
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-5 py-4">
-            <div>
-              <h2 className="text-sm font-semibold text-ink">Test data</h2>
-              <p className="mt-0.5 text-xs text-muted">The values this recording types/selects when it runs. Edit anything below, then hit <strong>Run recording</strong>.</p>
-            </div>
-            {testData.length > 0 && (
-              <Button variant="secondary" onClick={saveTestDataOnly} disabled={savingData}>
-                {savingData ? "Saving..." : "Save without running"}
-              </Button>
-            )}
-          </div>
-          <div className="px-5 py-4">
-            {testDataLoading && <Spinner label="Loading test data..." />}
-            {testDataError && <Callout tone="error">{testDataError}</Callout>}
-            {saveDataError && <Callout tone="error">{saveDataError}</Callout>}
-            {saveDataNotice && <Callout tone="success">{saveDataNotice}</Callout>}
-            {!testDataLoading && !testDataError && testData.length === 0 && (
-              <p className="text-sm text-muted">This recording has no typed or selected values to edit.</p>
-            )}
-            {testData.length > 0 && (
-              <div className="mt-2 max-h-[28rem] w-full overflow-auto rounded-sm border border-line scroll-thin">
-                <table className="w-full min-w-[40rem] border-collapse text-left text-sm">
-                  <thead className="sticky top-0 bg-rail">
-                    <tr>
-                      <th className="w-12 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">#</th>
-                      <th className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">Field</th>
-                      <th className="w-36 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">Type</th>
-                      <th className="w-[45%] px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">Value</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {testData.map((f, i) => (
-                      <tr key={f.index} className="border-t border-line odd:bg-panel even:bg-[#FBFDFF]">
-                        <td className="px-3 py-2 text-xs text-muted">{i + 1}</td>
-                        <td className="px-3 py-2 align-middle text-ink">{f.label}</td>
-                        <td className="px-3 py-2 align-middle font-mono text-[13px] text-slate-600">{f.action}</td>
-                        <td className="px-2 py-1.5">
-                          <TextInput value={editValues[f.index] ?? ""} onChange={(e) => updateValue(f.index, e.target.value)} />
-                        </td>
+            {!loading && !loadError && (
+              <>
+                <div className="max-h-[75vh] min-h-[24rem] w-full overflow-auto rounded-sm border border-line scroll-thin">
+                  <table className="w-full min-w-[56rem] border-collapse text-left text-sm">
+                    <thead className="sticky top-0 z-10 bg-rail">
+                      <tr>
+                        <th className="w-8 border border-line px-1 py-2" title="Drag a row by its handle to move it" />
+                        <th className="border border-line px-2 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">#</th>
+                        <th className="border border-line px-2 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">Action/Method</th>
+                        <th className="border border-line px-2 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">Name</th>
+                        <th className="border border-line px-2 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">Present element</th>
+                        <th className="border border-line px-2 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600">Input</th>
+                        <th className="border border-line px-2 py-2 text-xs font-semibold uppercase tracking-wide text-slate-600"></th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody>
+                      {steps.map((s, i) => (
+                        <Fragment key={s._id}>
+                        <tr
+                          draggable={armedRow === i}
+                          onDragStart={(e) => {
+                            setDragFrom(i);
+                            e.dataTransfer.effectAllowed = "move";
+                            try { e.dataTransfer.setData("text/plain", String(i + 1)); } catch { /* old browsers */ }
+                          }}
+                          onDragOver={(e) => handleDragOver(e, i)}
+                          onDrop={handleDrop}
+                          onDragEnd={endDrag}
+                          className={`odd:bg-panel even:bg-[#FBFDFF] ${dragFrom === i ? "opacity-40" : ""}`}
+                          style={
+                            dragOver && dragOver.index === i && dragFrom !== null && dragFrom !== i
+                              ? { boxShadow: `inset 0 ${dragOver.after ? "-3px" : "3px"} 0 0 #1F5FE0` }
+                              : undefined
+                          }
+                        >
+                          <td className="border border-line px-0 py-1.5 text-center">
+                            <span
+                              role="button"
+                              aria-label={`Drag step ${i + 1} to move it`}
+                              title="Drag to move this step"
+                              onMouseDown={() => setArmedRow(i)}
+                              onMouseUp={() => setArmedRow(null)}
+                              className="inline-block cursor-grab select-none px-1 text-base leading-none text-muted hover:text-ink active:cursor-grabbing"
+                            >
+                              ⋮⋮
+                            </span>
+                          </td>
+                          <td className="border border-line px-2 py-1.5 text-xs text-muted">{i + 1}</td>
+                          {CHECK_ROWS.has(s.action) ? (
+                            <>
+                              <td className={cellClass}>
+                                <button type="button" onClick={() => setCheckRow(checkRow === s._id ? null : s._id)}
+                                  className={`w-full px-2 py-1.5 text-left text-sm font-semibold ${s.action === "assert" ? "text-signal-tealDark" : "text-signal-slate"}`}>
+                                  {String(s.check_source || "").startsWith("verify-") ? "VERIFY" : ACTION_LABELS[s.action]}
+                                  {s.check_source === "ai" || s.original?.check_source === "ai" || s.check_source === "verify-ai" || s.check_source === "verify-hybrid" ? " ✨" : ""}
+                                </button>
+                              </td>
+                              <td className={cellClass}>
+                                <input className={inputClass} value={s.label || ""} placeholder={s.action === "assert" ? "e.g. Loan saved" : "e.g. balance_before"}
+                                  onChange={(e) => patchRow(s._id, s.action === "assert"
+                                    ? { label: e.target.value, assertion: { ...(s.assertion || {}), name: e.target.value } }
+                                    : { label: e.target.value, capture_cfg: { ...(s.capture_cfg || {}), name: e.target.value } })} />
+                              </td>
+                              <td className={cellClass}>
+                                <button type="button" onClick={() => setCheckRow(s._id)} className="block w-full px-2 py-1.5 text-left text-xs text-muted">
+                                  {(() => {
+                                    const tgt = (s.action === "assert" ? s.assertion : s.capture_cfg)?.target || {};
+                                    if (tgt.step_row_id) return `Element of step ${rowNo(tgt.step_row_id) || "?"}`;
+                                    if (tgt.preset) return tgt.preset.replace(/_/g, " ");
+                                    if (tgt.label) return tgt.label;
+                                    if (tgt.locators) return "The element marked while recording";
+                                    if (tgt.selector) return tgt.selector;
+                                    const needsElement = (catalog?.types || []).find((x) => x.type === s.assertion?.type)?.target === "element";
+                                    return s.action === "assert" && !needsElement ? "The page" : "⚠ Choose where to look";
+                                  })()}
+                                </button>
+                              </td>
+                              <td className={cellClass}>
+                                <button type="button" onClick={() => setCheckRow(s._id)} className="block w-full px-2 py-1.5 text-left text-sm text-ink">
+                                  {s.action === "assert"
+                                    ? `${(catalog?.types || []).find((x) => x.type === s.assertion?.type)?.label || s.assertion?.type || ""}${
+                                        s.assertion?.expected !== undefined && s.assertion?.expected !== "" ? `: ${s.assertion.expected}` : ""}`
+                                    : "remember its value"}
+                                </button>
+                              </td>
+                            </>
+                          ) : (
+                          <>
+                          <td className={cellClass}>
+                            <Select
+                              value={s.action}
+                              onChange={(e) => {
+                                const newAction = e.target.value;
+                                updateField(i, "action", newAction);
+                                if (newAction === "copy" || newAction === "ocr_capture") updateField(i, "captured_as", s.label || "");
+                              }}
+                              className="border-0 bg-transparent px-2 py-1.5 text-sm focus:outline-none"
+                            >
+                              {Object.entries(ACTION_LABELS).filter(([value]) => !KEEP_ONLY.has(value) || s.action === value).map(([value, label]) => (
+                                <option key={value} value={value}>
+                                  {label}
+                                </option>
+                              ))}
+                            </Select>
+                          </td>
+                          <td className={cellClass}>
+                            {NEEDS_NAME.has(s.action) ? (
+                              <input
+                                className={inputClass}
+                                value={s.label || ""}
+                                onChange={(e) => updateField(i, "label", e.target.value)}
+                                placeholder="e.g. Login Button"
+                              />
+                            ) : (
+                              <span className="block px-2 py-1.5 text-xs text-muted">—</span>
+                            )}
+                          </td>
+                          <td className={cellClass}>
+                            {NEEDS_SELECTOR.has(s.action) ? (
+                              <div>
+                                <textarea
+                                  className="w-full min-w-[16rem] resize-y border-0 bg-transparent px-2 py-1.5 font-mono text-xs text-ink focus:bg-brand-blueLight focus:outline-none"
+                                  rows={2}
+                                  defaultValue={selectorCellText(s, selectorDrafts, s._id)}
+                                  onBlur={(e) => handleSelectorBlur(i, s._id, e.target.value)}
+                                  placeholder="<html app='msedge.exe' />&#10;<webctrl id='username' tag='INPUT' />"
+                                />
+                                {parsingRow === s._id && <div className="px-2 pb-1 text-xs text-muted">Parsing...</div>}
+                                {selectorErrors[s._id] && <div className="px-2 pb-1 text-xs text-signal-rust">{selectorErrors[s._id]}</div>}
+                              </div>
+                            ) : (
+                              <span className="block px-2 py-1.5 text-xs text-muted">—</span>
+                            )}
+                          </td>
+                          <td className={cellClass}>
+                            <input
+                              className={inputClass}
+                              value={s.value || ""}
+                              onChange={(e) => updateField(i, "value", e.target.value)}
+                              placeholder={INPUT_PLACEHOLDER[s.action] || ""}
+                            />
+                          </td>
+                          </>
+                          )}
+                          <td className="border border-line px-1 py-1.5 text-center">
+                            <div className="flex items-center justify-center gap-1">
+                              <button type="button" onClick={() => addCheckAfter(i)} title="Add a check right after this step"
+                                aria-label={`Add a check after step ${i + 1}`} className="rounded-sm px-1 text-xs font-semibold text-signal-tealDark hover:bg-[#F0FDF7]">
+                                ✓+
+                              </button>
+                              {(s.runtime_input_types || []).length > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (!s.runtime_config?.configurable) updateField(i, "runtime_config", newRuntimeConfig(s));
+                                    setConfigRow(configRow === s._id ? null : s._id);
+                                  }}
+                                  title={s.runtime_config?.configurable
+                                    ? `Value chosen for each run: ${s.runtime_config.variable_name}`
+                                    : "Let each run choose this step's value"}
+                                  aria-label={`Runtime value settings for step ${i + 1}`}
+                                  className={`rounded-sm px-1 ${s.runtime_config?.configurable ? "bg-brand-blue text-white" : "text-muted hover:text-ink"}`}
+                                >
+                                  ⚙
+                                </button>
+                              )}
+                              <button type="button" className="px-1 text-muted hover:text-ink disabled:opacity-30" disabled={i === 0} onClick={() => moveRow(i, -1)} title="Move up">
+                                ↑
+                              </button>
+                              <button type="button" className="px-1 text-muted hover:text-ink disabled:opacity-30" disabled={i === steps.length - 1} onClick={() => moveRow(i, 1)} title="Move down">
+                                ↓
+                              </button>
+                              <button type="button" className="rounded-sm px-1.5 font-semibold text-signal-rust hover:bg-[#FBEEEA]" onClick={() => deleteRow(i)} title="Delete this step" aria-label={`Delete step ${i + 1}`}>
+                                ✕
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                        {checkRow === s._id && CHECK_ROWS.has(s.action) && (
+                          <tr>
+                            <td colSpan={7} className="border border-line px-3 py-3">
+                              <CheckEditor row={s} rows={steps} catalog={catalog} onChange={(patch) => patchRow(s._id, patch)} />
+                              <div className="mt-2 flex gap-3 text-xs">
+                                <button type="button" className="font-medium text-brand-blue" onClick={() => setCheckRow(null)}>Done</button>
+                                <span className="text-muted">Saved with “Save changes” below.</span>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                        {configRow === s._id && s.runtime_config?.configurable && (
+                          <tr>
+                            <td colSpan={7} className="border border-line px-3 py-3">
+                              <RuntimeStepConfig step={s} config={s.runtime_config} onChange={(cfg) => updateField(i, "runtime_config", cfg)} />
+                              <div className="mt-2 flex gap-3 text-xs">
+                                <button type="button" className="font-medium text-brand-blue" onClick={() => setConfigRow(null)}>Done</button>
+                                <button type="button" className="font-medium text-signal-rust"
+                                  onClick={() => { updateField(i, "runtime_config", null); setConfigRow(null); }}>
+                                  Stop asking for this value (always use the recorded one)
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                        </Fragment>
+                      ))}
+                      {steps.length === 0 && (
+                        <tr>
+                          <td colSpan={7} className="border border-line px-3 py-4 text-center text-sm text-muted">
+                            No steps yet - add one below.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button variant="secondary" onClick={addRow}>
+                    + Add row
+                  </Button>
+                  <Button variant="secondary" onClick={() => addCheckAfter(steps.length - 1)}>✓ Add check</Button>
+                  <Button variant="secondary" onClick={() => addRememberAfter(steps.length - 1)} title="For a check that a value changed (before / after)">
+                    ⧉ Remember a value
+                  </Button>
+                  <Button variant="secondary" onClick={() => askSuggestions("checks")} disabled={!!suggesting}>
+                    {suggesting === "checks" ? "Thinking..." : "✨ Suggest checks"}
+                  </Button>
+                  {pendingReview && (
+                    <Button variant="secondary" onClick={() => askSuggestions("review")} disabled={!!suggesting}>
+                      {suggesting === "review" ? "Reviewing..." : "✨ Review recorded checks"}
+                    </Button>
+                  )}
+                  <Button variant="ghost" onClick={() => askSuggestions("locators")} disabled={!!suggesting}
+                    title="Steps found only by a long generated path - add sturdier ways to find them">
+                    {suggesting === "locators" ? "Looking..." : "Strengthen locators"}
+                  </Button>
+                  <Button onClick={saveAll} disabled={saving}>
+                    {saving ? "Saving..." : "Save changes"}
+                  </Button>
+                  <Button variant="secondary" onClick={load} disabled={saving}>
+                    Discard &amp; reload
+                  </Button>
+                </div>
+                {notice && <Callout tone={notice.tone}>{notice.text}</Callout>}
+                {dialog && dialog.kind !== "locators" && (
+                  <CheckSuggestions
+                    title={dialog.kind === "review" ? "Checks you marked while recording" : "Suggested checks"}
+                    items={dialog.items} catalog={catalog} aiAvailable={dialog.aiAvailable}
+                    onDone={applySuggestions} onCancel={() => setDialog(null)}
+                  />
+                )}
+                {dialog && dialog.kind === "locators" && (
+                  <LocatorSuggestions items={dialog.items} aiAvailable={dialog.aiAvailable}
+                    onDone={applyLocators} onCancel={() => setDialog(null)} />
+                )}
+              </>
             )}
-          </div>
-        </Panel>
-      )}
-
-      {/* ---- 4. Excel-style step editor (full width, below the test data) ---- */}
-      {selectedRecFile && <StepEditor recordingFile={selectedRecFile} reloadKey={stepsReload} onSaved={() => { loadTestData(selectedRecFile); loadRecordings(); setRuntimeReload((n) => n + 1); }} />}
-
-      {selectedRecording?.recording_id && <VersionHistory recordingId={selectedRecording.recording_id} />}
-      {job && job.job_id && <ExecutionDetails job={job} hideAssertions hideRerunExport />}
-      {report && <ReportView key={report.transaction_id} report={report} />}
-      {!selectedRecFile && recordings.length > 0 && (
-        <Panel><div className="px-5 py-10 text-center text-sm text-muted">Pick a saved recording to review its test data and run it.</div></Panel>
-      )}
-
-      {/* ---- 5. Less-used tool, kept out of the way -------------------------- */}
-      {(
-        <Disclosure title="Create a navigation menu check (no recording needed)">
-          <div className="grid gap-3 sm:grid-cols-2">
-            <p className="text-xs text-muted sm:col-span-2">
-              Checks every link in the site&apos;s menu - Personal Banking &gt; Accounts &gt; Saving Account and so on. On each
-              run it opens the menus with the mouse, clicks every link and verifies the page that opens. Nobody has
-              to hover or record anything.
-            </p>
-            <Field label="Application">
-              <Select value={menuApp} onChange={(e) => setMenuApp(e.target.value)}>
-                {applicationNames.map((name) => (
-                  <option key={name} value={name}>{name}</option>
-                ))}
-              </Select>
-            </Field>
-            {menuApp === "Others" && (
-              <Field label="Website address">
-                <TextInput value={menuUrl} onChange={(e) => setMenuUrl(e.target.value)} placeholder="https://ca.statebank" />
-              </Field>
-            )}
-            <Field label="Name">
-              <TextInput value={menuName} onChange={(e) => setMenuName(e.target.value)} placeholder="Optional, e.g. Navbar regression" />
-            </Field>
-            <Field label="Menu selector" hint="Leave blank - the menu is found automatically. Fill in a CSS selector (e.g. nav or #main-menu) only if the wrong menu gets picked.">
-              <TextInput value={menuSelector} onChange={(e) => setMenuSelector(e.target.value)} placeholder="Optional" />
-            </Field>
-            <div className="sm:col-span-2"><Checkbox label="Fail a link if its menu does not open on hover" checked={menuStrict} onChange={setMenuStrict} /></div>
-            <div className="sm:col-span-2">
-              <Button variant="secondary" onClick={handleCreateMenuCheck} disabled={menuBusy}>
-                {menuBusy ? "Creating..." : "Create menu check"}
-              </Button>
-            </div>
-            {menuNotice && <div className="sm:col-span-2"><Callout tone={menuNotice.tone}>{menuNotice.text}</Callout></div>}
           </div>
         </Disclosure>
-      )}
-    </div>
+      </div>
+    </Panel>
   );
 }
